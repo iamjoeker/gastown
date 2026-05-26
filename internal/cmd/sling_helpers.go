@@ -19,6 +19,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/formula"
 	rigpkg "github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -42,8 +43,15 @@ import (
 // Storage API, making this function unnecessary. Until then, this is the
 // routing bridge between gt and the routing-free bd CLI.
 func resolveBeadDir(beadID string) string {
-	townRoot, err := workspace.FindFromCwd()
+	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
+		return "."
+	}
+	return resolveBeadDirFromTownRoot(townRoot, beadID)
+}
+
+func resolveBeadDirFromTownRoot(townRoot, beadID string) string {
+	if townRoot == "" {
 		return "."
 	}
 	townBeadsDir := filepath.Join(townRoot, ".beads")
@@ -292,9 +300,9 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {
 func verifyBeadExists(beadID string) error {
 	out, err := bdShowBeadOutput(beadID)
 	if err != nil {
-		return fmt.Errorf("bead '%s' not found (bd show failed)", beadID)
+		return fmt.Errorf("bead '%s' not found (bd show failed: %w)", beadID, err)
 	}
-	if len(out) == 0 {
+	if len(strings.TrimSpace(string(out))) == 0 {
 		return fmt.Errorf("bead '%s' not found", beadID)
 	}
 	return nil
@@ -316,14 +324,21 @@ func verifyBeadExistsInTargetRigDatabase(beadID, targetRig, townRoot string) err
 	}
 
 	targetRigDir := beads.GetRigDirForName(townRoot, targetRig)
-	if targetRigDir == "" {
+	targetBeadsDir := ""
+	if targetRigDir != "" {
+		targetBeadsDir = filepath.Join(targetRigDir, ".beads")
+	} else {
+		targetBeadsDir = doltserver.FindRigBeadsDir(townRoot, targetRig)
+		targetRigDir = filepath.Dir(targetBeadsDir)
+	}
+	if targetBeadsDir == "" || targetRigDir == "." {
 		return fmt.Errorf("cannot resolve target rig %q beads database for bead %s; refusing to sling before creating hooks or molecule side effects", targetRig, beadID)
 	}
-	targetBeadsDir := filepath.Join(targetRigDir, ".beads")
 
-	out, err := BdCmd("--db", targetBeadsDir, "show", beadID, "--json").
+	out, err := BdCmd("show", beadID, "--json").
 		AllowStale().
 		Dir(targetRigDir).
+		WithBeadsDir(targetBeadsDir).
 		StripBeadsDir().
 		Stderr(io.Discard).
 		Output()
@@ -369,6 +384,21 @@ func bdShowBeadOutput(beadID string) ([]byte, error) {
 	return out, err
 }
 
+func bdShowBeadOutputFromTownRoot(townRoot, beadID string) ([]byte, error) {
+	if townRoot == "" {
+		return bdShowBeadOutput(beadID)
+	}
+	out, err := bdShowBeadDirectCmdFromTownRoot(townRoot, beadID).Stderr(io.Discard).Output()
+	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return out, nil
+	}
+	routedOut, routedErr := bdShowBeadRoutedCmdFromTownRoot(townRoot, beadID).Stderr(io.Discard).Output()
+	if routedErr == nil && len(strings.TrimSpace(string(routedOut))) > 0 {
+		return routedOut, nil
+	}
+	return out, err
+}
+
 func bdShowBeadDirectCmd(beadID string) *bdCmd {
 	return BdCmd("show", beadID, "--json").
 		AllowStale().
@@ -376,12 +406,23 @@ func bdShowBeadDirectCmd(beadID string) *bdCmd {
 		StripBeadsDir()
 }
 
+func bdShowBeadDirectCmdFromTownRoot(townRoot, beadID string) *bdCmd {
+	return BdCmd("show", beadID, "--json").
+		AllowStale().
+		Dir(resolveBeadDirFromTownRoot(townRoot, beadID)).
+		StripBeadsDir()
+}
+
 func bdShowBeadRoutedCmd(beadID string) *bdCmd {
 	bdc := BdCmd("show", beadID, "--json").AllowStale()
 	if townRoot, err := workspace.FindFromCwdOrError(); err == nil && townRoot != "" {
-		return bdc.Dir(townRoot).WithRouting()
+		return bdShowBeadRoutedCmdFromTownRoot(townRoot, beadID)
 	}
 	return bdc.Dir(resolveBeadDir(beadID)).StripBeadsDir()
+}
+
+func bdShowBeadRoutedCmdFromTownRoot(townRoot, beadID string) *bdCmd {
+	return BdCmd("show", beadID, "--json").AllowStale().Dir(townRoot).WithRouting()
 }
 
 // getBeadInfo returns status and assignee for a bead.
@@ -391,10 +432,22 @@ func getBeadInfo(beadID string) (*beadInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bead '%s' not found", beadID)
 	}
+	return parseBeadInfo(beadID, out)
+}
+
+func getBeadInfoFromTownRoot(townRoot, beadID string) (*beadInfo, error) {
+	out, err := bdShowBeadOutputFromTownRoot(townRoot, beadID)
+	if err != nil {
+		return nil, fmt.Errorf("bead '%s' not found", beadID)
+	}
+	return parseBeadInfo(beadID, out)
+}
+
+func parseBeadInfo(beadID string, out []byte) (*beadInfo, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("bead '%s' not found", beadID)
 	}
-	// bd show --json returns an array (issue + dependents), take first element
+	// bd show --json returns an array (issue + dependents), take first element.
 	var infos []beadInfo
 	if err := json.Unmarshal(out, &infos); err != nil {
 		return nil, fmt.Errorf("parsing bead info: %w", err)

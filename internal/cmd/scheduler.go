@@ -309,15 +309,14 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 		// Close ALL sling contexts for this specific work bead (there may be
 		// duplicates if concurrent scheduleBead calls raced past idempotency).
 		// Scan all rig dirs since contexts live in target rig beads. (GH#3468)
-		contexts := listAllSlingContexts(townRoot)
+		contexts := listAllSlingContextRecords(townRoot)
 
 		closed := 0
 		for _, ctx := range contexts {
-			fields := beads.ParseSlingContextFields(ctx.Description)
+			fields := beads.ParseSlingContextFields(ctx.issue.Description)
 			if fields != nil && fields.WorkBeadID == schedulerClearBead {
-				b := beadsForContext(townRoot, fields)
-				if err := b.CloseSlingContext(ctx.ID, "cleared"); err != nil {
-					fmt.Printf("  %s Could not close context %s: %v\n", style.Dim.Render("Warning:"), ctx.ID, err)
+				if err := beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "cleared"); err != nil {
+					fmt.Printf("  %s Could not close context %s: %v\n", style.Dim.Render("Warning:"), ctx.issue.ID, err)
 					continue
 				}
 				closed++
@@ -334,7 +333,7 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 	}
 
 	// Close all open sling contexts across all dirs
-	allContexts := listAllSlingContexts(townRoot)
+	allContexts := listAllSlingContextRecords(townRoot)
 
 	if len(allContexts) == 0 {
 		fmt.Println("Scheduler is already empty.")
@@ -343,10 +342,8 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 
 	cleared := 0
 	for _, ctx := range allContexts {
-		fields := beads.ParseSlingContextFields(ctx.Description)
-		b := beadsForContext(townRoot, fields)
-		if err := b.CloseSlingContext(ctx.ID, "cleared"); err != nil {
-			fmt.Printf("  %s Could not close context %s: %v\n", style.Dim.Render("Warning:"), ctx.ID, err)
+		if err := beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "cleared"); err != nil {
+			fmt.Printf("  %s Could not close context %s: %v\n", style.Dim.Render("Warning:"), ctx.issue.ID, err)
 			continue
 		}
 		cleared++

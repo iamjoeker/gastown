@@ -126,7 +126,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 
 	// 1. Get bead info + status check
-	info, err := getBeadInfo(params.BeadID)
+	info, err := getBeadInfoFromTownRoot(townRoot, params.BeadID)
 	if err != nil {
 		result.ErrMsg = err.Error()
 		return result, fmt.Errorf("could not get bead info: %w", err)
