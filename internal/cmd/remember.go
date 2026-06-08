@@ -215,7 +215,25 @@ func bdKvClear(key string) error {
 	return cmd.Run()
 }
 
-// bdKvListJSON calls bd kv list --json and returns the parsed map.
+// parseBdKvListJSON parses bd kv list --json output, keeping only string values.
+func parseBdKvListJSON(data []byte) (map[string]string, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing kv list: %w", err)
+	}
+
+	kvs := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s *string
+		if err := json.Unmarshal(v, &s); err != nil || s == nil {
+			continue
+		}
+		kvs[k] = *s
+	}
+	return kvs, nil
+}
+
+// bdKvListJSON calls bd kv list --json and returns the parsed string values.
 func bdKvListJSON() (map[string]string, error) {
 	cmd := exec.Command("bd", "kv", "list", "--json")
 	out, err := cmd.Output()
@@ -223,22 +241,5 @@ func bdKvListJSON() (map[string]string, error) {
 		return nil, err
 	}
 
-	// bd kv list may include non-string values (e.g. the numeric
-	// schema_version key), so decode into RawMessage first and keep only
-	// the string-valued entries. Memories are always stored as strings.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parsing kv list: %w", err)
-	}
-
-	kvs := make(map[string]string, len(raw))
-	for k, v := range raw {
-		var s string
-		if err := json.Unmarshal(v, &s); err != nil {
-			// Skip non-string values (e.g. schema_version).
-			continue
-		}
-		kvs[k] = s
-	}
-	return kvs, nil
+	return parseBdKvListJSON(out)
 }
