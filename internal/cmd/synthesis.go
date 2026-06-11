@@ -540,10 +540,25 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
 	desc.WriteString(fmt.Sprintf("review_id: %s\n", reviewID))
 	desc.WriteString("\n")
 
+	var outputDir, outputSynthesis string
+	if f != nil && f.Output != nil {
+		outputDir = expandOutputTemplate(f.Output.Directory, reviewID, "")
+		outputSynthesis = f.Output.Synthesis
+	}
+
 	// Add synthesis instructions from formula
 	if f != nil && f.Synthesis != nil && f.Synthesis.Description != "" {
+		formulaName := meta.Formula
+		if formulaName == "" {
+			formulaName = f.Name
+		}
+		synCtx := formulaTemplateContext(formulaName, meta.Title, reviewID, 0, "", nil, nil, nil)
+		synCtx["problem"] = meta.Title
+		addOutputTemplateContext(synCtx, outputDir, outputSynthesis)
+		synDesc := renderTemplateOrDefault(f.Synthesis.Description, synCtx, f.Synthesis.Description)
+
 		desc.WriteString("## Instructions\n\n")
-		desc.WriteString(f.Synthesis.Description)
+		desc.WriteString(synDesc)
 		desc.WriteString("\n\n")
 	}
 
@@ -563,8 +578,7 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
 
 	// Add output path if configured
 	if f != nil && f.Output != nil && f.Output.Synthesis != "" {
-		outputPath := expandOutputTemplate(f.Output.Directory, reviewID, "")
-		outputPath = filepath.Join(outputPath, f.Output.Synthesis)
+		outputPath := filepath.Join(outputDir, f.Output.Synthesis)
 		desc.WriteString(fmt.Sprintf("\n## Output\n\nWrite synthesis to: %s\n", outputPath))
 	}
 

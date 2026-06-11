@@ -371,6 +371,61 @@ func TestDesignFormulaOutputUsesReviewID(t *testing.T) {
 	}
 }
 
+func TestSynthesisDescriptionRendersOutputContext(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"design", "mol-prd-review", "mol-plan-review", "code-review"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			content, err := formula.GetEmbeddedFormulaContent(name)
+			if err != nil {
+				t.Fatalf("GetEmbeddedFormulaContent(%s): %v", name, err)
+			}
+			f, err := formula.Parse(content)
+			if err != nil {
+				t.Fatalf("Parse(%s): %v", name, err)
+			}
+			if f.Synthesis == nil || f.Output == nil {
+				t.Fatalf("%s missing synthesis or output config", name)
+			}
+
+			ctx := formulaTemplateContext(name, "local files", "abc123", 0, "", nil, nil,
+				map[string]interface{}{
+					"context":    "extra context",
+					"plan":       "test plan",
+					"prd_review": "prd-review.md",
+					"problem":    "test problem",
+					"scope":      "test scope",
+				})
+			addOutputTemplateContext(ctx, ".out/abc123", f.Output.Synthesis)
+
+			got, err := renderTemplate(f.Synthesis.Description, ctx)
+			if err != nil {
+				t.Fatalf("render synthesis description: %v", err)
+			}
+			if strings.Contains(got, "{{.") || strings.Contains(got, "<no value>") {
+				t.Fatalf("synthesis description left template placeholders unrendered: %q", got)
+			}
+			if !strings.Contains(got, ".out/abc123") {
+				t.Fatalf("synthesis description missing rendered output directory: %q", got)
+			}
+			if name == "design" {
+				for _, want := range []string{
+					"All dimension analyses from: .out/abc123/",
+					"A synthesized design at: .out/abc123/design-doc.md",
+					"# Design: test problem",
+				} {
+					if !strings.Contains(got, want) {
+						t.Fatalf("synthesis description missing %q", want)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestFormulaRunExamplesUseSetVars(t *testing.T) {
 	t.Parallel()
 
@@ -400,10 +455,14 @@ func TestFormulaRunExamplesUseSetVars(t *testing.T) {
 	if strings.Contains(ideaText, "<design-id>") {
 		t.Fatal("mol-idea-to-plan still references stale <design-id> output paths")
 	}
+	if strings.Contains(ideaText, ".designs/<review-id>") {
+		t.Fatal("mol-idea-to-plan conflates design output ID with PRD review ID")
+	}
 	for _, want := range []string{
 		"--set problem=\"{{problem}}\"",
 		"--set context=\"See .prd-reviews/{{review_id}}/prd-draft.md. {{context}}\"",
 		"--set context=\"PRD with clarifications: .prd-reviews/{{review_id}}/prd-draft.md. {{context}}\"",
+		".designs/<design-review-id>/design-doc.md",
 	} {
 		if !strings.Contains(ideaText, want) {
 			t.Fatalf("mol-idea-to-plan missing %q", want)
