@@ -631,7 +631,7 @@ func ParseMRFields(issue *Issue) *MRFields {
 
 		key := strings.TrimSpace(line[:colonIdx])
 		value := strings.TrimSpace(line[colonIdx+1:])
-		if value == "" {
+		if value == "" || strings.EqualFold(value, "null") {
 			continue
 		}
 
@@ -787,6 +787,9 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"sourceissue":        true,
 		"worker":             true,
 		"rig":                true,
+		"commit_sha":         true,
+		"commit-sha":         true,
+		"commitsha":          true,
 		"merge_commit":       true,
 		"merge-commit":       true,
 		"mergecommit":        true,
