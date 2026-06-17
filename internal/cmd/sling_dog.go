@@ -277,6 +277,18 @@ func dogWorksOnHook(d *dog.Dog, work string, hooked *beads.Issue) bool {
 	return !attachedAt.Before(d.WorkStartedAt.UTC())
 }
 
+func (d *DogDispatchInfo) worksOnHook(hooked *beads.Issue) bool {
+	if d == nil {
+		return false
+	}
+	return dogWorksOnHook(&dog.Dog{
+		Name:          d.DogName,
+		State:         dog.StateWorking,
+		Work:          d.workDesc,
+		WorkStartedAt: d.workStartedAt,
+	}, d.workDesc, hooked)
+}
+
 // StartDelayedSession starts the dog session after bead setup is complete.
 // This should only be called when DelaySessionStart was true during dispatch.
 func (d *DogDispatchInfo) StartDelayedSession() (string, error) {

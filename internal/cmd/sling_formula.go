@@ -236,7 +236,13 @@ func shouldReuseExistingFormula(existing *beads.Issue, delayedDogInfo *DogDispat
 	if existing == nil || force {
 		return false
 	}
-	return delayedDogInfo == nil || !delayedDogInfo.ownsWork
+	if delayedDogInfo == nil {
+		return true
+	}
+	if delayedDogInfo.ownsWork {
+		return false
+	}
+	return delayedDogInfo.worksOnHook(existing)
 }
 
 // verifyFormulaExists checks that the formula exists using bd formula show.
@@ -418,6 +424,9 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 			}
 		}
 		return nil
+	}
+	if delayedDogInfo != nil && !delayedDogInfo.ownsWork {
+		return fmt.Errorf("dog formula reuse became stale before hook verification; retry dispatch")
 	}
 	if existing != nil && !slingForce && delayedDogInfo != nil && delayedDogInfo.ownsWork {
 		if err := cleanupStaleDogFormulaWispFn(existing.ID, formulaWorkDir); err != nil {

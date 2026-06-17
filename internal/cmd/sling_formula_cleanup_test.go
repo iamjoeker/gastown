@@ -133,6 +133,19 @@ func TestRunSlingFormulaExistingHookedDogStartsDelayedSession(t *testing.T) {
 	}
 }
 
+func TestRunSlingFormulaNonOwnedDogReuseCannotCreateFreshWisp(t *testing.T) {
+	body := runSlingFormulaSourceForTest(t)
+	reuseIdx := strings.Index(body, "shouldReuseExistingFormula(existing, delayedDogInfo, slingForce)")
+	guardIdx := strings.Index(body, "delayedDogInfo != nil && !delayedDogInfo.ownsWork")
+	stepIdx := strings.Index(body, "// Step 1: Cook the formula")
+	if reuseIdx == -1 || guardIdx == -1 || stepIdx == -1 {
+		t.Fatal("could not find dog reuse guard or cook step")
+	}
+	if guardIdx < reuseIdx || guardIdx > stepIdx {
+		t.Fatal("non-owned dog reuse must abort before creating a fresh formula wisp")
+	}
+}
+
 func TestRunSlingFormulaDogNudgeBeforeEmptyPaneReturn(t *testing.T) {
 	body := runSlingFormulaSourceForTest(t)
 

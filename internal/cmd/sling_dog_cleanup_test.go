@@ -182,13 +182,27 @@ func TestDogWorksOnHookRequiresFreshAttachment(t *testing.T) {
 }
 
 func TestShouldReuseExistingFormulaSkipsStaleHookAfterFreshDogAssignment(t *testing.T) {
+	startedAt := time.Date(2026, 6, 16, 20, 30, 15, 900_000_000, time.UTC)
 	existing := &beads.Issue{ID: "gt-wisp-stale"}
+	freshDogHook := &beads.Issue{
+		ID:          "gt-wisp-fresh",
+		Description: "attached_formula: mol-dog-reaper\nattached_at: " + startedAt.Format(time.RFC3339Nano),
+	}
+	reusedDog := &DogDispatchInfo{
+		DogName:       "alpha",
+		workDesc:      "mol-dog-reaper",
+		workStartedAt: startedAt,
+		ownsWork:      false,
+	}
 
 	if !shouldReuseExistingFormula(existing, nil, false) {
 		t.Fatal("non-dog existing formula should be reused")
 	}
-	if !shouldReuseExistingFormula(existing, &DogDispatchInfo{ownsWork: false}, false) {
+	if !shouldReuseExistingFormula(freshDogHook, reusedDog, false) {
 		t.Fatal("dog dispatch that already reused work should no-op")
+	}
+	if shouldReuseExistingFormula(existing, reusedDog, false) {
+		t.Fatal("dog dispatch must revalidate reused work against the current hooked formula")
 	}
 	if shouldReuseExistingFormula(existing, &DogDispatchInfo{ownsWork: true}, false) {
 		t.Fatal("fresh dog assignment must not resurrect a stale hooked formula")
