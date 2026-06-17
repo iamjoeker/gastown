@@ -1304,9 +1304,49 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 	return newest, nil
 }
 
-// ShowMultiple fetches multiple issues by ID in a single bd call.
+// ShowMultiple fetches multiple issues by ID, grouped by routed database.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
+// If one routed group fails, successful groups are returned with the error.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Issue), nil
+	}
+
+	if !b.noRoute {
+		fallbackDir := b.getResolvedBeadsDir()
+		groups := make(map[string][]string)
+		for _, id := range ids {
+			targetDir := ResolveRoutingTarget(b.getTownRoot(), id, fallbackDir)
+			groups[targetDir] = append(groups[targetDir], id)
+		}
+
+		if len(groups) > 1 || groups[fallbackDir] == nil {
+			result := make(map[string]*Issue, len(ids))
+			var firstErr error
+			for targetDir, groupIDs := range groups {
+				target := b
+				if targetDir != fallbackDir {
+					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+				}
+				issues, err := target.showMultipleLocal(groupIDs)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				for id, issue := range issues {
+					result[id] = issue
+				}
+			}
+			return result, firstErr
+		}
+	}
+
+	return b.showMultipleLocal(ids)
+}
+
+func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
 	}

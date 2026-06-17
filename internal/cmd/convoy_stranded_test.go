@@ -21,6 +21,22 @@ func TestIsReadyIssue_BlockingAndStatus(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "unknown issue never ready",
+			in: trackedIssueInfo{
+				Status:  trackedStatusUnknown,
+				Blocked: false,
+			},
+			want: false,
+		},
+		{
+			name: "blank status never ready",
+			in: trackedIssueInfo{
+				Status:  " ",
+				Blocked: false,
+			},
+			want: false,
+		},
+		{
 			name: "blocked open issue not ready",
 			in: trackedIssueInfo{
 				Status:  "open",
@@ -71,6 +87,17 @@ func TestApplyFreshIssueDetails_SetsBlockedFlag(t *testing.T) {
 
 	if !dep.Blocked {
 		t.Fatalf("applyFreshIssueDetails() should set Blocked=true when details are blocked")
+	}
+}
+
+func TestApplyFreshIssueDetails_BlankStatusBecomesUnknown(t *testing.T) {
+	dep := trackedDependency{ID: "gt-123"}
+	details := &issueDetails{ID: "gt-123", Status: "  "}
+
+	applyFreshIssueDetails(&dep, details)
+
+	if dep.Status != trackedStatusUnknown {
+		t.Fatalf("dep.Status = %q, want %q", dep.Status, trackedStatusUnknown)
 	}
 }
 
