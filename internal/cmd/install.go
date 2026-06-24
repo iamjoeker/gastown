@@ -732,43 +732,22 @@ func initTownBeads(townPath string) error {
 		return fmt.Errorf("ensuring config.yaml: %w", err)
 	}
 
-	beadsEnv := withBeadsDirEnv(beadsDir)
-
-	// Set beads.role to maintainer (town-level beads are always maintainer-owned).
-	// Without this, bd doctor warns about missing role configuration.
-	roleSetCmd := exec.Command("bd", "config", "set", "beads.role", "maintainer")
-	roleSetCmd.Dir = townPath
-	roleSetCmd.Env = beadsEnv
-	if roleOutput, roleErr := roleSetCmd.CombinedOutput(); roleErr != nil {
-		fmt.Printf("   %s Could not set beads.role: %s\n", style.Dim.Render("⚠"), strings.TrimSpace(string(roleOutput)))
+	// Set beads.role to maintainer (town-level beads are always maintainer-owned)
+	// without invoking old bd config/schema initialization during fresh install.
+	if err := beads.EnsureConfigYAMLValue(beadsDir, "beads.role", "maintainer"); err != nil {
+		fmt.Printf("   %s Could not set beads.role: %v\n", style.Dim.Render("⚠"), err)
 	}
 
-	// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
-	// bd >= 1.0.0 rejects this with "cannot be set via 'bd config set'" because init persists
-	// it directly; treat that as already-set rather than a failure.
-	prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", "hq")
-	prefixSetCmd.Dir = townPath
-	prefixSetCmd.Env = beadsEnv
-	if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
-		out := strings.TrimSpace(string(prefixOutput))
-		if !strings.Contains(out, "cannot be set via") {
-			return fmt.Errorf("bd config set issue_prefix failed: %s", out)
-		}
-	}
-
-	// Configure custom types for Gas Town (agent, role, rig, convoy, slot).
-	// These were extracted from beads core in v0.46.0 and now require explicit config.
-	if err := beads.EnsureCustomTypes(beadsDir); err != nil {
+	// Configure custom types for Gas Town before any bd config command can force
+	// an older bd binary through legacy schema initialization.
+	if err := beads.EnsureCustomTypesConfigYAML(beadsDir); err != nil {
 		return fmt.Errorf("ensuring custom types: %w", err)
 	}
 
 	// Configure allowed_prefixes for convoy beads (hq-cv-* IDs).
 	// This allows bd create --id=hq-cv-xxx to pass prefix validation.
-	prefixCmd := exec.Command("bd", "config", "set", "allowed_prefixes", "hq,hq-cv")
-	prefixCmd.Dir = townPath
-	prefixCmd.Env = beadsEnv
-	if prefixOutput, prefixErr := prefixCmd.CombinedOutput(); prefixErr != nil {
-		fmt.Printf("   %s Could not set allowed_prefixes: %s\n", style.Dim.Render("⚠"), strings.TrimSpace(string(prefixOutput)))
+	if err := beads.EnsureConfigYAMLValue(beadsDir, "allowed_prefixes", "hq,hq-cv"); err != nil {
+		fmt.Printf("   %s Could not set allowed_prefixes: %v\n", style.Dim.Render("⚠"), err)
 	}
 
 	// Ensure issues.jsonl exists — bd expects this file for git-tracked issue data.
@@ -848,7 +827,7 @@ func initTownAgentBeads(townPath string) error {
 	// bd init doesn't enable "custom" issue types by default, but Gas Town uses
 	// agent beads during install and runtime. Ensure these types are enabled
 	// before attempting to create any town-level system beads.
-	if err := ensureBeadsCustomTypes(townPath, constants.BeadsCustomTypesList()); err != nil {
+	if err := beads.EnsureCustomTypesConfigYAML(beads.ResolveBeadsDir(townPath)); err != nil {
 		return err
 	}
 

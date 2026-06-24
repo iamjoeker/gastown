@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gofrs/flock"
+	beadsdk "github.com/steveyegge/beads"
 
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/telemetry"
@@ -218,13 +220,15 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	target := b.agentBeadTarget()
 	targetDir := target.getResolvedBeadsDir()
 
-	// Ensure target database has custom types configured.
-	// This is cached (sentinel file + in-memory) so repeated calls are fast.
-	// On fresh rigs, this may fail if the database can't be initialized.
-	// Don't bail out — try the bd create calls anyway (GH#1769).
-	_ = EnsureCustomTypes(targetDir)
-
 	description := FormatAgentDescription(title, fields)
+	if issue, err := target.createAgentBeadViaStore(context.Background(), id, title, description); err == nil {
+		return issue, nil
+	}
+
+	// Ensure target database has custom types configured before falling back to
+	// the bd CLI. The store path above avoids stale external bd schema during
+	// fresh install; this remains for older stores or non-server configurations.
+	_ = EnsureCustomTypes(targetDir)
 
 	buildArgs := func() []string {
 		a := []string{"create", "--json",
@@ -262,6 +266,33 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	// Note: hook_bead slot no longer set - bd slot removed in v0.62 (hq-l6mm5)
 
 	return &issue, nil
+}
+
+func (b *Beads) createAgentBeadViaStore(ctx context.Context, id, title, description string) (*Issue, error) {
+	store, cleanup, err := b.OpenStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	now := time.Now().UTC()
+	actor := b.getActor()
+	issue := &beadsdk.Issue{
+		ID:          id,
+		Title:       title,
+		Description: description,
+		Status:      beadsdk.StatusOpen,
+		Priority:    2,
+		IssueType:   beadsdk.TypeTask,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		CreatedBy:   actor,
+		Labels:      []string{"gt:agent"},
+	}
+	if err := store.CreateIssue(ctx, issue, actor); err != nil {
+		return nil, err
+	}
+	return sdkIssueToIssue(issue), nil
 }
 
 // CreateOrReopenAgentBead creates an agent bead or reopens an existing one.

@@ -2,10 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -449,18 +453,25 @@ func getTownBeadsDir() (string, error) {
 // "exit status 1". BEADS_DIR is stripped from the subprocess environment to
 // prevent stale overrides from interfering with bd's workspace detection.
 func runBdJSON(dir string, args ...string) ([]byte, error) {
-	return runBdJSONWithOptions(dir, false, args...)
+	return runBdJSONWithOptions(dir, false, false, args...)
 }
 
 func runBdJSONAllowStale(dir string, args ...string) ([]byte, error) {
-	return runBdJSONWithOptions(dir, true, args...)
+	return runBdJSONWithOptions(dir, true, false, args...)
 }
 
-func runBdJSONWithOptions(dir string, allowStale bool, args ...string) ([]byte, error) {
+func runBdJSONWithAutoCommit(dir string, args ...string) ([]byte, error) {
+	return runBdJSONWithOptions(dir, false, true, args...)
+}
+
+func runBdJSONWithOptions(dir string, allowStale, autoCommit bool, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	bdc := BdCmd(args...).Dir(dir).StripBeadsDir().Stderr(&stderr)
 	if allowStale {
 		bdc.AllowStale()
+	}
+	if autoCommit {
+		bdc.WithAutoCommit()
 	}
 	cmd := bdc.Build()
 	cmd.Dir = dir
@@ -492,49 +503,137 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		return nil, fmt.Errorf("invalid bead ID: %q", issueID)
 	}
 
-	// The dependency target was historically a single depends_on_id column.
-	// The schema migration split it into typed columns
-	// (depends_on_issue_id / depends_on_wisp_id / depends_on_external), where
-	// cross-database refs live in depends_on_external as "external:<prefix>:<id>".
-	// "down": targets issueID depends on → COALESCE the three target columns.
-	// "up":   issues that depend on issueID → match issueID against all three.
-	var selectExpr, whereClause, parseKey string
+	var parseKey string
 	if direction == "up" {
-		selectExpr = "issue_id"
 		parseKey = "issue_id"
-		whereClause = fmt.Sprintf(
-			"(depends_on_issue_id = '%s' OR depends_on_wisp_id = '%s' OR %s)",
-			issueID, issueID, sqlExternalDepTargetClause(issueID))
 	} else {
-		selectExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id"
 		parseKey = "depends_on_id"
-		whereClause = fmt.Sprintf("issue_id = '%s'", issueID)
+	}
+	if depType != "" && !isValidBeadID(depType) {
+		return nil, fmt.Errorf("invalid dep type: %q", depType)
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM dependencies WHERE %s", selectExpr, whereClause)
-	if depType != "" {
-		if !isValidBeadID(depType) {
-			return nil, fmt.Errorf("invalid dep type: %q", depType)
+	if ids, err := bdDepListRawIDsViaDolt(dir, issueID, direction, depType); err == nil {
+		return ids, nil
+	}
+
+	var lastErr error
+	for _, legacy := range []bool{false, true} {
+		query := rawDepSQLLiteral(issueID, direction, depType, legacy)
+		out, err := runBdJSONWithAutoCommit(dir, "sql", query, "--json")
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		query += fmt.Sprintf(" AND type = '%s'", depType)
+		ids, err := parseRawDepRows(out, parseKey)
+		if err != nil {
+			return nil, fmt.Errorf("parsing dep sql for %s: %w", issueID, err)
+		}
+		return ids, nil
 	}
+	return nil, fmt.Errorf("bd sql for deps of %s: %w", issueID, lastErr)
+}
 
-	out, err := runBdJSON(dir, "sql", query, "--json")
+func bdDepListRawIDsViaDolt(dir, issueID, direction, depType string) ([]string, error) {
+	beadsDir := beads.ResolveBeadsDir(dir)
+	cfg, ok := readBeadsRuntimeConfig(beadsDir)
+	if !ok || cfg.Database == "" || cfg.Port == 0 {
+		return nil, fmt.Errorf("missing server metadata for %s", beadsDir)
+	}
+	host := cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	dsn := fmt.Sprintf("root@tcp(%s)/%s?parseTime=true", net.JoinHostPort(host, strconv.Itoa(cfg.Port)), url.PathEscape(cfg.Database))
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("bd sql for deps of %s: %w", issueID, err)
+		return nil, err
 	}
+	defer db.Close()
 
-	// Parse JSON array of single-column rows
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	typedQuery, typedArgs := rawDepSQLArgs(issueID, direction, depType, false)
+	ids, err := queryRawDepIDs(ctx, db, typedQuery, typedArgs)
+	if err == nil {
+		return ids, nil
+	}
+	legacyQuery, legacyArgs := rawDepSQLArgs(issueID, direction, depType, true)
+	return queryRawDepIDs(ctx, db, legacyQuery, legacyArgs)
+}
+
+func rawDepSQLArgs(issueID, direction, depType string, legacy bool) (string, []any) {
+	var query string
+	var args []any
+	if direction == "up" {
+		if legacy {
+			query = "SELECT issue_id FROM dependencies WHERE depends_on_id = ?"
+			args = append(args, issueID)
+		} else {
+			query = "SELECT issue_id FROM dependencies WHERE (depends_on_issue_id = ? OR depends_on_wisp_id = ? OR depends_on_external LIKE ? ESCAPE '!')"
+			args = append(args, issueID, issueID, "%:"+strings.ReplaceAll(issueID, "_", "!_"))
+		}
+	} else if legacy {
+		query = "SELECT depends_on_id FROM dependencies WHERE issue_id = ?"
+		args = append(args, issueID)
+	} else {
+		query = "SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id FROM dependencies WHERE issue_id = ?"
+		args = append(args, issueID)
+	}
+	if depType != "" {
+		query += " AND type = ?"
+		args = append(args, depType)
+	}
+	return query, args
+}
+
+func rawDepSQLLiteral(issueID, direction, depType string, legacy bool) string {
+	query, args := rawDepSQLArgs(issueID, direction, depType, legacy)
+	for _, arg := range args {
+		query = strings.Replace(query, "?", "'"+arg.(string)+"'", 1)
+	}
+	return query
+}
+
+func queryRawDepIDs(ctx context.Context, db *sql.DB, query string, args []any) ([]string, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]bool)
+	var ids []string
+	for rows.Next() {
+		var rawID sql.NullString
+		if err := rows.Scan(&rawID); err != nil {
+			return nil, err
+		}
+		if !rawID.Valid {
+			continue
+		}
+		id := beads.ExtractIssueID(rawID.String)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func parseRawDepRows(out []byte, parseKey string) ([]string, error) {
 	var rows []map[string]string
 	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parsing dep sql for %s: %w", issueID, err)
+		return nil, err
 	}
-
 	seen := make(map[string]bool, len(rows))
 	var ids []string
 	for _, row := range rows {
-		rawID := row[parseKey]
-		id := beads.ExtractIssueID(rawID)
+		id := beads.ExtractIssueID(row[parseKey])
 		if id != "" && !seen[id] {
 			seen[id] = true
 			ids = append(ids, id)
