@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration && scheduler_integration
 
 // Package cmd contains integration tests for the capacity scheduler subsystem.
 // These tests exercise scheduler CLI operations (schedule, list, status, dispatch
@@ -9,27 +9,23 @@
 //
 // Run with:
 //
-//	go test -tags=integration -run 'TestScheduler' -timeout 5m -count=1 -v ./internal/cmd/
+//	go test -tags='integration scheduler_integration' -run 'TestScheduler' -timeout 15m -count=1 -v ./internal/cmd/
 package cmd
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 )
 
@@ -39,74 +35,39 @@ import (
 var schedulerTestCounter atomic.Int32
 
 // initBeadsDBForServer initializes a beads DB that can operate against the
-// shared Dolt test server. It uses the Beads SDK directly instead of shelling
-// out to bd init; the scheduler suite creates dozens of fixture databases, and
-// full CLI init repeatedly exhausts the internal/cmd integration timeout.
+// shared Dolt test server. Uses local init (bd init --prefix --server-port)
+// which reliably creates the schema and records the ephemeral port in
+// metadata.json so subsequent bd commands reach the test server.
 func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string) {
 	t.Helper()
 	initSchedulerGitRepo(t, dir, homeDir)
 
-	beadsDir := filepath.Join(dir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("mkdir %s: %v", beadsDir, err)
+	args := []string{"init", "--quiet", "--non-interactive", "--skip-hooks", "--skip-agents", "--prefix", prefix}
+	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
+	// instead of defaulting to port 3307.
+	// bd v1.0.0+ defaults to embedded mode; --server is required to use an
+	// external server (v0.57.0 defaulted to server mode and ignored --server).
+	if p := schedulerDoltPort(); p != "" {
+		args = append(args, "--server", "--external", "--server-port", p)
 	}
-
-	port := schedulerDoltPort()
-	if port == "" {
-		t.Fatal("scheduler Dolt port is not set")
+	cmd := exec.Command("bd", args...)
+	cmd.Dir = dir
+	cmd.Env = schedulerBDInitEnv(homeDir, filepath.Join(dir, ".beads"))
+	out, err := cmd.CombinedOutput()
+	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
+	if err != nil {
+		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, out)
 	}
-	portNum, err := strconv.Atoi(port)
-	if err != nil || portNum <= 0 {
-		t.Fatalf("invalid scheduler Dolt port %q", port)
-	}
-
-	metadata := struct {
-		Database       string `json:"database"`
-		Backend        string `json:"backend"`
-		IssuePrefix    string `json:"issue_prefix"`
-		DoltMode       string `json:"dolt_mode"`
-		DoltServerHost string `json:"dolt_server_host"`
-		DoltServerPort int    `json:"dolt_server_port"`
-		DoltServerUser string `json:"dolt_server_user"`
-		DoltDatabase   string `json:"dolt_database"`
-	}{
-		Database:       "dolt",
-		Backend:        "dolt",
-		IssuePrefix:    prefix,
-		DoltMode:       "server",
-		DoltServerHost: "127.0.0.1",
-		DoltServerPort: portNum,
-		DoltServerUser: "root",
-		DoltDatabase:   schedulerDoltDatabaseName(prefix),
-	}
-	writeJSONFile(t, filepath.Join(beadsDir, "metadata.json"), metadata)
-	if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte(port+"\n"), 0644); err != nil {
-		t.Fatalf("write dolt-server.port in %s: %v", beadsDir, err)
-	}
-	if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
-		t.Fatalf("write config.yaml in %s: %v", beadsDir, err)
-	}
-
-	seedSchedulerBeadsDB(t, beadsDir, prefix, port)
-
-	for _, kv := range []struct {
-		key   string
-		value string
-	}{
-		{"types.custom", constants.BeadsCustomTypes},
-		{"status.custom", constants.BeadsCustomStatuses},
-	} {
-		if err := beads.EnsureConfigYAMLValue(beadsDir, kv.key, kv.value); err != nil {
-			t.Fatalf("write %s in %s: %v", kv.key, beadsDir, err)
-		}
-	}
-	writeSchedulerCustomConfigSentinels(t, beadsDir)
 
 	// Create empty issues.jsonl to prevent bd auto-export from corrupting
 	// routes.jsonl (same as initBeadsDBWithPrefix does).
 	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
 	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
 		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
+	}
+
+	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
+		t.Fatalf("ensure custom types in %s: %v", dir, err)
 	}
 }
 
@@ -120,109 +81,13 @@ func initSchedulerGitRepo(t *testing.T, dir, homeDir string) {
 	}
 }
 
-func seedSchedulerBeadsDB(t *testing.T, beadsDir, prefix, port string) {
-	t.Helper()
-	withSchedulerBeadsSDKEnv(t, port, func() {
-		store, err := beadsdk.OpenFromConfig(context.Background(), beadsDir)
-		if err != nil {
-			t.Fatalf("open scheduler beads DB %s: %v", beadsDir, err)
-		}
-		defer store.Close()
-
-		for _, kv := range []struct {
-			key   string
-			value string
-		}{
-			{"issue_prefix", prefix},
-			{"types.custom", constants.BeadsCustomTypes},
-			{"status.custom", constants.BeadsCustomStatuses},
-		} {
-			if err := store.SetConfig(context.Background(), kv.key, kv.value); err != nil {
-				t.Fatalf("set %s in %s: %v", kv.key, beadsDir, err)
-			}
-		}
-
-		got, err := store.GetConfig(context.Background(), "issue_prefix")
-		if err != nil || got != prefix {
-			t.Fatalf("issue_prefix in %s = %q, %v; want %q", beadsDir, got, err, prefix)
-		}
-	})
-}
-
-func withSchedulerBeadsSDKEnv(t *testing.T, port string, fn func()) {
-	t.Helper()
-	keys := map[string]struct{}{
-		"BEADS_DIR":                  {},
-		"BEADS_DB":                   {},
-		"BD_DB":                      {},
-		"BEADS_SHARED_SERVER_DIR":    {},
-		"BEADS_TEST_MODE":            {},
-		"BEADS_DOLT_AUTO_START":      {},
-		"BEADS_DOLT_SERVER_HOST":     {},
-		"BEADS_DOLT_SERVER_PORT":     {},
-		"BEADS_DOLT_PORT":            {},
-		"BEADS_DOLT_SERVER_DATABASE": {},
+func schedulerBDInitEnv(homeDir, beadsDir string) []string {
+	env := cleanSchedulerTestEnv(homeDir)
+	if p := schedulerDoltPort(); p != "" {
+		env = beads.StripEnvKey(env, "GT_DOLT_PORT")
+		env = append(env, "GT_DOLT_PORT="+p)
 	}
-	for _, entry := range os.Environ() {
-		key, _, ok := strings.Cut(entry, "=")
-		if ok && strings.HasPrefix(key, "BEADS_DOLT_") {
-			keys[key] = struct{}{}
-		}
-	}
-	type envValue struct {
-		value string
-		ok    bool
-	}
-	saved := make(map[string]envValue, len(keys))
-	for key := range keys {
-		value, ok := os.LookupEnv(key)
-		saved[key] = envValue{value: value, ok: ok}
-		if err := os.Unsetenv(key); err != nil {
-			t.Fatalf("unset %s: %v", key, err)
-		}
-	}
-	defer func() {
-		for key := range keys {
-			if saved[key].ok {
-				_ = os.Setenv(key, saved[key].value)
-			} else {
-				_ = os.Unsetenv(key)
-			}
-		}
-	}()
-
-	for key, value := range map[string]string{
-		"BEADS_TEST_MODE":        "1",
-		"BEADS_DOLT_AUTO_START":  "0",
-		"BEADS_DOLT_SERVER_HOST": "127.0.0.1",
-		"BEADS_DOLT_SERVER_PORT": port,
-		"BEADS_DOLT_PORT":        port,
-	} {
-		if err := os.Setenv(key, value); err != nil {
-			t.Fatalf("set %s: %v", key, err)
-		}
-	}
-
-	fn()
-}
-
-func writeSchedulerCustomConfigSentinels(t *testing.T, beadsDir string) {
-	t.Helper()
-	for _, file := range []struct {
-		name  string
-		value string
-	}{
-		{".gt-types-configured", constants.BeadsCustomTypes},
-		{".gt-statuses-configured", constants.BeadsCustomStatuses},
-	} {
-		if err := os.WriteFile(filepath.Join(beadsDir, file.name), []byte(file.value+"\n"), 0644); err != nil {
-			t.Fatalf("write %s in %s: %v", file.name, beadsDir, err)
-		}
-	}
-}
-
-func schedulerDoltDatabaseName(prefix string) string {
-	return strings.ReplaceAll(prefix, "-", "_")
+	return beads.BuildMutationPinnedBDEnv(env, beadsDir)
 }
 
 func schedulerDoltPort() string {
@@ -261,6 +126,32 @@ func cleanupSchedulerBeadsDatabases(t *testing.T, prefixes ...string) {
 	})
 }
 
+func setTestBeadStatus(t *testing.T, dir, beadID, status string) {
+	t.Helper()
+	beadsDir := filepath.Join(dir, ".beads")
+	dbName := beads.DatabaseNameFromMetadata(beadsDir)
+	if dbName == "" {
+		t.Fatalf("no Dolt database metadata in %s", beadsDir)
+	}
+	port := schedulerDoltPort()
+	if port == "" {
+		port = "3307"
+	}
+	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/%s", port, dbName)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dbName, err)
+	}
+	defer db.Close()
+	res, err := db.Exec("UPDATE issues SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", status, beadID)
+	if err != nil {
+		t.Fatalf("set %s status to %s: %v", beadID, status, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n != 1 {
+		t.Fatalf("set %s status affected %d rows, want 1", beadID, n)
+	}
+}
+
 // setupSchedulerIntegrationTown creates a minimal town filesystem for scheduler tests.
 // Uses the shared Dolt test server (managed by requireDoltServer)
 // for beads databases. No gt install, no Claude credentials, no agent sessions.
@@ -270,7 +161,7 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	t.Helper()
 
 	if _, err := exec.LookPath("bd"); err != nil {
-		t.Skip("bd not installed, skipping scheduler integration test")
+		t.Fatalf("bd not installed: %v", err)
 	}
 
 	requireDoltServer(t)
@@ -282,8 +173,8 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
 
-	// Configure git identity in isolated HOME for scheduler paths that still
-	// exercise bd/gt subprocesses inside temp repos.
+	// Configure git/dolt identity in isolated HOME (needed by bd init --server
+	// which initializes a git repo inside .beads/).
 	configureTestGitIdentity(t, tmpDir)
 
 	// Generate unique prefixes per test to avoid cross-test data leakage on
@@ -745,7 +636,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	t.Helper()
 
 	if _, err := exec.LookPath("bd"); err != nil {
-		t.Skip("bd not installed, skipping scheduler integration test")
+		t.Fatalf("bd not installed: %v", err)
 	}
 
 	requireDoltServer(t)
@@ -1662,15 +1553,7 @@ func TestScheduleBead_RefusesTombstone(t *testing.T) {
 
 	beadID := createTestBead(t, rigPath, "Tombstone bead refused by scheduleBead")
 
-	// Tombstone the bead. bd uses `bd close --tombstone` for terminal removal.
-	closeCmd := exec.Command("bd", "close", beadID, "--tombstone")
-	closeCmd.Dir = rigPath
-	if out, err := closeCmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "unknown flag: --tombstone") {
-			t.Skip("bd CLI does not support close --tombstone")
-		}
-		t.Fatalf("bd close --tombstone %s failed: %v\n%s", beadID, err, out)
-	}
+	setTestBeadStatus(t, rigPath, beadID, "tombstone")
 
 	out, err := runGTCmdMayFail(t, gtBinary, hqPath, env,
 		"sling", beadID, "testrig", "--hook-raw-bead")
