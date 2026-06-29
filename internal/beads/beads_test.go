@@ -167,6 +167,93 @@ func TestBuildPinnedBDEnvUsesSelectedConnectionMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildPinnedBDEnvPinsRigDatabaseInsideTown(t *testing.T) {
+	townDir := t.TempDir()
+	beadsDir := filepath.Join(townDir, "minime", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"minime","dolt_server_host":"127.0.0.1","dolt_server_port":4407}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	env := BuildPinnedBDEnv([]string{
+		"PATH=/usr/bin",
+		"BEADS_DIR=" + filepath.Join(townDir, ".beads"),
+		"BEADS_DOLT_SERVER_DATABASE=hq",
+		"BEADS_DOLT_DATA_DIR=" + filepath.Join(townDir, ".dolt-data"),
+	}, beadsDir)
+	got := envMap(env)
+
+	if got["BEADS_DIR"] != beadsDir {
+		t.Fatalf("BEADS_DIR = %q, want %q in %v", got["BEADS_DIR"], beadsDir, env)
+	}
+	if got["BEADS_DOLT_SERVER_DATABASE"] != "minime" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want minime in %v", got["BEADS_DOLT_SERVER_DATABASE"], env)
+	}
+	if value, ok := got["BEADS_DOLT_DATA_DIR"]; ok {
+		t.Fatalf("BEADS_DOLT_DATA_DIR should be stripped, got %q in %v", value, env)
+	}
+}
+
+func TestBuildPinnedBDEnvFollowsRedirectBeforeMetadata(t *testing.T) {
+	rigRoot := t.TempDir()
+	rigBeadsDir := filepath.Join(rigRoot, ".beads")
+	canonicalBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	for _, dir := range []string{rigBeadsDir, canonicalBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","dolt_server_host":"wrong-host","dolt_server_port":9999}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(canonicalBeadsDir, "metadata.json"), []byte(`{"dolt_database":"gastown","dolt_server_host":"127.0.0.2","dolt_server_port":4407}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	env := BuildPinnedBDEnv([]string{
+		"PATH=/usr/bin",
+		"BEADS_DIR=/wrong",
+		"BEADS_DOLT_SERVER_DATABASE=hq",
+		"BEADS_DOLT_DATA_DIR=/wrong/data",
+	}, rigBeadsDir)
+	got := envMap(env)
+
+	if got["BEADS_DIR"] != canonicalBeadsDir {
+		t.Fatalf("BEADS_DIR = %q, want canonical %q in %v", got["BEADS_DIR"], canonicalBeadsDir, env)
+	}
+	if got["BEADS_DOLT_SERVER_DATABASE"] != "gastown" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want gastown in %v", got["BEADS_DOLT_SERVER_DATABASE"], env)
+	}
+	if got["BEADS_DOLT_SERVER_HOST"] != "127.0.0.2" || got["BEADS_DOLT_SERVER_PORT"] != "4407" || got["BEADS_DOLT_PORT"] != "4407" {
+		t.Fatalf("connection env used stale redirect metadata: %v", env)
+	}
+	if _, ok := got["BEADS_DOLT_DATA_DIR"]; ok {
+		t.Fatalf("BEADS_DOLT_DATA_DIR should be stripped in %v", env)
+	}
+
+	routingEnv := BuildRoutingBDEnv([]string{
+		"PATH=/usr/bin",
+		"BEADS_DIR=/wrong",
+		"BEADS_DOLT_SERVER_DATABASE=hq",
+	}, rigBeadsDir)
+	routingGot := envMap(routingEnv)
+	if _, ok := routingGot["BEADS_DIR"]; ok {
+		t.Fatalf("routing env should not set BEADS_DIR: %v", routingEnv)
+	}
+	if _, ok := routingGot["BEADS_DOLT_SERVER_DATABASE"]; ok {
+		t.Fatalf("routing env should not set BEADS_DOLT_SERVER_DATABASE: %v", routingEnv)
+	}
+	if routingGot["BEADS_DOLT_SERVER_HOST"] != "127.0.0.2" || routingGot["BEADS_DOLT_SERVER_PORT"] != "4407" || routingGot["BEADS_DOLT_PORT"] != "4407" {
+		t.Fatalf("routing env should use canonical connection metadata: %v", routingEnv)
+	}
+}
+
 func TestBuildPinnedBDEnvStripsCaseVariantTargetEnvWhenKeysAreCaseInsensitive(t *testing.T) {
 	withCaseInsensitiveEnvKeys(t)
 
@@ -366,12 +453,24 @@ func TestBuildMutationBDEnvForcesWritableCommit(t *testing.T) {
 
 func TestArgsAreReadOnlyClassifiesKnownReadCommands(t *testing.T) {
 	cases := [][]string{
+		{"--version"},
+		{"--help"},
 		{"show", "gt-123", "--json"},
 		{"--allow-stale", "show", "gt-123", "--json"},
+		{"search", "term", "--json"},
 		{"query", "merge-request", "--json"},
 		{"dep", "list", "hq-cv-123", "--json"},
+		{"formula", "list"},
+		{"formula", "show", "mol-polecat-work"},
+		{"kv", "get", "key"},
+		{"kv", "list"},
+		{"message", "thread", "hq-msg", "--json"},
+		{"mol", "current", "--json"},
 		{"mol", "wisp", "list", "--json"},
 		{"sql", "SELECT 1"},
+		{"sql", "SHOW TABLES"},
+		{"sql", "EXPLAIN SELECT 1"},
+		{"sql", "DESCRIBE dependencies"},
 		{"sql", "--csv", "SELECT 1"},
 		{"config", "get", "issue_prefix"},
 	}
@@ -387,10 +486,25 @@ func TestArgsAreReadOnlyClassifiesKnownReadCommands(t *testing.T) {
 
 func TestArgsAreReadOnlyFailsClosedForMutations(t *testing.T) {
 	cases := [][]string{
+		{"--db", "hq", "show", "gt-123"},
+		{"--directory", "/tmp", "list"},
+		{"--repo", "gastown", "show", "gt-123"},
+		{"--unknown", "show", "gt-123"},
 		{"update", "gt-123", "--status=open"},
 		{"close", "gt-123"},
+		{"label", "add", "gt-123", "read"},
+		{"message", "send", "mayor", "--body", "hi"},
+		{"formula", "cook", "mol-polecat-work"},
+		{"kv", "set", "key", "value"},
 		{"mol", "wisp", "formula"},
+		{"mol", "wisp", "create", "mol-test"},
 		{"sql", "UPDATE issues SET status='open'"},
+		{"sql", "DELETE FROM issues"},
+		{"sql", "INSERT INTO issues (id) VALUES ('gt-1')"},
+		{"sql", "WITH x AS (SELECT 1) SELECT * FROM x"},
+		{"sql", "WITH x AS (SELECT 1) UPDATE issues SET status='open'"},
+		{"sql", "WITH x AS (SELECT 1) DELETE FROM issues"},
+		{"sql", "WITH x AS (SELECT 1) INSERT INTO issues (id) VALUES ('gt-1')"},
 		{"config", "set", "issue_prefix", "gt"},
 	}
 	for _, args := range cases {

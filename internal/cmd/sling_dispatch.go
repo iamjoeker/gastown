@@ -376,7 +376,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		FormulaVars:      formulaVarsForAttachment,
 	}
 	// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
-	if err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {
+	if err := storeFieldsInBeadFromTownRoot(townRoot, beadToHook, fieldUpdates); err != nil {
 		fmt.Printf("  %s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
 	}
 

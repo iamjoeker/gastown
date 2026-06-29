@@ -26,7 +26,7 @@ func TestReadBeadsRuntimeConfigServerMetadata(t *testing.T) {
 		t.Fatalf("write metadata: %v", err)
 	}
 
-	cfg, ok := readBeadsRuntimeConfig(beadsDir, townRoot)
+	cfg, ok := readBeadsRuntimeConfig(beadsDir)
 	if !ok {
 		t.Fatal("readBeadsRuntimeConfig did not detect server metadata")
 	}
@@ -42,6 +42,8 @@ func TestReadBeadsRuntimeConfigServerMetadata(t *testing.T) {
 }
 
 func TestReadBeadsRuntimeConfigDefaultServerAddr(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "32769")
+
 	townRoot := t.TempDir()
 	beadsDir := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -56,7 +58,7 @@ func TestReadBeadsRuntimeConfigDefaultServerAddr(t *testing.T) {
 		t.Fatalf("write metadata: %v", err)
 	}
 
-	cfg, ok := readBeadsRuntimeConfig(beadsDir, townRoot)
+	cfg, ok := readBeadsRuntimeConfig(beadsDir)
 	if !ok {
 		t.Fatal("readBeadsRuntimeConfig did not detect server metadata")
 	}
@@ -65,6 +67,35 @@ func TestReadBeadsRuntimeConfigDefaultServerAddr(t *testing.T) {
 	}
 	if cfg.Port != doltserver.DefaultPort {
 		t.Fatalf("Port = %d, want default %d", cfg.Port, doltserver.DefaultPort)
+	}
+}
+
+func TestReadBeadsRuntimeConfigPortFileFallback(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "32769")
+
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir beads dir: %v", err)
+	}
+	metadata := `{
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "database": "dolt"
+}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte("43113\n"), 0600); err != nil {
+		t.Fatalf("write port file: %v", err)
+	}
+
+	cfg, ok := readBeadsRuntimeConfig(beadsDir)
+	if !ok {
+		t.Fatal("readBeadsRuntimeConfig did not detect server metadata")
+	}
+	if cfg.Port != 43113 {
+		t.Fatalf("Port = %d, want port file 43113", cfg.Port)
 	}
 }
 
@@ -83,7 +114,7 @@ func TestReadBeadsRuntimeConfigIgnoresEmbeddedMetadata(t *testing.T) {
 		t.Fatalf("write metadata: %v", err)
 	}
 
-	if _, ok := readBeadsRuntimeConfig(beadsDir, townRoot); ok {
+	if _, ok := readBeadsRuntimeConfig(beadsDir); ok {
 		t.Fatal("embedded metadata should not be reported as shared-server config")
 	}
 }

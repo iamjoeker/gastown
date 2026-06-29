@@ -559,6 +559,14 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 	}
 
 	dp := capacity.ReconstructFromContext(b.Context)
+	targetBeadsDir := filepath.Join(townRoot, ".beads")
+	if dp.RigName != "" {
+		resolved, ok := beads.ResolveRepoAliasBeadsDir(townRoot, dp.RigName)
+		if !ok {
+			return nil, fmt.Errorf("cannot resolve target rig %q beads database for %s", dp.RigName, b.WorkBeadID)
+		}
+		targetBeadsDir = resolved
+	}
 	params := SlingParams{
 		BeadID:           dp.BeadID,
 		RigName:          dp.RigName,
@@ -579,7 +587,7 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 		NoConvoy:         true,
 		NoBoot:           true,
 		TownRoot:         townRoot,
-		BeadsDir:         filepath.Join(townRoot, ".beads"),
+		BeadsDir:         targetBeadsDir,
 	}
 
 	fmt.Printf("  Dispatching %s → %s...\n", b.WorkBeadID, b.TargetRig)

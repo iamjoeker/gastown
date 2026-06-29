@@ -27,16 +27,23 @@ jobs:
           git config --global user.name "CI Bot"
           git config --global user.email "ci@gastown.test"
 
+      - name: Resolve beads version
+        id: beads-version
+        run: |
+          version="$(go list -mod=readonly -m -f '{{.Version}}' github.com/steveyegge/beads)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Cache beads (bd)
         id: cache-beads
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ~/go/bin/bd
-          key: beads-nightly-${{ hashFiles('.github/workflows/nightly-integration.yml') }}
+          key: beads-nightly-${{ runner.os }}-${{ runner.arch }}-${{ steps.beads-version.outputs.version }}-${{ hashFiles('go.mod', 'go.sum') }}
 
       - name: Install beads (bd)
         if: steps.cache-beads.outputs.cache-hit != 'true'
-        run: go install github.com/steveyegge/beads/cmd/bd@v0.57.0
+        run: CGO_ENABLED=0 go install "github.com/steveyegge/beads/cmd/bd@${{ steps.beads-version.outputs.version }}"
 
       - name: Install Dolt
         run: |
@@ -61,4 +68,30 @@ jobs:
         run: go build -v ./cmd/gt
 
       - name: Run all integration tests
-        run: gotestsum --format testname --junitfile junit.xml -- -v -tags=integration -timeout=20m ./...
+        run: |
+          status=0
+
+          gotestsum --format testname --junitfile junit.xml -- \
+            -v -tags=integration -timeout=20m ./... || status=1
+
+          gotestsum --format testname --junitfile junit-scheduler-1.xml -- \
+            -tags='integration scheduler_integration' -timeout=20m -v \
+            -run '^(TestScheduler(CircuitBreakerExclusion|AutoConvoyCreation|BlockedStatusReporting|SlingDryRun|SlingContextIdempotency|SlingContextWorkBeadPristine))$' \
+            ./internal/cmd || status=1
+
+          gotestsum --format testname --junitfile junit-scheduler-2.xml -- \
+            -tags='integration scheduler_integration' -timeout=20m -v \
+            -run '^(TestScheduler(MultiRigDispatch|MultiRigEpicAutoResolve|ConvoyFlagRejection|EpicFlagRejection|EpicDetection|MixedBatchRejection|MultiRigConvoyAutoResolve))$' \
+            ./internal/cmd || status=1
+
+          gotestsum --format testname --junitfile junit-scheduler-3.xml -- \
+            -tags='integration scheduler_integration' -timeout=20m -v \
+            -run '^(TestScheduler(DisabledMode|DirectModeNoQueue|DeferredTaskWithoutRig|DeferredNonRigRejection|DeferredAcceptsDogTarget|DirectEpicDispatch|BatchEpicRejection))$' \
+            ./internal/cmd || status=1
+
+          gotestsum --format testname --junitfile junit-scheduler-4.xml -- \
+            -tags='integration scheduler_integration' -timeout=20m -v \
+            -run '^(TestScheduler(InvalidJSONContextCleanup|ActualDispatchRoutesPollutedEnvToTargetRig|FormulaDispatchRoutesPollutedEnvToTargetRig|DispatchFailureRecordedInContextSourceDB|DirectConvoyDispatch)|TestScheduleBead_(RefusesClosed|RefusesTombstone|ClosedForceDoesNotBypass))$' \
+            ./internal/cmd || status=1
+
+          exit "$status"

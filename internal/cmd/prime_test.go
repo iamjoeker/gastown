@@ -134,6 +134,44 @@ func TestGetAgentBeadID_UsesRigPrefix(t *testing.T) {
 	}
 }
 
+func TestRigBeadsRootPrefersRouteResolvedRigDir(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestRoutes(t, townRoot, []beads.Route{
+		{Prefix: "gt-", Path: "gastown/mayor/rig"},
+		{Prefix: "hq-", Path: "."},
+	})
+
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		Rig:      "gastown",
+		Polecat:  "toast",
+		TownRoot: townRoot,
+		WorkDir:  filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown"),
+	}
+
+	got := rigBeadsRoot(ctx)
+	want := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if got != want {
+		t.Fatalf("rigBeadsRoot() = %q, want route-resolved %q", got, want)
+	}
+}
+
+func TestRigBeadsRootFallsBackWhenRouteMissing(t *testing.T) {
+	townRoot := t.TempDir()
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		Rig:      "gastown",
+		TownRoot: townRoot,
+		WorkDir:  filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown"),
+	}
+
+	got := rigBeadsRoot(ctx)
+	want := filepath.Join(townRoot, "gastown")
+	if got != want {
+		t.Fatalf("rigBeadsRoot() = %q, want fallback %q", got, want)
+	}
+}
+
 func TestPrimeFlagCombinations(t *testing.T) {
 	gtBin := buildGT(t)
 

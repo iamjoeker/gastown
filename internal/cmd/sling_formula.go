@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -248,13 +249,18 @@ func shouldReuseExistingFormula(existing *beads.Issue, delayedDogInfo *DogDispat
 // verifyFormulaExists checks that the formula exists using bd formula show.
 // Formulas are TOML files (.formula.toml).
 // Requests stale-read compatibility for consistency with verifyBeadExists.
-func verifyFormulaExists(formulaName string) error {
+func verifyFormulaExists(formulaName, workDir, townRoot string) error {
+	if workDir == "" {
+		workDir = townRoot
+	}
 	// Try bd formula show (handles all formula file formats)
 	// Use Output() instead of Run() to detect bd exit 0 bug:
 	// when formula not found, bd may exit 0 but produce empty stdout.
 	// Stderr discarded — first attempt may fail expectedly (retry with mol- prefix).
 	if out, err := BdCmd("formula", "show", formulaName).
 		AllowStale().
+		Dir(workDir).
+		WithGTRoot(townRoot).
 		Stderr(io.Discard).Output(); err == nil && len(out) > 0 {
 		return nil
 	}
@@ -262,7 +268,15 @@ func verifyFormulaExists(formulaName string) error {
 	// Try with mol- prefix
 	if out, err := BdCmd("formula", "show", "mol-"+formulaName).
 		AllowStale().
+		Dir(workDir).
+		WithGTRoot(townRoot).
 		Stderr(io.Discard).Output(); err == nil && len(out) > 0 {
+		return nil
+	}
+	if _, err := formula.GetEmbeddedFormulaContent(formulaName); err == nil {
+		return nil
+	}
+	if _, err := formula.GetEmbeddedFormulaContent("mol-" + formulaName); err == nil {
 		return nil
 	}
 
@@ -405,7 +419,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 			existingMode = fields.Mode
 		}
 		if existingMode != mode {
-			if err := storeFieldsInBead(existing.ID, beadFieldUpdates{Mode: &mode}); err != nil {
+			if err := storeFieldsInBeadFromTownRoot(townRoot, existing.ID, beadFieldUpdates{Mode: &mode}); err != nil {
 				return fmt.Errorf("updating existing formula mode: %w", err)
 			}
 			if mode != "" || existingMode != "" {
@@ -516,7 +530,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 		Mode:            &mode,
 		FormulaVars:     strings.Join(slingVars, "\n"),
 	}
-	if err := storeFieldsInBead(wispRootID, fieldUpdates); err != nil {
+	if err := storeFieldsInBeadFromTownRoot(townRoot, wispRootID, fieldUpdates); err != nil {
 		fmt.Printf("%s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
 	} else if slingArgs != "" {
 		fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))

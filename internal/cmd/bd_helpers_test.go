@@ -547,6 +547,52 @@ func TestBdCmd_DirPinsMetadataDatabaseOverInheritedDefault(t *testing.T) {
 	}
 }
 
+func TestBdCmd_WithBeadsDirFollowsRedirectBeforeMetadata(t *testing.T) {
+	rigRoot := t.TempDir()
+	redirectBeadsDir := filepath.Join(rigRoot, ".beads")
+	canonicalBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	for _, dir := range []string{redirectBeadsDir, canonicalBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(redirectBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(redirectBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","dolt_server_host":"wrong-host","dolt_server_port":9999}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(canonicalBeadsDir, "metadata.json"), []byte(`{"dolt_database":"gastown","dolt_server_host":"127.0.0.2","dolt_server_port":4407}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	bdc := &bdCmd{
+		args: []string{"show", "gt-abc", "--json"},
+		env: []string{
+			"PATH=/usr/bin",
+			"BEADS_DIR=/town/.beads",
+			"BEADS_DOLT_SERVER_DATABASE=hq",
+			"BEADS_DOLT_DATA_DIR=/wrong/data",
+		},
+		stderr: os.Stderr,
+	}
+	cmd := bdc.WithBeadsDir(redirectBeadsDir).Build()
+	envMap := parseEnv(cmd.Env)
+
+	if envMap["BEADS_DIR"] != canonicalBeadsDir {
+		t.Fatalf("BEADS_DIR = %q, want canonical %q in %v", envMap["BEADS_DIR"], canonicalBeadsDir, cmd.Env)
+	}
+	if envMap["BEADS_DOLT_SERVER_DATABASE"] != "gastown" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want gastown in %v", envMap["BEADS_DOLT_SERVER_DATABASE"], cmd.Env)
+	}
+	if envMap["BEADS_DOLT_SERVER_HOST"] != "127.0.0.2" || envMap["BEADS_DOLT_SERVER_PORT"] != "4407" || envMap["BEADS_DOLT_PORT"] != "4407" {
+		t.Fatalf("connection env used stale redirect metadata: %v", cmd.Env)
+	}
+	if _, ok := envMap["BEADS_DOLT_DATA_DIR"]; ok {
+		t.Fatalf("BEADS_DOLT_DATA_DIR should be stripped in %v", cmd.Env)
+	}
+}
+
 func TestBdCmd_WithBeadsDir_OverridesInherited(t *testing.T) {
 	// WithBeadsDir should override an inherited BEADS_DIR from the parent
 	// process. This is the core fix for gt-ctir: without overriding,
@@ -744,6 +790,99 @@ func TestBdCmd_WithRoutingDoesNotPinBeadsDir(t *testing.T) {
 	}
 	if envMap["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" {
 		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want 127.0.0.1 in %v", envMap["BEADS_DOLT_SERVER_HOST"], cmd.Env)
+	}
+}
+
+func TestBdCmd_UsesCentralReadMutationModes(t *testing.T) {
+	rigDir := t.TempDir()
+	beadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+	baseEnv := []string{
+		"PATH=/usr/bin",
+		"BEADS_DIR=/wrong",
+		"BEADS_DOLT_SERVER_DATABASE=hq",
+		"BD_DOLT_AUTO_COMMIT=off",
+		"BD_READONLY=false",
+	}
+
+	tests := []struct {
+		name           string
+		setup          func() *bdCmd
+		wantPinned     bool
+		wantReadOnly   bool
+		wantAutoCommit string
+	}{
+		{
+			name: "read pinned via Dir",
+			setup: func() *bdCmd {
+				return (&bdCmd{args: []string{"show", "gt-abc"}, env: append([]string{}, baseEnv...), stderr: os.Stderr}).Dir(rigDir)
+			},
+			wantPinned:     true,
+			wantReadOnly:   true,
+			wantAutoCommit: "off",
+		},
+		{
+			name: "mutation pinned via WithBeadsDir",
+			setup: func() *bdCmd {
+				return (&bdCmd{args: []string{"update", "gt-abc", "--status=open"}, env: append([]string{}, baseEnv...), stderr: os.Stderr}).WithBeadsDir(beadsDir)
+			},
+			wantPinned:     true,
+			wantAutoCommit: "on",
+		},
+		{
+			name: "read routing",
+			setup: func() *bdCmd {
+				return (&bdCmd{args: []string{"message", "thread", "hq-msg"}, env: append([]string{}, baseEnv...), stderr: os.Stderr}).Dir(rigDir).WithRouting()
+			},
+			wantReadOnly:   true,
+			wantAutoCommit: "off",
+		},
+		{
+			name: "auto commit forces mutation for read args",
+			setup: func() *bdCmd {
+				return (&bdCmd{args: []string{"show", "gt-abc"}, env: append([]string{}, baseEnv...), stderr: os.Stderr}).Dir(rigDir).WithAutoCommit()
+			},
+			wantPinned:     true,
+			wantAutoCommit: "on",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := tt.setup().Build()
+			envMap := parseEnv(cmd.Env)
+			if tt.wantPinned {
+				if envMap["BEADS_DIR"] != beadsDir {
+					t.Fatalf("BEADS_DIR = %q, want %q in %v", envMap["BEADS_DIR"], beadsDir, cmd.Env)
+				}
+				if envMap["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
+					t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb in %v", envMap["BEADS_DOLT_SERVER_DATABASE"], cmd.Env)
+				}
+			} else {
+				if value, ok := envMap["BEADS_DIR"]; ok {
+					t.Fatalf("BEADS_DIR should be absent for routing command, got %q in %v", value, cmd.Env)
+				}
+				if value, ok := envMap["BEADS_DOLT_SERVER_DATABASE"]; ok {
+					t.Fatalf("BEADS_DOLT_SERVER_DATABASE should be absent for routing command, got %q in %v", value, cmd.Env)
+				}
+			}
+			if envMap["BD_DOLT_AUTO_COMMIT"] != tt.wantAutoCommit {
+				t.Fatalf("BD_DOLT_AUTO_COMMIT = %q, want %q in %v", envMap["BD_DOLT_AUTO_COMMIT"], tt.wantAutoCommit, cmd.Env)
+			}
+			if tt.wantReadOnly {
+				if envMap["BD_READONLY"] != "true" {
+					t.Fatalf("BD_READONLY = %q, want true in %v", envMap["BD_READONLY"], cmd.Env)
+				}
+			} else if value, ok := envMap["BD_READONLY"]; ok {
+				t.Fatalf("BD_READONLY should be absent for mutation command, got %q in %v", value, cmd.Env)
+			}
+		})
 	}
 }
 

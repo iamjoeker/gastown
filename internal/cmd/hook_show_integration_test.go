@@ -27,10 +27,21 @@ func TestHookShowShorthandResolvesToCanonical(t *testing.T) {
 	}
 
 	townRoot, polecatDir, rigPrefix := setupHookTestTown(t)
-	_ = townRoot
 
 	rigDir := filepath.Join(polecatDir, "..", "..", "mayor", "rig")
 	initBeadsDBWithPrefix(t, rigDir, rigPrefix)
+	rigRootBeadsDir := filepath.Join(townRoot, "gastown", ".beads")
+	if err := os.MkdirAll(rigRootBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir stale rig-root beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigRootBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq"}`), 0644); err != nil {
+		t.Fatalf("write stale rig-root metadata: %v", err)
+	}
+	t.Setenv("BEADS_DIR", filepath.Join(townRoot, ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "hq")
+	t.Setenv("BEADS_DB", filepath.Join(townRoot, "wrong.db"))
+	t.Setenv("BD_DB", filepath.Join(townRoot, "wrong.bd"))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(townRoot, "wrong-data"))
 
 	b := beads.New(rigDir)
 	issue, err := b.Create(beads.CreateOptions{

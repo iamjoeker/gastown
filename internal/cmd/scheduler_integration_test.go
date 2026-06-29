@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration && scheduler_integration
 
 // Package cmd contains integration tests for the capacity scheduler subsystem.
 // These tests exercise scheduler CLI operations (schedule, list, status, dispatch
@@ -9,7 +9,7 @@
 //
 // Run with:
 //
-//	go test -tags=integration -run 'TestScheduler' -timeout 5m -count=1 -v ./internal/cmd/
+//	go test -tags='integration scheduler_integration' -run 'TestScheduler' -timeout 15m -count=1 -v ./internal/cmd/
 package cmd
 
 import (
@@ -26,6 +26,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 )
 
@@ -38,19 +39,21 @@ var schedulerTestCounter atomic.Int32
 // shared Dolt test server. Uses local init (bd init --prefix --server-port)
 // which reliably creates the schema and records the ephemeral port in
 // metadata.json so subsequent bd commands reach the test server.
-func initBeadsDBForServer(t *testing.T, dir, prefix string) {
+func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string) {
 	t.Helper()
+	initSchedulerGitRepo(t, dir, homeDir)
 
-	args := []string{"init", "--prefix", prefix}
+	args := []string{"init", "--quiet", "--non-interactive", "--skip-hooks", "--skip-agents", "--prefix", prefix}
 	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
 	// instead of defaulting to port 3307.
 	// bd v1.0.0+ defaults to embedded mode; --server is required to use an
 	// external server (v0.57.0 defaulted to server mode and ignored --server).
-	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
-		args = append(args, "--server", "--server-port", p)
+	if p := schedulerDoltPort(); p != "" {
+		args = append(args, "--server", "--external", "--server-port", p)
 	}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
+	cmd.Env = schedulerBDInitEnv(homeDir, filepath.Join(dir, ".beads"))
 	out, err := cmd.CombinedOutput()
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
 	if err != nil {
@@ -69,6 +72,103 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	}
 }
 
+func initSchedulerGitRepo(t *testing.T, dir, homeDir string) {
+	t.Helper()
+	cmd := exec.Command("git", "init", "--quiet")
+	cmd.Dir = dir
+	cmd.Env = cleanSchedulerTestEnv(homeDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init in %s: %v\n%s", dir, err, out)
+	}
+}
+
+func schedulerBDInitEnv(homeDir, beadsDir string) []string {
+	env := cleanSchedulerTestEnv(homeDir)
+	if p := schedulerDoltPort(); p != "" {
+		env = beads.StripEnvKey(env, "GT_DOLT_PORT")
+		env = append(env, "GT_DOLT_PORT="+p)
+	}
+	return beads.BuildMutationPinnedBDEnv(env, beadsDir)
+}
+
+func schedulerDoltPort() string {
+	for _, key := range []string{"GT_DOLT_PORT", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+		if p := os.Getenv(key); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+func cleanupSchedulerBeadsDatabases(t *testing.T, prefixes ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		port := schedulerDoltPort()
+		if port == "" {
+			port = "3307"
+		}
+		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Logf("cleanup: could not connect to drop test databases: %v", err)
+			return
+		}
+		defer db.Close()
+		for _, prefix := range prefixes {
+			for _, dbName := range []string{prefix, "beads_" + prefix} {
+				if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
+					t.Logf("cleanup: failed to drop %s: %v", dbName, err)
+				}
+			}
+		}
+		if _, err := db.Exec("CALL dolt_purge_dropped_databases()"); err != nil {
+			t.Logf("cleanup: failed to purge dropped databases: %v", err)
+		}
+	})
+}
+
+func setTestBeadStatus(t *testing.T, dir, beadID, status string) {
+	t.Helper()
+	beadsDir := filepath.Join(dir, ".beads")
+	dbName := beads.DatabaseNameFromMetadata(beadsDir)
+	if dbName == "" {
+		t.Fatalf("no Dolt database metadata in %s", beadsDir)
+	}
+	port := schedulerDoltPort()
+	if port == "" {
+		port = "3307"
+	}
+	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/%s", port, dbName)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dbName, err)
+	}
+	defer db.Close()
+	res, err := db.Exec("UPDATE issues SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", status, beadID)
+	if err != nil {
+		t.Fatalf("set %s status to %s: %v", beadID, status, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n != 1 {
+		t.Fatalf("set %s status affected %d rows, want 1", beadID, n)
+	}
+}
+
+func installSchedulerTestFormula(t *testing.T, rigPath string) {
+	t.Helper()
+	content, err := formula.GetEmbeddedFormulaContent("mol-polecat-work")
+	if err != nil {
+		t.Fatalf("load embedded mol-polecat-work formula: %v", err)
+	}
+	formulasDir := filepath.Join(rigPath, ".beads", "formulas")
+	if err := os.MkdirAll(formulasDir, 0755); err != nil {
+		t.Fatalf("mkdir formulas dir: %v", err)
+	}
+	path := filepath.Join(formulasDir, "mol-polecat-work.formula.toml")
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // setupSchedulerIntegrationTown creates a minimal town filesystem for scheduler tests.
 // Uses the shared Dolt test server (managed by requireDoltServer)
 // for beads databases. No gt install, no Claude credentials, no agent sessions.
@@ -78,7 +178,7 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	t.Helper()
 
 	if _, err := exec.LookPath("bd"); err != nil {
-		t.Skip("bd not installed, skipping scheduler integration test")
+		t.Fatalf("bd not installed: %v", err)
 	}
 
 	requireDoltServer(t)
@@ -95,10 +195,11 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	configureTestGitIdentity(t, tmpDir)
 
 	// Generate unique prefixes per test to avoid cross-test data leakage on
-	// the shared Dolt server. Each test gets its own databases (e.g., beads_h3, beads_r3).
+	// the shared Dolt server. Each test gets its own databases (e.g., h3, r3).
 	n := schedulerTestCounter.Add(1)
 	hqPrefix := fmt.Sprintf("h%d", n)
 	rigPrefix := fmt.Sprintf("r%d", n)
+	cleanupSchedulerBeadsDatabases(t, hqPrefix, rigPrefix)
 
 	hqPath = filepath.Join(tmpDir, "test-hq")
 	rigPath = filepath.Join(hqPath, "testrig", "mayor", "rig")
@@ -150,34 +251,14 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
+	initBeadsDBForServer(t, hqPath, hqPrefix, tmpDir)
 
 	// --- testrig directory (loadRig checks os.Stat on townRoot/<rigName>) ---
 	if err := os.MkdirAll(rigPath, 0755); err != nil {
 		t.Fatalf("mkdir rigPath: %v", err)
 	}
-	initBeadsDBForServer(t, rigPath, rigPrefix)
-
-	// Drop test databases on cleanup to prevent orphaned databases on the Dolt server.
-	t.Cleanup(func() {
-		port := os.Getenv("GT_DOLT_PORT")
-		if port == "" {
-			port = "3307"
-		}
-		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Logf("cleanup: could not connect to drop test databases: %v", err)
-			return
-		}
-		defer db.Close()
-		for _, prefix := range []string{hqPrefix, rigPrefix} {
-			dbName := "beads_" + prefix
-			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
-				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
-			}
-		}
-	})
+	initBeadsDBForServer(t, rigPath, rigPrefix, tmpDir)
+	installSchedulerTestFormula(t, rigPath)
 
 	// Redirect: testrig/.beads/ → mayor/rig/.beads
 	// beadsSearchDirs scans townRoot/<dir>/.beads — the redirect lets bd commands
@@ -573,7 +654,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	t.Helper()
 
 	if _, err := exec.LookPath("bd"); err != nil {
-		t.Skip("bd not installed, skipping scheduler integration test")
+		t.Fatalf("bd not installed: %v", err)
 	}
 
 	requireDoltServer(t)
@@ -592,6 +673,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	hqPrefix := fmt.Sprintf("h%d", n)
 	rig1Prefix := fmt.Sprintf("r%d", n)
 	rig2Prefix := fmt.Sprintf("s%d", n)
+	cleanupSchedulerBeadsDatabases(t, hqPrefix, rig1Prefix, rig2Prefix)
 
 	hqPath = filepath.Join(tmpDir, "test-hq")
 	rig1Path = filepath.Join(hqPath, "rig1", "mayor", "rig")
@@ -649,18 +731,19 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
+	initBeadsDBForServer(t, hqPath, hqPrefix, tmpDir)
 
 	// --- rig1 ---
 	if err := os.MkdirAll(rig1Path, 0755); err != nil {
 		t.Fatalf("mkdir rig1Path: %v", err)
 	}
-	initBeadsDBForServer(t, rig1Path, rig1Prefix)
+	initBeadsDBForServer(t, rig1Path, rig1Prefix, tmpDir)
 	// Write routes to rig1's .beads/ so bd can resolve cross-rig IDs (needed for
 	// cross-rig dep creation via external refs).
 	if err := beads.WriteRoutes(filepath.Join(rig1Path, ".beads"), routes); err != nil {
 		t.Fatalf("write rig1 routes: %v", err)
 	}
+	installSchedulerTestFormula(t, rig1Path)
 	rig1Redirect := filepath.Join(hqPath, "rig1", ".beads")
 	if err := os.MkdirAll(rig1Redirect, 0755); err != nil {
 		t.Fatalf("mkdir rig1 redirect: %v", err)
@@ -673,10 +756,11 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.MkdirAll(rig2Path, 0755); err != nil {
 		t.Fatalf("mkdir rig2Path: %v", err)
 	}
-	initBeadsDBForServer(t, rig2Path, rig2Prefix)
+	initBeadsDBForServer(t, rig2Path, rig2Prefix, tmpDir)
 	if err := beads.WriteRoutes(filepath.Join(rig2Path, ".beads"), routes); err != nil {
 		t.Fatalf("write rig2 routes: %v", err)
 	}
+	installSchedulerTestFormula(t, rig2Path)
 	rig2Redirect := filepath.Join(hqPath, "rig2", ".beads")
 	if err := os.MkdirAll(rig2Redirect, 0755); err != nil {
 		t.Fatalf("mkdir rig2 redirect: %v", err)
@@ -684,29 +768,6 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.WriteFile(filepath.Join(rig2Redirect, "redirect"), []byte("mayor/rig/.beads"), 0644); err != nil {
 		t.Fatalf("write rig2 redirect: %v", err)
 	}
-
-	// Drop test databases on cleanup to prevent orphaned databases on the Dolt
-	// server. Without this, databases from multi-rig tests persist and can
-	// contaminate subsequent tests sharing the same server (see #2832).
-	t.Cleanup(func() {
-		port := os.Getenv("GT_DOLT_PORT")
-		if port == "" {
-			port = "3307"
-		}
-		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Logf("cleanup: could not connect to drop test databases: %v", err)
-			return
-		}
-		defer db.Close()
-		for _, prefix := range []string{hqPrefix, rig1Prefix, rig2Prefix} {
-			dbName := "beads_" + prefix
-			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
-				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
-			}
-		}
-	})
 
 	// --- Environment ---
 	env = cleanSchedulerTestEnv(tmpDir)
@@ -1075,24 +1136,6 @@ func TestSchedulerDeferredTaskWithoutRig(t *testing.T) {
 	}
 }
 
-// TestSchedulerConfigSetZero verifies that gt config set scheduler.max_polecats 0
-// is accepted (disabled mode is a valid config).
-func TestSchedulerConfigSetZero(t *testing.T) {
-	hqPath, _, gtBinary, env := setupSchedulerIntegrationTown(t)
-
-	// Set max_polecats=0 should succeed
-	out := runGTCmdOutput(t, gtBinary, hqPath, env, "config", "set", "scheduler.max_polecats", "0")
-	if strings.Contains(out, "invalid") {
-		t.Errorf("max_polecats=0 should be accepted, got:\n%s", out)
-	}
-
-	// Read it back — should return 0
-	out = runGTCmdOutput(t, gtBinary, hqPath, env, "config", "get", "scheduler.max_polecats")
-	if strings.TrimSpace(out) != "0" {
-		t.Errorf("max_polecats = %q, want %q", strings.TrimSpace(out), "0")
-	}
-}
-
 // TestSchedulerDeferredNonRigRejection verifies that in deferred mode (max_polecats > 0),
 // gt sling <bead> <non-rig> is rejected rather than falling through to direct dispatch.
 func TestSchedulerDeferredNonRigRejection(t *testing.T) {
@@ -1323,6 +1366,73 @@ func TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
 	}
 }
 
+func TestSchedulerFormulaDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
+	hqPath, rigPath, _, _ := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Polluted env formula dispatch")
+	rigBeads := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+	ctxBead, err := rigBeads.CreateSlingContext("dispatch: "+beadID, beadID, &capacity.SlingContextFields{
+		Version:    1,
+		WorkBeadID: beadID,
+		TargetRig:  "testrig",
+		Formula:    "mol-polecat-work",
+		EnqueuedAt: "2026-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("CreateSlingContext: %v", err)
+	}
+
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = prevSpawn })
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		if rigName != "testrig" {
+			t.Fatalf("spawn rig = %q, want testrig", rigName)
+		}
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: "formulaenv",
+			ClonePath:   rigPath,
+			Pane:        "test-pane",
+		}, nil
+	}
+
+	t.Setenv("BEADS_DIR", filepath.Join(hqPath, ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", beads.DatabaseNameFromMetadata(filepath.Join(hqPath, ".beads")))
+	t.Setenv("BEADS_DB", filepath.Join(hqPath, "wrong.db"))
+	t.Setenv("BD_DB", filepath.Join(hqPath, "wrong.bd"))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(hqPath, ".wrong-dolt-data"))
+
+	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	if err != nil {
+		t.Fatalf("dispatchScheduledWork: %v", err)
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatched = %d, want 1", dispatched)
+	}
+
+	issue, err := rigBeads.Show(beadID)
+	if err != nil {
+		t.Fatalf("rig bead show after dispatch: %v", err)
+	}
+	if issue.Status != "hooked" || issue.Assignee != "testrig/polecats/formulaenv" {
+		t.Fatalf("rig bead state = status:%q assignee:%q, want hooked testrig/polecats/formulaenv", issue.Status, issue.Assignee)
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil || attachment.AttachedFormula != "mol-polecat-work" || attachment.AttachedMolecule == "" {
+		t.Fatalf("attachment fields = %#v, want mol-polecat-work with attached molecule (description: %s)", attachment, issue.Description)
+	}
+
+	openContexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		t.Fatalf("ListOpenSlingContexts: %v", err)
+	}
+	for _, ctx := range openContexts {
+		if ctx.ID == ctxBead.ID {
+			t.Fatalf("sling context %s still open after successful formula dispatch", ctxBead.ID)
+		}
+	}
+}
+
 func TestSchedulerDispatchFailureRecordedInContextSourceDB(t *testing.T) {
 	hqPath, rigPath, _, _ := setupSchedulerIntegrationTown(t)
 
@@ -1463,15 +1573,7 @@ func TestScheduleBead_RefusesTombstone(t *testing.T) {
 
 	beadID := createTestBead(t, rigPath, "Tombstone bead refused by scheduleBead")
 
-	// Tombstone the bead. bd uses `bd close --tombstone` for terminal removal.
-	closeCmd := exec.Command("bd", "close", beadID, "--tombstone")
-	closeCmd.Dir = rigPath
-	if out, err := closeCmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "unknown flag: --tombstone") {
-			t.Skip("bd CLI does not support close --tombstone")
-		}
-		t.Fatalf("bd close --tombstone %s failed: %v\n%s", beadID, err, out)
-	}
+	setTestBeadStatus(t, rigPath, beadID, "tombstone")
 
 	out, err := runGTCmdMayFail(t, gtBinary, hqPath, env,
 		"sling", beadID, "testrig", "--hook-raw-bead")

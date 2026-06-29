@@ -346,6 +346,7 @@ exit /b 0
 	gotBondCount := 0
 	gotCreate := false
 	gotTargetDBCheck := false
+	gotFormulaShow := false
 	gotHook := false
 	gotMetadata := false
 	assertTargetRig := func(kind, dir, beadsDir, database, beadsDB, bdDB, dataDir, args string) {
@@ -390,6 +391,9 @@ exit /b 0
 		case strings.Contains(args, "show "+newBeadID) && strings.Contains(args, "--json"):
 			gotTargetDBCheck = true
 			assertTargetRig("target DB check", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
+		case strings.Contains(args, "formula show "):
+			gotFormulaShow = true
+			assertTargetRig("formula show", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "cook "):
 			switch {
 			case strings.Contains(args, "mol-polecat-work"):
@@ -421,7 +425,7 @@ exit /b 0
 			assertTargetRig("metadata update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--description="):
 			assertTargetRig("description update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
-		case args == "--version" || strings.HasPrefix(args, "version") || strings.Contains(args, " version") || strings.HasPrefix(args, "formula ") || strings.Contains(args, "show gt-rig-") || strings.Contains(args, "show mol-"):
+		case args == "--version" || strings.HasPrefix(args, "version") || strings.Contains(args, " version") || strings.Contains(args, "show gt-rig-") || strings.Contains(args, "show mol-"):
 			// Explicitly exempt non-target-bead lookups; every gt-new123 operation
 			// above must still prove it is pinned to the gastown database.
 		default:
@@ -429,9 +433,9 @@ exit /b 0
 		}
 	}
 
-	if !gotCreate || !gotTargetDBCheck || !gotPolecatCook || !gotPolecatWisp || !gotReviewCook || !gotReviewWisp || gotBondCount < 2 || !gotHook || !gotMetadata {
-		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v polecat(cook=%v wisp=%v) review(cook=%v wisp=%v) bondCount=%d hook=%v metadata=%v (log: %q)",
-			gotCreate, gotTargetDBCheck, gotPolecatCook, gotPolecatWisp, gotReviewCook, gotReviewWisp, gotBondCount, gotHook, gotMetadata, string(logBytes))
+	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotPolecatWisp || !gotReviewCook || !gotReviewWisp || gotBondCount < 2 || !gotHook || !gotMetadata {
+		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v formulaShow=%v polecat(cook=%v wisp=%v) review(cook=%v wisp=%v) bondCount=%d hook=%v metadata=%v (log: %q)",
+			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotPolecatWisp, gotReviewCook, gotReviewWisp, gotBondCount, gotHook, gotMetadata, string(logBytes))
 	}
 }
 
@@ -566,7 +570,7 @@ func TestSlingRollsBackSpawnedPolecatOnInstantiateFailure(t *testing.T) {
 	if err := config.SaveRigsConfig(rigsPath, rigs); err != nil {
 		t.Fatalf("SaveRigsConfig: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir rig beads dir: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(townRoot, "gastown"), 0755); err != nil {
@@ -728,7 +732,7 @@ func TestSlingRollsBackSpawnedPolecatOnHookFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"version":1}`), 0644); err != nil {
 		t.Fatalf("write town marker: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir gastown mayor rig: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
@@ -848,7 +852,7 @@ func TestSlingRejectsBeadMissingFromTargetRigBeforeSpawn(t *testing.T) {
 	if err := config.SaveRigsConfig(rigsPath, rigs); err != nil {
 		t.Fatalf("SaveRigsConfig: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir target rig dir: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
@@ -979,7 +983,7 @@ func setupCrossDatabaseSlingGuardTest(t *testing.T) (townRoot, logPath string) {
 	if err := config.SaveRigsConfig(rigsPath, rigs); err != nil {
 		t.Fatalf("SaveRigsConfig: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir target rig dir: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {

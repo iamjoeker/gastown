@@ -888,15 +888,15 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	return hookedBeads[0], nil
 }
 
-// rigBeadsRoot returns the directory to use for beads queries.
-// For rig-level agents (polecats, crew, witness, refinery), returns the rig
-// root (e.g., ~/gt/myrig/) which has the authoritative .beads/ database.
-// For town-level agents, returns ctx.WorkDir unchanged.
-//
-// This avoids relying on .beads/redirect in polecat worktrees, which can
-// fail to resolve and cause polecats to see no hooked work. (GH#2503)
+// rigBeadsRoot returns the route-owned directory to use for beads queries.
+// For rig-level agents (polecats, crew, witness, refinery), prefer the rig DB
+// from town routes rather than rig-root metadata, which can be a stale redirect
+// shim during recovery. For town-level agents, returns ctx.WorkDir unchanged.
 func rigBeadsRoot(ctx RoleContext) string {
 	if ctx.Rig != "" && ctx.TownRoot != "" {
+		if rigDir := beads.GetRigDirForName(ctx.TownRoot, ctx.Rig); rigDir != "" {
+			return rigDir
+		}
 		return filepath.Join(ctx.TownRoot, ctx.Rig)
 	}
 	return ctx.WorkDir

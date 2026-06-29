@@ -712,15 +712,15 @@ type beadsRuntimeConfig struct {
 	Port     int
 }
 
-func currentBeadsRuntimeConfig(townRoot string) (beadsRuntimeConfig, bool) {
+func currentBeadsRuntimeConfig() (beadsRuntimeConfig, bool) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return beadsRuntimeConfig{}, false
 	}
-	return readBeadsRuntimeConfig(beads.ResolveBeadsDir(cwd), townRoot)
+	return readBeadsRuntimeConfig(beads.ResolveBeadsDir(cwd))
 }
 
-func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool) {
+func readBeadsRuntimeConfig(beadsDir string) (beadsRuntimeConfig, bool) {
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
@@ -748,7 +748,14 @@ func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool
 	}
 	port := metadata.DoltServerPort
 	if port == 0 {
-		port = doltserver.DefaultConfig(townRoot).Port
+		if data, err := os.ReadFile(filepath.Join(beadsDir, "dolt-server.port")); err == nil {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && parsed > 0 {
+				port = parsed
+			}
+		}
+	}
+	if port == 0 {
+		port = doltserver.DefaultPort
 	}
 	database := metadata.DoltDatabase
 	if database == "" {
@@ -764,7 +771,7 @@ func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool
 }
 
 func printBeadsRuntimeConfig(townRoot string) {
-	cfg, ok := currentBeadsRuntimeConfig(townRoot)
+	cfg, ok := currentBeadsRuntimeConfig()
 	if !ok {
 		return
 	}

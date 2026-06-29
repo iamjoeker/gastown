@@ -452,7 +452,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 					idType, args[0])
 			}
 			if verifyBeadExists(args[0]) != nil {
-				if verifyFormulaExists(args[0]) == nil {
+				formulaWorkDir := townRoot
+				if rigBeadsDir, ok := beads.ResolveRepoAliasBeadsDir(townRoot, rigName); ok {
+					formulaWorkDir = filepath.Dir(rigBeadsDir)
+				}
+				if verifyFormulaExists(args[0], formulaWorkDir, townRoot) == nil {
 					// Standalone formula slinging (cook+wisp+attach) is not bead-based
 					// dispatch and does not consume a scheduler slot — fall through to
 					// runSlingFormula, which handles polecat spawning via resolveTarget.
@@ -569,7 +573,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		if err := verifyBeadExists(beadID); err != nil {
 			return err
 		}
-		if err := verifyFormulaExists(formulaName); err != nil {
+		if err := verifyFormulaExists(formulaName, beads.ResolveHookDir(townRoot, beadID, ""), townRoot); err != nil {
 			return err
 		}
 	} else {
@@ -582,7 +586,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			beadID = firstArg
 		} else {
 			// Not a verified bead - try as standalone formula
-			if err := verifyFormulaExists(firstArg); err == nil {
+			if err := verifyFormulaExists(firstArg, townRoot, townRoot); err == nil {
 				// Standalone formula mode: gt sling <formula> [target]
 				// Deferred dispatch is handled above for the 2-arg rig case (gh#3917).
 				return runSlingFormula(ctx, args)
@@ -1052,7 +1056,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		slingMerge,
 		slingOwned,
 	)
-	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
+	if err := storeFieldsInBeadFromTownRoot(townRoot, beadID, fieldUpdates); err != nil {
 		// Warn but don't fail - polecat will still complete work
 		fmt.Printf("%s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
 	} else {

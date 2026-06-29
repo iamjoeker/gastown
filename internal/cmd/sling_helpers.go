@@ -19,7 +19,6 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
-	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/formula"
 	rigpkg "github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -323,17 +322,11 @@ func verifyBeadExistsInTargetRigDatabase(beadID, targetRig, townRoot string) err
 		return fmt.Errorf("cannot verify bead %s in target rig %q: town root is unavailable; refusing to sling before creating hooks or molecule side effects", beadID, targetRig)
 	}
 
-	targetRigDir := beads.GetRigDirForName(townRoot, targetRig)
-	targetBeadsDir := ""
-	if targetRigDir != "" {
-		targetBeadsDir = filepath.Join(targetRigDir, ".beads")
-	} else {
-		targetBeadsDir = doltserver.FindRigBeadsDir(townRoot, targetRig)
-		targetRigDir = filepath.Dir(targetBeadsDir)
-	}
-	if targetBeadsDir == "" || targetRigDir == "." {
+	targetBeadsDir, ok := beads.ResolveRepoAliasBeadsDir(townRoot, targetRig)
+	if !ok {
 		return fmt.Errorf("cannot resolve target rig %q beads database for bead %s; refusing to sling before creating hooks or molecule side effects", targetRig, beadID)
 	}
+	targetRigDir := filepath.Dir(targetBeadsDir)
 
 	out, err := BdCmd("show", beadID, "--json").
 		AllowStale().
@@ -511,12 +504,16 @@ func buildSlingFieldUpdates(
 // storeArgsInBead, storeAttachedMoleculeInBead, and storeNoMergeInBead calls that each
 // independently read-modify-write and could race under concurrent access.
 func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+	return storeFieldsInBeadFromTownRoot("", beadID, updates)
+}
+
+func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpdates) error {
 	logPath := os.Getenv("GT_TEST_ATTACHED_MOLECULE_LOG")
 
 	issue := &beads.Issue{}
 	if logPath == "" {
 		// Read the bead once
-		out, err := bdShowBeadOutput(beadID)
+		out, err := bdShowBeadOutputFromTownRoot(townRoot, beadID)
 		if err != nil {
 			return fmt.Errorf("fetching bead: %w", err)
 		}
@@ -588,8 +585,12 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 		return nil
 	}
 
+	updateDir := resolveBeadDir(beadID)
+	if townRoot != "" {
+		updateDir = resolveBeadDirFromTownRoot(townRoot, beadID)
+	}
 	if err := BdCmd("update", beadID, "--description="+newDesc).
-		Dir(resolveBeadDir(beadID)).
+		Dir(updateDir).
 		StripBeadsDir().
 		WithAutoCommit().
 		Run(); err != nil {
