@@ -1210,7 +1210,7 @@ func TestResolveDoltPort_GTDoltPortTakesPrecedenceOverConfigYAML(t *testing.T) {
 	}
 }
 
-func TestResolveDoltPort_FromRunningStateFile(t *testing.T) {
+func TestResolveDoltPort_IgnoresRunningStateFile(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "")
 	tmpDir := t.TempDir()
 	daemonDir := filepath.Join(tmpDir, "daemon")
@@ -1222,8 +1222,33 @@ func TestResolveDoltPort_FromRunningStateFile(t *testing.T) {
 	}
 
 	got := resolveDoltPort(tmpDir)
-	if got != 4417 {
-		t.Errorf("resolveDoltPort() = %d, want 4417", got)
+	if got != 0 {
+		t.Errorf("resolveDoltPort() = %d, want 0 (transient state ignored)", got)
+	}
+}
+
+func TestResolveDoltPort_ConfigYAMLBeatsRunningStateFile(t *testing.T) {
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
+	t.Setenv("GT_DOLT_PORT", "")
+	tmpDir := t.TempDir()
+	daemonDir := filepath.Join(tmpDir, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(daemonDir, "dolt-state.json"), []byte(`{"running":true,"port":4417}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	doltDataDir := filepath.Join(tmpDir, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  port: 3309\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveDoltPort(tmpDir)
+	if got != 3309 {
+		t.Errorf("resolveDoltPort() = %d, want 3309 (config.yaml > transient state)", got)
 	}
 }
 

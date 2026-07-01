@@ -415,20 +415,15 @@ func sanitizeOTELAttrValue(s string, maxLen int) string {
 //
 // Resolution order:
 //  1. GT_DOLT_PORT environment variable (explicit operator intent)
-//  2. daemon/dolt-state.json when it says the server is running
-//  3. .dolt-data/config.yaml listener.port
-//  4. mayor/daemon.json env.GT_DOLT_PORT
-//  5. 0 (caller should skip injection — DefaultPort 3307 remains the default)
+//  2. .dolt-data/config.yaml listener.port
+//  3. mayor/daemon.json env.GT_DOLT_PORT
+//  4. 0 (caller should skip injection — DefaultPort 3307 remains the default)
 func ResolveDoltPort(townRoot string) int {
 	if port := resolveDoltPortFromEnv(); port > 0 {
 		return port
 	}
 	if townRoot == "" {
 		return 0
-	}
-
-	if port := resolveDoltPortFromState(townRoot); port > 0 {
-		return port
 	}
 
 	if port := resolveDoltPortFromConfigYAML(townRoot); port > 0 {
@@ -476,25 +471,6 @@ func resolveDoltPortFromEnv() int {
 		}
 	}
 	return 0
-}
-
-func resolveDoltPortFromState(townRoot string) int {
-	statePath := filepath.Join(townRoot, "daemon", "dolt-state.json")
-	data, err := os.ReadFile(statePath)
-	if err != nil {
-		return 0
-	}
-	var state struct {
-		Running bool `json:"running"`
-		Port    int  `json:"port"`
-	}
-	if err := json.Unmarshal(data, &state); err != nil {
-		return 0
-	}
-	if !state.Running || state.Port <= 0 {
-		return 0
-	}
-	return state.Port
 }
 
 func resolveDoltPortFromConfigYAML(townRoot string) int {

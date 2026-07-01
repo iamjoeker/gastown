@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -73,20 +72,14 @@ func TestDashboardCmd_RequiresWorkspace(t *testing.T) {
 	}
 }
 
-func TestEnsureDoltPortEnv_ReadsStateFile(t *testing.T) {
-	// Create a temporary town root with dolt-state.json
+func TestEnsureDoltPortEnv_ReadsConfigYAML(t *testing.T) {
+	// Create a temporary town root with durable Dolt config.
 	townRoot := t.TempDir()
-	daemonDir := filepath.Join(townRoot, "daemon")
-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-
-	state := doltserver.State{Running: true, Port: 13307}
-	data, err := json.Marshal(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(daemonDir, "dolt-state.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  port: 13307\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -137,16 +130,14 @@ func TestEnsureDoltPortEnv_GTDoltPortOverridesWrongBeadsPort(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "8080")
 	t.Setenv("BEADS_DOLT_PORT", "8080")
 
-	// Create dolt-state.json with a different running port. Explicit GT_DOLT_PORT
-	// is still authoritative for dashboard-spawned subprocesses.
+	// Create durable config with a different port. Explicit GT_DOLT_PORT is still
+	// authoritative for dashboard-spawned subprocesses.
 	townRoot := t.TempDir()
-	daemonDir := filepath.Join(townRoot, "daemon")
-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	state := doltserver.State{Running: true, Port: 3308}
-	data, _ := json.Marshal(state)
-	if err := os.WriteFile(filepath.Join(daemonDir, "dolt-state.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  port: 3308\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
