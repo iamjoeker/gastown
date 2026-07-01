@@ -439,8 +439,8 @@ func ResolveDoltPort(townRoot string) int {
 
 // ResolveConfiguredDoltPort determines the durable configured Dolt port for
 // initializing a target town. Unlike ResolveDoltPort, it does not consult
-// transient daemon state and it lets the target town's managed config beat
-// ambient GT_DOLT_PORT, which may be stale in long-lived agent sessions.
+// ambient GT_DOLT_PORT until after the target town's managed config, which may
+// be stale in long-lived agent sessions.
 //
 // Resolution order:
 //  1. .dolt-data/config.yaml listener.port unless GT_DOLT_IGNORE_CONFIG=1
@@ -458,6 +458,25 @@ func ResolveConfiguredDoltPort(townRoot string) int {
 		return port
 	}
 	return 0
+}
+
+// ResolveConfiguredDoltHost determines the durable configured Dolt host for
+// initializing a target town. The target town's managed config beats ambient
+// GT_DOLT_HOST, which may describe the caller's current town instead.
+//
+// Resolution order:
+//  1. .dolt-data/config.yaml listener.host unless GT_DOLT_IGNORE_CONFIG=1
+//  2. GT_DOLT_HOST environment variable
+//  3. mayor/daemon.json env.GT_DOLT_HOST
+//  4. "" (caller should use its default)
+func ResolveConfiguredDoltHost(townRoot string) string {
+	if host := resolveDoltHostFromConfigYAML(townRoot); host != "" {
+		return host
+	}
+	if host := strings.TrimSpace(os.Getenv("GT_DOLT_HOST")); host != "" {
+		return host
+	}
+	return resolveDoltHostFromDaemonJSON(townRoot)
 }
 
 func resolveDoltPort(townRoot string) int {

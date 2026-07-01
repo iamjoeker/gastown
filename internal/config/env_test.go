@@ -1411,6 +1411,33 @@ func TestResolveConfiguredDoltPort_DaemonJSONFallback(t *testing.T) {
 	}
 }
 
+func TestResolveConfiguredDoltHost_ConfigYAMLBeatsEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
+	t.Setenv("GT_DOLT_HOST", "stale-host")
+	doltDataDir := filepath.Join(tmpDir, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  host: 127.0.0.2\n  port: 5507\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := ResolveConfiguredDoltHost(tmpDir)
+	if got != "127.0.0.2" {
+		t.Errorf("ResolveConfiguredDoltHost() = %q, want 127.0.0.2", got)
+	}
+}
+
+func TestResolveConfiguredDoltHost_FallsBackToEnv(t *testing.T) {
+	t.Setenv("GT_DOLT_HOST", "127.0.0.4")
+
+	got := ResolveConfiguredDoltHost(t.TempDir())
+	if got != "127.0.0.4" {
+		t.Errorf("ResolveConfiguredDoltHost() = %q, want 127.0.0.4", got)
+	}
+}
+
 func TestAgentEnv_InjectsDoltPort(t *testing.T) {
 	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
 	t.Setenv("GT_DOLT_HOST", "")

@@ -176,11 +176,11 @@ func ensureDoltPortEnv(townRoot string) {
 	os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
 	os.Setenv("BEADS_DOLT_PORT", portStr)
 
-	if host := os.Getenv("GT_DOLT_HOST"); host != "" {
+	if host := config.ResolveDoltHost(townRoot); host != "" {
+		os.Setenv("GT_DOLT_HOST", host)
 		os.Setenv("BEADS_DOLT_SERVER_HOST", host)
-	} else if doltCfg := doltserver.DefaultConfig(townRoot); doltCfg.Host != "" {
-		os.Setenv("GT_DOLT_HOST", doltCfg.Host)
-		os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
+	} else {
+		os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 	}
 }
 

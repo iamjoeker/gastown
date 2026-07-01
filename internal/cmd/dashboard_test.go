@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 func TestDashboardCmd_FlagsExist(t *testing.T) {
@@ -79,12 +78,14 @@ func TestEnsureDoltPortEnv_ReadsConfigYAML(t *testing.T) {
 	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  port: 13307\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  host: 127.0.0.2\n  port: 13307\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	// Clear any existing env vars
+	t.Setenv("GT_DOLT_HOST", "")
 	t.Setenv("GT_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 	t.Setenv("BEADS_DOLT_PORT", "")
 
@@ -99,19 +100,27 @@ func TestEnsureDoltPortEnv_ReadsConfigYAML(t *testing.T) {
 	if got := os.Getenv("BEADS_DOLT_SERVER_PORT"); got != "13307" {
 		t.Errorf("BEADS_DOLT_SERVER_PORT = %q, want %q", got, "13307")
 	}
+	if got := os.Getenv("GT_DOLT_HOST"); got != "127.0.0.2" {
+		t.Errorf("GT_DOLT_HOST = %q, want %q", got, "127.0.0.2")
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_HOST"); got != "127.0.0.2" {
+		t.Errorf("BEADS_DOLT_SERVER_HOST = %q, want %q", got, "127.0.0.2")
+	}
 }
 
 func TestEnsureDoltPortEnv_FallsBackToDefault(t *testing.T) {
-	// Use a temp dir with no dolt-state.json
+	// Use a temp dir with no durable Dolt config.
 	townRoot := t.TempDir()
 
+	t.Setenv("GT_DOLT_HOST", "")
 	t.Setenv("GT_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 	t.Setenv("BEADS_DOLT_PORT", "")
 
 	ensureDoltPortEnv(townRoot)
 
-	want := "3307" // doltserver.DefaultPort
+	want := "3307"
 	if got := os.Getenv("GT_DOLT_PORT"); got != want {
 		t.Errorf("GT_DOLT_PORT = %q, want %q (default)", got, want)
 	}
@@ -120,6 +129,9 @@ func TestEnsureDoltPortEnv_FallsBackToDefault(t *testing.T) {
 	}
 	if got := os.Getenv("BEADS_DOLT_SERVER_PORT"); got != want {
 		t.Errorf("BEADS_DOLT_SERVER_PORT = %q, want %q (default)", got, want)
+	}
+	if got, ok := os.LookupEnv("BEADS_DOLT_SERVER_HOST"); ok {
+		t.Errorf("BEADS_DOLT_SERVER_HOST = %q, want unset", got)
 	}
 }
 

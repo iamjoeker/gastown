@@ -667,8 +667,12 @@ func buildBdInitArgs(townPath string) []string {
 
 func bdInitDoltConfig(townPath string) *doltserver.Config {
 	cfg := doltserver.DefaultConfig(townPath)
-	// bd init targets durable town configuration. Keep the non-port defaults
-	// from DefaultConfig, but do not inherit transient daemon-state ports.
+	// bd init targets durable town configuration. Keep non-endpoint defaults from
+	// DefaultConfig, but do not let ambient endpoint env override target config.
+	cfg.Host = ""
+	if host := config.ResolveConfiguredDoltHost(townPath); host != "" {
+		cfg.Host = host
+	}
 	cfg.Port = doltserver.DefaultPort
 	if port := config.ResolveConfiguredDoltPort(townPath); port > 0 {
 		cfg.Port = port
@@ -788,7 +792,18 @@ func initTownBeads(townPath string) error {
 // target beads directory, with stale selectors stripped and canonical Dolt
 // endpoint aliases rebuilt from the shared helper.
 func withBeadsDirEnv(beadsDir string) []string {
-	return beads.BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
+	base := os.Environ()
+	if townRoot := beads.FindTownRoot(filepath.Dir(beads.ResolveBeadsDir(beadsDir))); townRoot != "" {
+		if host := config.ResolveConfiguredDoltHost(townRoot); host != "" {
+			base = beads.StripEnvKey(base, "GT_DOLT_HOST")
+			base = append(base, "GT_DOLT_HOST="+host)
+		}
+		if port := config.ResolveConfiguredDoltPort(townRoot); port > 0 {
+			base = beads.StripEnvKey(base, "GT_DOLT_PORT")
+			base = append(base, "GT_DOLT_PORT="+strconv.Itoa(port))
+		}
+	}
+	return beads.BuildMutationPinnedBDEnv(base, beadsDir)
 }
 
 // ensureCustomTypes registers Gas Town custom issue types with beads.
