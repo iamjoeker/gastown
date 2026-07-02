@@ -83,7 +83,7 @@ func isBDTargetEnv(entry string) bool {
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
 	if beadsDir == "" {
-		return addGTDerivedDoltTargetEnv(env)
+		return addGTDerivedDoltConnectionEnv(env)
 	}
 	beadsDir = canonicalBeadsDir(beadsDir)
 	env = append(env, "BEADS_DIR="+beadsDir)
@@ -91,7 +91,7 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
 		env = append(env, dbEnv)
 	}
-	return addGTDerivedDoltTargetEnv(env)
+	return addGTDerivedDoltConnectionEnv(env)
 }
 
 // BuildRoutingBDEnv returns env for a bd subprocess that intentionally relies on
@@ -101,7 +101,7 @@ func BuildRoutingBDEnv(base []string, fallbackBeadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
 	fallbackBeadsDir = canonicalBeadsDir(fallbackBeadsDir)
 	env = append(env, doltTargetEnvFromBeadsDir(fallbackBeadsDir)...)
-	return addGTDerivedDoltTargetEnv(env)
+	return addGTDerivedDoltConnectionEnv(env)
 }
 
 // BuildReadOnlyPinnedBDEnv returns env for a read-only bd subprocess pinned to
@@ -341,9 +341,11 @@ func envKeyHasPrefix(keyName, prefix string) bool {
 	return strings.HasPrefix(keyName, prefix)
 }
 
-func addGTDerivedDoltTargetEnv(env []string) []string {
+func addGTDerivedDoltConnectionEnv(env []string) []string {
 	gtHost := envValue(env, "GT_DOLT_HOST")
 	gtPort := envValue(env, "GT_DOLT_PORT")
+	// GT_DOLT_DATA is intentionally not translated to BEADS_DOLT_DATA_DIR here:
+	// data-dir env selects direct-mode storage and can override metadata routing.
 	if gtHost != "" && envValue(env, "BEADS_DOLT_SERVER_HOST") == "" {
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+gtHost)
 	}

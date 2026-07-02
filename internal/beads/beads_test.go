@@ -254,6 +254,52 @@ func TestBuildPinnedBDEnvFollowsRedirectBeforeMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildBDEnvDoesNotRestoreGTDoltDataDir(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":4407}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	base := []string{
+		"PATH=/usr/bin",
+		"GT_DOLT_DATA=/town/.dolt-data",
+		"BEADS_DOLT_DATA_DIR=/wrong/data",
+		"BEADS_DOLT_SERVER_DATABASE=hq",
+	}
+
+	tests := []struct {
+		name       string
+		env        []string
+		wantDB     string
+		wantDBGone bool
+	}{
+		{name: "pinned", env: BuildPinnedBDEnv(base, beadsDir), wantDB: "rigdb"},
+		{name: "routing", env: BuildRoutingBDEnv(base, beadsDir), wantDBGone: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := envMap(tc.env)
+			if value, ok := got["BEADS_DOLT_DATA_DIR"]; ok {
+				t.Fatalf("BEADS_DOLT_DATA_DIR should stay stripped, got %q in %v", value, tc.env)
+			}
+			if tc.wantDBGone {
+				if value, ok := got["BEADS_DOLT_SERVER_DATABASE"]; ok {
+					t.Fatalf("BEADS_DOLT_SERVER_DATABASE should be stripped, got %q in %v", value, tc.env)
+				}
+				return
+			}
+			if got["BEADS_DOLT_SERVER_DATABASE"] != tc.wantDB {
+				t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want %q in %v", got["BEADS_DOLT_SERVER_DATABASE"], tc.wantDB, tc.env)
+			}
+		})
+	}
+}
+
 func TestBuildPinnedBDEnvStripsCaseVariantTargetEnvWhenKeysAreCaseInsensitive(t *testing.T) {
 	withCaseInsensitiveEnvKeys(t)
 
