@@ -9,6 +9,27 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 )
 
+func TestMailHelpUsesTownRootMessagingConfig(t *testing.T) {
+	const want = "<town-root>/config/messaging.json"
+
+	for _, command := range []struct {
+		name string
+		long string
+	}{
+		{name: "send", long: mailSendCmd.Long},
+		{name: "announces", long: mailAnnouncesCmd.Long},
+	} {
+		t.Run(command.name, func(t *testing.T) {
+			if !strings.Contains(command.long, want) {
+				t.Fatalf("help should document %q:\n%s", want, command.long)
+			}
+			if strings.Contains(command.long, "~/gt/config/messaging.json") {
+				t.Fatalf("help should not document the obsolete home-relative path:\n%s", command.long)
+			}
+		})
+	}
+}
+
 // TestClaimPatternMatching tests claim pattern matching via the beads package.
 // This verifies that the pattern matching used for queue eligibility works correctly.
 func TestClaimPatternMatching(t *testing.T) {

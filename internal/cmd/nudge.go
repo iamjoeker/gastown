@@ -106,7 +106,7 @@ Role shortcuts (expand to session names):
 
 Channel syntax:
   channel:<name>  Nudges all members of a named channel defined in
-                  ~/gt/config/messaging.json under "nudge_channels".
+                  <town-root>/config/messaging.json under "nudge_channels".
                   Patterns like "gastown/polecats/*" are expanded.
 
 DND (Do Not Disturb):

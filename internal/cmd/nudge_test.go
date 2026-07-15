@@ -21,6 +21,17 @@ func setupNudgeTestRegistry(t *testing.T) {
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
 
+func TestNudgeHelpUsesTownRootMessagingConfig(t *testing.T) {
+	const want = "<town-root>/config/messaging.json"
+
+	if !strings.Contains(nudgeCmd.Long, want) {
+		t.Fatalf("help should document %q:\n%s", want, nudgeCmd.Long)
+	}
+	if strings.Contains(nudgeCmd.Long, "~/gt/config/messaging.json") {
+		t.Fatalf("help should not document the obsolete home-relative path:\n%s", nudgeCmd.Long)
+	}
+}
+
 func TestNudgeStdinConflict(t *testing.T) {
 	// Save and restore package-level flags
 	origMessage := nudgeMessageFlag

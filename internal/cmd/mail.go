@@ -107,7 +107,7 @@ Addresses:
   <rig>/           - Broadcast to a rig
   list:<name>      - Send to a mailing list (fans out to all members)
 
-Mailing lists are defined in ~/gt/config/messaging.json and allow
+Mailing lists are defined in <town-root>/config/messaging.json and allow
 sending to multiple recipients at once. Each recipient gets their
 own copy of the message.
 
@@ -434,7 +434,7 @@ SYNTAX:
   gt mail announces              # List all announce channels
   gt mail announces <channel>    # Read messages from a channel
 
-Announce channels are bulletin boards defined in ~/gt/config/messaging.json.
+Announce channels are bulletin boards defined in <town-root>/config/messaging.json.
 Messages are broadcast to readers and persist until retention limit is reached.
 Unlike regular mail, announce messages are NOT removed when read.
 
