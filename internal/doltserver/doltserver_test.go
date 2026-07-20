@@ -4001,6 +4001,9 @@ func TestDefaultConfig_IgnoreConfigUsesEnvPort(t *testing.T) {
 func TestDefaultConfig_ManagedDefaultsAndEnvOverrides(t *testing.T) {
 	townRoot := t.TempDir()
 	t.Setenv("GT_DOLT_PORT", "")
+	unsetEnv(t, "GT_DOLT_STATS_ENABLED")
+	unsetEnv(t, "GT_DOLT_EVENT_SCHEDULER")
+	unsetEnv(t, "GT_DOLT_AUTO_GC")
 
 	config := DefaultConfig(townRoot)
 	if config.EventScheduler != "OFF" {
