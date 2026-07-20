@@ -104,9 +104,14 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
 		},
 		{
-			name: "done without mr blocks reuse until cleanup",
+			name: "done without mr and clean cleanup is reusable and safe",
 			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-clean"},
+		},
+		{
+			name: "done without mr blocks reuse when cleanup is dirty",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupUnpushed},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "cleanup-has_unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"cleanup_status=has_unpushed"}},
 		},
 		{
 			name: "working counts as working capacity",

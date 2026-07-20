@@ -66,7 +66,11 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
-	if in.State != StateIdle {
+	// StateDone (agent_state=done, seen before a polecat's own idle transition
+	// lands) falls through to the real predicate checks below instead of
+	// bailing out here — otherwise a merged/clean polecat gets NEEDS_RECOVERY
+	// with no blockers, disagreeing with git-state for no reason (gt-check-recovery-bug).
+	if in.State != StateIdle && in.State != StateDone {
 		verdict := WorkstateVerdictNeedsRecovery
 		needsRecovery := true
 		if in.State == StateWorking {
