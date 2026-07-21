@@ -1171,7 +1171,7 @@ if [ "$1" = "--allow-stale" ] && [ "${2:-}" = "version" ]; then
   echo 'bd version 1.0.0'
   exit 0
 fi
-printf '%s|%s|%s|%s|%s\n' "$*" "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_DATA_DIR:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" >> "${BD_LOG}"
+printf '%s|%s|%s|%s|%s|%s\n' "$*" "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_DATA_DIR:-}" "${GT_DOLT_DATA:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" >> "${BD_LOG}"
 cmd="$1"
 shift || true
 if [ "$cmd" = "--allow-stale" ]; then
@@ -1206,7 +1206,7 @@ esac
 	}
 	line := strings.TrimSpace(string(logBytes))
 	parts := strings.Split(line, "|")
-	if len(parts) != 5 {
+	if len(parts) != 6 {
 		t.Fatalf("malformed bd log: %q", line)
 	}
 	if !strings.Contains(parts[0], "show gt-hq-oy83-cleanup --json") {
@@ -1221,8 +1221,11 @@ esac
 	if parts[3] != "" {
 		t.Fatalf("BEADS_DOLT_DATA_DIR leaked: %q", parts[3])
 	}
-	if parts[4] != "gastown" {
-		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want gastown", parts[4])
+	if parts[4] != "" {
+		t.Fatalf("GT_DOLT_DATA leaked: %q", parts[4])
+	}
+	if parts[5] != "gastown" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want gastown", parts[5])
 	}
 }
 

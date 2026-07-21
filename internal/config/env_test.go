@@ -764,6 +764,37 @@ func TestSanitizeAgentEnv_ClearsClaudeCode(t *testing.T) {
 	}
 }
 
+func TestSanitizeAgentEnv_ClearsBDTargetSelectors(t *testing.T) {
+	t.Parallel()
+
+	resolvedEnv := map[string]string{
+		"GT_DOLT_PORT":             "13307",
+		"GT_DOLT_HOST":             "dolt.example",
+		"BEADS_DOLT_PORT":          "13307",
+		"BEADS_DOLT_SERVER_PORT":   "13307",
+		"BEADS_DOLT_SERVER_HOST":   "dolt.example",
+		"BEADS_DOLT_AUTO_START":    "0",
+		"BEADS_DOLT_SERVER_SOCKET": "/tmp/stale.sock",
+	}
+	callerEnv := map[string]string{}
+	for _, key := range bdTargetSelectorEnvVars {
+		resolvedEnv[key] = "stale"
+		callerEnv[key] = "caller-stale"
+	}
+
+	SanitizeAgentEnv(resolvedEnv, callerEnv)
+
+	for _, key := range bdTargetSelectorEnvVars {
+		assertEnv(t, resolvedEnv, key, "")
+	}
+	assertEnv(t, resolvedEnv, "GT_DOLT_PORT", "13307")
+	assertEnv(t, resolvedEnv, "GT_DOLT_HOST", "dolt.example")
+	assertEnv(t, resolvedEnv, "BEADS_DOLT_PORT", "13307")
+	assertEnv(t, resolvedEnv, "BEADS_DOLT_SERVER_PORT", "13307")
+	assertEnv(t, resolvedEnv, "BEADS_DOLT_SERVER_HOST", "dolt.example")
+	assertEnv(t, resolvedEnv, "BEADS_DOLT_AUTO_START", "0")
+}
+
 func TestAgentEnv_ExcludesAnthropicBaseURL(t *testing.T) {
 	// Not parallel — t.Setenv modifies process environment.
 
@@ -839,6 +870,31 @@ func TestAgentEnv_IncludesClaudeCodeClearing(t *testing.T) {
 			assertEnv(t, env, "CLAUDECODE", "")
 		})
 	}
+}
+
+func TestAgentEnv_ClearsBDTargetSelectors(t *testing.T) {
+	// Not parallel: t.Setenv modifies process environment.
+	for _, key := range bdTargetSelectorEnvVars {
+		t.Setenv(key, "stale")
+	}
+	t.Setenv("GT_DOLT_PORT", "13307")
+	t.Setenv("GT_DOLT_HOST", "dolt.example")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+
+	env := AgentEnv(AgentEnvConfig{
+		Role:      "polecat",
+		Rig:       "myrig",
+		AgentName: "Toast",
+		TownRoot:  "/town",
+	})
+	for _, key := range bdTargetSelectorEnvVars {
+		assertEnv(t, env, key, "")
+	}
+	assertEnv(t, env, "GT_DOLT_PORT", "13307")
+	assertEnv(t, env, "BEADS_DOLT_PORT", "13307")
+	assertEnv(t, env, "BEADS_DOLT_SERVER_PORT", "13307")
+	assertEnv(t, env, "BEADS_DOLT_SERVER_HOST", "dolt.example")
+	assertEnv(t, env, "BEADS_DOLT_AUTO_START", "0")
 }
 
 func TestAgentEnv_DisablesBdBackup(t *testing.T) {

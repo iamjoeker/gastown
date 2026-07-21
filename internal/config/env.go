@@ -23,6 +23,21 @@ var IdentityEnvVars = []string{
 	"GT_SESSION", "GT_AGENT", "BD_ACTOR", "GIT_AUTHOR_NAME", "BEADS_AGENT_NAME",
 }
 
+var bdTargetSelectorEnvVars = []string{
+	"BEADS_DIR",
+	"BEADS_DB",
+	"BD_DB",
+	"BEADS_SHARED_SERVER_DIR",
+	"BEADS_DOLT_DATA_DIR",
+	"BEADS_DOLT_DATABASE",
+	"BEADS_DOLT_SERVER_DATABASE",
+	"BEADS_DOLT_HOST",
+	"BEADS_DOLT_SHARED_SERVER",
+	"BEADS_DOLT_SERVER_MODE",
+	"BEADS_DOLT_SERVER_SOCKET",
+	"GT_DOLT_DATA",
+}
+
 // AgentEnvConfig specifies the configuration for generating agent environment variables.
 // This is the single source of truth for all agent environment configuration.
 type AgentEnvConfig struct {
@@ -222,6 +237,8 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// See: https://github.com/steveyegge/gastown/issues/1666
 	env["CLAUDECODE"] = ""
 
+	clearBDTargetSelectorEnv(env)
+
 	// Propagate Claude Code's own OTEL telemetry when GT telemetry is enabled.
 	// Reuses the same VictoriaMetrics endpoint as gastown's telemetry so all
 	// metrics (gt + claude) land in the same store.
@@ -392,6 +409,12 @@ func setDoltPortEnv(env map[string]string, port string) {
 	env["GT_DOLT_PORT"] = port
 	env["BEADS_DOLT_SERVER_PORT"] = port
 	env["BEADS_DOLT_PORT"] = port
+}
+
+func clearBDTargetSelectorEnv(env map[string]string) {
+	for _, key := range bdTargetSelectorEnvVars {
+		env[key] = ""
+	}
 }
 
 // sanitizeOTELAttrValue prepares a string for use as a value in OTEL_RESOURCE_ATTRIBUTES.

@@ -356,6 +356,8 @@ func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {
 	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\nprintf '\\nBEADS_DIR=%s\\nBEADS_DOLT_SERVER_DATABASE=%s\\nBEADS_DOLT_DATA_DIR=%s\\nBD_DOLT_AUTO_COMMIT=%s\\nBD_NO_GIT_OPS=%s\\n' \"${BEADS_DIR:-}\" \"${BEADS_DOLT_SERVER_DATABASE:-}\" \"${BEADS_DOLT_DATA_DIR:-}\" \"${BD_DOLT_AUTO_COMMIT:-}\" \"${BD_NO_GIT_OPS:-}\"\n"), 0755))
 	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "stale")
+	t.Setenv("BEADS_DOLT_DATA_DIR", "/stale/data")
+	t.Setenv("GT_DOLT_DATA", "/stale/data")
 	t.Setenv("BEADS_DIR", "/wrong")
 
 	srv, err := New(Config{
@@ -394,6 +396,7 @@ func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {
 		assert.NotContains(t, resp.Stdout, "[gastown]")
 		assert.Contains(t, resp.Stdout, "BEADS_DIR="+canonicalBeads)
 		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=gastown\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_DATA_DIR=\n")
 		assert.Contains(t, resp.Stdout, "BD_DOLT_AUTO_COMMIT=on")
 		assert.Contains(t, resp.Stdout, "BD_NO_GIT_OPS=true")
 		assert.NotContains(t, resp.Stdout, "BEADS_DIR="+decoyBeads)
@@ -413,6 +416,7 @@ func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {
 		assert.NotContains(t, resp.Stdout, "[gastown]")
 		assert.Contains(t, resp.Stdout, "BEADS_DIR="+canonicalBeads)
 		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=gastown\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_DATA_DIR=\n")
 		assert.Contains(t, resp.Stdout, "BD_DOLT_AUTO_COMMIT=on")
 	})
 
@@ -423,6 +427,7 @@ func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {
 		assert.NotContains(t, resp.Stdout, "[hq]")
 		assert.Contains(t, resp.Stdout, "BEADS_DIR="+townBeads)
 		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=hq\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_DATA_DIR=\n")
 	})
 
 	t.Run("town alias", func(t *testing.T) {
@@ -432,6 +437,7 @@ func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {
 		assert.NotContains(t, resp.Stdout, "[town]")
 		assert.Contains(t, resp.Stdout, "BEADS_DIR="+townBeads)
 		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=hq\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_DATA_DIR=\n")
 	})
 
 	t.Run("path-like repo remains explicit", func(t *testing.T) {

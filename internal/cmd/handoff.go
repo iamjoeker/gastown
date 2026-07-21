@@ -974,6 +974,7 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	if _, hasNodeOpts := agentEnv["NODE_OPTIONS"]; !hasNodeOpts {
 		envMap["NODE_OPTIONS"] = ""
 	}
+	config.SanitizeAgentEnv(envMap, agentEnv)
 
 	// Build the full command with OS-appropriate env prefix
 	var cdPrefix string

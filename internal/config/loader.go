@@ -2404,6 +2404,8 @@ func SanitizeAgentEnv(resolvedEnv, callerEnv map[string]string) {
 	if _, ok := callerEnv["CLAUDECODE"]; !ok {
 		resolvedEnv["CLAUDECODE"] = ""
 	}
+
+	clearBDTargetSelectorEnv(resolvedEnv)
 }
 
 // PrependEnv prepends export statements to a command string.

@@ -266,6 +266,86 @@ func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
 	}
 }
 
+func TestBuildRestartCommand_ClearsBDTargetSelectors(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	witnessDir := filepath.Join(rigPath, "witness")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "target-cleaner"
+	townSettings.Agents = map[string]*config.RuntimeConfig{
+		"target-cleaner": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions"},
+			Env: map[string]string{
+				"BEADS_DIR":                  "/agent/beads",
+				"BEADS_DOLT_DATA_DIR":        "/agent/data",
+				"BEADS_DOLT_SERVER_DATABASE": "agentdb",
+				"BEADS_DOLT_SERVER_SOCKET":   "/agent/socket",
+				"GT_DOLT_DATA":               "/agent/data",
+				"GT_DOLT_PORT":               "1555",
+				"GT_DOLT_HOST":               "agent-host",
+			},
+		},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	_ = os.Setenv("GT_AGENT", "target-cleaner")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	if err := os.Chdir(witnessDir); err != nil {
+		t.Fatalf("chdir witness dir: %v", err)
+	}
+
+	cmd, err := buildRestartCommand("gt-witness")
+	if err != nil {
+		t.Fatalf("buildRestartCommand: %v", err)
+	}
+
+	for _, key := range []string{"BEADS_DIR", "BEADS_DOLT_DATA_DIR", "BEADS_DOLT_SERVER_DATABASE", "BEADS_DOLT_SERVER_SOCKET", "GT_DOLT_DATA"} {
+		if !strings.Contains(cmd, key+"=") {
+			t.Fatalf("restart command missing cleared %s assignment: %q", key, cmd)
+		}
+	}
+	for _, stale := range []string{"/agent/beads", "/agent/data", "agentdb", "/agent/socket"} {
+		if strings.Contains(cmd, stale) {
+			t.Fatalf("restart command leaked stale bd selector value %q: %q", stale, cmd)
+		}
+	}
+	for _, want := range []string{"GT_DOLT_PORT=1555", "GT_DOLT_HOST=agent-host"} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("restart command missing preserved connection env %q: %q", want, cmd)
+		}
+	}
+}
+
 func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
 	setupHandoffTestRegistry(t)
 
