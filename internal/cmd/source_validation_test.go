@@ -73,6 +73,58 @@ func TestValidateMergeRequestSourceUsesPreResolvedSource(t *testing.T) {
 	}
 }
 
+func TestMqSubmitPathUsesRoutedSourceAndCurrentRigQueueBeads(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+
+	currentBD := beads.New(workDir)
+	source, err := resolveSubmitSourceIssue(workDir, "bd-source")
+	if err != nil {
+		t.Fatalf("resolveSubmitSourceIssue: %v", err)
+	}
+
+	if _, err := currentBD.Create(beads.CreateOptions{
+		Title:       "Merge: bd-source",
+		Labels:      []string{"gt:merge-request"},
+		Priority:    source.Issue.Priority,
+		Description: "branch: polecat/refuge/bd-source\ntarget: main\nsource_issue: bd-source\nrig: gastown",
+		Ephemeral:   true,
+		Rig:         "gastown",
+	}); err != nil {
+		t.Fatalf("current-rig MR create: %v", err)
+	}
+	if err := source.BD.AddComment("bd-source", "MR created: gt-mr"); err != nil {
+		t.Fatalf("source back-link comment: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
+	assertBDLogContains(t, log, currentBeadsDir, "create --json")
+	assertBDLogContains(t, log, ownerBeadsDir, "comments add bd-source")
+	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
+}
+
+func TestDoneNoMRClosePathUsesRoutedSourceBeads(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+
+	source, err := resolveSubmitSourceIssue(workDir, "bd-source")
+	if err != nil {
+		t.Fatalf("resolveSubmitSourceIssue: %v", err)
+	}
+	if skipReason, fatal := doneSourceCloseSkipReason(source.BD, "bd-source", source.Issue); skipReason != "" || fatal {
+		t.Fatalf("doneSourceCloseSkipReason = %q, %v; want close allowed", skipReason, fatal)
+	}
+	if err := source.BD.ForceCloseWithReason("done", "bd-source"); err != nil {
+		t.Fatalf("routed source close: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
+	assertBDLogContains(t, log, ownerBeadsDir, "close bd-source")
+	assertBDLogNotContains(t, log, currentBeadsDir, "close bd-source")
+}
+
 func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBeadsDir string) {
 	t.Helper()
 	townRoot := t.TempDir()
@@ -145,4 +197,77 @@ exit 1
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	beads.ResetBdAllowStaleCacheForTest()
+}
+
+func installSubmitSourceBDRecorder(t *testing.T, currentBeadsDir, ownerBeadsDir string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  shift
+fi
+if [ "$1" = "version" ]; then
+  echo "bd stub"
+  exit 0
+fi
+printf '%%s\t%%s\n' "$BEADS_DIR" "$*" >> %q
+if [ "$1" = "show" ] && [ "$2" = "bd-source" ]; then
+  if [ "$BEADS_DIR" = %q ]; then
+    echo '[{"id":"bd-source","title":"current mirror","status":"open","priority":1,"issue_type":"task"}]'
+    exit 0
+  fi
+  if [ "$BEADS_DIR" = %q ]; then
+    echo '[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task"}]'
+    exit 0
+  fi
+  echo "Issue not found in $BEADS_DIR" >&2
+  exit 1
+fi
+if [ "$1" = "create" ]; then
+  echo '{"id":"gt-mr","title":"Merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"]}'
+  exit 0
+fi
+if [ "$1" = "comments" ] && [ "$2" = "add" ]; then
+  exit 0
+fi
+if [ "$1" = "close" ]; then
+  exit 0
+fi
+echo "unexpected bd command: $*" >&2
+exit 1
+`, logPath, currentBeadsDir, ownerBeadsDir)
+	path := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write bd recorder: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+	return logPath
+}
+
+func readSubmitSourceBDLog(t *testing.T, logPath string) string {
+	t.Helper()
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd recorder log: %v", err)
+	}
+	return string(log)
+}
+
+func assertBDLogContains(t *testing.T, log, beadsDir, args string) {
+	t.Helper()
+	needle := beadsDir + "\t" + args
+	if !strings.Contains(log, needle) {
+		t.Fatalf("bd log missing %q:\n%s", needle, log)
+	}
+}
+
+func assertBDLogNotContains(t *testing.T, log, beadsDir, args string) {
+	t.Helper()
+	needle := beadsDir + "\t" + args
+	if strings.Contains(log, needle) {
+		t.Fatalf("bd log unexpectedly contains %q:\n%s", needle, log)
+	}
 }
