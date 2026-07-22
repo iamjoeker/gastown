@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func TestRoutedIssueBeadsUsesTownRoutesForCustomPrefix(t *testing.T) {
@@ -125,6 +126,59 @@ func TestDoneNoMRClosePathUsesRoutedSourceBeads(t *testing.T) {
 	assertBDLogNotContains(t, log, currentBeadsDir, "close bd-source")
 }
 
+func TestRunMqSubmitWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_RIG", "")
+	t.Chdir(workDir)
+
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitNoCleanup = true
+	if err := runMqSubmit(nil, nil); err != nil {
+		t.Fatalf("runMqSubmit: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
+	assertBDLogContains(t, log, currentBeadsDir, "create --json")
+	assertBDLogContains(t, log, ownerBeadsDir, "comments add bd-source")
+	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
+}
+
+func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupRoutedSubmitGitRepo(t, workDir, false)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetDoneFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_ROLE", "unknown")
+	t.Setenv("GT_RIG", "")
+	t.Setenv("GT_POLECAT", "")
+	t.Setenv("BD_ACTOR", "")
+	t.Chdir(workDir)
+
+	doneIssue = "bd-source"
+	doneCleanupStatus = "unpushed"
+	doneSkipVerify = true
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error { return nil }
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
+	assertBDLogContains(t, log, currentBeadsDir, "create --json")
+	assertBDLogContains(t, log, ownerBeadsDir, "comments add bd-source")
+	assertBDLogContains(t, log, currentBeadsDir, "show gt-mr --json")
+	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
+}
+
 func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBeadsDir string) {
 	t.Helper()
 	townRoot := t.TempDir()
@@ -154,6 +208,48 @@ func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBea
 		t.Fatalf("write routes: %v", err)
 	}
 	return workDir, currentBeadsDir, ownerBeadsDir
+}
+
+func routedSourceTestTownRoot(workDir string) string {
+	return filepath.Clean(filepath.Join(workDir, "..", "..", "..", ".."))
+}
+
+func setupRoutedSubmitCommandTown(t *testing.T, workDir string) {
+	t.Helper()
+	townRoot := routedSourceTestTownRoot(workDir)
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"gastown": {GitURL: "file://test-gastown"},
+		},
+	}); err != nil {
+		t.Fatalf("save rigs config: %v", err)
+	}
+}
+
+func setupRoutedSubmitGitRepo(t *testing.T, workDir string, pushBranch bool) string {
+	t.Helper()
+	remote := t.TempDir()
+	runGitForMQSubmitTest(t, remote, "init", "--bare")
+	runGitForMQSubmitTest(t, workDir, "init")
+	runGitForMQSubmitTest(t, workDir, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, workDir, "config", "user.name", "Test User")
+	runGitForMQSubmitTest(t, workDir, "remote", "add", "origin", remote)
+	writeMQSubmitTestFile(t, workDir, ".gitignore", ".beads/\n.runtime/\n")
+	writeMQSubmitTestFile(t, workDir, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, workDir, "add", ".gitignore", "file.txt")
+	runGitForMQSubmitTest(t, workDir, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, workDir, "branch", "-M", "main")
+	runGitForMQSubmitTest(t, workDir, "push", "-u", "origin", "main")
+	branch := "feature/routed-submit"
+	runGitForMQSubmitTest(t, workDir, "checkout", "-b", branch)
+	writeMQSubmitTestFile(t, workDir, "file.txt", "feature\n")
+	runGitForMQSubmitTest(t, workDir, "commit", "-am", "feature")
+	if pushBranch {
+		runGitForMQSubmitTest(t, workDir, "push", "origin", branch)
+	}
+	return branch
 }
 
 func installSubmitSourceBDStub(t *testing.T, currentBeadsDir, ownerBeadsDir string, ownerMissing bool) {
@@ -214,15 +310,27 @@ fi
 printf '%%s\t%%s\n' "$BEADS_DIR" "$*" >> %q
 if [ "$1" = "show" ] && [ "$2" = "bd-source" ]; then
   if [ "$BEADS_DIR" = %q ]; then
-    echo '[{"id":"bd-source","title":"current mirror","status":"open","priority":1,"issue_type":"task"}]'
+    echo '[{"id":"bd-source","title":"current mirror","status":"open","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\\nmerge_strategy: mr"}]'
     exit 0
   fi
   if [ "$BEADS_DIR" = %q ]; then
-    echo '[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task"}]'
+    echo '[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\\nmerge_strategy: mr"}]'
     exit 0
   fi
   echo "Issue not found in $BEADS_DIR" >&2
   exit 1
+fi
+if [ "$1" = "show" ] && [ "$2" = "gt-mr" ]; then
+  echo '[{"id":"gt-mr","title":"Merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"],"description":"branch: feature/routed-submit\\ntarget: main\\nsource_issue: bd-source\\nrig: gastown"}]'
+  exit 0
+fi
+if [ "$1" = "list" ]; then
+  echo '[]'
+  exit 0
+fi
+if [ "$1" = "sql" ]; then
+  echo '[]'
+  exit 0
 fi
 if [ "$1" = "create" ]; then
   echo '{"id":"gt-mr","title":"Merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"]}'
@@ -270,4 +378,41 @@ func assertBDLogNotContains(t *testing.T, log, beadsDir, args string) {
 	if strings.Contains(log, needle) {
 		t.Fatalf("bd log unexpectedly contains %q:\n%s", needle, log)
 	}
+}
+
+func resetMqSubmitFlagsForTest(t *testing.T) {
+	t.Helper()
+	oldBranch, oldIssue, oldEpic := mqSubmitBranch, mqSubmitIssue, mqSubmitEpic
+	oldPriority := mqSubmitPriority
+	oldNoCleanup, oldSkipDeps, oldResubmit := mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit
+	mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = "", "", ""
+	mqSubmitPriority = -1
+	mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = false, false, false
+	t.Cleanup(func() {
+		mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = oldBranch, oldIssue, oldEpic
+		mqSubmitPriority = oldPriority
+		mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = oldNoCleanup, oldSkipDeps, oldResubmit
+	})
+}
+
+func resetDoneFlagsForTest(t *testing.T) {
+	t.Helper()
+	oldIssue, oldStatus, oldCleanupStatus, oldTarget := doneIssue, doneStatus, doneCleanupStatus, doneTarget
+	oldPriority := donePriority
+	oldResume, oldPreVerified, oldSkipVerify := doneResume, donePreVerified, doneSkipVerify
+	oldUpdateAgentStateOnDoneFn := updateAgentStateOnDoneFn
+	doneIssue = ""
+	donePriority = -1
+	doneStatus = ExitCompleted
+	doneCleanupStatus = ""
+	doneResume = false
+	donePreVerified = false
+	doneTarget = ""
+	doneSkipVerify = false
+	t.Cleanup(func() {
+		doneIssue, doneStatus, doneCleanupStatus, doneTarget = oldIssue, oldStatus, oldCleanupStatus, oldTarget
+		donePriority = oldPriority
+		doneResume, donePreVerified, doneSkipVerify = oldResume, oldPreVerified, oldSkipVerify
+		updateAgentStateOnDoneFn = oldUpdateAgentStateOnDoneFn
+	})
 }
