@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -652,58 +654,152 @@ func calculateWorkStatus(completed, total int, activityColor string) string {
 	}
 }
 
-// FetchMergeQueue fetches open PRs from registered rigs.
-func (f *LiveConvoyFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
+// mergeRequestLabel marks a bead as a merge request. Same label `gt mq list`
+// filters on — the dashboard and CLI must read the same source (gt-4qp).
+const mergeRequestLabel = "gt:merge-request"
+
+// MergeQueueResult holds the merge-request rows for the dashboard panel.
+// Failed rigs are reported so a partial queue is never rendered as complete.
+type MergeQueueResult struct {
+	Rows []MergeQueueRow
+	// FailedRigs names rigs whose MR query errored. Their rows are missing, so
+	// the count is a floor, not a total.
+	FailedRigs []string
+}
+
+// fetcherListMergeRequests is the injection point for MR queries (stubbed in tests).
+// It mirrors `gt mq list`: a Beads wrapper rooted at the rig, queried for
+// open merge-request beads across both the issues and wisps tables.
+var fetcherListMergeRequests = func(rigPath string, opts beads.ListOptions) ([]*beads.Issue, error) {
+	return beads.New(rigPath).ListMergeRequests(opts)
+}
+
+// FetchMergeQueue fetches the actual merge queue: open merge-request beads from
+// each registered rig's own beads db.
+//
+// This deliberately does NOT list GitHub PRs. The panel previously ran
+// `gh pr list` against each rig's git_url, which for forked rigs is the
+// UPSTREAM — so it rendered the upstream community's backlog as our merge queue
+// (62 rows when every queue was empty) and disagreed with `gt mq list` (gt-4qp).
+// PR data is enrichment only, and only when an MR bead records one.
+func (f *LiveConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 	// Load registered rigs from config
 	rigsConfigPath := filepath.Join(f.townRoot, "mayor", "rigs.json")
 	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("loading rigs config: %w", err)
+		return MergeQueueResult{}, fmt.Errorf("loading rigs config: %w", err)
 	}
 
-	var result []MergeQueueRow
+	// Sort rig names so rows render in a stable order.
+	rigNames := make([]string, 0, len(rigsConfig.Rigs))
+	for rigName := range rigsConfig.Rigs {
+		rigNames = append(rigNames, rigName)
+	}
+	sort.Strings(rigNames)
 
-	for rigName, entry := range rigsConfig.Rigs {
-		// Convert git URL to owner/repo format for gh CLI
-		repoPath := gitURLToRepoPath(entry.GitURL)
-		if repoPath == "" {
-			continue
-		}
+	var result MergeQueueResult
 
-		prs, err := f.fetchPRsForRepo(repoPath, rigName)
+	for _, rigName := range rigNames {
+		rows, err := f.fetchMergeRequestsForRig(rigName)
 		if err != nil {
-			// Non-fatal: continue with other repos
+			// Non-fatal: continue with other rigs, but say the count is short.
+			log.Printf("dashboard: merge queue for rig %s failed: %v", rigName, err)
+			result.FailedRigs = append(result.FailedRigs, rigName)
 			continue
 		}
-		result = append(result, prs...)
+		result.Rows = append(result.Rows, rows...)
 	}
+
+	// Layer GitHub PR state on top of the queue — never the other way around.
+	f.enrichWithPRStatus(result.Rows)
 
 	return result, nil
 }
 
-// gitURLToRepoPath converts a git URL to owner/repo format.
-// Supports HTTPS (https://github.com/owner/repo.git) and
-// SSH (git@github.com:owner/repo.git) formats.
-func gitURLToRepoPath(gitURL string) string {
-	// Handle HTTPS format: https://github.com/owner/repo.git
-	if strings.HasPrefix(gitURL, "https://github.com/") {
-		path := strings.TrimPrefix(gitURL, "https://github.com/")
-		path = strings.TrimSuffix(path, ".git")
-		return path
+// fetchMergeRequestsForRig returns open MR beads for one rig, matching the
+// filtering `gt mq list <rig>` applies.
+func (f *LiveConvoyFetcher) fetchMergeRequestsForRig(rigName string) ([]MergeQueueRow, error) {
+	// Rig.BeadsPath() is the rig root; beads.New resolves .beads from there.
+	rigPath := filepath.Join(f.townRoot, rigName)
+
+	// Priority -1 means "no priority filter" — 0 would filter to P0 only.
+	issues, err := fetcherListMergeRequests(rigPath, beads.ListOptions{
+		Label:    mergeRequestLabel,
+		Status:   "open",
+		Priority: -1,
+		Rig:      rigName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("querying merge queue for %s: %w", rigName, err)
 	}
 
-	// Handle SSH format: git@github.com:owner/repo.git
-	if strings.HasPrefix(gitURL, "git@github.com:") {
-		path := strings.TrimPrefix(gitURL, "git@github.com:")
-		path = strings.TrimSuffix(path, ".git")
-		return path
+	rows := make([]MergeQueueRow, 0, len(issues))
+	for _, issue := range issues {
+		if issue == nil {
+			continue
+		}
+		// bd list does not reliably honour the status filter; re-check here the
+		// way gt mq list does.
+		if !strings.EqualFold(issue.Status, "open") {
+			continue
+		}
+
+		fields := beads.ParseMRFields(issue)
+
+		// Wisps are shared across all rigs on the Dolt server, so an MR that
+		// names a different rig must not appear under this one.
+		if fields != nil && fields.Rig != "" && !strings.EqualFold(fields.Rig, rigName) {
+			continue
+		}
+
+		rows = append(rows, mergeQueueRowFromMR(issue, fields, rigName))
 	}
 
-	// Unsupported format
-	return ""
+	return rows, nil
 }
 
-// prResponse represents the JSON response from gh pr list.
+// mergeQueueRowFromMR builds a display row from an MR bead and its parsed fields.
+func mergeQueueRowFromMR(issue *beads.Issue, fields *beads.MRFields, rigName string) MergeQueueRow {
+	row := MergeQueueRow{
+		ID:    issue.ID,
+		Repo:  rigName,
+		Title: issue.Title,
+	}
+
+	if created, err := time.Parse(time.RFC3339, issue.CreatedAt); err == nil {
+		row.Age = formatMailAge(time.Since(created))
+	}
+
+	if fields == nil {
+		// No parsable MR fields — still a real queue entry, just sparse.
+		row.ColorClass = "mq-yellow"
+		return row
+	}
+
+	row.Branch = fields.Branch
+	row.Target = fields.Target
+	row.SourceIssue = fields.SourceIssue
+	row.Worker = fields.Worker
+	row.RetryCount = fields.RetryCount
+	row.ConvoyID = fields.ConvoyID
+
+	// PR link is enrichment: shown only when the MR bead recorded one.
+	row.HasPR = fields.PRURL != "" || fields.PRNumber > 0
+	row.URL = fields.PRURL
+	row.Number = fields.PRNumber
+
+	// A conflict retry is the one queue-level signal we can colour without
+	// asking GitHub anything.
+	if fields.RetryCount > 0 {
+		row.ColorClass = "mq-red"
+	} else {
+		row.ColorClass = "mq-green"
+	}
+
+	return row
+}
+
+// prResponse represents the JSON response from a gh pr view lookup.
 type prResponse struct {
 	Number            int    `json:"number"`
 	Title             string `json:"title"`
@@ -716,43 +812,92 @@ type prResponse struct {
 	} `json:"statusCheckRollup"`
 }
 
-// fetchPRsForRepo fetches open PRs for a single repo.
-func (f *LiveConvoyFetcher) fetchPRsForRepo(repoFull, repoShort string) ([]MergeQueueRow, error) {
-	stdout, err := runCmd(f.ghCmdTimeout, "gh", "pr", "list",
+// mergeQueueEnrichConcurrency bounds simultaneous `gh pr view` lookups so a
+// large queue cannot stall the dashboard render behind serial network calls.
+const mergeQueueEnrichConcurrency = 4
+
+// prURLPattern matches a GitHub PR URL, capturing owner/repo and the number.
+var prURLPattern = regexp.MustCompile(`^https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)`)
+
+// parsePRURL extracts owner/repo and PR number from a PR URL.
+func parsePRURL(prURL string) (repo string, number int, ok bool) {
+	m := prURLPattern.FindStringSubmatch(prURL)
+	if m == nil {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(m[2])
+	if err != nil {
+		return "", 0, false
+	}
+	return m[1], n, true
+}
+
+// enrichWithPRStatus fills CI and mergeable status for rows whose MR bead
+// recorded a PR. Lookups are per-MR by PR number — never an unbounded
+// `gh pr list`, which is what surfaced unrelated upstream PRs (gt-4qp).
+// Failures are silent: PR status is decoration, and the row already exists
+// on the strength of its MR bead.
+func (f *LiveConvoyFetcher) enrichWithPRStatus(rows []MergeQueueRow) {
+	type target struct {
+		idx    int
+		repo   string
+		number int
+	}
+
+	var targets []target
+	for i, row := range rows {
+		if !row.HasPR || row.URL == "" {
+			continue
+		}
+		repo, number, ok := parsePRURL(row.URL)
+		if !ok {
+			continue
+		}
+		// Prefer the number recorded on the bead; fall back to the URL's.
+		if row.Number > 0 {
+			number = row.Number
+		}
+		targets = append(targets, target{idx: i, repo: repo, number: number})
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, mergeQueueEnrichConcurrency)
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		go func(t target) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			pr, err := f.fetchPRStatus(t.repo, t.number)
+			if err != nil {
+				return
+			}
+			rows[t.idx].CIStatus = determineCIStatus(pr.StatusCheckRollup)
+			rows[t.idx].Mergeable = determineMergeableStatus(pr.Mergeable)
+			rows[t.idx].ColorClass = determineColorClass(rows[t.idx].CIStatus, rows[t.idx].Mergeable)
+		}(t)
+	}
+	wg.Wait()
+}
+
+// fetchPRStatus looks up a single PR's CI and mergeable state.
+func (f *LiveConvoyFetcher) fetchPRStatus(repoFull string, number int) (*prResponse, error) {
+	stdout, err := fetcherRunCmd(f.ghCmdTimeout, "gh", "pr", "view", strconv.Itoa(number),
 		"--repo", repoFull,
-		"--state", "open",
 		"--json", "number,title,url,mergeable,statusCheckRollup")
 	if err != nil {
-		return nil, fmt.Errorf("fetching PRs for %s: %w", repoFull, err)
+		return nil, fmt.Errorf("fetching PR %s#%d: %w", repoFull, number, err)
 	}
 
-	var prs []prResponse
-	if err := json.Unmarshal(stdout.Bytes(), &prs); err != nil {
-		return nil, fmt.Errorf("parsing PRs for %s: %w", repoFull, err)
+	var pr prResponse
+	if err := json.Unmarshal(stdout.Bytes(), &pr); err != nil {
+		return nil, fmt.Errorf("parsing PR %s#%d: %w", repoFull, number, err)
 	}
-
-	result := make([]MergeQueueRow, 0, len(prs))
-	for _, pr := range prs {
-		row := MergeQueueRow{
-			Number: pr.Number,
-			Repo:   repoShort,
-			Title:  pr.Title,
-			URL:    pr.URL,
-		}
-
-		// Determine CI status from statusCheckRollup
-		row.CIStatus = determineCIStatus(pr.StatusCheckRollup)
-
-		// Determine mergeable status
-		row.Mergeable = determineMergeableStatus(pr.Mergeable)
-
-		// Determine color class based on overall status
-		row.ColorClass = determineColorClass(row.CIStatus, row.Mergeable)
-
-		result = append(result, row)
-	}
-
-	return result, nil
+	return &pr, nil
 }
 
 // determineCIStatus evaluates the overall CI status from status checks.
@@ -1034,7 +1179,7 @@ func (f *LiveConvoyFetcher) getMergeQueueCount() int {
 	if err != nil {
 		return 0
 	}
-	return len(mergeQueue)
+	return len(mergeQueue.Rows)
 }
 
 // getRefineryStatusHint returns appropriate status for refinery based on merge queue.
