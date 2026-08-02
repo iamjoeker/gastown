@@ -52,7 +52,7 @@ Examples:
   gt done --target feat/my-branch      # Explicit MR target branch
   gt done --pre-verified --target feat/contract-review  # Pre-verified with explicit target
   gt done --issue gt-abc               # Explicit issue ID
-  gt done --skip-verify                # Audit-only escape hatch for non-code closes
+  gt done --skip-verify                # Non-code (no_merge/review_only) beads only; refused on code beads
   gt done --status ESCALATED           # Signal blocker, skip MR
   gt done --status DEFERRED            # Pause work, skip MR`,
 	RunE:         runDone,
@@ -660,7 +660,7 @@ func init() {
 	doneCmd.Flags().BoolVar(&doneResume, "resume", false, "Resume from last checkpoint (auto-detected, for Witness recovery)")
 	doneCmd.Flags().BoolVar(&donePreVerified, "pre-verified", false, "Mark MR as pre-verified (polecat ran gates after rebasing onto target)")
 	doneCmd.Flags().StringVar(&doneTarget, "target", "", "Explicit MR target branch (overrides formula_vars and auto-detection)")
-	doneCmd.Flags().BoolVar(&doneSkipVerify, "skip-verify", false, "Skip verified-push checks for audit/test-only completion (recorded on bead)")
+	doneCmd.Flags().BoolVar(&doneSkipVerify, "skip-verify", false, "Skip verified-push checks for non-code (no_merge/review_only) completion; refused on code beads, recorded on bead, witness notified")
 
 	rootCmd.AddCommand(doneCmd)
 }
@@ -1023,17 +1023,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// IMPORTANT: The error message must NOT mention --cleanup-status=clean.
 		// LLM agents read error messages and self-bypass (the original bug).
 		if aheadCount == 0 {
+			// Whether commits exist on the remote feature branch. After a polecat
+			// pushes to origin/<feature-branch> and submits an MR, if master advances
+			// (e.g., other MRs land), the feature branch is no longer ahead of
+			// origin/master — but the work WAS committed and pushed. (GH#wd7)
+			// Computed before the guards below because both the zero-commit guard and
+			// the ledger guard need it (gt-r5p).
+			branchPushedWithWork := false
+			if branch != defaultBranch {
+				pushed, unpushed, pushErr := g.BranchPushedToRemote(branch, "origin")
+				branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
+			}
+
 			if os.Getenv("GT_POLECAT") != "" && doneCleanupStatus != "clean" && !isNoMergeTask {
-				// Before failing, check whether commits exist on the remote feature branch.
-				// After a polecat pushes to origin/<feature-branch> and submits an MR,
-				// if master advances (e.g., other MRs land), the feature branch is no
-				// longer ahead of origin/master — but the work WAS committed and pushed.
-				// In that case, treat as "MR already submitted" and fall through. (GH#wd7)
-				branchPushedWithWork := false
-				if branch != defaultBranch {
-					pushed, unpushed, pushErr := g.BranchPushedToRemote(branch, "origin")
-					branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
-				}
 				if !branchPushedWithWork {
 					return fmt.Errorf("cannot complete: no commits on branch ahead of %s\n"+
 						"Polecats must have at least 1 commit to submit.\n"+
@@ -1076,11 +1078,29 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				if !skipClose {
 					closeReason := "Completed with no code changes (already fixed or already merged)"
 					noMRCommitSHA, _ := g.Rev("HEAD")
+
+					// Ledger integrity (gt-r5p): a no-MR close records HEAD as proof of
+					// work, but on this path HEAD is the base ref — someone else's commit.
+					// Refuse the close outright rather than annotate the bead with it.
+					if refusal := noMRCloseRefusal(noMRCloseContext{
+						IssueID:              issueID,
+						IsPolecat:            os.Getenv("GT_POLECAT") != "",
+						IsNonCodeTask:        isNoMergeTask,
+						BranchPushedWithWork: branchPushedWithWork,
+						SkipVerify:           doneSkipVerify,
+					}); refusal != "" {
+						style.PrintWarning("%s", refusal)
+						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, refusal)
+						return fmt.Errorf("cannot close %s: %s", issueID, refusal)
+					}
+
 					if doneSkipVerify {
-						noteVerifiedPushSkipped(bd, cwd, issueID, defaultBranch, noMRCommitSHA, "--skip-verify on no-MR close")
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
-						}
+						// Non-code close: no commit represents this work, so record none.
+						// Recording HEAD here is what put an unrelated upstream commit in
+						// the ledger as proof against gt-y20.
+						noteVerifiedPushSkipped(g, bd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, "", "--skip-verify on no-MR non-code close")
+						closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: none (non-code close, no work to verify)", closeReason, defaultBranch)
 					} else if !isNoMergeTask {
 						if g.ForkBackedRemote("origin") {
 							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead", branch, baseRef)
@@ -1230,7 +1250,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
-				noteVerifiedPushSkipped(directBd, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
+				noteVerifiedPushSkipped(g, directBd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
+				notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, "direct merge")
 			} else if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
 				pushFailed = true
 				errMsg := verifyErr.Error()
@@ -1330,7 +1351,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
-				noteVerifiedPushSkipped(directBd, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on late direct merge")
+				noteVerifiedPushSkipped(g, directBd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on late direct merge")
+				notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, "late direct merge")
 			} else if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
 				pushFailed = true
 				errMsg := verifyErr.Error()
@@ -1442,7 +1464,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			pushedCommitSHA, _ = g.Rev("HEAD")
 		}
 		if doneSkipVerify {
-			noteVerifiedPushSkipped(sourceBD, cwd, issueID, branch, pushedCommitSHA, "--skip-verify on branch push")
+			noteVerifiedPushSkipped(g, sourceBD, sourceIssueForNoMerge, cwd, issueID, branch, pushedCommitSHA, "--skip-verify on branch push")
+			notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, "branch push")
 		} else if verifyErr := verifyPushedCommitWithBareFallback(g, townRoot, rigName, branch, pushedCommitSHA); verifyErr != nil {
 			pushFailed = true
 			errMsg := verifyErr.Error()
@@ -2052,6 +2075,33 @@ func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
 	}
 }
 
+// notifyDoneSkipVerifyUsed tells the witness that a completion bypassed
+// verified-push checks. A close with no verification should be visible for
+// review, not merely annotated on the bead nobody re-reads (gt-r5p).
+func notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, phase string) {
+	if townRoot == "" || rigName == "" || issueID == "" {
+		return
+	}
+	if sender == "" {
+		sender = fmt.Sprintf("%s/polecat", rigName)
+	}
+
+	router := mail.NewRouter(townRoot)
+	defer router.WaitPendingNotifications()
+	msg := &mail.Message{
+		To:      fmt.Sprintf("%s/witness", rigName),
+		From:    sender,
+		Subject: fmt.Sprintf("DONE_SKIP_VERIFY: %s", issueID),
+		Body: fmt.Sprintf("gt done completed %s with --skip-verify during %s.\n\nVerified-push checks were bypassed. Confirm the recorded work is real before trusting the close.",
+			issueID, phase),
+	}
+	if err := router.Send(msg); err != nil {
+		style.PrintWarning("could not notify witness about --skip-verify use: %v", err)
+	} else {
+		fmt.Printf("%s Witness notified: DONE_SKIP_VERIFY\n", style.Bold.Render("✓"))
+	}
+}
+
 func noteVerifiedPushFailure(sourceBD *beads.Beads, cwd, issueID, branch, commit string, verifyErr error) {
 	if issueID == "" || cwd == "" {
 		return
@@ -2066,11 +2116,38 @@ func noteVerifiedPushFailure(sourceBD *beads.Beads, cwd, issueID, branch, commit
 	_ = bd.AddComment(issueID, msg)
 }
 
-func noteVerifiedPushSkipped(sourceBD *beads.Beads, cwd, issueID, branch, commit, reason string) {
+// noteVerifiedPushSkipped annotates the bead when verified-push checks were
+// skipped. The commit is only recorded as proof of work when it survives the
+// ledger checks — authored by the closing agent, and created after the bead was
+// slung. Anything else is recorded as unverifiable rather than as evidence
+// (gt-r5p): a SHA on a bead is read as proof it was done.
+func noteVerifiedPushSkipped(g *git.Git, sourceBD *beads.Beads, sourceIssue *beads.Issue, cwd, issueID, branch, commit, reason string) {
 	if issueID == "" || cwd == "" {
 		return
 	}
+
+	rejection := ""
+	commit = strings.TrimSpace(commit)
+	switch {
+	case commit == "":
+		rejection = "no commit recorded"
+	case g == nil:
+		rejection = "no git context to validate commit authorship"
+	default:
+		info, err := g.CommitMeta(commit)
+		if err != nil {
+			rejection = fmt.Sprintf("could not read commit metadata: %v", err)
+		} else {
+			rejection = ledgerProofRejection(info, issueSlungAt(sourceIssue), closingAgentIdentities())
+		}
+	}
+
 	msg := fmt.Sprintf("verified_push_skipped: commit %s branch origin/%s reason=%s", commit, branch, reason)
+	if rejection != "" {
+		msg = fmt.Sprintf("verified_push_skipped: NO VERIFIED COMMIT branch origin/%s reason=%s unverifiable=%s", branch, reason, rejection)
+		style.PrintWarning("not recording a commit as proof of work on %s: %s", issueID, rejection)
+	}
+
 	bd := sourceBD
 	if bd == nil {
 		bd, _, _ = routedIssueBeads(cwd, issueID)
