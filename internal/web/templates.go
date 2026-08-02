@@ -15,26 +15,23 @@ var templateFS embed.FS
 
 // ConvoyData represents data passed to the convoy template.
 type ConvoyData struct {
-	Convoys    []ConvoyRow
-	MergeQueue []MergeQueueRow
-	// MergeQueueFailedRigs names rigs whose merge-queue query errored. Non-empty
-	// means the rendered count is a floor, not a total.
-	MergeQueueFailedRigs []string
-	Workers              []WorkerRow
-	Mail                 []MailRow
-	Rigs                 []RigRow
-	Dogs                 []DogRow
-	Escalations          []EscalationRow
-	Health               *HealthRow
-	Queues               []QueueRow
-	Sessions             []SessionRow
-	Hooks                []HookRow
-	Mayor                *MayorStatus
-	Issues               []IssueRow
-	Activity             []ActivityRow
-	Summary              *DashboardSummary
-	Expand               string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken            string // Token for CSRF protection on POST requests
+	Convoys     []ConvoyRow
+	MergeQueue  []MergeQueueRow
+	Workers     []WorkerRow
+	Mail        []MailRow
+	Rigs        []RigRow
+	Dogs        []DogRow
+	Escalations []EscalationRow
+	Health      *HealthRow
+	Queues      []QueueRow
+	Sessions    []SessionRow
+	Hooks       []HookRow
+	Mayor       *MayorStatus
+	Issues      []IssueRow
+	Activity    []ActivityRow
+	Summary     *DashboardSummary
+	Expand      string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken   string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
@@ -187,26 +184,11 @@ type WorkerRow struct {
 	AgentType    string        // "polecat" (ephemeral sessions) or "refinery" (permanent)
 }
 
-// MergeQueueRow represents one merge-request bead in the merge queue.
-//
-// Rows come from rig-local MR beads — the same source `gt mq list <rig>` reads —
-// so the dashboard and the CLI can never disagree (gt-4qp). GitHub PR data is
-// enrichment layered on top, present only when the MR bead records a PR.
+// MergeQueueRow represents a PR in the merge queue.
 type MergeQueueRow struct {
-	ID          string // MR bead ID (e.g., "gt-mr-abc12")
-	Repo        string // Rig name (e.g., "roxas", "gastown")
-	Title       string
-	Branch      string // Source branch being merged
-	Target      string // Target branch (e.g., "main")
-	SourceIssue string // The work item being merged
-	Worker      string // Who did the work
-	RetryCount  int    // Conflict-resolution cycles so far
-	ConvoyID    string // Parent convoy, if any
-	Age         string // Human-readable age since submission
-
-	// PR enrichment — populated only when the MR bead carries PRURL/PRNumber.
-	HasPR      bool
 	Number     int
+	Repo       string // Short repo name (e.g., "roxas", "gastown")
+	Title      string
 	URL        string
 	CIStatus   string // "pass", "fail", "pending"
 	Mergeable  string // "ready", "conflict", "pending"
@@ -250,7 +232,7 @@ func LoadTemplates() (*template.Template, error) {
 		"dogStateClass":      dogStateClass,
 		"queueStatusClass":   queueStatusClass,
 		"polecatStatusClass": polecatStatusClass,
-		"activityTypeClass":  activityTypeClass,
+		"activityTypeClass": activityTypeClass,
 		"contains": func(s, substr string) bool {
 			return strings.Contains(s, substr)
 		},
