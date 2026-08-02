@@ -343,6 +343,11 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// --force is forwarded to the underlying `bd close`. bd refuses to close a
+	// bead whose assignee does not match the acting identity and advises using
+	// --force; before this flag existed that advice was unreachable from here.
+	mailbox.SetForceClose(mailArchiveForce)
+
 	if mailArchiveStale {
 		if len(args) > 0 {
 			return errors.New("--stale cannot be combined with message IDs")
