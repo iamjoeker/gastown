@@ -142,6 +142,7 @@ var (
 	polecatNukeAll                       bool
 	polecatNukeDryRun                    bool
 	polecatNukeForce                     bool
+	polecatNukeOverrideRestartFirst      bool
 	polecatCheckRecoveryJSON             bool
 	polecatCheckRecoveryReconcileCleanup bool
 	polecatPoolInitDryRun                bool
@@ -179,6 +180,12 @@ This is the nuclear option for post-merge cleanup. It:
   3. Deletes the polecat branch
   4. Closes the agent bead (if exists)
 
+WHO MAY RUN THIS: a human or the Mayor. A witness identity is refused
+(restart-first policy, gt-dsgp) — the witness restarts a stuck polecat with
+'gt session restart', which preserves the worktree and branch, and escalates
+when work is at risk. --override-restart-first exists for a human driving a
+witness shell.
+
 SAFETY CHECKS: The command refuses to nuke a polecat if:
   - cleanup_status is dirty, unknown, or missing
   - Worktree fallback detects unpushed/uncommitted/stashed changes
@@ -203,8 +210,10 @@ var polecatGitStateCmd = &cobra.Command{
 	Short: "Show git state for pre-kill verification",
 	Long: `Show git state for a polecat's worktree.
 
-Used by the Witness for pre-kill verification to ensure no work is lost.
-Returns whether the worktree is clean (safe to kill) or dirty (needs cleanup).
+Used by the Witness to verify no work is at risk before restarting a polecat,
+and by the Mayor before nuking one. Reports whether the worktree is clean (no
+work at risk) or dirty (needs cleanup). A clean verdict is a statement about
+git, not authorization to destroy the sandbox.
 
 Checks:
   - Working tree: uncommitted changes
@@ -220,16 +229,20 @@ Examples:
 
 var polecatCheckRecoveryCmd = &cobra.Command{
 	Use:   "check-recovery <rig>/<polecat>",
-	Short: "Check if polecat needs recovery vs safe to nuke",
+	Short: "Check whether a dormant polecat's work is at risk",
 	Long: `Check recovery status of a polecat based on cleanup_status, active_mr, and merge queue state.
 
-Used by the Witness to determine appropriate cleanup action:
-  - SAFE_TO_NUKE: cleanup_status is 'clean', active_mr is terminal, AND work submitted to merge queue
+Reports whether any work is at risk. It does NOT authorize destroying the polecat:
+  - SAFE_TO_NUKE: no work at risk — cleanup_status is 'clean', active_mr is terminal, AND work submitted to merge queue
   - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
   - NEEDS_RECOVERY: cleanup_status, active_mr, or fallback git predicates require recovery
+  - PENDING_MR: work is waiting on an active merge request
 
-This prevents accidental data loss when cleaning up dormant polecats.
-The Witness should escalate NEEDS_RECOVERY and NEEDS_MQ_SUBMIT cases to the Mayor.
+The verdict names a work-at-risk state, not an action for the caller. The
+witness_action field names what a witness may do about it: 'restart' to reclaim
+the slot (worktree and branch preserved), 'escalate' when work is at risk, or
+'leave-alone' while an MR is in flight. Nuking is never among them — under the
+restart-first policy (gt-dsgp) that requires a human or Mayor identity.
 
 Examples:
   gt polecat check-recovery greenplace/Toast
@@ -239,12 +252,13 @@ Examples:
 }
 
 var (
-	polecatStaleJSON      bool
-	polecatStaleThreshold int
-	polecatStaleCleanup   bool
-	polecatStaleDryRun    bool
-	polecatPruneDryRun    bool
-	polecatPruneRemote    bool
+	polecatStaleJSON                 bool
+	polecatStaleThreshold            int
+	polecatStaleCleanup              bool
+	polecatStaleDryRun               bool
+	polecatStaleOverrideRestartFirst bool
+	polecatPruneDryRun               bool
+	polecatPruneRemote               bool
 )
 
 var polecatStaleCmd = &cobra.Command{
@@ -346,6 +360,7 @@ func init() {
 	polecatNukeCmd.Flags().BoolVar(&polecatNukeAll, "all", false, "Nuke all polecats in the rig")
 	polecatNukeCmd.Flags().BoolVar(&polecatNukeDryRun, "dry-run", false, "Show what would be nuked without doing it")
 	polecatNukeCmd.Flags().BoolVarP(&polecatNukeForce, "force", "f", false, "Force nuke, bypassing all safety checks (LOSES WORK)")
+	polecatNukeCmd.Flags().BoolVar(&polecatNukeOverrideRestartFirst, restartFirstOverrideFlag, false, "Nuke from a witness identity anyway (human-only escape hatch; restart-first policy normally refuses)")
 
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
@@ -356,6 +371,7 @@ func init() {
 	polecatStaleCmd.Flags().IntVar(&polecatStaleThreshold, "threshold", 20, "Commits behind main to consider stale")
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleCleanup, "cleanup", false, "Automatically nuke stale polecats")
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleDryRun, "dry-run", false, "Show what would be cleaned without doing it")
+	polecatStaleCmd.Flags().BoolVar(&polecatStaleOverrideRestartFirst, restartFirstOverrideFlag, false, "Run --cleanup from a witness identity anyway (human-only escape hatch; restart-first policy normally refuses)")
 
 	// Prune flags
 	polecatPruneCmd.Flags().BoolVar(&polecatPruneDryRun, "dry-run", false, "Show what would be pruned without doing it")
@@ -952,7 +968,10 @@ func runPolecatGitState(cmd *cobra.Command, args []string) error {
 	// Verdict
 	fmt.Println()
 	if state.Clean {
-		fmt.Printf("  Verdict:       %s\n", style.Success.Render("CLEAN (safe to kill)"))
+		// "safe to kill" read as an instruction to the Witness, which may not
+		// kill anything (gt-y20). State the git fact; leave the action to the
+		// caller's policy.
+		fmt.Printf("  Verdict:       %s\n", style.Success.Render("CLEAN (no work at risk)"))
 	} else {
 		fmt.Printf("  Verdict:       %s\n", style.Error.Render("DIRTY (needs cleanup)"))
 	}
@@ -1013,7 +1032,8 @@ type RecoveryStatus struct {
 	Polecat              string                `json:"polecat"`
 	CleanupStatus        polecat.CleanupStatus `json:"cleanup_status"`
 	NeedsRecovery        bool                  `json:"needs_recovery"`
-	Verdict              string                `json:"verdict"` // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
+	Verdict              string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
+	WitnessAction        string                `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
 	Reason               string                `json:"reason,omitempty"`
 	Reusable             bool                  `json:"reusable"`
 	SafeToNuke           bool                  `json:"safe_to_nuke"`
@@ -1168,6 +1188,10 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
 	}
 
+	// Derived last: reconcile and the MQ checks can still flip the verdict above,
+	// and the permitted witness action must track the verdict actually reported.
+	status.WitnessAction = witnessActionFor(status.Verdict)
+
 	// JSON output
 	if polecatCheckRecoveryJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -1196,15 +1220,18 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	case "NEEDS_MQ_SUBMIT":
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
 		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
 		fmt.Printf("  %s Work is pushed but was never submitted to the merge queue.\n", style.Warning.Render("⚠"))
 		fmt.Println("  Submit to MQ before cleanup, or the branch will be orphaned.")
 	case "PENDING_MR":
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("PENDING_MR"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
 		fmt.Println("  Work is waiting on an active merge request; preserve this polecat until it lands.")
 	case "NEEDS_RECOVERY":
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
 		if len(status.Blockers) > 0 {
 			fmt.Printf("  %s Cleanup refused by these predicate(s):\n", style.Warning.Render("⚠"))
@@ -1223,12 +1250,21 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
 	default:
-		fmt.Printf("  Verdict:         %s\n", style.Success.Render("SAFE_TO_NUKE"))
+		// Deliberately NOT success-styled (gt-y20). This verdict says "no work
+		// is at risk", not "you may destroy this polecat" — and the Witness is
+		// the main caller. A green checkmark next to the word "nuke" is what
+		// steered the witness in dn-v29.
+		fmt.Printf("  Verdict:         %s\n", style.Dim.Render("SAFE_TO_NUKE (no work at risk)"))
 		if status.MQStatus != "" {
 			fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
 		}
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
-		fmt.Printf("  %s Safe to nuke - no work at risk.\n", style.Success.Render("✓"))
+		fmt.Println("  No work at risk. Reclaim the slot by restarting — the sandbox is preserved:")
+		fmt.Printf("    gt session restart %s/%s\n", rigName, polecatName)
+		fmt.Println()
+		fmt.Printf("  %s\n", style.Dim.Render("Nuking is not a witness action — it requires a human or Mayor identity"))
+		fmt.Printf("  %s\n", style.Dim.Render("(restart-first policy, gt-dsgp)"))
 	}
 
 	return nil
@@ -1731,6 +1767,13 @@ func splitLines(s string) []string {
 }
 
 func runPolecatNuke(cmd *cobra.Command, args []string) error {
+	// Restart-first policy (gt-dsgp) — enforced before anything else, including
+	// --dry-run, because a dry run that prints "Would nuke ..." is itself a
+	// steering surface for an identity that may not nuke at all.
+	if err := checkRestartFirstNukePolicy("gt polecat nuke", polecatNukeOverrideRestartFirst); err != nil {
+		return err
+	}
+
 	targets, err := resolvePolecatTargets(args, polecatNukeAll)
 	if err != nil {
 		return err
@@ -2158,6 +2201,10 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 
 	// Cleanup if requested
 	if polecatStaleCleanup && staleCount > 0 {
+		// --cleanup nukes. Same policy gate as `gt polecat nuke` (gt-y20).
+		if err := checkRestartFirstNukePolicy("gt polecat stale --cleanup", polecatStaleOverrideRestartFirst); err != nil {
+			return err
+		}
 		fmt.Println()
 		if polecatStaleDryRun {
 			fmt.Printf("Would clean up %d stale polecat(s):\n", staleCount)

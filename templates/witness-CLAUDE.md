@@ -47,13 +47,27 @@ Never use `tmux has-session -t deacon` — that session does not exist.
 
 ## Dormant Polecat Recovery Protocol
 
+> **Restart-first policy (gt-dsgp): the witness NEVER nukes polecats.**
+> Nuking only happens via explicit `gt polecat nuke` from a human or Mayor.
+> `gt polecat nuke` refuses a witness identity — do not try to route around it.
+> To reclaim a slot, restart: the worktree and branch are preserved.
+
 ```bash
 gt polecat check-recovery {{RIG}}/<name>
 ```
 
-Returns one of:
-- **SAFE_TO_NUKE**: cleanup_status is 'clean' — proceed with normal cleanup
-- **NEEDS_RECOVERY**: unpushed/uncommitted work exists
+The verdict describes whether work is at risk. It does NOT authorize an action.
+Read the `witness_action` field for what *you* may do:
+
+| Verdict | Meaning | `witness_action` |
+|---------|---------|------------------|
+| SAFE_TO_NUKE | No work at risk | `restart` — `gt session restart {{RIG}}/<name>` |
+| NEEDS_MQ_SUBMIT | Pushed but never submitted to MQ | `escalate` |
+| NEEDS_RECOVERY | Unpushed/uncommitted work exists | `escalate` |
+| PENDING_MR | MR in flight; refinery needs the branch | `leave-alone` |
+
+The verdict name `SAFE_TO_NUKE` is legacy vocabulary describing git state, not
+an instruction to you. Treat it as `restart`.
 
 ### If NEEDS_RECOVERY
 
@@ -70,41 +84,42 @@ This polecat has unpushed work that will be lost if nuked.
 Please coordinate recovery before authorizing cleanup."
 ```
 
-Only use `--force` after Mayor authorizes or confirms work is unrecoverable.
+`--force` is the Mayor's flag, not yours. Escalate; do not run it.
 
 ---
 
-## Pre-Kill Verification Checklist
+## Pre-Restart Verification Checklist
 
-Before killing ANY polecat session:
+Before restarting ANY polecat session:
 
 ```
-[ ] 1. gt polecat check-recovery {{RIG}}/<name>  # Must be SAFE_TO_NUKE
+[ ] 1. gt polecat check-recovery {{RIG}}/<name>  # witness_action must be 'restart'
 [ ] 2. gt polecat git-state <name>               # Must be clean
 [ ] 3. bd show <issue-id>                        # Should show 'closed'
 [ ] 4. Check merge queue or PR status
 ```
 
-**If NEEDS_RECOVERY:** Escalate to Mayor, wait for authorization, do NOT nuke.
+**If witness_action is `escalate`:** Escalate to Mayor and stop. Do not nuke.
 
 **If git state dirty but polecat still alive:**
 1. Nudge the worker to clean up
 2. Wait 5 minutes for response
 3. If still dirty after 3 attempts → Escalate to Mayor
 
-**If SAFE_TO_NUKE and all checks pass:**
-1. **Send MERGE_READY** (BEFORE killing):
+**If witness_action is `restart` and all checks pass:**
+1. **Send MERGE_READY** (BEFORE restarting):
    ```bash
    gt mail send {{RIG}}/refinery -s "MERGE_READY <polecat>" -m "Branch: <branch>
    Issue: <issue-id>
    Polecat: <polecat>
    Verified: clean git state, issue closed"
    ```
-2. **Nuke the polecat:**
+2. **Restart the polecat** — this reclaims the slot and preserves the sandbox:
    ```bash
-   gt polecat nuke {{RIG}}/<name>
+   gt session restart {{RIG}}/<name>
    ```
-   Use `gt polecat nuke` instead of raw git — it handles worktree cleanup properly.
+   Do NOT run `gt polecat nuke`. It will refuse your identity, and destroying
+   the sandbox is the Mayor's call, not yours.
 
 **CRITICAL: NO ROUTINE REPORTS TO MAYOR**
 
