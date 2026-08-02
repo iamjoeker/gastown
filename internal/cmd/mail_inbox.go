@@ -223,7 +223,9 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s %s%s%s\n\n", style.Bold.Render("Subject:"), msg.Subject, typeStr, priorityStr)
 	fmt.Printf("From: %s\n", msg.From)
 	fmt.Printf("To: %s\n", msg.To)
-	fmt.Printf("Date: %s\n", msg.Timestamp.Local().Format("2006-01-02 15:04:05"))
+	// Zone label: mail renders local time while bd renders UTC. Correlating the
+	// two is routine and the offset was silently carried as an error.
+	fmt.Printf("Date: %s\n", msg.Timestamp.Local().Format("2006-01-02 15:04:05 MST"))
 	fmt.Printf("ID: %s\n", style.Dim.Render(msg.ID))
 
 	if msg.ThreadID != "" {
