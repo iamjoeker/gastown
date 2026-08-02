@@ -82,6 +82,17 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	syncFailures map[string]int
 
+	// missingWispConfigWarned tracks rigs already warned about a missing wisp
+	// config, so the warning is logged on transition rather than on every
+	// isRigOperational call. That check runs on each daemon poll (~5s), and the
+	// unthrottled warning drowned the log: 39 of the last 50 lines in one
+	// observed window, which made a 6-minute recurring event effectively
+	// invisible in the default `gt daemon logs` view.
+	// A rig is removed from this set when its config reappears, so a
+	// disappear/reappear cycle warns again.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	missingWispConfigWarned map[string]bool
+
 	// PATCH-006: Resolved binary paths to avoid PATH issues in subprocesses.
 	gtPath string
 	bdPath string
@@ -2193,9 +2204,20 @@ func (d *Daemon) getPatrolRigs(patrol string) []string {
 func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	cfg := wisp.NewConfig(d.config.TownRoot, rigName)
 
-	// Warn if wisp config is missing - parked/docked state may have been lost
+	// Warn if wisp config is missing - parked/docked state may have been lost.
+	// Logged on transition only: this function runs on every daemon poll, and
+	// warning each time buries every other log line (see missingWispConfigWarned).
 	if _, err := os.Stat(cfg.ConfigPath()); os.IsNotExist(err) {
-		d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost", rigName)
+		if d.missingWispConfigWarned == nil {
+			d.missingWispConfigWarned = make(map[string]bool)
+		}
+		if !d.missingWispConfigWarned[rigName] {
+			d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost (further occurrences suppressed until it reappears)", rigName)
+			d.missingWispConfigWarned[rigName] = true
+		}
+	} else if d.missingWispConfigWarned[rigName] {
+		// Config came back - clear the latch so a future loss warns again.
+		delete(d.missingWispConfigWarned, rigName)
 	}
 
 	// Check wisp layer first (local/ephemeral overrides)
