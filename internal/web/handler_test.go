@@ -18,29 +18,30 @@ var errFetchFailed = errors.New("fetch failed")
 
 // MockConvoyFetcher is a mock implementation for testing.
 type MockConvoyFetcher struct {
-	Convoys     []ConvoyRow
-	MergeQueue  []MergeQueueRow
-	Workers     []WorkerRow
-	Mail        []MailRow
-	Rigs        []RigRow
-	Dogs        []DogRow
-	Escalations []EscalationRow
-	Health      *HealthRow
-	Queues      []QueueRow
-	Sessions    []SessionRow
-	Hooks       []HookRow
-	Mayor       *MayorStatus
-	Issues      []IssueRow
-	Activity    []ActivityRow
-	Error       error
+	Convoys              []ConvoyRow
+	MergeQueue           []MergeQueueRow
+	MergeQueueFailedRigs []string
+	Workers              []WorkerRow
+	Mail                 []MailRow
+	Rigs                 []RigRow
+	Dogs                 []DogRow
+	Escalations          []EscalationRow
+	Health               *HealthRow
+	Queues               []QueueRow
+	Sessions             []SessionRow
+	Hooks                []HookRow
+	Mayor                *MayorStatus
+	Issues               []IssueRow
+	Activity             []ActivityRow
+	Error                error
 }
 
 func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	return m.Convoys, m.Error
 }
 
-func (m *MockConvoyFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
-	return m.MergeQueue, nil
+func (m *MockConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
+	return MergeQueueResult{Rows: m.MergeQueue, FailedRigs: m.MergeQueueFailedRigs}, nil
 }
 
 func (m *MockConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
@@ -287,6 +288,7 @@ func TestConvoyHandler_MergeQueueRendering(t *testing.T) {
 		Convoys: []ConvoyRow{},
 		MergeQueue: []MergeQueueRow{
 			{
+				HasPR:      true,
 				Number:     123,
 				Repo:       "roxas",
 				Title:      "Fix authentication bug",
@@ -296,6 +298,7 @@ func TestConvoyHandler_MergeQueueRendering(t *testing.T) {
 				ColorClass: "mq-green",
 			},
 			{
+				HasPR:      true,
 				Number:     456,
 				Repo:       "gastown",
 				Title:      "Add dashboard feature",
@@ -350,6 +353,94 @@ func TestConvoyHandler_MergeQueueRendering(t *testing.T) {
 	}
 }
 
+// TestConvoyHandler_MergeQueueFailedRigNotice asserts a partial queue is never
+// rendered as if it were complete (gt-4qp).
+func TestConvoyHandler_MergeQueueFailedRigNotice(t *testing.T) {
+	mock := &MockConvoyFetcher{
+		Convoys: []ConvoyRow{},
+		MergeQueue: []MergeQueueRow{
+			{ID: "gt-mr-1", Repo: "gastown", Title: "MR", Branch: "b", Target: "main"},
+			{ID: "gt-mr-2", Repo: "gastown", Title: "MR", Branch: "b", Target: "main"},
+		},
+		MergeQueueFailedRigs: []string{"beads"},
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "truncation-notice") {
+		t.Error("A failed rig should render an incomplete-count notice")
+	}
+	if !strings.Contains(body, "unavailable for: beads") {
+		t.Error("Notice should name the failed rig")
+	}
+	// The count must read as a floor, not a total.
+	if !strings.Contains(body, `<span class="count">2+</span>`) {
+		t.Error("Incomplete count should render with a '+' suffix")
+	}
+}
+
+// TestConvoyHandler_MergeQueuePROptional asserts PR link and CI status render
+// only for MR beads that actually recorded a PR — PR data is enrichment, and
+// a row exists on the strength of its MR bead alone.
+func TestConvoyHandler_MergeQueuePROptional(t *testing.T) {
+	mock := &MockConvoyFetcher{
+		Convoys: []ConvoyRow{},
+		MergeQueue: []MergeQueueRow{
+			{
+				ID: "gt-mr-nopr", Repo: "gastown", Title: "No PR yet",
+				Branch: "polecat/chrome/gt-9", Target: "main", Worker: "chrome",
+				ColorClass: "mq-green",
+			},
+			{
+				ID: "gt-mr-pr", Repo: "gastown", Title: "Has a PR",
+				Branch: "polecat/nux/gt-8", Target: "main", Worker: "nux",
+				HasPR: true, Number: 42, URL: "https://github.com/o/r/pull/42",
+				CIStatus: "pass", Mergeable: "ready", ColorClass: "mq-green",
+			},
+		},
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+
+	// MR bead IDs are the primary identity of a queue row.
+	for _, id := range []string{"gt-mr-nopr", "gt-mr-pr"} {
+		if !strings.Contains(body, id) {
+			t.Errorf("Response should contain MR bead ID %q", id)
+		}
+	}
+	if !strings.Contains(body, "#42") {
+		t.Error("Row with a recorded PR should show its PR number")
+	}
+	if !strings.Contains(body, "CI Pass") {
+		t.Error("Row with a recorded PR should show CI status")
+	}
+	// The PR detail view is driven by data-pr-url; a PR-less MR must not offer it.
+	if strings.Count(body, "data-pr-url") != 1 {
+		t.Error("Only the MR with a recorded PR should carry data-pr-url")
+	}
+	// Branch/target routing is queue information, not PR information.
+	if !strings.Contains(body, "polecat/chrome/gt-9") {
+		t.Error("Row should show the branch being merged")
+	}
+}
+
 func TestConvoyHandler_EmptyMergeQueue(t *testing.T) {
 	mock := &MockConvoyFetcher{
 		Convoys:    []ConvoyRow{},
@@ -369,7 +460,7 @@ func TestConvoyHandler_EmptyMergeQueue(t *testing.T) {
 	body := w.Body.String()
 
 	// Should show empty state for merge queue
-	if !strings.Contains(body, "No PRs in queue") {
+	if !strings.Contains(body, "Merge queue empty") {
 		t.Error("Response should show empty merge queue message")
 	}
 }
@@ -599,6 +690,7 @@ func TestConvoyHandler_FullDashboard(t *testing.T) {
 		},
 		MergeQueue: []MergeQueueRow{
 			{
+				HasPR:      true,
 				Number:     789,
 				Repo:       "testrig",
 				Title:      "Test PR",
@@ -676,6 +768,7 @@ func TestE2E_Server_FullDashboard(t *testing.T) {
 		},
 		MergeQueue: []MergeQueueRow{
 			{
+				HasPR:      true,
 				Number:     101,
 				Repo:       "roxas",
 				Title:      "E2E Test PR",
@@ -834,8 +927,8 @@ func TestE2E_Server_MergeQueueEmpty(t *testing.T) {
 	}
 
 	// Empty state message
-	if !strings.Contains(body, "No PRs in queue") {
-		t.Error("Should show 'No PRs in queue' when empty")
+	if !strings.Contains(body, "Merge queue empty") {
+		t.Error("Should show 'Merge queue empty' when empty")
 	}
 }
 
@@ -860,6 +953,7 @@ func TestE2E_Server_MergeQueueStatuses(t *testing.T) {
 			mock := &MockConvoyFetcher{
 				MergeQueue: []MergeQueueRow{
 					{
+						HasPR:      true,
 						Number:     42,
 						Repo:       "test",
 						Title:      "Test PR",
@@ -1008,8 +1102,8 @@ func (m *MockConvoyFetcherWithErrors) FetchConvoys() ([]ConvoyRow, error) {
 	return m.Convoys, nil
 }
 
-func (m *MockConvoyFetcherWithErrors) FetchMergeQueue() ([]MergeQueueRow, error) {
-	return nil, m.MergeQueueError
+func (m *MockConvoyFetcherWithErrors) FetchMergeQueue() (MergeQueueResult, error) {
+	return MergeQueueResult{}, m.MergeQueueError
 }
 
 func (m *MockConvoyFetcherWithErrors) FetchWorkers() ([]WorkerRow, error) {
@@ -1241,7 +1335,7 @@ func (m *CountingMockFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	*m.fetchCount++
 	return m.inner.FetchConvoys()
 }
-func (m *CountingMockFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
+func (m *CountingMockFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 	return m.inner.FetchMergeQueue()
 }
 func (m *CountingMockFetcher) FetchWorkers() ([]WorkerRow, error) { return m.inner.FetchWorkers() }

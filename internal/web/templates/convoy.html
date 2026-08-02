@@ -471,7 +471,7 @@
                 </div>
             </div>
 
-            <!-- Row 2: Mail, Merge Queue, Escalations -->
+            <!-- Row 2: Mail, Open PRs, Escalations -->
 
             <!-- Mail Panel -->
             <div class="panel" id="mail-panel">
@@ -572,41 +572,55 @@
                 </div>
             </div>
 
-            <!-- Merge Queue Panel -->
+            <!-- Merge Queue Panel: rows are merge-request beads, same source as `gt mq list` -->
             <div class="panel" id="merge-queue-panel">
                 <div class="panel-header">
                     <h2>🔀 Merge Queue</h2>
-                    <span class="count">{{len .MergeQueue}}</span>
+                    <span class="count">{{len .MergeQueue}}{{if .MergeQueueFailedRigs}}+{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    <!-- PR List View -->
+                    {{if .MergeQueueFailedRigs}}
+                    <p class="truncation-notice">⚠️ Merge queue unavailable for: {{range $i, $r := .MergeQueueFailedRigs}}{{if $i}}, {{end}}{{$r}}{{end}} — count is incomplete</p>
+                    {{end}}
+                    <!-- MR List View -->
                     <div id="pr-list">
                         {{if .MergeQueue}}
                         <table>
                             <thead>
                                 <tr>
-                                    <th>PR</th>
-                                    <th>Repo</th>
+                                    <th>MR</th>
+                                    <th>Rig</th>
                                     <th>Title</th>
+                                    <th>Branch → Target</th>
+                                    <th>Worker</th>
                                     <th>CI</th>
                                     <th>Merge</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {{range .MergeQueue}}
-                                <tr class="pr-row {{.ColorClass}}" data-pr-url="{{.URL}}" data-pr-repo="{{.Repo}}" data-pr-number="{{.Number}}">
-                                    <td><span class="pr-link">#{{.Number}}</span></td>
+                                <tr class="pr-row {{.ColorClass}}"{{if .HasPR}} data-pr-url="{{.URL}}" data-pr-repo="{{.Repo}}" data-pr-number="{{.Number}}"{{end}}>
+                                    <td>
+                                        <span class="mr-id">{{.ID}}</span>
+                                        {{if .HasPR}}<span class="pr-link">#{{.Number}}</span>{{end}}
+                                        {{if .RetryCount}}<span class="badge badge-red" title="Conflict retries">↻{{.RetryCount}}</span>{{end}}
+                                    </td>
                                     <td>{{.Repo}}</td>
                                     <td class="pr-title">{{.Title}}</td>
+                                    <td class="mr-branches"><code>{{.Branch}}</code> → <code>{{.Target}}</code></td>
+                                    <td>{{.Worker}}</td>
                                     <td>
-                                        {{if eq .CIStatus "pass"}}<span class="badge badge-green">CI Pass</span>
+                                        {{if not .HasPR}}<span class="badge badge-muted" title="No PR recorded on this merge request">—</span>
+                                        {{else if eq .CIStatus "pass"}}<span class="badge badge-green">CI Pass</span>
                                         {{else if eq .CIStatus "fail"}}<span class="badge badge-red">CI Fail</span>
-                                        {{else}}<span class="badge badge-yellow">CI Running</span>{{end}}
+                                        {{else if eq .CIStatus "pending"}}<span class="badge badge-yellow">CI Running</span>
+                                        {{else}}<span class="badge badge-muted">—</span>{{end}}
                                     </td>
                                     <td>
-                                        {{if eq .Mergeable "ready"}}<span class="badge badge-green">Ready</span>
+                                        {{if not .HasPR}}<span class="badge badge-muted" title="No PR recorded on this merge request">—</span>
+                                        {{else if eq .Mergeable "ready"}}<span class="badge badge-green">Ready</span>
                                         {{else if eq .Mergeable "conflict"}}<span class="badge badge-red">Conflict</span>
                                         {{else}}<span class="badge badge-muted">Pending</span>{{end}}
                                     </td>
@@ -616,7 +630,7 @@
                         </table>
                         {{else}}
                         <div class="empty-state">
-                            <p>No PRs in queue</p>
+                            <p>Merge queue empty</p>
                         </div>
                         {{end}}
                     </div>

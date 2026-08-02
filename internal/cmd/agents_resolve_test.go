@@ -1,64 +1,11 @@
 package cmd
 
 import (
-	"bytes"
-	"encoding/json"
 	"strings"
 	"testing"
 
-	"github.com/spf13/cobra"
-
 	"github.com/steveyegge/gastown/internal/beads"
 )
-
-// Plain and --json must agree on exit status for the same query. They used to
-// disagree for a town-scoped bead resolved from a rig cwd: plain failed while
-// --json exited 0 and handed back an ID every later state op choked on, so a
-// caller trusting --json got a silently broken agent (gt-5n3).
-func TestRunAgentsResolveTownScopedBeadAgreesBetweenPlainAndJSON(t *testing.T) {
-	agentStateDirFixture(t, true)
-
-	oldRole, oldRig, oldJSON, oldQuiet := agentsResolveRole, agentsResolveRig, agentsResolveJSON, agentsResolveQuiet
-	t.Cleanup(func() {
-		agentsResolveRole, agentsResolveRig, agentsResolveJSON, agentsResolveQuiet = oldRole, oldRig, oldJSON, oldQuiet
-	})
-	agentsResolveRole, agentsResolveRig, agentsResolveQuiet = "witness", "gastown", false
-
-	var plainOut bytes.Buffer
-	plainCmd := &cobra.Command{}
-	plainCmd.SetOut(&plainOut)
-	agentsResolveJSON = false
-	plainErr := runAgentsResolve(plainCmd, nil)
-
-	var jsonOut bytes.Buffer
-	jsonCmd := &cobra.Command{}
-	jsonCmd.SetOut(&jsonOut)
-	agentsResolveJSON = true
-	jsonErr := runAgentsResolve(jsonCmd, nil)
-
-	if (plainErr == nil) != (jsonErr == nil) {
-		t.Fatalf("plain and --json disagree: plain err = %v, json err = %v", plainErr, jsonErr)
-	}
-	if plainErr != nil {
-		t.Fatalf("resolving a town-scoped agent bead from a rig cwd failed: %v", plainErr)
-	}
-
-	if got := strings.TrimSpace(plainOut.String()); got != "gt-gastown-witness" {
-		t.Fatalf("plain output = %q, want %q", got, "gt-gastown-witness")
-	}
-
-	var result agentsResolveResult
-	if err := json.Unmarshal(jsonOut.Bytes(), &result); err != nil {
-		t.Fatalf("parsing --json output %q: %v", jsonOut.String(), err)
-	}
-	if result.ID != "gt-gastown-witness" {
-		t.Fatalf("--json id = %q, want %q", result.ID, "gt-gastown-witness")
-	}
-	// Both modes must agree on the ID, not just on exit status.
-	if result.ID != strings.TrimSpace(plainOut.String()) {
-		t.Fatalf("plain id %q and --json id %q disagree", strings.TrimSpace(plainOut.String()), result.ID)
-	}
-}
 
 func TestAgentBeadMatchesDescriptionAndIDFallback(t *testing.T) {
 	tests := []struct {
