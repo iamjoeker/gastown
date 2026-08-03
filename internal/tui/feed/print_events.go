@@ -142,12 +142,7 @@ func matchesFilters(event *Event, sinceTime time.Time, mol, eventType, rig strin
 // printEvent formats and prints a single event line.
 func printEvent(event Event) {
 	symbol := typeSymbol(event.Type)
-	// Zone-labelled: the feed renders local time while bd renders UTC, and
-	// correlating a feed line against a bead timestamp is routine here. Unlabelled,
-	// the offset was silently carried as an error — a prediction stated in UTC and
-	// compared against a local feed line read as 11 minutes overdue when it was 11
-	// minutes away, and was within one step of being recorded as a failed test.
-	ts := event.Time.Local().Format("15:04:05 MST")
+	ts := event.Time.Local().Format("15:04:05")
 	actor := event.Actor
 	if actor == "" {
 		actor = "system"

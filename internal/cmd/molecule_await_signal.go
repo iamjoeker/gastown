@@ -132,9 +132,8 @@ func init() {
 }
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
-	// Find the beads database holding the agent bead (rig-local when it lives
-	// there, town when agent identity is town-scoped)
-	beadsDir, err := resolveAgentStateBeadsDir(awaitSignalAgentBead)
+	// Find beads directory (rig-local for bead operations)
+	beadsDir, err := resolveAgentTrackingBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
 	}

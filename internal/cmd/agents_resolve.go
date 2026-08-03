@@ -26,10 +26,7 @@ var agentsResolveCmd = &cobra.Command{
 
 The resolver searches the current rig database and the town database across
 both durable issues and ephemeral wisps. It prefers the current rig's wisp
-record, then rig issue, town wisp, and town issue. Closed beads are ignored.
-
-A town-scoped match is a valid result: patrol await/state commands read and
-write agent state against whichever database holds the bead.`,
+record, then rig issue, town wisp, and town issue. Closed beads are ignored.`,
 	RunE: runAgentsResolve,
 }
 
@@ -111,6 +108,10 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 		}
 		return fmt.Errorf("%s", message)
 	}
+	if rig != "" && agentBeadSourceIsTown(match.Source) && !agentsResolveJSON {
+		return fmt.Errorf("agent bead %s was found only in %s; patrol await/state commands require a rig-local agent bead", match.ID, match.Source)
+	}
+
 	if agentsResolveJSON {
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(agentsResolveResult{
 			ID:       match.ID,
@@ -270,4 +271,8 @@ func agentBeadSourceRank(source agentBeadSource) int {
 	default:
 		return 99
 	}
+}
+
+func agentBeadSourceIsTown(source agentBeadSource) bool {
+	return source == agentSourceTownWisps || source == agentSourceTownIssues
 }

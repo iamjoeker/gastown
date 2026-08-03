@@ -23,6 +23,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
@@ -81,17 +82,6 @@ type Daemon struct {
 	// Used to escalate logging from WARN to ERROR after repeated failures.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	syncFailures map[string]int
-
-	// missingWispConfigWarned tracks rigs already warned about a missing wisp
-	// config, so the warning is logged on transition rather than on every
-	// isRigOperational call. That check runs on each daemon poll (~5s), and the
-	// unthrottled warning drowned the log: 39 of the last 50 lines in one
-	// observed window, which made a 6-minute recurring event effectively
-	// invisible in the default `gt daemon logs` view.
-	// A rig is removed from this set when its config reappears, so a
-	// disappear/reappear cycle warns again.
-	// Only accessed from heartbeat loop goroutine - no sync needed.
-	missingWispConfigWarned map[string]bool
 
 	// PATCH-006: Resolved binary paths to avoid PATH issues in subprocesses.
 	gtPath string
@@ -1739,11 +1729,20 @@ func (d *Daemon) ensureWitnessesRunning() {
 	})
 }
 
-// hasPendingEvents checks if there are pending .event files in the given channel directory.
-// Used to gate agent spawning: don't burn API credits starting a Claude session when
-// there's nothing to process. The agent's await-event handles the actual consumption.
-func (d *Daemon) hasPendingEvents(channel string) bool {
-	eventDir := filepath.Join(d.config.TownRoot, "events", channel)
+// hasPendingEvents checks if there are pending .event files on the given rig's
+// channel. Used to gate agent spawning: don't burn API credits starting a Claude
+// session when there's nothing to process. The agent's await-event handles the
+// actual consumption.
+//
+// The rig argument matters: the gate runs once per rig, so reading a town-global
+// directory would let one rig's event spawn every other rig's agent (and those
+// agents would then find nothing to do). ChannelDir is the same resolver the
+// emitters and watchers use.
+func (d *Daemon) hasPendingEvents(rigName, channel string) bool {
+	eventDir, err := channelevents.ChannelDir(d.config.TownRoot, rigName, channel)
+	if err != nil {
+		return false // Unresolvable channel = nothing pending
+	}
 	entries, err := os.ReadDir(eventDir)
 	if err != nil {
 		return false // Directory doesn't exist or unreadable = no pending events
@@ -1853,7 +1852,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
 	// But spawning a NEW session with an empty queue burns API credits for nothing.
 	// The refinery formula uses await-event internally, so it will wake when events appear.
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents(rigName, "refinery") {
 		// Check if session already exists before skipping — let running sessions continue
 		r := &rig.Rig{
 			Name: rigName,
@@ -2204,20 +2203,9 @@ func (d *Daemon) getPatrolRigs(patrol string) []string {
 func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	cfg := wisp.NewConfig(d.config.TownRoot, rigName)
 
-	// Warn if wisp config is missing - parked/docked state may have been lost.
-	// Logged on transition only: this function runs on every daemon poll, and
-	// warning each time buries every other log line (see missingWispConfigWarned).
+	// Warn if wisp config is missing - parked/docked state may have been lost
 	if _, err := os.Stat(cfg.ConfigPath()); os.IsNotExist(err) {
-		if d.missingWispConfigWarned == nil {
-			d.missingWispConfigWarned = make(map[string]bool)
-		}
-		if !d.missingWispConfigWarned[rigName] {
-			d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost (further occurrences suppressed until it reappears)", rigName)
-			d.missingWispConfigWarned[rigName] = true
-		}
-	} else if d.missingWispConfigWarned[rigName] {
-		// Config came back - clear the latch so a future loss warns again.
-		delete(d.missingWispConfigWarned, rigName)
+		d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost", rigName)
 	}
 
 	// Check wisp layer first (local/ephemeral overrides)

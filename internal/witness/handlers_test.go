@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -128,6 +129,10 @@ type testMayorEvent struct {
 
 func setupSlotOpenTestTown(t *testing.T) (string, string) {
 	t.Helper()
+	// These tests assert on emitted events, so they must opt in to real
+	// emission — channelevents refuses to write under `go test` otherwise.
+	// Safe here: every emit lands under the t.TempDir() town root below.
+	t.Setenv(channelevents.AllowTestEmitEnv, "1")
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
 		t.Fatal(err)
@@ -2709,13 +2714,17 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 
 	// Set GT_TEST_NUDGE_LOG to prevent actual tmux operations in nudgeRefinery
 	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	// Opt in to real emission against the temp town root above.
+	t.Setenv(channelevents.AllowTestEmitEnv, "1")
 
 	result := &HandlerResult{}
 	// notifyRefineryMergeReady takes workDir and calls workspace.Find(workDir) internally
 	notifyRefineryMergeReady(townRoot, "dashboard", result)
 
-	// Verify that a MERGE_READY event file was created in the refinery channel
-	eventDir := filepath.Join(townRoot, "events", "refinery")
+	// Verify that a MERGE_READY event file was created on the refinery channel
+	// of the rig the merge belongs to. The rig segment is the whole point: an
+	// event in the flat directory would be visible to every rig's refinery.
+	eventDir := filepath.Join(townRoot, "events", "dashboard", "refinery")
 	entries, err := os.ReadDir(eventDir)
 	if err != nil {
 		t.Fatalf("reading event dir: %v", err)
@@ -2729,7 +2738,7 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	}
 
 	if len(eventFiles) == 0 {
-		t.Fatal("expected at least one .event file in ~/gt/events/refinery/, got none")
+		t.Fatal("expected at least one .event file in ~/gt/events/dashboard/refinery/, got none")
 	}
 
 	// Read and verify the event content
