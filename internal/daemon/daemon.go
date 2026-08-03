@@ -23,6 +23,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
@@ -1728,11 +1729,20 @@ func (d *Daemon) ensureWitnessesRunning() {
 	})
 }
 
-// hasPendingEvents checks if there are pending .event files in the given channel directory.
-// Used to gate agent spawning: don't burn API credits starting a Claude session when
-// there's nothing to process. The agent's await-event handles the actual consumption.
-func (d *Daemon) hasPendingEvents(channel string) bool {
-	eventDir := filepath.Join(d.config.TownRoot, "events", channel)
+// hasPendingEvents checks if there are pending .event files on the given rig's
+// channel. Used to gate agent spawning: don't burn API credits starting a Claude
+// session when there's nothing to process. The agent's await-event handles the
+// actual consumption.
+//
+// The rig argument matters: the gate runs once per rig, so reading a town-global
+// directory would let one rig's event spawn every other rig's agent (and those
+// agents would then find nothing to do). ChannelDir is the same resolver the
+// emitters and watchers use.
+func (d *Daemon) hasPendingEvents(rigName, channel string) bool {
+	eventDir, err := channelevents.ChannelDir(d.config.TownRoot, rigName, channel)
+	if err != nil {
+		return false // Unresolvable channel = nothing pending
+	}
 	entries, err := os.ReadDir(eventDir)
 	if err != nil {
 		return false // Directory doesn't exist or unreadable = no pending events
@@ -1842,7 +1852,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
 	// But spawning a NEW session with an empty queue burns API credits for nothing.
 	// The refinery formula uses await-event internally, so it will wake when events appear.
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents(rigName, "refinery") {
 		// Check if session already exists before skipping — let running sessions continue
 		r := &rig.Rig{
 			Name: rigName,
