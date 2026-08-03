@@ -673,21 +673,6 @@ type HeartbeatStatus struct {
 	Fresh      bool      `json:"fresh"`
 	Stale      bool      `json:"stale"`
 	VeryStale  bool      `json:"very_stale"`
-
-	// Verdict is the health conclusion, which unlike the age flags above
-	// accounts for wake-cycle advancement. A Deacon wedged on unsubmitted
-	// composer input keeps writing heartbeats, so Fresh stays true while the
-	// Deacon makes no progress; Verdict reports "wedged" for that case.
-	Verdict string `json:"verdict"`
-
-	// Healthy is whether Verdict means no intervention is needed. Prefer this
-	// over Fresh for automated checks.
-	Healthy bool `json:"healthy"`
-
-	// CycleStalledSec is how long the wake-cycle counter has sat unchanged,
-	// set only once that exceeds the stall threshold. Informational, not a
-	// fault: legitimate await-signal sleep stalls the cycle identically.
-	CycleStalledSec float64 `json:"cycle_stalled_seconds,omitempty"`
 }
 
 func runDeaconStatus(cmd *cobra.Command, args []string) error {
@@ -716,15 +701,6 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 	var hbStatus *HeartbeatStatus
 	if townRoot != "" {
 		if hb := deacon.ReadHeartbeat(townRoot); hb != nil {
-			// Fold this poll into the cycle-advancement record. A wedged Deacon
-			// runs no code, so it cannot report its own stall — the stall is
-			// only visible by comparing successive observations, and whoever
-			// polls has to be the one to persist them.
-			now := time.Now()
-			th := deacon.DefaultHealthThresholds()
-			obs := deacon.ObserveCycle(townRoot, hb, now)
-			verdict := deacon.EvaluateHealth(hb, obs, now, th)
-
 			hbStatus = &HeartbeatStatus{
 				Timestamp:  hb.Timestamp,
 				AgeSec:     hb.Age().Seconds(),
@@ -733,15 +709,6 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 				Fresh:      hb.IsFresh(),
 				Stale:      hb.IsStale(),
 				VeryStale:  hb.IsVeryStale(),
-				Verdict:    string(verdict),
-				Healthy:    verdict.Healthy(),
-			}
-			// Only surface the stall once it is long enough to be worth an
-			// operator's attention. A healthy Deacon between wake cycles always
-			// has some nonzero stall, and reporting that as "stalled" is the
-			// same misleading-status problem this change exists to fix.
-			if obs.CycleFrozen(now, th.CycleStall) {
-				hbStatus.CycleStalledSec = obs.StallDuration(now).Seconds()
 			}
 		}
 	}
@@ -806,20 +773,13 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 		if hbStatus.LastAction != "" {
 			fmt.Printf("  Last action: %s\n", hbStatus.LastAction)
 		}
-		if hbStatus.CycleStalledSec > 0 {
-			stalled := time.Duration(hbStatus.CycleStalledSec * float64(time.Second))
-			fmt.Printf("  No cycle progress for: %s\n", stalled.Round(time.Second))
+		health := "fresh"
+		if hbStatus.VeryStale {
+			health = "very stale"
+		} else if hbStatus.Stale {
+			health = "stale"
 		}
-		fmt.Printf("  Health: %s\n", hbStatus.Verdict)
-		if hbStatus.Verdict == string(deacon.VerdictWedged) {
-			// The failure this verdict exists to surface is invisible to every
-			// other probe the town has: tmux has-session passes and the
-			// heartbeat reads fresh. Say what it means and what to do, because
-			// recovery is deliberately not automated.
-			fmt.Printf("    %s\n", style.Bold.Render(
-				"Deacon is alive but completing no wake cycles — likely unsubmitted input in its composer."))
-			fmt.Printf("    Inspect with: %s\n", style.Dim.Render("gt deacon attach"))
-		}
+		fmt.Printf("  Health: %s\n", health)
 	} else if townRoot != "" {
 		fmt.Println()
 		fmt.Printf("  Heartbeat: %s\n", style.Dim.Render("no heartbeat file"))
