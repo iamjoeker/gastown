@@ -2238,6 +2238,43 @@ func (g *Git) Rev(ref string) (string, error) {
 	return g.run("rev-parse", ref)
 }
 
+// CommitIdentity holds authorship and timing metadata for a single commit.
+// Used to validate that a commit recorded on a bead as proof of work was
+// actually produced by the agent doing the recording (gt-r5p).
+type CommitIdentity struct {
+	SHA            string
+	AuthorName     string
+	AuthorEmail    string
+	CommitterName  string
+	CommitterEmail string
+	CommittedAt    time.Time
+}
+
+// CommitMeta returns authorship and timing metadata for the given ref.
+func (g *Git) CommitMeta(ref string) (*CommitIdentity, error) {
+	const sep = "\x1f"
+	out, err := g.run("show", "-s", "--format=%H"+sep+"%an"+sep+"%ae"+sep+"%cn"+sep+"%ce"+sep+"%cI", ref)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimSpace(out), sep)
+	if len(parts) != 6 {
+		return nil, fmt.Errorf("unexpected commit metadata for %s: %q", ref, out)
+	}
+	committedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(parts[5]))
+	if err != nil {
+		return nil, fmt.Errorf("parsing commit date for %s: %w", ref, err)
+	}
+	return &CommitIdentity{
+		SHA:            strings.TrimSpace(parts[0]),
+		AuthorName:     strings.TrimSpace(parts[1]),
+		AuthorEmail:    strings.TrimSpace(parts[2]),
+		CommitterName:  strings.TrimSpace(parts[3]),
+		CommitterEmail: strings.TrimSpace(parts[4]),
+		CommittedAt:    committedAt,
+	}, nil
+}
+
 // IsAncestor checks if ancestor is an ancestor of descendant.
 func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
 	_, err := g.run("merge-base", "--is-ancestor", ancestor, descendant)
