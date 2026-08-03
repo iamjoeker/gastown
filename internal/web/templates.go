@@ -20,21 +20,30 @@ type ConvoyData struct {
 	// MergeQueueFailedRigs names rigs whose merge-queue query errored. Non-empty
 	// means the rendered count is a floor, not a total.
 	MergeQueueFailedRigs []string
-	Workers              []WorkerRow
-	Mail                 []MailRow
-	Rigs                 []RigRow
-	Dogs                 []DogRow
-	Escalations          []EscalationRow
-	Health               *HealthRow
-	Queues               []QueueRow
-	Sessions             []SessionRow
-	Hooks                []HookRow
-	Mayor                *MayorStatus
-	Issues               []IssueRow
-	Activity             []ActivityRow
-	Summary              *DashboardSummary
-	Expand               string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken            string // Token for CSRF protection on POST requests
+	// OpenPRs is the separate, additive "Open Pull Requests" panel (not the
+	// Merge Queue — see gt-4qp and OpenPRResult).
+	OpenPRs               []OpenPRRow
+	OpenPRsFailedRepos    []string
+	OpenPRsTruncatedRepos []string
+	// OpenPRsLimit is the per-repo cap passed to `gh pr list` (openPRListLimit).
+	// Shown in the UI whenever a repo hits it, so the count is never truncated
+	// silently the way the pre-gt-4qp Merge Queue panel was.
+	OpenPRsLimit int
+	Workers      []WorkerRow
+	Mail         []MailRow
+	Rigs         []RigRow
+	Dogs         []DogRow
+	Escalations  []EscalationRow
+	Health       *HealthRow
+	Queues       []QueueRow
+	Sessions     []SessionRow
+	Hooks        []HookRow
+	Mayor        *MayorStatus
+	Issues       []IssueRow
+	Activity     []ActivityRow
+	Summary      *DashboardSummary
+	Expand       string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken    string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.

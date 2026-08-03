@@ -23,6 +23,7 @@ var staticFiles embed.FS
 type ConvoyFetcher interface {
 	FetchConvoys() ([]ConvoyRow, error)
 	FetchMergeQueue() (MergeQueueResult, error)
+	FetchOpenPRs() (OpenPRResult, error)
 	FetchWorkers() ([]WorkerRow, error)
 	FetchMail() ([]MailRow, error)
 	FetchRigs() ([]RigRow, error)
@@ -182,7 +183,7 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// fetchAndRender runs all 14 fetchers in parallel and renders the template.
+// fetchAndRender runs all 15 fetchers in parallel and renders the template.
 // Returns the rendered HTML bytes, or nil on template error.
 func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []byte {
 	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
@@ -191,6 +192,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	var (
 		convoys     []ConvoyRow
 		mergeQueue  MergeQueueResult
+		openPRs     OpenPRResult
 		workers     []WorkerRow
 		mail        []MailRow
 		rigs        []RigRow
@@ -207,7 +209,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	)
 
 	// Run all fetches in parallel with error logging
-	wg.Add(14)
+	wg.Add(15)
 
 	go func() {
 		defer wg.Done()
@@ -223,6 +225,14 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		mergeQueue, err = h.fetcher.FetchMergeQueue()
 		if err != nil {
 			log.Printf("dashboard: FetchMergeQueue failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var err error
+		openPRs, err = h.fetcher.FetchOpenPRs()
+		if err != nil {
+			log.Printf("dashboard: FetchOpenPRs failed: %v", err)
 		}
 	}()
 	go func() {
@@ -343,24 +353,28 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	summary := computeSummary(workers, hooks, issues, convoys, escalations, activity)
 
 	data := ConvoyData{
-		Convoys:              convoys,
-		MergeQueue:           mergeQueue.Rows,
-		MergeQueueFailedRigs: mergeQueue.FailedRigs,
-		Workers:              workers,
-		Mail:                 mail,
-		Rigs:                 rigs,
-		Dogs:                 dogs,
-		Escalations:          escalations,
-		Health:               health,
-		Queues:               queues,
-		Sessions:             sessions,
-		Hooks:                hooks,
-		Mayor:                mayor,
-		Issues:               enrichIssuesWithAssignees(issues, hooks),
-		Activity:             activity,
-		Summary:              summary,
-		Expand:               expandPanel,
-		CSRFToken:            h.csrfToken,
+		Convoys:               convoys,
+		MergeQueue:            mergeQueue.Rows,
+		MergeQueueFailedRigs:  mergeQueue.FailedRigs,
+		OpenPRs:               openPRs.Rows,
+		OpenPRsFailedRepos:    openPRs.FailedRepos,
+		OpenPRsTruncatedRepos: openPRs.TruncatedRepos,
+		OpenPRsLimit:          openPRListLimit,
+		Workers:               workers,
+		Mail:                  mail,
+		Rigs:                  rigs,
+		Dogs:                  dogs,
+		Escalations:           escalations,
+		Health:                health,
+		Queues:                queues,
+		Sessions:              sessions,
+		Hooks:                 hooks,
+		Mayor:                 mayor,
+		Issues:                enrichIssuesWithAssignees(issues, hooks),
+		Activity:              activity,
+		Summary:               summary,
+		Expand:                expandPanel,
+		CSRFToken:             h.csrfToken,
 	}
 
 	var buf bytes.Buffer

@@ -673,6 +673,62 @@
                 </div>
             </div>
 
+            <!-- Open Pull Requests Panel: GitHub PR visibility only.
+                 This is deliberately separate from the Merge Queue panel above —
+                 gt-4qp fixed the Merge Queue to read MR beads, not GitHub PRs, and
+                 that fix must stand. This panel restores PR visibility that fix
+                 removed, without conflating the two concepts. Repo per rig is
+                 push_url (falling back to git_url) — see FetchOpenPRs. -->
+            <div class="panel" id="open-prs-panel">
+                <div class="panel-header">
+                    <h2>🔗 Open Pull Requests</h2>
+                    <span class="count">{{len .OpenPRs}}{{if .OpenPRsFailedRepos}}+{{end}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+                    <button class="expand-btn">Expand</button>
+                </div>
+                <div class="panel-body">
+                    {{if .OpenPRsFailedRepos}}
+                    <p class="truncation-notice">⚠️ Open PRs unavailable for: {{range $i, $r := .OpenPRsFailedRepos}}{{if $i}}, {{end}}{{$r}}{{end}} — count is incomplete</p>
+                    {{end}}
+                    {{if .OpenPRsTruncatedRepos}}
+                    <p class="truncation-notice">⚠️ {{range $i, $r := .OpenPRsTruncatedRepos}}{{if $i}}, {{end}}{{$r}}{{end}} had {{.OpenPRsLimit}}+ open PRs — showing first {{.OpenPRsLimit}} only, count is a floor</p>
+                    {{end}}
+                    {{if .OpenPRs}}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>PR</th>
+                                <th>Rig</th>
+                                <th>Title</th>
+                                <th>Author</th>
+                                <th>Branch</th>
+                                <th>Age</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {{range .OpenPRs}}
+                            <tr>
+                                <td>
+                                    <a href="{{.URL}}" target="_blank" rel="noopener" class="pr-link">#{{.Number}}</a>
+                                    {{if .IsDraft}}<span class="badge badge-muted">Draft</span>{{end}}
+                                </td>
+                                <td>{{.Rig}}</td>
+                                <td class="pr-title">{{.Title}}</td>
+                                <td>{{.Author}}</td>
+                                <td><code>{{.Branch}}</code></td>
+                                <td>{{.Age}}</td>
+                            </tr>
+                            {{end}}
+                        </tbody>
+                    </table>
+                    {{else}}
+                    <div class="empty-state">
+                        <p>No open pull requests</p>
+                    </div>
+                    {{end}}
+                </div>
+            </div>
+
             <!-- Escalations Panel -->
             <div class="panel">
                 <div class="panel-header">

@@ -971,6 +971,182 @@ func determineColorClass(ciStatus, mergeable string) string {
 	return "mq-yellow"
 }
 
+// OpenPRResult holds open-GitHub-PR rows for the "Open Pull Requests" panel.
+//
+// This panel is deliberately separate from the Merge Queue (MergeQueueResult /
+// FetchMergeQueue). gt-4qp correctly stopped the Merge Queue panel from reading
+// GitHub PRs directly — PRs are not the merge queue, and querying them rendered
+// an upstream org's unrelated backlog as this town's queue. That fix stands.
+// But it also removed all PR visibility from the dashboard, so this is a new,
+// additive panel that restores it without touching the Merge Queue's behavior.
+type OpenPRResult struct {
+	Rows []OpenPRRow
+	// FailedRepos names repos whose `gh pr list` query errored (404, no access,
+	// auth, timeout, ...). Their rows are simply missing — a failing repo must
+	// never blank the whole panel.
+	FailedRepos []string
+	// TruncatedRepos names repos that had openPRListLimit or more open PRs, so
+	// that repo's contribution to the count is a floor, not a total. Never
+	// truncate silently (gt-4qp's bug was exactly this, via gh's default
+	// --limit of 30).
+	TruncatedRepos []string
+}
+
+// OpenPRRow represents a single open GitHub pull request.
+type OpenPRRow struct {
+	Rig     string // Rig name this PR was queried for (e.g., "duly_noted")
+	Repo    string // owner/repo actually queried (e.g., "iamjoeker/work_journal")
+	Number  int
+	Title   string
+	Author  string
+	Branch  string // head ref name
+	URL     string
+	Age     string // human-readable age since creation
+	IsDraft bool
+}
+
+// openPRListLimit bounds `gh pr list` per repo. gh's own default is 30 — the
+// exact default that let gt-4qp's bug silently truncate 151 upstream PRs down
+// to a reported 62. This MUST always be passed explicitly to `gh pr list`, and
+// any repo that hits it is recorded in TruncatedRepos so the panel never
+// reports a truncated count as a total.
+const openPRListLimit = 100
+
+// fetcherListOpenPRs is the injection point for `gh pr list` queries (stubbed in tests).
+var fetcherListOpenPRs = func(timeout time.Duration, repo string) (*bytes.Buffer, error) {
+	return fetcherRunCmd(timeout, "gh", "pr", "list",
+		"--repo", repo,
+		"--state", "open",
+		"--limit", strconv.Itoa(openPRListLimit),
+		"--json", "number,title,url,author,headRefName,createdAt,isDraft")
+}
+
+// FetchOpenPRs fetches open GitHub PRs for the repo each registered rig
+// actually develops against, as a panel separate from and additional to the
+// Merge Queue. See OpenPRResult for why the two must not be conflated.
+func (f *LiveConvoyFetcher) FetchOpenPRs() (OpenPRResult, error) {
+	rigsConfigPath := filepath.Join(f.townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		return OpenPRResult{}, fmt.Errorf("loading rigs config: %w", err)
+	}
+
+	// Sort rig names so rows render in a stable order.
+	rigNames := make([]string, 0, len(rigsConfig.Rigs))
+	for rigName := range rigsConfig.Rigs {
+		rigNames = append(rigNames, rigName)
+	}
+	sort.Strings(rigNames)
+
+	var result OpenPRResult
+	for _, rigName := range rigNames {
+		entry := rigsConfig.Rigs[rigName]
+
+		// Repo resolution: push_url wins when set, else git_url.
+		//
+		// push_url is where this town's own work actually lands, so it's the
+		// repo whose PRs are "ours". git_url is only a safe fallback for rigs
+		// with no push_url (e.g. duly_noted) — for those, git_url IS the repo
+		// we develop against, not a fork upstream.
+		//
+		// Querying git_url unconditionally is exactly what caused the original
+		// bug (gt-4qp): for forked rigs (e.g. beads, gastown) git_url points at
+		// the upstream org, which this town only reads from, and listing PRs
+		// there surfaced dozens of unrelated upstream contributors' PRs.
+		devURL := entry.PushURL
+		if devURL == "" {
+			devURL = entry.GitURL
+		}
+
+		repo := gitURLToRepoPath(devURL)
+		if repo == "" {
+			// Not a GitHub URL we know how to query (e.g. a local path). Not a
+			// failure — just nothing to show for this rig.
+			continue
+		}
+
+		rows, truncated, err := f.fetchOpenPRsForRepo(rigName, repo)
+		if err != nil {
+			// Non-fatal: read-only or missing access to some orgs is expected.
+			// Name the repo and move on so one bad repo can't blank the panel.
+			log.Printf("dashboard: open PRs for rig %s (%s) failed: %v", rigName, repo, err)
+			result.FailedRepos = append(result.FailedRepos, repo)
+			continue
+		}
+		if truncated {
+			result.TruncatedRepos = append(result.TruncatedRepos, repo)
+		}
+		result.Rows = append(result.Rows, rows...)
+	}
+
+	return result, nil
+}
+
+// fetchOpenPRsForRepo lists open PRs for a single owner/repo.
+func (f *LiveConvoyFetcher) fetchOpenPRsForRepo(rigName, repo string) ([]OpenPRRow, bool, error) {
+	stdout, err := fetcherListOpenPRs(f.ghCmdTimeout, repo)
+	if err != nil {
+		// gh exits non-zero alike for 404, private/no-access, and rate limits;
+		// we can't reliably distinguish them, so all are a soft per-repo failure.
+		return nil, false, fmt.Errorf("gh pr list for %s: %w", repo, err)
+	}
+
+	var prs []struct {
+		Number      int    `json:"number"`
+		Title       string `json:"title"`
+		URL         string `json:"url"`
+		HeadRefName string `json:"headRefName"`
+		CreatedAt   string `json:"createdAt"`
+		IsDraft     bool   `json:"isDraft"`
+		Author      struct {
+			Login string `json:"login"`
+		} `json:"author"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &prs); err != nil {
+		return nil, false, fmt.Errorf("parsing gh pr list output for %s: %w", repo, err)
+	}
+
+	rows := make([]OpenPRRow, 0, len(prs))
+	for _, pr := range prs {
+		row := OpenPRRow{
+			Rig:     rigName,
+			Repo:    repo,
+			Number:  pr.Number,
+			Title:   pr.Title,
+			Author:  pr.Author.Login,
+			Branch:  pr.HeadRefName,
+			URL:     pr.URL,
+			IsDraft: pr.IsDraft,
+		}
+		if created, err := time.Parse(time.RFC3339, pr.CreatedAt); err == nil {
+			row.Age = formatMailAge(time.Since(created))
+		}
+		rows = append(rows, row)
+	}
+
+	return rows, len(prs) >= openPRListLimit, nil
+}
+
+// gitURLToRepoPath converts a git remote URL to GitHub "owner/repo" form.
+// Supports SSH (git@github.com:owner/repo.git) and HTTPS
+// (https://github.com/owner/repo[.git]) forms; returns "" for anything else
+// (non-GitHub remotes, local paths, etc).
+//
+// A function of this name and shape existed before gt-4qp and was removed as
+// unused when the Merge Queue panel stopped querying `gh pr list` directly.
+// It is reintroduced here only for the separate Open Pull Requests panel
+// (FetchOpenPRs) — the Merge Queue panel must keep reading MR beads, per gt-4qp.
+func gitURLToRepoPath(gitURL string) string {
+	gitURL = strings.TrimSpace(gitURL)
+	if path, ok := strings.CutPrefix(gitURL, "https://github.com/"); ok {
+		return strings.TrimSuffix(path, ".git")
+	}
+	if path, ok := strings.CutPrefix(gitURL, "git@github.com:"); ok {
+		return strings.TrimSuffix(path, ".git")
+	}
+	return ""
+}
+
 // FetchWorkers fetches all running worker sessions (polecats and refinery) with activity data.
 func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	// Load registered rigs to filter sessions

@@ -18,22 +18,25 @@ var errFetchFailed = errors.New("fetch failed")
 
 // MockConvoyFetcher is a mock implementation for testing.
 type MockConvoyFetcher struct {
-	Convoys              []ConvoyRow
-	MergeQueue           []MergeQueueRow
-	MergeQueueFailedRigs []string
-	Workers              []WorkerRow
-	Mail                 []MailRow
-	Rigs                 []RigRow
-	Dogs                 []DogRow
-	Escalations          []EscalationRow
-	Health               *HealthRow
-	Queues               []QueueRow
-	Sessions             []SessionRow
-	Hooks                []HookRow
-	Mayor                *MayorStatus
-	Issues               []IssueRow
-	Activity             []ActivityRow
-	Error                error
+	Convoys               []ConvoyRow
+	MergeQueue            []MergeQueueRow
+	MergeQueueFailedRigs  []string
+	OpenPRs               []OpenPRRow
+	OpenPRsFailedRepos    []string
+	OpenPRsTruncatedRepos []string
+	Workers               []WorkerRow
+	Mail                  []MailRow
+	Rigs                  []RigRow
+	Dogs                  []DogRow
+	Escalations           []EscalationRow
+	Health                *HealthRow
+	Queues                []QueueRow
+	Sessions              []SessionRow
+	Hooks                 []HookRow
+	Mayor                 *MayorStatus
+	Issues                []IssueRow
+	Activity              []ActivityRow
+	Error                 error
 }
 
 func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
@@ -42,6 +45,10 @@ func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 
 func (m *MockConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 	return MergeQueueResult{Rows: m.MergeQueue, FailedRigs: m.MergeQueueFailedRigs}, nil
+}
+
+func (m *MockConvoyFetcher) FetchOpenPRs() (OpenPRResult, error) {
+	return OpenPRResult{Rows: m.OpenPRs, FailedRepos: m.OpenPRsFailedRepos, TruncatedRepos: m.OpenPRsTruncatedRepos}, nil
 }
 
 func (m *MockConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
@@ -1106,6 +1113,10 @@ func (m *MockConvoyFetcherWithErrors) FetchMergeQueue() (MergeQueueResult, error
 	return MergeQueueResult{}, m.MergeQueueError
 }
 
+func (m *MockConvoyFetcherWithErrors) FetchOpenPRs() (OpenPRResult, error) {
+	return OpenPRResult{}, nil
+}
+
 func (m *MockConvoyFetcherWithErrors) FetchWorkers() ([]WorkerRow, error) {
 	return nil, m.WorkersError
 }
@@ -1338,10 +1349,11 @@ func (m *CountingMockFetcher) FetchConvoys() ([]ConvoyRow, error) {
 func (m *CountingMockFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 	return m.inner.FetchMergeQueue()
 }
-func (m *CountingMockFetcher) FetchWorkers() ([]WorkerRow, error) { return m.inner.FetchWorkers() }
-func (m *CountingMockFetcher) FetchMail() ([]MailRow, error)      { return m.inner.FetchMail() }
-func (m *CountingMockFetcher) FetchRigs() ([]RigRow, error)       { return m.inner.FetchRigs() }
-func (m *CountingMockFetcher) FetchDogs() ([]DogRow, error)       { return m.inner.FetchDogs() }
+func (m *CountingMockFetcher) FetchOpenPRs() (OpenPRResult, error) { return m.inner.FetchOpenPRs() }
+func (m *CountingMockFetcher) FetchWorkers() ([]WorkerRow, error)  { return m.inner.FetchWorkers() }
+func (m *CountingMockFetcher) FetchMail() ([]MailRow, error)       { return m.inner.FetchMail() }
+func (m *CountingMockFetcher) FetchRigs() ([]RigRow, error)        { return m.inner.FetchRigs() }
+func (m *CountingMockFetcher) FetchDogs() ([]DogRow, error)        { return m.inner.FetchDogs() }
 func (m *CountingMockFetcher) FetchEscalations() ([]EscalationRow, error) {
 	return m.inner.FetchEscalations()
 }
