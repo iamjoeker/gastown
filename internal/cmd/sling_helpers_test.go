@@ -107,9 +107,22 @@ func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
 // TestNudgeRefineryNoOpWithoutLog verifies that nudgeRefinery doesn't panic
 // or error when called without the test log env var and without a real tmux session.
 // The tmux NudgeSession call should fail silently.
+//
+// This test previously blanked GT_TEST_NUDGE_LOG to reach the production path.
+// The guard checked for a non-empty value, so the blank read as "not a test"
+// and the call fell through to a live channelevents emit — every run of this
+// package woke all three refineries with a synthetic MQ_SUBMIT. Presence of the
+// variable now marks test mode regardless of value, so reaching the production
+// path requires genuinely unsetting it, and the run is confined to a temp
+// directory with no town root so no real event can be resolved even then.
 func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
-	// Ensure test log is NOT set so we exercise the real tmux path
+	// t.Setenv registers the restore-on-cleanup hook (and bars t.Parallel);
+	// Unsetenv then removes the variable so the production path is reached.
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
+	if err := os.Unsetenv("GT_TEST_NUDGE_LOG"); err != nil {
+		t.Fatalf("unset nudge log: %v", err)
+	}
+	t.Chdir(t.TempDir())
 
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")

@@ -160,7 +160,10 @@ func TestEnsureRefineryRunningSafetyStoppedDoesNotSpawn(t *testing.T) {
 	townRoot := t.TempDir()
 	writeDaemonTownFile(t, townRoot, "mayor/town.json", `{"name":"test"}`)
 	writeDaemonTownFile(t, townRoot, ".beads/metadata.json", `{"prefix":"hq"}`)
-	writeDaemonTownFile(t, townRoot, "events/refinery/pending.event", "{}")
+	// Rig-scoped: the spawn gate reads this rig's channel, so a flat event
+	// here would leave the gate seeing an empty queue and skipping early,
+	// short-circuiting the check this test is actually about.
+	writeDaemonTownFile(t, townRoot, "events/testrig/refinery/pending.event", "{}")
 	if err := os.MkdirAll(filepath.Join(townRoot, "testrig"), 0o755); err != nil {
 		t.Fatalf("mkdir rig: %v", err)
 	}
@@ -192,7 +195,10 @@ func TestEnsureRefineryRunningForkRigDoesNotSpawn(t *testing.T) {
 		t.Skip("mock tmux script uses POSIX shell")
 	}
 	townRoot := t.TempDir()
-	writeDaemonTownFile(t, townRoot, "events/refinery/pending.event", "{}")
+	// Rig-scoped: the spawn gate reads this rig's channel, so a flat event
+	// here would leave the gate seeing an empty queue and skipping early,
+	// short-circuiting the check this test is actually about.
+	writeDaemonTownFile(t, townRoot, "events/testrig/refinery/pending.event", "{}")
 	writeDaemonTownFile(t, townRoot, "testrig/config.json", `{"upstream_url":"https://github.com/upstream/repo","beads":{"prefix":"gt"}}`)
 
 	binDir := t.TempDir()
@@ -819,16 +825,25 @@ func TestIsRunningFromPID_LiveProcess(t *testing.T) {
 	}
 }
 
-func TestHasPendingEvents_EmptyDir(t *testing.T) {
-	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
-	if err := os.MkdirAll(eventDir, 0755); err != nil {
+// rigEventDir creates and returns the event directory for a rig's channel.
+// Channels are rig-scoped, so the refinery channel lives one level deeper than
+// the flat events/<channel> layout this gate originally read.
+func rigEventDir(t *testing.T, townRoot, rigName, channel string) string {
+	t.Helper()
+	dir := filepath.Join(townRoot, "events", rigName, channel)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	return dir
+}
+
+func TestHasPendingEvents_EmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigEventDir(t, tmpDir, "gastown", "refinery")
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false for empty event directory")
 	}
 }
@@ -838,17 +853,14 @@ func TestHasPendingEvents_MissingDir(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when event directory doesn't exist")
 	}
 }
 
 func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
-	if err := os.MkdirAll(eventDir, 0755); err != nil {
-		t.Fatal(err)
-	}
+	eventDir := rigEventDir(t, tmpDir, "gastown", "refinery")
 
 	// Create an event file
 	eventFile := filepath.Join(eventDir, "1234567890-1-12345.event")
@@ -858,17 +870,14 @@ func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected true when .event files exist")
 	}
 }
 
 func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
-	if err := os.MkdirAll(eventDir, 0755); err != nil {
-		t.Fatal(err)
-	}
+	eventDir := rigEventDir(t, tmpDir, "gastown", "refinery")
 
 	// Create a non-event file (e.g., .tmp or .lock)
 	if err := os.WriteFile(filepath.Join(eventDir, "temp.lock"), []byte{}, 0644); err != nil {
@@ -877,8 +886,49 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when only non-.event files exist")
+	}
+}
+
+// TestHasPendingEvents_RigIsolation verifies the spawn gate reads only the
+// named rig's channel. The gate runs once per rig, so a town-global read would
+// let one rig's MQ_SUBMIT spawn a Claude session for every other rig — sessions
+// that then find an empty queue and go straight back to sleep, having burned
+// API credits for nothing.
+func TestHasPendingEvents_RigIsolation(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventDir := rigEventDir(t, tmpDir, "gastown", "refinery")
+	rigEventDir(t, tmpDir, "beads", "refinery")
+
+	eventFile := filepath.Join(eventDir, "1234567890-1-12345.event")
+	if err := os.WriteFile(eventFile, []byte(`{"type":"MQ_SUBMIT"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if !d.hasPendingEvents("gastown", "refinery") {
+		t.Error("gastown has a pending event and should be spawned")
+	}
+	if d.hasPendingEvents("beads", "refinery") {
+		t.Error("beads has no pending events; gastown's event must not spawn its refinery")
+	}
+}
+
+// TestHasPendingEvents_UnresolvableChannel verifies the gate treats a channel
+// it cannot resolve as "nothing pending" rather than spawning an agent. An
+// empty rig name on a rig-scoped channel is unresolvable by design: falling
+// back to the flat path would reintroduce the shared directory.
+func TestHasPendingEvents_UnresolvableChannel(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if d.hasPendingEvents("", "refinery") {
+		t.Error("expected false when the rig is unknown")
+	}
+	if d.hasPendingEvents("gastown", "../escape") {
+		t.Error("expected false for an invalid channel name")
 	}
 }
 

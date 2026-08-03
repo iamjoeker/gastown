@@ -10,11 +10,28 @@ import (
 	"github.com/steveyegge/gastown/internal/channelevents"
 )
 
+// testEmitRig names the rig used by the emit tests below. "test-channel" is not
+// a town-scoped channel, so it is rig-scoped and needs one.
+const testEmitRig = "testrig"
+
+// allowTestEmit opts a single test in to real event emission.
+//
+// channelevents.emit refuses to write under `go test` unless this is set. That
+// backstop exists because of this very package: a test here once reached a live
+// emit and woke every refinery in the town. Set it only in a test that emits
+// exclusively to a t.TempDir() town root, as the ones below do.
+func allowTestEmit(t *testing.T) {
+	t.Helper()
+	t.Setenv(channelevents.AllowTestEmitEnv, "1")
+}
+
 func TestEmitEvent(t *testing.T) {
+	allowTestEmit(t)
+
 	t.Run("basic event creation", func(t *testing.T) {
 		townRoot := t.TempDir()
 
-		path, err := channelevents.EmitToTown(townRoot, "test-channel", "MERGE_READY", []string{"polecat=nux", "branch=feat/test"})
+		path, err := channelevents.EmitToRig(townRoot, testEmitRig, "test-channel", "MERGE_READY", []string{"polecat=nux", "branch=feat/test"})
 		if err != nil {
 			t.Fatalf("EmitEvent failed: %v", err)
 		}
@@ -56,7 +73,7 @@ func TestEmitEvent(t *testing.T) {
 
 	t.Run("empty payload", func(t *testing.T) {
 		townRoot := t.TempDir()
-		path, err := channelevents.EmitToTown(townRoot, "test-channel", "PATROL_WAKE", nil)
+		path, err := channelevents.EmitToRig(townRoot, testEmitRig, "test-channel", "PATROL_WAKE", nil)
 		if err != nil {
 			t.Fatalf("EmitEvent failed: %v", err)
 		}
@@ -87,7 +104,7 @@ func TestEmitEvent(t *testing.T) {
 		townRoot := t.TempDir()
 		paths := make(map[string]bool)
 		for i := 0; i < 5; i++ {
-			path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", nil)
+			path, err := channelevents.EmitToRig(townRoot, testEmitRig, "test-channel", "TEST", nil)
 			if err != nil {
 				t.Fatalf("EmitEvent failed on iteration %d: %v", i, err)
 			}
@@ -100,7 +117,7 @@ func TestEmitEvent(t *testing.T) {
 
 	t.Run("malformed payload pair ignored", func(t *testing.T) {
 		townRoot := t.TempDir()
-		path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", []string{"valid=yes", "no-equals-sign"})
+		path, err := channelevents.EmitToRig(townRoot, testEmitRig, "test-channel", "TEST", []string{"valid=yes", "no-equals-sign"})
 		if err != nil {
 			t.Fatalf("EmitEvent failed: %v", err)
 		}
@@ -124,36 +141,55 @@ func TestEmitEvent(t *testing.T) {
 }
 
 func TestEmitEventChannelValidation(t *testing.T) {
+	allowTestEmit(t)
 	townRoot := t.TempDir()
 
+	// Channel names become path segments, so they are validated before use.
+	// EmitToRig is the rig-scoped entry point; EmitToTown would reject all of
+	// these on scope alone and never reach the name check.
+
 	// Valid channel name should succeed
-	_, err := channelevents.EmitToTown(townRoot, "valid-channel", "TEST", nil)
+	_, err := channelevents.EmitToRig(townRoot, testEmitRig, "valid-channel", "TEST", nil)
 	if err != nil {
 		t.Errorf("valid channel name rejected: %v", err)
 	}
 
 	// Path traversal should be rejected
-	_, err = channelevents.EmitToTown(townRoot, "../etc", "TEST", nil)
+	_, err = channelevents.EmitToRig(townRoot, testEmitRig, "../etc", "TEST", nil)
 	if err == nil {
 		t.Error("expected error for path traversal channel name, got nil")
 	}
 
 	// Slash in channel should be rejected
-	_, err = channelevents.EmitToTown(townRoot, "foo/bar", "TEST", nil)
+	_, err = channelevents.EmitToRig(townRoot, testEmitRig, "foo/bar", "TEST", nil)
 	if err == nil {
 		t.Error("expected error for channel with slash, got nil")
 	}
 
 	// Empty channel should be rejected
-	_, err = channelevents.EmitToTown(townRoot, "", "TEST", nil)
+	_, err = channelevents.EmitToRig(townRoot, testEmitRig, "", "TEST", nil)
 	if err == nil {
 		t.Error("expected error for empty channel name, got nil")
+	}
+
+	// A rig name is a path segment too, and gets the same treatment.
+	_, err = channelevents.EmitToRig(townRoot, "../etc", "valid-channel", "TEST", nil)
+	if err == nil {
+		t.Error("expected error for path traversal rig name, got nil")
+	}
+
+	// A rig-scoped channel with no rig must fail rather than silently falling
+	// back to the flat path — that fallback is the collision being prevented.
+	_, err = channelevents.EmitToRig(townRoot, "", "valid-channel", "TEST", nil)
+	if err == nil {
+		t.Error("expected error for rig-scoped channel with empty rig, got nil")
 	}
 }
 
 func TestEmitEventPIDInFilename(t *testing.T) {
+	allowTestEmit(t)
 	townRoot := t.TempDir()
-	path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", nil)
+	path, err := channelevents.EmitToRig(townRoot, testEmitRig, "test-channel", "TEST", nil)
 	if err != nil {
 		t.Fatalf("emit failed: %v", err)
 	}
