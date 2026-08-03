@@ -160,7 +160,7 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	var beadsDir string
 	if awaitEventAgentBead != "" {
 		var wdErr error
-		beadsDir, wdErr = resolveAgentStateBeadsDir(awaitEventAgentBead)
+		beadsDir, wdErr = resolveAgentTrackingBeadsDir()
 		if wdErr == nil {
 			labels, labErr := getAgentLabels(awaitEventAgentBead, beadsDir)
 			if labErr != nil {
