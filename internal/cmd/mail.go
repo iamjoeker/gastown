@@ -50,6 +50,7 @@ var (
 	// Archive flags
 	mailArchiveStale  bool
 	mailArchiveDryRun bool
+	mailArchiveForce  bool
 )
 
 var mailCmd = &cobra.Command{
@@ -519,6 +520,7 @@ func init() {
 	// Archive flags
 	mailArchiveCmd.Flags().BoolVar(&mailArchiveStale, "stale", false, "Archive messages sent before session start")
 	mailArchiveCmd.Flags().BoolVarP(&mailArchiveDryRun, "dry-run", "n", false, "Show what would be archived without archiving")
+	mailArchiveCmd.Flags().BoolVar(&mailArchiveForce, "force", false, "Archive even if the bead's assignee does not match the acting identity")
 
 	// Add subcommands
 	mailCmd.AddCommand(mailSendCmd)
