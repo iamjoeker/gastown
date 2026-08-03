@@ -801,11 +801,7 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 	if hbStatus != nil {
 		fmt.Println()
 		ageDur := time.Duration(hbStatus.AgeSec * float64(time.Second))
-		// Label the counter explicitly. The Deacon's patrol reports carry their
-		// own, separate "cycle N" sequence, and the two sit in the same numeric
-		// range — an unqualified "cycle N" here was read as the patrol counter
-		// and produced a wrong report of patrol-cycle inflation.
-		fmt.Printf("  Heartbeat: %s ago (heartbeat cycle %d)\n",
+		fmt.Printf("  Heartbeat: %s ago (cycle %d)\n",
 			ageDur.Round(time.Second), hbStatus.Cycle)
 		if hbStatus.LastAction != "" {
 			fmt.Printf("  Last action: %s\n", hbStatus.LastAction)
