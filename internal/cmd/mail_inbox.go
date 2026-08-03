@@ -223,7 +223,9 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s %s%s%s\n\n", style.Bold.Render("Subject:"), msg.Subject, typeStr, priorityStr)
 	fmt.Printf("From: %s\n", msg.From)
 	fmt.Printf("To: %s\n", msg.To)
-	fmt.Printf("Date: %s\n", msg.Timestamp.Local().Format("2006-01-02 15:04:05"))
+	// Zone label: mail renders local time while bd renders UTC. Correlating the
+	// two is routine and the offset was silently carried as an error.
+	fmt.Printf("Date: %s\n", msg.Timestamp.Local().Format("2006-01-02 15:04:05 MST"))
 	fmt.Printf("ID: %s\n", style.Dim.Render(msg.ID))
 
 	if msg.ThreadID != "" {
@@ -342,6 +344,11 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// --force is forwarded to the underlying `bd close`. bd refuses to close a
+	// bead whose assignee does not match the acting identity and advises using
+	// --force; before this flag existed that advice was unreachable from here.
+	mailbox.SetForceClose(mailArchiveForce)
 
 	if mailArchiveStale {
 		if len(args) > 0 {

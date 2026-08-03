@@ -45,6 +45,28 @@ type Mailbox struct {
 	// methods bypass the bd subprocess and use the store directly.
 	// Callers are responsible for closing the store.
 	store beadsdk.Storage
+
+	// forceClose adds --force to the underlying `bd close`.
+	//
+	// bd refuses to close a bead whose assignee does not match the acting
+	// identity, and its error tells the operator to "use --force". Until this
+	// existed, gt surfaced that advice while offering no way to act on it: the
+	// suggested remedy was unreachable from the command that suggested it.
+	//
+	// That is reachable in normal operation because agent addressing is not
+	// canonical — mail may be delivered to one form of an agent's address while
+	// the agent acts under another, so an agent can be unable to archive its
+	// own mail. See SetForceClose.
+	forceClose bool
+}
+
+// SetForceClose makes subsequent close operations pass --force to bd.
+//
+// Intended for `gt mail archive --force`, where the operator has decided to
+// archive their own mail despite an assignee/actor mismatch. It does not
+// suppress any other error.
+func (m *Mailbox) SetForceClose(force bool) {
+	m.forceClose = force
 }
 
 // NewMailbox creates a mailbox for the given JSONL path (legacy mode).
@@ -601,6 +623,9 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 	// Pass session ID for work attribution if available
 	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
 		args = append(args, "--session="+sessionID)
+	}
+	if m.forceClose {
+		args = append(args, "--force")
 	}
 
 	ctx, cancel := bdWriteCtx()
