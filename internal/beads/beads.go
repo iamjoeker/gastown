@@ -948,7 +948,9 @@ func (b *Beads) buildRunEnv() []string {
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
 			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
-		return SuppressBDSideEffects(env)
+		// run() pins BEADS_DIR in isolated mode too, so the same role-routing
+		// guarantee has to hold here (gt-2ta).
+		return withProjectBeadsRole(SuppressBDSideEffects(env))
 	}
 	// runWithStdin appends BEADS_DIR after probing bd --allow-stale support, so
 	// keep buildRunEnv focused on Dolt target isolation and avoid duplicate
@@ -1319,7 +1321,15 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by",
 		labelFilter, statusFilter)
 
+	// The wisps table is the ONLY source of MR beads: the bd list half above
+	// runs with Ephemeral=false and so never returns them. If this query fails
+	// we must not report an empty queue — a silently-empty merge queue reads as
+	// "nothing to merge" and strands every polecat's work (gt-2ta). Degrade only
+	// for installs whose bd predates the wisps table.
 	sqlOut, sqlErr := b.run("sql", "--json", query)
+	if sqlErr != nil && !isMissingWispsTableErr(sqlErr) {
+		return nil, fmt.Errorf("querying merge-request wisps: %w", sqlErr)
+	}
 	if sqlErr == nil && len(sqlOut) > 0 && isJSONBytes(sqlOut) {
 		var rows []struct {
 			ID          string `json:"id"`
@@ -1360,6 +1370,21 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 
 	issueResults = filterMergeRequestsByRig(issueResults, opts.Rig)
 	return b.hydrateMergeRequestDetails(issueResults)
+}
+
+// isMissingWispsTableErr reports whether a wisps query failed only because this
+// bd/database predates the wisps table. Those installs have no ephemeral MRs to
+// miss, so degrading to the issues-table results is safe. Any other SQL failure
+// is real and must surface.
+func isMissingWispsTableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "table not found") ||
+		strings.Contains(msg, "doesn't exist") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "unknown table")
 }
 
 func filterMergeRequestsByRig(issues []*Issue, rigName string) []*Issue {

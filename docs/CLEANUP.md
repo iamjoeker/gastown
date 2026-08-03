@@ -19,11 +19,12 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 | Command | What it does |
 |---------|-------------|
 | `gt polecat remove <rig>/<polecat>` | Removes polecat worktree/directory (fails if session running) |
-| `gt polecat nuke <rig>/<polecat>` | Nuclear: kills session, deletes worktree, deletes branch, closes bead |
-| `gt polecat nuke <rig> --all` | Nukes all polecats in a rig |
+| `gt polecat nuke <rig>/<polecat>` | Nuclear: kills session, deletes worktree, deletes branch, closes bead. **Human/Mayor only** — refuses a witness identity (restart-first policy, gt-dsgp) |
+| `gt polecat nuke <rig> --all` | Nukes all polecats in a rig (same identity restriction) |
 | `gt polecat gc <rig>` | GC stale polecat branches (orphaned, old timestamped) |
-| `gt polecat stale <rig>` | Detects stale polecats; `--cleanup` auto-nukes them |
-| `gt polecat check-recovery` | Pre-nuke safety check (SAFE_TO_NUKE vs NEEDS_RECOVERY) |
+| `gt polecat stale <rig>` | Detects stale polecats; `--cleanup` auto-nukes them (same identity restriction) |
+| `gt polecat check-recovery` | Reports whether work is at risk (SAFE_TO_NUKE vs NEEDS_RECOVERY) and what the witness may do about it (`witness_action`) |
+| `gt session restart <rig>/<polecat>` | How the **witness** reclaims a slot — preserves worktree and branch |
 | `gt polecat identity remove <rig> <name>` | Removes a polecat identity |
 | `gt done` | Polecat self-cleaning: pushes branch, submits MR/PR path as configured, preserves handoff metadata, kills own session. MR skipped for `--status ESCALATED\|DEFERRED` or `no_merge` paths |
 
