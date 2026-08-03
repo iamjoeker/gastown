@@ -1087,6 +1087,21 @@
             text-decoration: underline;
         }
 
+        /* Merge-request identity and branch routing */
+        .mr-id {
+            font-family: monospace;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .mr-branches {
+            font-size: 0.7rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 220px;
+        }
+
         .pr-title {
             color: var(--text-secondary);
             max-width: 250px;
@@ -1992,6 +2007,16 @@
 
         .panel.expanded .tl-timeline {
             max-height: none;
+        }
+
+        /* Truncation notice — shown when a panel's data hit a fetch cap */
+        .truncation-notice {
+            margin: 0 0 8px;
+            padding: 6px 8px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border-left: 3px solid var(--yellow, #d4a017);
+            background: rgba(212, 160, 23, 0.08);
         }
 
         /* Empty state */
