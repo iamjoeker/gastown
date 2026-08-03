@@ -234,16 +234,14 @@
         const d = JSON.parse(output);
         return d.action !== "nuke";
 
-- description: "Dead session + clean git: restart to reclaim the slot"
+- description: "Dead session + clean git: safe to nuke"
   vars:
     role: witness
     role_context: >
-      You are the Witness. A dead session with clean git state (no uncommitted changes,
-      no unpushed commits) has no data at risk, so restart it — that reclaims the slot
-      and preserves the worktree and branch. You NEVER nuke; nuking requires a human
-      or Mayor (restart-first policy, gt-dsgp).
+      You are the Witness. Dead session with clean git state (no uncommitted changes,
+      no unpushed commits) is safe to nuke. No data loss risk.
     formula_step: survey-workers
-    allowed_actions: '["no-op", "nudge", "escalate", "restart", "nuke", "mark-zombie", "create-cleanup-wisp"]'
+    allowed_actions: '["no-op", "nudge", "escalate", "nuke", "mark-zombie", "create-cleanup-wisp"]'
     shell_output: |
       $ tmux has-session -t bd-polecat-Nutmeg 2>/dev/null; echo $?
       1
@@ -261,11 +259,7 @@
     - type: javascript
       value: |
         const d = JSON.parse(output);
-        return d.action === "restart";
-    - type: javascript
-      value: |
-        const d = JSON.parse(output);
-        return d.action !== "nuke";
+        return d.action === "nuke";
 
 - description: "Edge: long-running build command (not stuck)"
   vars:
