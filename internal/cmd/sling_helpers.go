@@ -930,22 +930,20 @@ func wakeRigAgents(rigName string) {
 func nudgeWitness(rigName, message string) {
 	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 
-	// Test hook: log nudge for test observability
-	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
-		entry := fmt.Sprintf("nudge:%s:%s\n", witnessSession, message)
-		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			_, _ = f.WriteString(entry)
-			_ = f.Close()
-		}
-		return // Don't actually nudge tmux in tests
+	// Test hook: log nudge for test observability. Returns before both the
+	// event emit and the tmux nudge — a unit test must never emit a real town
+	// event or poke a live session.
+	if logPath, inTest := testNudgeHook(); inTest {
+		writeTestNudgeLog(logPath, fmt.Sprintf("nudge:%s:%s\n", witnessSession, message))
+		return
 	}
 
 	// Emit a file event so the witness's await-event unblocks instantly.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", []string{
+		_, _ = channelevents.EmitToRig(townRoot, rigName, "witness", "POLECAT_DONE", []string{
 			"source=polecat",
+			"rig=" + rigName,
 			"message=" + message,
 		})
 	}
@@ -964,23 +962,22 @@ func nudgeWitness(rigName, message string) {
 func nudgeRefinery(rigName, message string) {
 	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 
-	// Test hook: log nudge for test observability (same pattern as GT_TEST_ATTACHED_MOLECULE_LOG)
-	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
-		entry := fmt.Sprintf("nudge:%s:%s\n", refinerySession, message)
-		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			_, _ = f.WriteString(entry)
-			_ = f.Close()
-		}
-		return // Don't actually nudge tmux in tests
+	// Test hook: log nudge for test observability (same pattern as
+	// GT_TEST_ATTACHED_MOLECULE_LOG). Returns before both the event emit and
+	// the tmux nudge — this is the exact path that used to leak real MQ_SUBMIT
+	// events into the town on every test run.
+	if logPath, inTest := testNudgeHook(); inTest {
+		writeTestNudgeLog(logPath, fmt.Sprintf("nudge:%s:%s\n", refinerySession, message))
+		return
 	}
 
 	// Emit a file event so the refinery's await-event unblocks instantly.
 	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+		_, _ = channelevents.EmitToRig(townRoot, rigName, "refinery", "MQ_SUBMIT", []string{
 			"source=sling",
+			"rig=" + rigName,
 			"message=" + message,
 		})
 	}
