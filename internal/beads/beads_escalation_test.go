@@ -325,15 +325,50 @@ func TestEscalationFieldsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestFilterEscalationRecordsSkipsMailMessages verifies that when both the
+// tracking bead AND its mail-notification echo are present in a query
+// result, the echo (which duplicates the tracking bead's escalation) is
+// dropped. The echo is identified as referencing the tracking bead via an
+// "escalation:<id>" label, matching what mail.Router.buildLabels actually
+// stamps on escalation-type mail (see TestRouterSendEscalationAddsStructuredLabels
+// in internal/mail).
 func TestFilterEscalationRecordsSkipsMailMessages(t *testing.T) {
 	issues := []*Issue{
 		{ID: "hq-root", Labels: []string{"gt:escalation"}},
-		{ID: "hq-mail", Labels: []string{"gt:escalation", "gt:message"}},
+		{ID: "hq-mail", Labels: []string{"gt:escalation", "gt:message", "escalation:hq-root"}},
 	}
 
 	got := filterEscalationRecords(issues)
 	if len(got) != 1 || got[0].ID != "hq-root" {
 		t.Fatalf("filterEscalationRecords() = %#v, want only root escalation", got)
+	}
+}
+
+// TestFilterEscalationRecordsKeepsOrphanedMailEcho is the regression test for
+// gt-nhp: `gt escalate list` reported "No escalations found" while ~21 open
+// escalation beads existed.
+//
+// Root cause: CreateEscalationBead creates the tracking bead as an ephemeral
+// wisp (--ephemeral --wisp-type=escalation). By the time `gt escalate list`
+// runs, that tracking bead is routinely gone (expired/promoted/GC'd — tracked
+// separately). All that remains is the mail-notification echo, which
+// mail.Router.buildLabels intentionally tags with BOTH "gt:escalation" and
+// "gt:message". The old filterEscalationRecords dropped every gt:message
+// entry unconditionally, so once every tracking bead had aged out, the list
+// path returned nothing even though the escalations themselves were still
+// open and directly showable via `bd show <id>`.
+//
+// filterEscalationRecords must only drop a gt:message-labeled entry when the
+// tracking bead it references is ALSO present in the batch; otherwise the
+// echo is the sole surviving record and must be kept.
+func TestFilterEscalationRecordsKeepsOrphanedMailEcho(t *testing.T) {
+	issues := []*Issue{
+		{ID: "hq-echo", Labels: []string{"gt:escalation", "gt:message", "escalation:hq-wisp-gone"}},
+	}
+
+	got := filterEscalationRecords(issues)
+	if len(got) != 1 || got[0].ID != "hq-echo" {
+		t.Fatalf("filterEscalationRecords() = %#v, want the orphaned mail echo kept", got)
 	}
 }
 

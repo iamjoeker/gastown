@@ -357,15 +357,59 @@ func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
 	return filterEscalationRecords(issues), nil
 }
 
+// filterEscalationRecords removes duplicate representations of the same
+// escalation from a `--label=gt:escalation` query result.
+//
+// An escalation can be represented by up to two beads:
+//  1. The tracking bead created by CreateEscalationBead (label: gt:escalation
+//     only).
+//  2. The mail notification sent to its routing target. mail.Router.buildLabels
+//     intentionally stamps escalation-type mail with BOTH "gt:escalation" and
+//     "gt:message" (see TestRouterSendEscalationAddsStructuredLabels), tagged
+//     with "escalation:<tracking-bead-id>" pointing back at bead #1, so that
+//     mail search can also find escalation traffic.
+//
+// When both beads are present in the query result, bead #2 is a duplicate of
+// #1 and should be skipped. But in practice the tracking bead is an ephemeral
+// wisp (gt-nhp investigation: CreateEscalationBead passes --ephemeral
+// --wisp-type=escalation) and is routinely gone by the time `gt escalate
+// list` runs — expired, promoted under a new ID, or GC'd (tracked
+// separately). When the tracking bead it references is absent, the mail
+// echo is the ONLY surviving record of the escalation, so it must be kept.
+// Unconditionally dropping every gt:message-labeled entry (the previous
+// behavior) discarded every escalation whose tracking bead had aged out —
+// which in this town is effectively all of them.
 func filterEscalationRecords(issues []*Issue) []*Issue {
+	trackingIDs := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		if !HasLabel(issue, "gt:message") {
+			trackingIDs[issue.ID] = true
+		}
+	}
+
 	filtered := issues[:0]
 	for _, issue := range issues {
 		if HasLabel(issue, "gt:message") {
-			continue
+			if ref := escalationRefLabel(issue); ref != "" && trackingIDs[ref] {
+				// The tracking bead this mail echoes is also in the result
+				// set — skip the echo to avoid showing the escalation twice.
+				continue
+			}
 		}
 		filtered = append(filtered, issue)
 	}
 	return filtered
+}
+
+// escalationRefLabel returns the tracking-bead ID referenced by an
+// "escalation:<id>" label, or "" if the issue carries no such label.
+func escalationRefLabel(issue *Issue) string {
+	for _, l := range issue.Labels {
+		if id, ok := strings.CutPrefix(l, "escalation:"); ok {
+			return id
+		}
+	}
+	return ""
 }
 
 // ListStaleEscalations returns escalations older than the given threshold.
