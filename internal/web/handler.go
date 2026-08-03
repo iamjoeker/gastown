@@ -22,7 +22,7 @@ var staticFiles embed.FS
 // ConvoyFetcher defines the interface for fetching convoy data.
 type ConvoyFetcher interface {
 	FetchConvoys() ([]ConvoyRow, error)
-	FetchMergeQueue() ([]MergeQueueRow, error)
+	FetchMergeQueue() (MergeQueueResult, error)
 	FetchWorkers() ([]WorkerRow, error)
 	FetchMail() ([]MailRow, error)
 	FetchRigs() ([]RigRow, error)
@@ -190,7 +190,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 
 	var (
 		convoys     []ConvoyRow
-		mergeQueue  []MergeQueueRow
+		mergeQueue  MergeQueueResult
 		workers     []WorkerRow
 		mail        []MailRow
 		rigs        []RigRow
@@ -343,23 +343,24 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	summary := computeSummary(workers, hooks, issues, convoys, escalations, activity)
 
 	data := ConvoyData{
-		Convoys:     convoys,
-		MergeQueue:  mergeQueue,
-		Workers:     workers,
-		Mail:        mail,
-		Rigs:        rigs,
-		Dogs:        dogs,
-		Escalations: escalations,
-		Health:      health,
-		Queues:      queues,
-		Sessions:    sessions,
-		Hooks:       hooks,
-		Mayor:       mayor,
-		Issues:      enrichIssuesWithAssignees(issues, hooks),
-		Activity:    activity,
-		Summary:     summary,
-		Expand:      expandPanel,
-		CSRFToken:   h.csrfToken,
+		Convoys:              convoys,
+		MergeQueue:           mergeQueue.Rows,
+		MergeQueueFailedRigs: mergeQueue.FailedRigs,
+		Workers:              workers,
+		Mail:                 mail,
+		Rigs:                 rigs,
+		Dogs:                 dogs,
+		Escalations:          escalations,
+		Health:               health,
+		Queues:               queues,
+		Sessions:             sessions,
+		Hooks:                hooks,
+		Mayor:                mayor,
+		Issues:               enrichIssuesWithAssignees(issues, hooks),
+		Activity:             activity,
+		Summary:              summary,
+		Expand:               expandPanel,
+		CSRFToken:            h.csrfToken,
 	}
 
 	var buf bytes.Buffer
