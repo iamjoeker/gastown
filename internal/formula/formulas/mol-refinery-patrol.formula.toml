@@ -187,15 +187,15 @@ default = "gt"
 id = "inbox-check"
 title = "Check refinery mail"
 description = """
-First, clean up CLOSED wisps from previous cycles:
+🚨 **WISP GC IS SUSPENDED — run NO variant of `bd mol wisp gc`, and do not reconstruct one from memory.** There is deliberately no command in this step.
 ```bash
-bd mol wisp gc --closed --force
+# wisp GC SUSPENDED (bd-czf): --closed --force destroys closed-but-unmerged MR beads
 ```
 
 🚨 **NEVER run `bd mol wisp gc --age`.** It has NO ownership filter and deletes
 any OPEN wisp older than the age window, including other agents' merge requests.
 MR beads are open wisps, so an age GC silently destroys pending merges town-wide.
-Only `--closed` is safe: closed wisps are done. Report stale open wisps to the
+NEITHER variant is safe. `--closed --force` purges ALL closed wisps with NO age threshold, and a merge-request wisp CLOSED WITHOUT MERGING is the only record of UNLANDED work. This contradicts an experimentally verified finding already in mol-deacon-patrol (2026-08-02). Run NO wisp gc until bd-czf lands; use deacon/preserve-then-gc.sh, which digests before deleting. Report stale open wisps to the
 reaper Dog instead of GC-ing them.
 
 Then check mail for MERGE_READY submissions, escalations, and messages.
