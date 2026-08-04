@@ -502,13 +502,7 @@ func outputAuditText(entries []AuditEntry) error {
 			currentDate = date
 		}
 
-		// Label the zone. Feed renders local time while bd renders UTC, and
-		// neither said so — correlating a feed line against a bead timestamp is
-		// a routine operation here and silently carried the UTC offset as an
-		// error. Observed cost: a prediction stated in UTC, compared against a
-		// local feed timestamp, read as 11 minutes overdue when it was 11
-		// minutes away, and was nearly recorded as a failed test.
-		timeStr := e.Timestamp.Format("15:04:05 MST")
+		timeStr := e.Timestamp.Format("15:04:05")
 		sourceStr := formatSource(e.Source)
 		typeStr := formatType(e.Type)
 
