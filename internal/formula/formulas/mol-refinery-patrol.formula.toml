@@ -195,7 +195,7 @@ description = """
 🚨 **NEVER run `bd mol wisp gc --age`.** It has NO ownership filter and deletes
 any OPEN wisp older than the age window, including other agents' merge requests.
 MR beads are open wisps, so an age GC silently destroys pending merges town-wide.
-NEITHER variant is safe. `--closed --force` purges ALL closed wisps with NO age threshold, and a merge-request wisp CLOSED WITHOUT MERGING is the only record of UNLANDED work. This contradicts an experimentally verified finding already in mol-deacon-patrol (2026-08-02). Run NO wisp gc until bd-czf lands; use deacon/preserve-then-gc.sh, which digests before deleting. Report stale open wisps to the
+NEITHER variant is safe. `--closed --force` purges ALL closed wisps with NO age threshold, and a merge-request wisp CLOSED WITHOUT MERGING is the only record of UNLANDED work. This contradicts an experimentally verified finding already in mol-deacon-patrol (2026-08-02). Run NO wisp gc until bd-czf lands, and do NOT reach for deacon/preserve-then-gc.sh either: that wrapper still DELETES, and the Deacon is exempt only because its scope is the hq database (21145/21145 hq- rows) where no merge-request beads live. YOUR scope is a rig database, which is exactly where MR beads live — running it here reproduces the bd-wisp-0yx loss with a digest as consolation. Report stale open wisps to the
 reaper Dog instead of GC-ing them.
 
 Then check mail for MERGE_READY submissions, escalations, and messages.
