@@ -328,12 +328,31 @@ func TestEscalationFieldsRoundTrip(t *testing.T) {
 func TestFilterEscalationRecordsSkipsMailMessages(t *testing.T) {
 	issues := []*Issue{
 		{ID: "hq-root", Labels: []string{"gt:escalation"}},
-		{ID: "hq-mail", Labels: []string{"gt:escalation", "gt:message"}},
+		{ID: "hq-mail", Labels: []string{"gt:message"}},
 	}
 
 	got := filterEscalationRecords(issues)
 	if len(got) != 1 || got[0].ID != "hq-root" {
 		t.Fatalf("filterEscalationRecords() = %#v, want only root escalation", got)
+	}
+}
+
+// Regression for hq-q0lc. `gt escalate` delivers an escalation AS mail, so the root
+// bead carries BOTH gt:escalation and gt:message — 74 of 74 escalation beads in the
+// hq store look like this, and none has the bare gt:escalation shape the original
+// fixture used. Filtering on gt:message alone therefore dropped every escalation and
+// `gt escalate list` always printed "No escalations found" while the queue held 13
+// open, 12 of them HIGH. The old test passed under the bug because it only ever
+// constructed the one shape production never produces.
+func TestFilterEscalationRecordsKeepsEscalationsDeliveredAsMail(t *testing.T) {
+	issues := []*Issue{
+		{ID: "hq-real", Labels: []string{"gt:escalation", "gt:message"}},
+		{ID: "hq-mail-only", Labels: []string{"gt:message"}},
+	}
+
+	got := filterEscalationRecords(issues)
+	if len(got) != 1 || got[0].ID != "hq-real" {
+		t.Fatalf("filterEscalationRecords() = %#v, want the escalation that was delivered as mail", got)
 	}
 }
 
