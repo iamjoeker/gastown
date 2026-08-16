@@ -189,10 +189,20 @@ func isRoleCommand(cmd *cobra.Command) bool {
 	return false
 }
 
+// isDoneCommand reports whether cmd belongs to the top-level `gt done` tree.
+//
+// The match is on the command PATH, not on the name alone. Other subcommands
+// are also named "done" — `gt dog done` is the one that bit us — and matching
+// the bare name anywhere up the parent chain made persistentPreRun apply
+// `gt done`'s polecat-worktree guard to them, so every `gt dog done` failed
+// with "gt done is for polecats only" for every actor, including the Mayor,
+// before runDogDone was ever entered (gt-p0q). Only a "done" whose parent is
+// the root command is the real one.
 func isDoneCommand(cmd *cobra.Command) bool {
 	for c := cmd; c != nil; c = c.Parent() {
 		if c.Name() == "done" {
-			return true
+			parent := c.Parent()
+			return parent == nil || !parent.HasParent()
 		}
 	}
 	return false
