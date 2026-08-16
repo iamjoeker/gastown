@@ -298,6 +298,32 @@ func TestIsDoneCommand(t *testing.T) {
 	}
 }
 
+// A subcommand that merely happens to be named "done" must NOT inherit
+// `gt done`'s polecat-worktree guard. Matching the bare name anywhere up the
+// parent chain made persistentPreRun reject every `gt dog done` with
+// "gt done is for polecats only" for every actor, so no dog could ever return
+// itself to idle (gt-p0q). The original test only ever constructed the
+// top-level "done" and the root, which is why this shipped.
+func TestIsDoneCommandIgnoresNestedDoneSubcommands(t *testing.T) {
+	root := &cobra.Command{Use: "gt"}
+	topLevelDone := &cobra.Command{Use: "done"}
+	dog := &cobra.Command{Use: "dog"}
+	dogDone := &cobra.Command{Use: "done"}
+	root.AddCommand(topLevelDone)
+	root.AddCommand(dog)
+	dog.AddCommand(dogDone)
+
+	if !isDoneCommand(topLevelDone) {
+		t.Fatal("gt done should still be detected")
+	}
+	if isDoneCommand(dogDone) {
+		t.Fatal("gt dog done must NOT be detected as gt done")
+	}
+	if isDoneCommand(dog) {
+		t.Fatal("gt dog must not be detected as gt done")
+	}
+}
+
 func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
 	townRoot, _ := setupDoneGuardWorktree(t, "nested", "shiny")
 	initDoneGuardGitRepo(t, townRoot)
