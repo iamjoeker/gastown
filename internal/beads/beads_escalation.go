@@ -357,10 +357,26 @@ func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
 	return filterEscalationRecords(issues), nil
 }
 
+// filterEscalationRecords drops mail-only beads that are not themselves escalations.
+//
+// It used to drop anything carrying "gt:message", on the assumption that a root
+// escalation and its mail copy could be told apart by that label. They cannot:
+// `gt escalate` delivers the escalation AS mail, so the root bead carries
+// "gt:message" too. Measured on the hq store (hq-q0lc): 74 of 74 escalation beads
+// carry "gt:message" and ZERO have the label-free "root" shape the old unit test
+// constructed. The old filter therefore discarded every escalation, always, and
+// `gt escalate list` could never return a non-empty result — while
+// `gt escalate list --all` looked fine because it bypasses this helper.
+//
+// Requiring the ABSENCE of "gt:escalation" keeps the original intent (a pure mail
+// message is not an escalation record) without depending on a label that does not
+// discriminate. Callers here already query --label=gt:escalation, so in practice
+// nothing is dropped; the guard remains meaningful for any caller passing a
+// broader set.
 func filterEscalationRecords(issues []*Issue) []*Issue {
 	filtered := issues[:0]
 	for _, issue := range issues {
-		if HasLabel(issue, "gt:message") {
+		if HasLabel(issue, "gt:message") && !HasLabel(issue, "gt:escalation") {
 			continue
 		}
 		filtered = append(filtered, issue)
