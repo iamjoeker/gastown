@@ -286,6 +286,104 @@ func TestConcurrentPolecatAdmissionReservationsDoNotExceedCap(t *testing.T) {
 	}
 }
 
+// A snapshot taken at max<=0 never counted anything: the per-disposition
+// fields are struct zero values, not zero counts. They must not reach the wire
+// as if they were measurements (gt-7yv).
+func TestCapacitySnapshotJSONOmitsUnmeasuredFieldsWhenAdmissionDisabled(t *testing.T) {
+	// Deliberately non-zero counters that a real max<=0 snapshot could never
+	// have produced — if any of them marshal, the guard is not doing its job.
+	data, err := json.Marshal(polecatCapacitySnapshot{
+		Max:             -1,
+		ActiveSessions:  3,
+		Working:         7,
+		RecoveryBlocked: 8,
+		ReusableIdle:    9,
+		PendingMR:       10,
+		Reservations:    11,
+		Free:            12,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"working", "recovery_blocked", "reusable_idle", "pending_mr", "reservations", "free"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("capacity JSON %s carries unmeasured field %q", data, key)
+		}
+	}
+	if got["measured"] != false {
+		t.Fatalf("capacity JSON %s: measured = %v, want false", data, got["measured"])
+	}
+	if got["admission"] != "disabled" {
+		t.Fatalf("capacity JSON %s: admission = %v, want disabled", data, got["admission"])
+	}
+	// max and active_sessions are the two fields that are genuinely measured.
+	if got["max"] != float64(-1) || got["active_sessions"] != float64(3) {
+		t.Fatalf("capacity JSON %s dropped a measured field", data)
+	}
+}
+
+func TestCapacitySnapshotJSONReportsMeasuredFieldsWhenAdmissionEnabled(t *testing.T) {
+	data, err := json.Marshal(polecatCapacitySnapshot{
+		Max:             4,
+		ActiveSessions:  3,
+		Working:         1,
+		RecoveryBlocked: 2,
+		ReusableIdle:    5,
+		PendingMR:       6,
+		Reservations:    1,
+		Free:            0,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := map[string]float64{
+		"max": 4, "working": 1, "recovery_blocked": 2, "reusable_idle": 5,
+		"pending_mr": 6, "reservations": 1, "free": 0, "active_sessions": 3,
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Fatalf("capacity JSON %s: %s = %v, want %v", data, key, got[key], value)
+		}
+	}
+	if got["measured"] != true || got["admission"] != "enabled" {
+		t.Fatalf("capacity JSON %s: measured/admission = %v/%v, want true/enabled", data, got["measured"], got["admission"])
+	}
+}
+
+// End-to-end over the real snapshot builder: a max<=0 town short-circuits, so
+// whatever it produces must marshal as unmeasured.
+func TestCapacitySnapshotForTownMarshalsUnmeasuredAtDirectDispatch(t *testing.T) {
+	townRoot := setupPolecatCapacityTestTown(t, -1)
+	snapshot, err := polecatCapacitySnapshotForTown(townRoot)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["measured"] != false || got["admission"] != "disabled" {
+		t.Fatalf("direct-dispatch capacity JSON = %s, want measured=false admission=disabled", data)
+	}
+	if _, ok := got["free"]; ok {
+		t.Fatalf("direct-dispatch capacity JSON = %s, want no free field", data)
+	}
+}
+
 func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 	tests := []struct {
 		name       string

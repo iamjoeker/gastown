@@ -35,6 +35,58 @@ No WITNESS_PING mail is sent. Witnesses observe the Deacon's last_activity
 timestamp instead, and only send an alert to the Mayor if the Deacon appears
 unresponsive (>5 minutes stale). This avoids heartbeat mail spam.
 
+## Verification Sweeps (gt-emm)
+
+**Any census you produce over working trees must be produced by a
+gitignore-blind traversal. A recursive `grep` is not one.**
+
+The agent shell shadows `grep` with `ugrep --ignore-files`, so every recursive
+search honors `.gitignore` — and the town gitignores `polecats/`, `mayor/`,
+`refinery/`, `crew/` and `deacon/dogs/`, which is where every checkout lives.
+Measured: `find` + per-file grep found 16 stale files where `grep -rl` over the
+same root found 0. The sweep did not merely miss some; it returned a perfect
+all-clear. A correct probe string delivered by a blind traversal still yields a
+false clean.
+
+The blindness is exactly correlated with risk: working clones are gitignored
+BECAUSE they are derived, and derived copies are where stale content lives.
+
+**Required for any "N found" or "clean" claim about a tree:**
+
+```bash
+scripts/town-sweep.sh -r "$GT_ROOT" -i '<glob>' '<pattern>'
+# or, by hand:
+find "$GT_ROOT" -type d -name .git -prune -o -type f -print0 \\
+  | xargs -0 grep -l -F -e '<pattern>' --
+```
+
+Exit code 2 from the script means coverage could not be guaranteed. Treat it as
+UNKNOWN, never as clean.
+
+**Report the traversal with the count.** A bare "0 found" is not a result — it is
+indistinguishable from a blind sweep. Include the tool, the number of files
+scanned, and the control outcome:
+
+```
+census: N files match '<pattern>' under <root>
+traversal: scripts/town-sweep.sh (gitignore-blind)   scanned: 767 files
+controls: --self-test 2 passed, 0 failed
+```
+
+**A count of zero deserves more scrutiny than a count of many** — zero is what
+the defect produces.
+
+**Controls must be planted INSIDE the ignored subtree.** A positive control that
+fires outside one validates the probe in a frame where the defect cannot appear,
+and certifies nothing. This has already happened here: a control was run, it
+fired, and it proved nothing, because the canary landed in a scratchpad outside
+any `.gitignore`. Use `scripts/town-sweep.sh --self-test`, which builds its
+fixture inside a gitignored subtree and also asserts the negative half (a
+gitignore-aware search MISSES the canary). Never plant a live canary inside
+another agent's sandbox.
+
+Full recipe: `docs/guides/verification-sweeps.md`.
+
 ## Abbreviated Patrol Mode (Idle Effort Tuning)
 
 When `await-signal` outputs `EFFORT: reduced`, run an ABBREVIATED patrol.
@@ -72,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -265,21 +317,81 @@ gt dolt kill-imposters 2>/dev/null || true
 
 **2. Stale test temp dirs**
 
-Glob `beads-test-dolt-*` and `beads-bd-tests-*` in TMPDIR. If the directory
-name contains a PID and that PID is dead, clean up.
+Find `beads-test-dolt-*` and `beads-bd-tests-*` directories in TMPDIR and remove
+only the ones PROVEN to be idle. This is an `rm -rf` path; it fails closed. Every
+check that cannot produce a positive "nothing is open here" answer REFUSES.
 
 ```bash
 TMPDIR="${TMPDIR:-/tmp}"
-for dir in "$TMPDIR"/beads-test-dolt-* "$TMPDIR"/beads-bd-tests-*; do
-  [ -d "$dir" ] || continue
-  # Extract PID from dir name if present, or check if any process has it open
-  # Use lsof to check if any process is using files in this dir
-  if ! lsof +D "$dir" >/dev/null 2>&1; then
+STALE_DIRS=0
+
+if ! command -v lsof >/dev/null 2>&1; then
+  # No lsof means no evidence. Missing evidence is not permission to delete.
+  echo "REFUSING all stale test dir cleanup: lsof not installed"
+else
+  while IFS= read -r dir; do
+    [ -d "$dir" ] || continue
+
+    # (a) Can WE walk the whole tree? If find cannot descend, lsof could not
+    #     either, and its silence means "I could not look", not "nothing open".
+    walk_err=$(find "$dir" -print 2>&1 >/dev/null)
+    if [ -n "$walk_err" ]; then
+      echo "REFUSING (cannot fully inspect): $dir"
+      continue
+    fi
+
+    # (b) lsof's STDOUT is the evidence. Its EXIT STATUS is not: on hosts with
+    #     docker nsfs/overlay mounts, `lsof +D` prints a can't-stat() warning and
+    #     exits non-zero on every run — including runs where it DID list live
+    #     handles. Testing the status deletes live data (gt-32z).
+    open_files=$(lsof +D "$dir" 2>/dev/null)
+    lsof_rc=$?
+    if [ -n "$open_files" ]; then
+      echo "REFUSING (live file handles): $dir"
+      continue
+    fi
+    # Empty output is only meaningful alongside lsof's "searched, found nothing"
+    # status (1). Anything else — 0 with no output, 127, a signal — is a broken
+    # check, not a clean bill of health.
+    if [ "$lsof_rc" -ne 1 ]; then
+      echo "REFUSING (lsof rc=$lsof_rc with no output, inconclusive): $dir"
+      continue
+    fi
+
     chmod -R u+w "$dir" 2>/dev/null
-    rm -rf "$dir" && echo "Cleaned stale test dir: $(basename "$dir")"
-  fi
-done
+    rm -rf "$dir" && { echo "Cleaned stale test dir: $(basename "$dir")"; STALE_DIRS=$((STALE_DIRS + 1)); }
+  done <<EOF
+$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'beads-test-dolt-*' 2>/dev/null
+  find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'beads-bd-tests-*' 2>/dev/null)
+EOF
+fi
+echo "stale_dirs=$STALE_DIRS"
 ```
+
+**WHY THIS GUARD IS SHAPED THIS WAY (gt-32z) — DO NOT SIMPLIFY IT.** The previous
+version was `if ! lsof +D "$dir" >/dev/null 2>&1; then rm -rf "$dir"; fi`, i.e.
+"delete when lsof exits non-zero". Measured on a host with docker mounts:
+
+```
+lsof +D <dir with 23 live handles on a running dolt server>   -> exit 1, correct STDOUT
+lsof +D <empty, nothing open>                                 -> exit 1, empty STDOUT
+lsof +D <directory we cannot read>                            -> exit 1, empty STDOUT
+lsof not installed                                            -> exit 127
+```
+
+Every failure mode exits non-zero, so the old test read every one of them as
+permission to `chmod -R u+w` and `rm -rf`. It failed OPEN into `rm -rf`, and it
+would have destroyed a live Dolt server's `.dolt/` — the exact unrecoverable
+corruption the town CLAUDE.md forbids — plus 1.6GB of a named polecat's in-flight
+P0 test fixtures.
+
+It never fired only because of a SECOND, unrelated bug: `for dir in A* B*` under
+zsh aborts the whole statement when `A*` matches nothing, so the loop ran zero
+iterations. Repairing the glob alone — the natural, obviously-correct-looking fix —
+would have armed the destruction on its first run. The `find` form above removes
+that dependency on shell glob semantics, which is why the guard had to be fixed in
+the same change. **Never restore an exit-status test here, and never re-add a bare
+glob `for` loop over these patterns.**
 
 **3. Stale PID/lock files**
 
@@ -353,7 +465,12 @@ If all counts are 0, log "Test pollution cleanup: clean" and move on.
 
 **Safety:**
 - NEVER kill this workspace's own legitimate dolt server (checked via data-dir)
-- NEVER remove dirs where lsof shows active file handles
+- NEVER remove dirs where lsof shows active file handles — and read lsof's
+  STDOUT, never its exit status, to decide that (gt-32z)
+- NEVER treat a check that could not run — missing tool, unreadable directory,
+  non-zero status from a tool that also warns about unrelated filesystems — as
+  permission to delete. Absence of a signal is not a clean bill of health.
+  Every such path must REFUSE and log why.
 - NEVER remove PID files where the PID is still alive
 - NEVER prune worktrees for dogs with live tmux sessions
 
@@ -1108,6 +1225,11 @@ Daily patrol digests preserve audit trail without per-cycle pollution.
 
 **Timing**: Run once per morning patrol cycle. The --yesterday flag ensures
 we don't try to digest today's incomplete data.
+
+**If the digest carries a content census over working trees** (stale copies,
+tripwire strings, "N files match"), the count must come from a gitignore-blind
+sweep and must be reported with its traversal and scanned-file count. See
+"Verification Sweeps" above. A bare "0 found" is not publishable.
 
 **Exit criteria:** Yesterday's patrol digests aggregated (or none to aggregate)."""
 
