@@ -139,6 +139,12 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 		"list",
 		"--json",
 		"--all", // Include closed beads too
+		// Receipts are created with --ephemeral, so bd classifies them as
+		// infrastructure beads and hides them from `bd list` unless asked.
+		// Without this the query returns [] even when the receipts exist,
+		// which makes `gt plugin history` report "No execution history" and
+		// leaves every cooldown gate permanently open.
+		"--include-infra",
 		"-l", "type:plugin-run",
 		"-l", fmt.Sprintf("plugin:%s", pluginName),
 	}
