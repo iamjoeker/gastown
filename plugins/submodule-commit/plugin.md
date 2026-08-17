@@ -16,12 +16,13 @@ timeout = "15m"
 notify_on_failure = true
 severity = "low"
 
-# Opt-in per rig via plugin frontmatter:
-# [plugin.submodule-commit]
-# enabled = true
-# commit_branch = "main"          # branch to commit on in each submodule
-# push_enabled = false            # push submodule commits (false = local only)
-# allowlist = []                  # empty = all submodules; ["path/to/sub"] = only those
+# Opt-in per rig via rig settings (settings/config.json), under "plugins":
+#   gt rig settings set <rig> plugins.submodule-commit.enabled true
+#   gt rig settings set <rig> plugins.submodule-commit.push_enabled true
+#   gt rig settings set <rig> plugins.submodule-commit.allowlist '["path/to/sub"]'
+# enabled       false = do nothing for this rig (the default)
+# push_enabled  push submodule commits (false = commit locally only)
+# allowlist     empty = all submodules; ["path/to/sub"] = only those
 +++
 
 # Submodule Commit
@@ -30,8 +31,11 @@ Auto-commits accumulated changes inside git submodules and updates the parent
 repo's submodule pointer. Polecats only operate on parent repo worktrees and
 have no commit mandate for submodule repos — this plugin fills that gap.
 
-**Opt-in only.** Rigs must enable this plugin in their `plugin.md` frontmatter.
-Current enabled rigs: `lilypad_chat` (3 Bitbucket submodules).
+**Opt-in only.** A rig does nothing here until it is enabled in rig settings:
+
+```bash
+gt rig settings set <rig> plugins.submodule-commit.enabled true
+```
 
 ## Step 1: Find opt-in rigs with submodules
 
@@ -108,14 +112,15 @@ TOTAL_PUSHED=0
 TOTAL_PARENT_UPDATED=0
 ERRORS=""
 
-for REPO_PATH in "${ENABLED_RIGS[@]}"; do
-  echo ""
-  echo "=== $REPO_PATH ==="
+for i in "${!ENABLED_RIGS[@]}"; do
+  REPO_PATH="${ENABLED_RIGS[$i]}"
+  RIG_NAME="${ENABLED_RIG_NAMES[$i]}"
 
-  RIG_NAME=$(basename "$REPO_PATH")
+  echo ""
+  echo "=== $RIG_NAME: $REPO_PATH ==="
 
   # Get plugin config
-  RIG_CONFIG=$(gt rig show "$RIG_NAME" --json 2>/dev/null | jq -r '.plugins["submodule-commit"] // {}' 2>/dev/null || echo "{}")
+  RIG_CONFIG=$(gt rig settings show "$RIG_NAME" 2>/dev/null | jq -r '.plugins["submodule-commit"] // {}' 2>/dev/null || echo "{}")
   COMMIT_BRANCH=$(echo "$RIG_CONFIG" | jq -r '.commit_branch // "main"')
   PUSH_ENABLED=$(echo "$RIG_CONFIG" | jq -r '.push_enabled // false')
   ALLOWLIST=$(echo "$RIG_CONFIG" | jq -r '.allowlist // [] | .[]' 2>/dev/null || true)
