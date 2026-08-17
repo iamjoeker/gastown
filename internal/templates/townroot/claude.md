@@ -75,6 +75,53 @@ creates nothing. **Default to nudge for routine agent-to-agent communication.**
 Only use mail when the message MUST survive the recipient's session death
 (handoffs, structured protocol messages, escalations). See `mail-protocol.md`.
 
+## Verification Sweeps — Recursive Search Is Blind Here (All Agents)
+
+**Never conclude "N found" or "clean" about a town or rig tree from a recursive
+`grep`.** The agent shell shadows `grep` with `ugrep --ignore-files`, so every
+recursive search honors `.gitignore` — and the town gitignores `polecats/`,
+`mayor/`, `refinery/`, `crew/` and `deacon/dogs/`, which is exactly where every
+working checkout lives.
+
+Measured on one machine, same pattern, same instant: `find` + per-file grep
+found **16** matching files where `grep -rl` over the same root found **0**. The
+sweep did not merely miss some — it returned a perfect all-clear, silently, and
+several agents repeated it. Getting the search pattern right is not enough; the
+traversal has to be right too.
+
+The blindness is exactly correlated with where risk lives: working clones are
+gitignored BECAUSE they are derived, and derived copies are where stale,
+divergent or pre-patch content accumulates.
+
+### Sweep like this instead
+
+```bash
+scripts/town-sweep.sh -r "$GT_ROOT" -i '*.toml' 'PATTERN'   # in the gastown repo
+```
+
+or by hand — `find` is not ignore-aware (the shell's `find` is bfs), and an
+explicit file list bypasses the ignore logic a second time:
+
+```bash
+find "$GT_ROOT" -type d -name .git -prune -o -type f -print0 \
+  | xargs -0 grep -l -F -e 'PATTERN' --
+```
+
+Searching a single explicit path is always safe. The Grep **tool** is not — it
+is ripgrep-backed and respects `.gitignore` by default.
+
+### Rules for reporting
+
+- Report the traversal and the number of files scanned alongside any count. A
+  bare "0 found" is indistinguishable from a blind sweep.
+- **A count of zero deserves more scrutiny than a count of many** — zero is what
+  the defect produces.
+- A positive control must be planted **inside** a gitignored subtree. One that
+  fires outside it validates your probe in a frame where the defect cannot
+  appear, and certifies nothing. Never plant one in another agent's live sandbox.
+
+Full recipe: `gastown/docs/guides/verification-sweeps.md`.
+
 ## Agent Memory
 
 **Use `{{cmd}} remember`, not MEMORY.md.** Memories are stored in beads and injected
