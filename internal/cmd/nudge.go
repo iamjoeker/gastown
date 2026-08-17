@@ -316,6 +316,18 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 //   - Session disappears: exit (nothing to deliver to).
 //   - Timeout: exit (queue stays for next input or watcher cycle).
 func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+	// Test hook, mirroring deliverNudge. Reaching this function from
+	// deliverNudge already implies the hook was absent — the check at the top of
+	// deliverNudge returns before the call at the end of wait-idle mode — but
+	// nudge_test.go calls watchAndDeliver directly, and a function that delivers
+	// keystrokes should not depend on its callers to decide whether that is
+	// safe. The enforcing check is in tmux.NudgeSessionWithOpts; this one keeps
+	// the polling and the queue drain from running at all.
+	if logPath, inTest := testNudgeHook(); inTest {
+		writeTestNudgeLog(logPath, fmt.Sprintf("watch:%s\n", sessionName))
+		return
+	}
+
 	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
 	deadline := time.Now().Add(idleWatcherTimeout)
 	for time.Now().Before(deadline) {
