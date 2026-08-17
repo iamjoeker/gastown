@@ -737,8 +737,21 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.priority > 1
 		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
+			-- gt:agent exempts AGENT BEADS: the town's per-role identity rows
+			-- (hq-mayor, bd-beads-witness, ...). gt agents resolve looks them up
+			-- by role and answers "no agent bead found" once one is CLOSED, which
+			-- halts mol-witness-patrol's loop-or-exit ("If it fails, STOP and
+			-- report") — so every witness/refinery respawning after a sweep walks
+			-- its own molecule into a halt.
+			--
+			-- Nothing else here catches them, which is why this recurred twice
+			-- (2026-08-10 and 2026-08-17, 7 of 8 both times): issue_type is
+			-- 'task', so the epic/convoy exclusion misses them and so does the
+			-- wisp-side "issue_type != 'agent'" guard; and role_type is EMPTY on
+			-- every agent bead, so keying on role_type would be equally inert.
+			-- The gt:agent LABEL is the only populated discriminator.
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
