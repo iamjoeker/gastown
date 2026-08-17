@@ -823,3 +823,63 @@ func assertOpsContainInOrder(t *testing.T, ops []string, want ...string) {
 	}
 	t.Fatalf("ops missing ordered sequence %v in %v", want[next:], ops)
 }
+
+// TestAutoCloseExemptsAgentBeads pins the fix for the recurring agent-bead
+// reaping incident (gt-caq / hq-02sk).
+//
+// AGENT BEADS are the town's per-role identity rows — hq-mayor, hq-deacon,
+// bd-beads-witness, gt-gastown-refinery and so on. `gt agents resolve` looks
+// them up by role and answers "no agent bead found" once one is CLOSED.
+// mol-witness-patrol's loop-or-exit makes exactly that call and is told to STOP
+// and report on failure, so every witness/refinery respawning after a sweep
+// walks its own molecule into a halt — the layer that would notice a stalled
+// town is the layer the sweep disables.
+//
+// The reaper stale-closed 7 of 8 agent beads on 2026-08-10 and AGAIN on
+// 2026-08-17. Nothing else in AutoClose catches them:
+//   - issue_type is 'task', so the epic/convoy exclusion does not apply, and
+//     neither does the wisp-side "issue_type != 'agent'" guard — no agent bead
+//     has ever carried type 'agent'.
+//   - role_type is EMPTY on every agent bead, so keying on role_type (as the
+//     escalation originally proposed) would be equally INERT: it would look
+//     like a fix and change nothing.
+//
+// The gt:agent LABEL is the only populated discriminator; all 8 carry it.
+// hq-deacon survived both sweeps only because it is the most active agent and
+// its updated_at stays under the staleness cutoff — recency, not protection —
+// so "one survivor" is not evidence that any guard works.
+func TestAutoCloseExemptsAgentBeads(t *testing.T) {
+	data, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	autoCloseBody := sourceBetween(t, string(data), "func AutoClose(", "// batchDeleteRows")
+
+	if !strings.Contains(autoCloseBody, "'gt:agent'") {
+		t.Fatal("AutoClose must exempt the gt:agent label, or the reaper stale-closes " +
+			"every agent bead and gt agents resolve stops answering by role")
+	}
+
+	// It must be exempted in the LABEL exclusion list specifically, not merely
+	// mentioned somewhere in the function.
+	idx := strings.Index(autoCloseBody, "l.label IN (")
+	if idx < 0 {
+		t.Fatal("AutoClose no longer has a label exclusion list")
+	}
+	rest := autoCloseBody[idx:]
+	end := strings.Index(rest, ")")
+	if end < 0 {
+		t.Fatal("label exclusion list is not terminated")
+	}
+	list := rest[:end]
+	if !strings.Contains(list, "'gt:agent'") {
+		t.Errorf("gt:agent appears in AutoClose but not inside the label exclusion list; "+
+			"it must be exempted there.\nlist: %s", list)
+	}
+	// The pre-existing exemptions must survive alongside it.
+	for _, label := range []string{"'gt:standing-orders'", "'gt:keep'", "'gt:role'", "'gt:rig'"} {
+		if !strings.Contains(list, label) {
+			t.Errorf("exemption %s was dropped from the label exclusion list", label)
+		}
+	}
+}
