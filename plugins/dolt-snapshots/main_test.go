@@ -376,7 +376,7 @@ func TestResolveRoutesFile(t *testing.T) {
 		t.Errorf("resolveRoutesFile with ROUTES_FILE = %q, want /env/routes.jsonl", got)
 	}
 
-	// Default is <town root>/.beads/routes.jsonl
+	// Default includes ~/gt/.beads/routes.jsonl
 	os.Unsetenv("ROUTES_FILE")
 	got := resolveRoutesFile("")
 	if !filepath.IsAbs(got) {
@@ -385,57 +385,6 @@ func TestResolveRoutesFile(t *testing.T) {
 	if filepath.Base(got) != "routes.jsonl" {
 		t.Errorf("resolveRoutesFile default should end with routes.jsonl, got %q", got)
 	}
-
-	// The default must follow the town root, not ~/gt (gt-3sz).
-	t.Setenv("GT_TOWN_ROOT", "/town")
-	if got := resolveRoutesFile(""); got != filepath.Join("/town", ".beads", "routes.jsonl") {
-		t.Errorf("resolveRoutesFile should honor GT_TOWN_ROOT, got %q", got)
-	}
-}
-
-func TestTownRoot(t *testing.T) {
-	// GT_TOWN_ROOT wins over GT_ROOT, and both win over ~/gt. The plugin used to
-	// consult neither and go straight to ~/gt, which is not the town root on
-	// every host (gt-3sz).
-	t.Run("GT_TOWN_ROOT wins", func(t *testing.T) {
-		t.Setenv("GT_TOWN_ROOT", "/town")
-		t.Setenv("GT_ROOT", "/other")
-		got, err := townRoot()
-		if err != nil {
-			t.Fatalf("townRoot() error = %v", err)
-		}
-		if got != "/town" {
-			t.Errorf("townRoot() = %q, want /town", got)
-		}
-	})
-
-	t.Run("GT_ROOT is the fallback", func(t *testing.T) {
-		t.Setenv("GT_TOWN_ROOT", "")
-		t.Setenv("GT_ROOT", "/other")
-		got, err := townRoot()
-		if err != nil {
-			t.Fatalf("townRoot() error = %v", err)
-		}
-		if got != "/other" {
-			t.Errorf("townRoot() = %q, want /other", got)
-		}
-	})
-
-	t.Run("falls back to ~/gt when nothing is set", func(t *testing.T) {
-		t.Setenv("GT_TOWN_ROOT", "")
-		t.Setenv("GT_ROOT", "")
-		home, err := os.UserHomeDir()
-		if err != nil {
-			t.Skip("no home dir")
-		}
-		got, err := townRoot()
-		if err != nil {
-			t.Fatalf("townRoot() error = %v", err)
-		}
-		if got != filepath.Join(home, "gt") {
-			t.Errorf("townRoot() = %q, want %q", got, filepath.Join(home, "gt"))
-		}
-	})
 }
 
 func TestConvoyRow_SnapshotLogic(t *testing.T) {
