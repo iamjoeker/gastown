@@ -1672,12 +1672,6 @@ func requireNotifyTestSocket(t *testing.T) string {
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
 	})
-	// These tests assert on real delivery, so authorize it — for this socket
-	// only. The isolation is what earns the authorization: the server was
-	// created just above and is killed on cleanup, so nothing here can reach a
-	// live agent even though tmux addresses panes by session name.
-	// See tmux.AllowTestNudgeEnv.
-	t.Setenv(tmux.AllowTestNudgeEnv, socket)
 	return socket
 }
 

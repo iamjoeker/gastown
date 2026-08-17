@@ -9,22 +9,49 @@ set -euo pipefail
 
 log() { echo "[gitignore-reconcile] $*"; }
 
-# --- Step 1: Enumerate rig repos ---------------------------------------------
+fail() {
+  log "ERROR: $*"
+  gt plugin record-run --plugin gitignore-reconcile --result failure \
+    --title "gitignore-reconcile: FAILED" --description "$*" >/dev/null 2>&1 || true
+  exit 1
+}
 
-RIG_JSON=$(gt rig list --json 2>/dev/null || true)
-if [ -z "$RIG_JSON" ]; then
-  log "SKIP: could not get rig list"
-  exit 0
+# --- Step 1: Enumerate rig repos ---------------------------------------------
+#
+# `gt rig list --json` publishes a "repos" array per rig: the git clones inside
+# the rig directory (mayor/rig, refinery/rig). A rig directory is not itself a
+# git repo, so there is no singular path to read.
+#
+# An absent key is a broken contract, not an empty work list. This plugin read
+# a nonexistent "repo_path" key for months and skipped every rig with exit 0
+# (gt-a7a), so the two cases are now kept distinguishable.
+
+if ! RIG_JSON=$(gt rig list --json 2>/dev/null); then
+  fail "gt rig list --json failed; cannot enumerate rig repos"
 fi
 
-RIG_PATHS=$(echo "$RIG_JSON" | jq -r '.[] | select(.repo_path != null and .repo_path != "") | .repo_path // empty' 2>/dev/null || true)
+if ! echo "$RIG_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  fail "gt rig list --json did not return a JSON array; cannot enumerate rig repos"
+fi
+
+RIG_TOTAL=$(echo "$RIG_JSON" | jq 'length')
+RIGS_WITH_KEY=$(echo "$RIG_JSON" | jq '[.[] | select(has("repos"))] | length')
+if [ "$RIG_TOTAL" -gt 0 ] && [ "$RIGS_WITH_KEY" -eq 0 ]; then
+  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key — gt is too old (rebuild it: gt plugin run rebuild-gt) or its schema changed. Refusing to report this as 'nothing to reconcile' (gt-a7a)."
+fi
+
+RIG_PATHS=$(echo "$RIG_JSON" | jq -r '.[] | (.repos // [])[]')
+
 if [ -z "$RIG_PATHS" ]; then
-  log "SKIP: no rigs with repo paths"
+  SUMMARY="no git clones found across $RIG_TOTAL rig(s)"
+  log "Nothing to reconcile: $SUMMARY"
+  gt plugin record-run --plugin gitignore-reconcile --result success \
+    --title "gitignore-reconcile: $SUMMARY" --description "$SUMMARY" >/dev/null 2>&1 || true
   exit 0
 fi
 
 RIG_COUNT=$(echo "$RIG_PATHS" | wc -l | tr -d ' ')
-log "Checking $RIG_COUNT rig repo(s) for tracked+ignored files"
+log "Checking $RIG_COUNT rig repo(s) across $RIG_TOTAL rig(s) for tracked+ignored files"
 
 # --- Step 2: Process each rig -----------------------------------------------
 
@@ -61,7 +88,9 @@ while IFS= read -r REPO_PATH; do
     [ -n "$HAS_POLECATS" ]   && REASON="${REASON:+$REASON, }active polecat worktrees"
     [ "$CURRENT_BRANCH" != "main" ] && REASON="${REASON:+$REASON, }not on main ($CURRENT_BRANCH)"
     log "  SKIP: $REASON — creating chore bead"
-    REPO_NAME=$(basename "$REPO_PATH")
+    # Every rig clone is named "rig" (<rig>/mayor/rig), so basename alone would
+    # title every bead identically. Keep the last three path components.
+    REPO_NAME=$(echo "$REPO_PATH" | awk -F/ 'NF>=3 {print $(NF-2)"/"$(NF-1)"/"$NF; next} {print}')
     bd create "gitignore-reconcile: $REPO_NAME has $FILE_COUNT tracked+ignored file(s)" \
       -t chore \
       -l "plugin:gitignore-reconcile,category:git-hygiene" \
