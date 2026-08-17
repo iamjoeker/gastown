@@ -707,16 +707,7 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 // Queries both the issues table (authoritative metadata source) and the
 // wisps table (fallback existence source). Issues take precedence for duplicate
 // IDs so labels/type are preserved for doctor validation.
-//
-// Agent beads live in the town database, so this resolves against the town
-// scope exactly like GetAgentBead and the agent-bead write paths (gt-gkl).
-// Without this, a rig-scoped client returns an empty set and every caller
-// reads the absence as "no cleanup_status" rather than "wrong database".
 func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
-	if target := b.agentBeadTarget(); target != b {
-		return target.ListAgentBeads()
-	}
-
 	// Query issues table first. Issues include labels and type metadata used by
 	// doctor checks (for example, validating gt:agent labels).
 	// Agent beads are type=agent (infrastructure), hidden by bd list default filter.
