@@ -35,6 +35,58 @@ No WITNESS_PING mail is sent. Witnesses observe the Deacon's last_activity
 timestamp instead, and only send an alert to the Mayor if the Deacon appears
 unresponsive (>5 minutes stale). This avoids heartbeat mail spam.
 
+## Verification Sweeps (gt-emm)
+
+**Any census you produce over working trees must be produced by a
+gitignore-blind traversal. A recursive `grep` is not one.**
+
+The agent shell shadows `grep` with `ugrep --ignore-files`, so every recursive
+search honors `.gitignore` — and the town gitignores `polecats/`, `mayor/`,
+`refinery/`, `crew/` and `deacon/dogs/`, which is where every checkout lives.
+Measured: `find` + per-file grep found 16 stale files where `grep -rl` over the
+same root found 0. The sweep did not merely miss some; it returned a perfect
+all-clear. A correct probe string delivered by a blind traversal still yields a
+false clean.
+
+The blindness is exactly correlated with risk: working clones are gitignored
+BECAUSE they are derived, and derived copies are where stale content lives.
+
+**Required for any "N found" or "clean" claim about a tree:**
+
+```bash
+scripts/town-sweep.sh -r "$GT_ROOT" -i '<glob>' '<pattern>'
+# or, by hand:
+find "$GT_ROOT" -type d -name .git -prune -o -type f -print0 \\
+  | xargs -0 grep -l -F -e '<pattern>' --
+```
+
+Exit code 2 from the script means coverage could not be guaranteed. Treat it as
+UNKNOWN, never as clean.
+
+**Report the traversal with the count.** A bare "0 found" is not a result — it is
+indistinguishable from a blind sweep. Include the tool, the number of files
+scanned, and the control outcome:
+
+```
+census: N files match '<pattern>' under <root>
+traversal: scripts/town-sweep.sh (gitignore-blind)   scanned: 767 files
+controls: --self-test 2 passed, 0 failed
+```
+
+**A count of zero deserves more scrutiny than a count of many** — zero is what
+the defect produces.
+
+**Controls must be planted INSIDE the ignored subtree.** A positive control that
+fires outside one validates the probe in a frame where the defect cannot appear,
+and certifies nothing. This has already happened here: a control was run, it
+fired, and it proved nothing, because the canary landed in a scratchpad outside
+any `.gitignore`. Use `scripts/town-sweep.sh --self-test`, which builds its
+fixture inside a gitignored subtree and also asserts the negative half (a
+gitignore-aware search MISSES the canary). Never plant a live canary inside
+another agent's sandbox.
+
+Full recipe: `docs/guides/verification-sweeps.md`.
+
 ## Abbreviated Patrol Mode (Idle Effort Tuning)
 
 When `await-signal` outputs `EFFORT: reduced`, run an ABBREVIATED patrol.
@@ -72,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -1108,6 +1160,11 @@ Daily patrol digests preserve audit trail without per-cycle pollution.
 
 **Timing**: Run once per morning patrol cycle. The --yesterday flag ensures
 we don't try to digest today's incomplete data.
+
+**If the digest carries a content census over working trees** (stale copies,
+tripwire strings, "N files match"), the count must come from a gitignore-blind
+sweep and must be reported with its traversal and scanned-file count. See
+"Verification Sweeps" above. A bare "0 found" is not publishable.
 
 **Exit criteria:** Yesterday's patrol digests aggregated (or none to aggregate)."""
 

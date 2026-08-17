@@ -4,8 +4,9 @@
 #
 # WHY THIS EXISTS (gt-emm)
 #
-# Recursive search in the agent shell respects .gitignore. Gas Town gitignores
-# every working clone:
+# Recursive search in the agent shell respects .gitignore. The agent shell
+# shadows `grep` with ugrep and passes `--ignore-files`, which makes every
+# recursive search honor .gitignore. Gas Town gitignores every working clone:
 #
 #     **/polecats/   **/mayor/rig/   **/refinery/rig/   **/crew/   **/deacon/dogs/
 #
@@ -22,9 +23,14 @@
 # rather than erroring, so a correct probe string delivered by a blind traversal
 # still yields a false clean.
 #
+# The same shadow also passes `-I`, so the interactive `grep` silently skips
+# binary files. That is a second silent-skip on the same tool; this script
+# searches binaries by default and makes skipping them an explicit opt-in.
+#
 # This script is the traversal half of a verification sweep. It walks with `find`
-# (not gitignore-aware) and hands grep an explicit file list (ignore logic bypassed
-# a second time), so no ignore rule can subtract from its coverage.
+# (not gitignore-aware — the shell's `find` shadow is bfs, which does not read
+# ignore files either) and hands grep an explicit file list, so the ignore logic
+# is bypassed twice and no ignore rule can subtract from its coverage.
 #
 # See docs/guides/verification-sweeps.md for the full recipe and the rules that
 # govern positive controls.
@@ -39,7 +45,7 @@ town-sweep.sh — gitignore-blind content sweep over a Gas Town tree
 
 USAGE
   town-sweep.sh [options] PATTERN
-  town-sweep.sh --self-test [-r ROOT]
+  town-sweep.sh --self-test [-r ROOT] [--live-control DIR]
 
 OPTIONS
   -r, --root DIR       Root to sweep (default: $GT_ROOT, else current directory)
@@ -50,6 +56,10 @@ OPTIONS
   -E, --regex          Treat PATTERN as an extended regex (default: fixed string)
       --text-only      Skip binary files (grep -I)
       --self-test      Run the built-in positive/negative controls and exit
+      --live-control DIR
+                       Self-test only: also plant a live canary in DIR, which must
+                       be a gitignored directory in a tree YOU own. Writes and then
+                       removes one dot-file. Omitted by default — see SELF-TEST.
   -h, --help           Show this help
 
 EXIT CODES
@@ -66,6 +76,18 @@ COVERAGE NOTES
   * If find or grep writes anything to stderr (unreadable directory, vanished
     path), the sweep exits 2 rather than printing a partial result. An incomplete
     sweep must never be mistaken for a clean one.
+
+SELF-TEST
+  --self-test builds a hermetic fixture (a repo that gitignores polecats/, with a
+  canary inside it) and asserts both halves: this sweep SEES the canary, and a
+  gitignore-aware search MISSES it. That is a complete proof of the mechanism and
+  it writes only under a fresh mktemp -d.
+
+  --live-control DIR additionally proves that one real tree is reachable. It
+  writes a canary INSIDE DIR, which the script verifies is genuinely gitignored —
+  a control planted outside an ignored subtree validates the probe in a frame
+  where the defect cannot appear, and certifies nothing. Point it at a tree you
+  own (your own sandbox), never at another agent's live working directory.
 EOF
 }
 
@@ -81,6 +103,7 @@ COUNT_ONLY=false
 REGEX=false
 TEXT_ONLY=false
 SELF_TEST=false
+LIVE_CONTROL=""
 PRUNE_GIT=true
 INCLUDES=()
 EXCLUDE_DIRS=()
@@ -90,6 +113,7 @@ while [[ $# -gt 0 ]]; do
         -r|--root)        [[ $# -ge 2 ]] || die "missing argument to $1"; ROOT="$2"; shift 2 ;;
         -i|--include)     [[ $# -ge 2 ]] || die "missing argument to $1"; INCLUDES+=("$2"); shift 2 ;;
         -x|--exclude-dir) [[ $# -ge 2 ]] || die "missing argument to $1"; EXCLUDE_DIRS+=("$2"); shift 2 ;;
+        --live-control)   [[ $# -ge 2 ]] || die "missing argument to $1"; LIVE_CONTROL="$2"; shift 2 ;;
         --include-git)    PRUNE_GIT=false; shift ;;
         -c|--count)       COUNT_ONLY=true; shift ;;
         -E|--regex)       REGEX=true; shift ;;
@@ -112,8 +136,11 @@ if [[ "$PRUNE_GIT" == "true" ]]; then
     EXCLUDE_DIRS+=(".git")
 fi
 
-# Number of files the last sweep() call actually visited.
+# Outputs of the last sweep() call. sweep() sets globals rather than printing,
+# because a command substitution would run it in a subshell and throw the scanned
+# count away — reporting "scanned 0 files" for a sweep that read thousands.
 SWEEP_SCANNED=0
+SWEEP_MATCHES=""
 
 # Build the find expression for the current INCLUDES/EXCLUDE_DIRS settings.
 # Result is left in the global array FIND_ARGS.
@@ -142,11 +169,15 @@ build_find_args() {
 # Walks with find and greps an explicit file list. Neither half consults
 # .gitignore, so ignored subtrees are covered like any other.
 #
-# Prints matching file paths on stdout, one per line. Sets SWEEP_SCANNED.
+# Sets SWEEP_MATCHES (newline-separated paths) and SWEEP_SCANNED.
 # Returns 0 if any file matched, 1 if none, 2 if coverage could not be guaranteed.
+# MUST NOT be called inside a command substitution — the globals would be lost.
 sweep() {
     local root="$1"
     local pattern="$2"
+
+    SWEEP_SCANNED=0
+    SWEEP_MATCHES=""
 
     if [[ ! -d "$root" ]]; then
         echo "$PROG: root is not a directory: $root" >&2
@@ -185,11 +216,11 @@ sweep() {
         grep_args+=(-F)
     fi
 
-    local matches
-    matches="$(xargs -0 grep "${grep_args[@]}" -e "$pattern" -- <"$listfile" 2>"$errfile")"
+    SWEEP_MATCHES="$(xargs -0 grep "${grep_args[@]}" -e "$pattern" -- <"$listfile" 2>"$errfile")"
 
     # grep noise on stderr means some file was not actually read. Same rule as find.
     if [[ -s "$errfile" ]]; then
+        SWEEP_MATCHES=""
         echo "$PROG: some files could not be read — result is NOT a clean bill of health" >&2
         sed "s|^|$PROG: grep: |" "$errfile" >&2
         rm -f "$listfile" "$errfile"
@@ -197,27 +228,7 @@ sweep() {
     fi
     rm -f "$listfile" "$errfile"
 
-    [[ -n "$matches" ]] || return 1
-    printf '%s\n' "$matches"
-    return 0
-}
-
-# Find one directory under $1 that git confirms is ignored. Used to place the
-# live control where the defect can actually appear.
-first_ignored_dir() {
-    local root="$1"
-    command -v git >/dev/null 2>&1 || return 0
-    [[ -d "$root" ]] || return 0
-    local d top
-    while IFS= read -r d; do
-        [[ -w "$d" ]] || continue
-        top="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" || continue
-        [[ -n "$top" ]] || continue
-        if git -C "$top" check-ignore -q "$d" 2>/dev/null; then
-            printf '%s\n' "$d"
-            return 0
-        fi
-    done < <(find "$root" -mindepth 1 -maxdepth 4 -type d -name .git -prune -o -type d -print 2>/dev/null)
+    [[ -n "$SWEEP_MATCHES" ]] || return 1
     return 0
 }
 
@@ -227,12 +238,17 @@ first_ignored_dir() {
 # it validates the probe in a frame where the defect cannot appear. Every control
 # below plants its canary INSIDE a gitignored directory, which is the only place
 # the defect is observable.
-self_test() {
-    local pass=0 fail=0
-    local tmp
-    tmp="$(mktemp -d)" || die "could not create temp dir"
-    trap 'rm -rf "$tmp"' EXIT
+SELF_TEST_TMP=""
+self_test_cleanup() {
+    [[ -n "$SELF_TEST_TMP" ]] && rm -rf "$SELF_TEST_TMP"
+}
 
+self_test() {
+    local pass=0 fail=0 skip=0
+    SELF_TEST_TMP="$(mktemp -d)" || die "could not create temp dir"
+    trap self_test_cleanup EXIT
+
+    local tmp="$SELF_TEST_TMP"
     local canary="wisp gc --age 1h --force"
 
     # Hermetic fixture: a repo that gitignores polecats/, with the canary inside it.
@@ -246,13 +262,12 @@ self_test() {
 
     echo "== control 1: blind sweep must SEE a canary inside the ignored subtree"
     INCLUDES=("*.formula.toml")
-    local hits
-    hits="$(sweep "$tmp/repo" "$canary")"
-    if [[ "$hits" == *"polecats/chrome/mol.formula.toml" ]]; then
-        echo "  PASS: sweep found the canary at $hits"
+    sweep "$tmp/repo" "$canary"
+    if [[ "$SWEEP_MATCHES" == *"polecats/chrome/mol.formula.toml" ]]; then
+        echo "  PASS: sweep found the canary at $SWEEP_MATCHES"
         pass=$((pass + 1))
     else
-        echo "  FAIL: sweep missed the canary (got: ${hits:-<nothing>})"
+        echo "  FAIL: sweep missed the canary (got: ${SWEEP_MATCHES:-<nothing>})"
         fail=$((fail + 1))
     fi
 
@@ -271,39 +286,62 @@ self_test() {
         fi
     else
         echo "  SKIP: git not available"
+        skip=$((skip + 1))
     fi
 
-    echo "== control 3: the live root's ignored subtrees are actually reachable"
+    echo "== control 3: a designated live tree's ignored subtree is reachable"
     INCLUDES=()
-    local live_dir
-    live_dir="$(first_ignored_dir "$ROOT")"
-    if [[ -n "$live_dir" ]]; then
-        local live_canary="$live_dir/.town-sweep-canary.$$"
+    if [[ -z "$LIVE_CONTROL" ]]; then
+        echo "  SKIP: no --live-control DIR given (controls 1-2 already prove the mechanism)"
+        skip=$((skip + 1))
+    elif [[ ! -d "$LIVE_CONTROL" || ! -w "$LIVE_CONTROL" ]]; then
+        echo "  FAIL: --live-control $LIVE_CONTROL is not a writable directory"
+        fail=$((fail + 1))
+    elif ! live_dir_is_ignored "$LIVE_CONTROL"; then
+        # Refusing here is the point: a control outside an ignored subtree passes
+        # trivially and certifies nothing. That is the failure mode that survived
+        # the old checklist.
+        echo "  FAIL: --live-control $LIVE_CONTROL is not gitignored — a control there proves nothing"
+        fail=$((fail + 1))
+    else
+        local live_canary="$LIVE_CONTROL/.town-sweep-canary.$$"
         if printf '%s\n' "$canary" >"$live_canary" 2>/dev/null; then
-            local live_hits
-            live_hits="$(sweep "$ROOT" "$canary")"
+            sweep "$ROOT" "$canary"
+            local rc=$?
             rm -f "$live_canary"
-            if [[ "$live_hits" == *".town-sweep-canary.$$"* ]]; then
-                echo "  PASS: sweep of $ROOT reached the gitignored path $live_dir"
+            if [[ $rc -eq 2 ]]; then
+                echo "  FAIL: sweep of $ROOT could not guarantee coverage"
+                fail=$((fail + 1))
+            elif [[ "$SWEEP_MATCHES" == *".town-sweep-canary.$$"* ]]; then
+                echo "  PASS: sweep of $ROOT reached the gitignored path $LIVE_CONTROL"
                 pass=$((pass + 1))
             else
-                echo "  FAIL: sweep of $ROOT did NOT reach the gitignored path $live_dir"
+                echo "  FAIL: sweep of $ROOT did NOT reach the gitignored path $LIVE_CONTROL"
                 fail=$((fail + 1))
             fi
         else
-            echo "  SKIP: no writable gitignored directory under $ROOT"
+            echo "  FAIL: could not write the canary into $LIVE_CONTROL"
+            fail=$((fail + 1))
         fi
-    else
-        echo "  SKIP: found no gitignored directory under $ROOT"
     fi
 
     INCLUDES=()
     [[ ${#saved_includes[@]} -gt 0 ]] && INCLUDES=("${saved_includes[@]}")
 
     echo
-    echo "self-test: $pass passed, $fail failed"
+    echo "self-test: $pass passed, $fail failed, $skip skipped"
     [[ $fail -eq 0 ]] || return 1
     return 0
+}
+
+# True when git confirms DIR is an ignored path. Used to reject a live control
+# planted where the defect cannot appear.
+live_dir_is_ignored() {
+    local dir="$1" top
+    command -v git >/dev/null 2>&1 || return 1
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    [[ -n "$top" ]] || return 1
+    git -C "$top" check-ignore -q "$dir" 2>/dev/null
 }
 
 # ── Resolve root ────────────────────────────────────────────────────────────
@@ -319,24 +357,26 @@ if [[ "$SELF_TEST" == "true" ]]; then
     exit $?
 fi
 
+[[ -n "$LIVE_CONTROL" ]] && die "--live-control is only meaningful with --self-test"
+
 if [[ -z "$PATTERN" ]]; then
     usage >&2
     exit 2
 fi
 
-RESULT="$(sweep "$ROOT" "$PATTERN")"
+sweep "$ROOT" "$PATTERN"
 RC=$?
 [[ $RC -eq 2 ]] && exit 2
 
 HITS=0
-[[ -n "$RESULT" ]] && HITS="$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')"
+[[ -n "$SWEEP_MATCHES" ]] && HITS="$(printf '%s\n' "$SWEEP_MATCHES" | wc -l | tr -d ' ')"
 
 echo "$PROG: scanned $SWEEP_SCANNED files under $ROOT (gitignore-blind), $HITS matched" >&2
 
 if [[ "$COUNT_ONLY" == "true" ]]; then
     echo "$HITS"
 else
-    [[ -n "$RESULT" ]] && printf '%s\n' "$RESULT"
+    [[ -n "$SWEEP_MATCHES" ]] && printf '%s\n' "$SWEEP_MATCHES"
 fi
 
 exit "$RC"
