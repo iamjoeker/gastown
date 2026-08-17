@@ -585,27 +585,6 @@ func SyncDatabasesSQL(townRoot string, opts SyncOptions) []SyncResult {
 // Returns the number of beads purged and any error encountered.
 // Errors are non-fatal — the caller should log them but continue with sync.
 // Must be called while the Dolt server is still running (bd purge needs SQL access).
-
-// purgeMinAge is the minimum age a closed ephemeral bead must reach before this
-// package will delete it. It exists so the age can never be omitted by accident:
-// see gt-5y7 for what happened when the flag was simply left off the argv.
-//
-// Matches the reaper's default purge_age (168h / 7d) deliberately — two
-// destructive paths that disagree about "old enough" is a defect in itself.
-const purgeMinAge = "168h"
-
-// buildPurgeArgs returns the argv for `bd purge`. It is a separate function so
-// the age flag can be asserted directly in a test — the defect in gt-5y7 was an
-// argv that looked fine in source and deleted everything at runtime, and a test
-// that scans this file for a string cannot tell those apart.
-func buildPurgeArgs(dryRun bool) []string {
-	args := []string{"purge", "--json", "--older-than", purgeMinAge}
-	if dryRun {
-		args = append(args, "--dry-run")
-	}
-	return args
-}
-
 func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// Resolve the beads directory for this rig (read-only — never create dirs during purge)
 	beadsDir := FindRigBeadsDir(townRoot, dbName)
@@ -638,27 +617,10 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// generous timeout as a circuit breaker against future regressions.
 	env := beads.BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
 	// Probe --allow-stale support with the same hardened target env used by purge.
-	//
-	// ⚠️ --older-than IS MANDATORY HERE (gt-5y7). `bd purge` treats it as OPTIONAL,
-	// and WITHOUT it deletes EVERY closed ephemeral bead regardless of age:
-	//
-	//     bd purge --force                   # Delete ALL closed ephemeral beads
-	//     bd purge --older-than 7d --force   # Only purge items closed 7+ days ago
-	//
-	// This call site omitted it since it was written, which made an ordinary
-	// polecat operation an unbounded purge. Observed live 2026-08-17: seven closed
-	// MR beads destroyed on the beads rig, including a closed-but-UNMERGED refinery
-	// rejection ~11 minutes old — exactly the category bd-czf says must never be
-	// purged. Nobody ran `wisp gc`; the hold on it was respected and irrelevant,
-	// because this path bypasses every mitigation aimed at gc.
-	//
-	// Wisps are UNVERSIONED and UNBACKED (hq-del4): no dolt history, wisp_events is
-	// dolt_ignore'd and cascades on delete. A wrong purge here is unrecoverable by
-	// any means the town has.
-	//
-	// The age matches the reaper's purge_age so the two destructive paths cannot
-	// disagree about what "old enough to delete" means.
-	args := beads.MaybePrependAllowStaleWithEnv(env, buildPurgeArgs(dryRun))
+	args := beads.MaybePrependAllowStaleWithEnv(env, []string{"purge", "--json"})
+	if dryRun {
+		args = append(args, "--dry-run")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

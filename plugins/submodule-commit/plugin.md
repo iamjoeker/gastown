@@ -16,13 +16,12 @@ timeout = "15m"
 notify_on_failure = true
 severity = "low"
 
-# Opt-in per rig via rig settings (settings/config.json), under "plugins":
-#   gt rig settings set <rig> plugins.submodule-commit.enabled true
-#   gt rig settings set <rig> plugins.submodule-commit.push_enabled true
-#   gt rig settings set <rig> plugins.submodule-commit.allowlist '["path/to/sub"]'
-# enabled       false = do nothing for this rig (the default)
-# push_enabled  push submodule commits (false = commit locally only)
-# allowlist     empty = all submodules; ["path/to/sub"] = only those
+# Opt-in per rig via plugin frontmatter:
+# [plugin.submodule-commit]
+# enabled = true
+# commit_branch = "main"          # branch to commit on in each submodule
+# push_enabled = false            # push submodule commits (false = local only)
+# allowlist = []                  # empty = all submodules; ["path/to/sub"] = only those
 +++
 
 # Submodule Commit
@@ -31,77 +30,37 @@ Auto-commits accumulated changes inside git submodules and updates the parent
 repo's submodule pointer. Polecats only operate on parent repo worktrees and
 have no commit mandate for submodule repos — this plugin fills that gap.
 
-**Opt-in only.** A rig does nothing here until it is enabled in rig settings:
-
-```bash
-gt rig settings set <rig> plugins.submodule-commit.enabled true
-```
+**Opt-in only.** Rigs must enable this plugin in their `plugin.md` frontmatter.
+Current enabled rigs: `lilypad_chat` (3 Bitbucket submodules).
 
 ## Step 1: Find opt-in rigs with submodules
 
-A rig directory is not a git repo — it contains up to two clones, `mayor/rig`
-and `refinery/rig`. `gt rig list --json` publishes them per rig as `repos`.
-There is no singular `repo_path` key, and there never was: reading one is what
-made this plugin skip every rig with exit 0 for months (gt-a7a).
-
-Two things follow from the layout. An absent key is a broken contract rather
-than an empty work list, so the two cases must stay distinguishable. And the
-rig name has to come from the JSON — every clone path ends in `/rig`, so
-`basename` resolved every rig to `rig` and every opt-in check answered false.
-
 ```bash
-fail() {
-  echo "ERROR: $*"
-  gt plugin record-run --plugin submodule-commit --result failure \
-    --title "submodule-commit: FAILED" --description "$*" >/dev/null 2>&1 || true
-  exit 1
-}
-
-if ! RIG_JSON=$(gt rig list --json 2>/dev/null); then
-  fail "gt rig list --json failed; cannot enumerate rig repos"
-fi
-if ! echo "$RIG_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
-  fail "gt rig list --json did not return a JSON array"
-fi
-
-RIG_TOTAL=$(echo "$RIG_JSON" | jq 'length')
-RIGS_WITH_KEY=$(echo "$RIG_JSON" | jq '[.[] | select(has("repos"))] | length')
-if [ "$RIG_TOTAL" -gt 0 ] && [ "$RIGS_WITH_KEY" -eq 0 ]; then
-  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key"
-fi
-
-RIG_REPOS=$(echo "$RIG_JSON" | jq -r '.[] | . as $rig | (.repos // [])[] | "\($rig.name)\t\(.)"')
-if [ -z "$RIG_REPOS" ]; then
-  echo "Nothing to do: no git clones found across $RIG_TOTAL rig(s)"
-  gt plugin record-run --plugin submodule-commit --result success \
-    --title "submodule-commit: no clones" --description "no clones" >/dev/null 2>&1 || true
+RIG_JSON=$(gt rig list --json 2>/dev/null || true)
+if [ -z "$RIG_JSON" ]; then
+  echo "SKIP: could not get rig list"
   exit 0
 fi
 
+# Find rigs that have .gitmodules
 ENABLED_RIGS=()
-ENABLED_RIG_NAMES=()
-while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
+while IFS= read -r REPO_PATH; do
   [ -z "$REPO_PATH" ] && continue
   [ ! -f "$REPO_PATH/.gitmodules" ] && continue
-  PLUGIN_ENABLED=$(gt rig settings show "$RIG_NAME" 2>/dev/null \
-    | jq -r '.plugins["submodule-commit"].enabled // false' 2>/dev/null || echo "false")
-  if [ "$PLUGIN_ENABLED" = "true" ]; then
+  # Check rig plugin config for opt-in
+  RIG_NAME=$(basename "$REPO_PATH")
+  PLUGIN_CONFIG=$(gt rig show "$RIG_NAME" --json 2>/dev/null | jq -r '.plugins["submodule-commit"].enabled // false' 2>/dev/null || echo "false")
+  if [ "$PLUGIN_CONFIG" = "true" ]; then
     ENABLED_RIGS+=("$REPO_PATH")
-    ENABLED_RIG_NAMES+=("$RIG_NAME")
-    echo "Opt-in rig: $RIG_NAME ($REPO_PATH)"
-  else
-    echo "Not opted in: $RIG_NAME ($REPO_PATH)"
   fi
-done <<< "$RIG_REPOS"
+done < <(echo "$RIG_JSON" | jq -r '.[] | select(.repo_path != null) | .repo_path // empty' 2>/dev/null)
 
 if [ ${#ENABLED_RIGS[@]} -eq 0 ]; then
-  echo "Nothing to do: no rig opted in"
-  gt plugin record-run --plugin submodule-commit --result success \
-    --title "submodule-commit: none opted in" --description "none opted in" >/dev/null 2>&1 || true
+  echo "SKIP: no opt-in rigs with submodules found"
   exit 0
 fi
 
-echo "Processing ${#ENABLED_RIGS[@]} opt-in repo(s)"
+echo "Processing ${#ENABLED_RIGS[@]} rig(s) with submodules"
 ```
 
 ## Step 2: For each opt-in rig, process its submodules
@@ -112,15 +71,14 @@ TOTAL_PUSHED=0
 TOTAL_PARENT_UPDATED=0
 ERRORS=""
 
-for i in "${!ENABLED_RIGS[@]}"; do
-  REPO_PATH="${ENABLED_RIGS[$i]}"
-  RIG_NAME="${ENABLED_RIG_NAMES[$i]}"
-
+for REPO_PATH in "${ENABLED_RIGS[@]}"; do
   echo ""
-  echo "=== $RIG_NAME: $REPO_PATH ==="
+  echo "=== $REPO_PATH ==="
+
+  RIG_NAME=$(basename "$REPO_PATH")
 
   # Get plugin config
-  RIG_CONFIG=$(gt rig settings show "$RIG_NAME" 2>/dev/null | jq -r '.plugins["submodule-commit"] // {}' 2>/dev/null || echo "{}")
+  RIG_CONFIG=$(gt rig show "$RIG_NAME" --json 2>/dev/null | jq -r '.plugins["submodule-commit"] // {}' 2>/dev/null || echo "{}")
   COMMIT_BRANCH=$(echo "$RIG_CONFIG" | jq -r '.commit_branch // "main"')
   PUSH_ENABLED=$(echo "$RIG_CONFIG" | jq -r '.push_enabled // false')
   ALLOWLIST=$(echo "$RIG_CONFIG" | jq -r '.allowlist // [] | .[]' 2>/dev/null || true)

@@ -1,10 +1,19 @@
 package cmd
 
-import "os"
+import (
+	"os"
+
+	"github.com/steveyegge/gastown/internal/tmux"
+)
 
 // testNudgeHookEnv marks the process as running under test and names the file
 // that nudges should be recorded to instead of being delivered.
-const testNudgeHookEnv = "GT_TEST_NUDGE_LOG"
+//
+// Aliased from the tmux package rather than restated: the enforcing check now
+// lives at the transport (tmux.NudgeSessionWithOpts), and two copies of this
+// name could drift apart silently — leaving one layer guarded and the other not,
+// which is the shape of the defect this whole mechanism exists to prevent.
+const testNudgeHookEnv = tmux.TestNudgeLogEnv
 
 // testNudgeHook reports whether the nudge test hook is active, and where (if
 // anywhere) nudges should be logged.
@@ -19,6 +28,11 @@ const testNudgeHookEnv = "GT_TEST_NUDGE_LOG"
 //
 // An empty path therefore means "test mode, nothing to record" — the caller
 // still returns without delivering.
+//
+// This is now a fast path, not the backstop. The check that actually enforces
+// the rule is tmux.NudgeSessionWithOpts's, which no call site can forget; this
+// one returns earlier so a guarded test skips the queue writes and idle polling
+// on the way there.
 func testNudgeHook() (logPath string, inTest bool) {
 	return os.LookupEnv(testNudgeHookEnv)
 }

@@ -18,6 +18,16 @@ func TestMain(m *testing.M) {
 	// user's personal server or the sentinel that indicates "no town context".
 	SetDefaultSocket(socket)
 
+	// This package's tests are the ones that must exercise real delivery, so
+	// authorize it — for this socket only. Naming the socket is what makes the
+	// authorization safe: it covers the isolated server started below and
+	// nothing else, so a test that somehow resolves the live town socket is
+	// still refused. See guardTestNudge.
+	if err := os.Setenv(AllowTestNudgeEnv, socket); err != nil {
+		fmt.Fprintf(os.Stderr, "setenv %s: %v\n", AllowTestNudgeEnv, err)
+		os.Exit(1)
+	}
+
 	// Start a sentinel session to keep the server alive for the entire test run.
 	// Without this, tests that kill their last session inadvertently take down
 	// the server, leaving a stale socket that prevents subsequent new-session

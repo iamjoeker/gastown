@@ -65,11 +65,8 @@ Run ` + "`gt prime`" + ` for full context after compaction, clear, or new sessio
 	if result.Status != StatusWarning {
 		t.Errorf("expected StatusWarning for missing sections, got %v", result.Status)
 	}
-	// Nothing but the identity anchor is present, so every required section is
-	// missing. Derived from the list rather than hard-coded: adding a required
-	// section is a normal event and must not break this test.
-	if want := len(templates.TownRootRequiredSections()); len(check.missingSections) != want {
-		t.Errorf("expected %d missing sections, got %d", want, len(check.missingSections))
+	if len(check.missingSections) != 2 {
+		t.Errorf("expected 2 missing sections, got %d", len(check.missingSections))
 	}
 }
 
@@ -97,19 +94,11 @@ Dolt is the data plane for beads.
 	if result.Status != StatusWarning {
 		t.Errorf("expected StatusWarning, got %v", result.Status)
 	}
-	// The Dolt section is present and must not be reported; the communication
-	// hygiene section is absent and must be. Assert membership, not a count —
-	// the fixture only covers one of the required sections, so the count grows
-	// whenever a new one is added.
-	missing := make(map[string]bool, len(check.missingSections))
-	for _, s := range check.missingSections {
-		missing[s.Name] = true
+	if len(check.missingSections) != 1 {
+		t.Errorf("expected 1 missing section, got %d", len(check.missingSections))
 	}
-	if !missing["Communication hygiene"] {
-		t.Errorf("expected 'Communication hygiene' to be missing, got %+v", check.missingSections)
-	}
-	if missing["Dolt awareness"] {
-		t.Errorf("'Dolt awareness' is present in the file but was reported missing")
+	if check.missingSections[0].Name != "Communication hygiene" {
+		t.Errorf("expected 'Communication hygiene' missing, got %q", check.missingSections[0].Name)
 	}
 }
 

@@ -1775,6 +1775,14 @@ func isTmuxIndex(value string) bool {
 // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
 // See NudgeOpts for available options.
 func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) error {
+	// Structural backstop: a unit test must never deliver keystrokes into a live
+	// agent pane. Checked here, before any lock or tmux command, because this is
+	// the one function every nudge in the codebase passes through. See
+	// guardTestNudge for why the check does not live at the call sites.
+	if handled, err := t.guardTestNudge(session, message); handled {
+		return err
+	}
+
 	// Cross-process lock: serialize nudges across OS processes via flock(2).
 	// Each `gt nudge` CLI invocation is a separate process, so the in-process
 	// channel semaphore below provides no cross-process protection. Without
