@@ -405,9 +405,57 @@ func parseEtime(etime string) (int, error) {
 	return days*86400 + hours*3600 + minutes*60 + seconds, nil
 }
 
+// neverAgentCommPrefixes names desktop/GUI applications that must NEVER be treated as
+// Gas Town agents, whatever the allow-list below grows to contain.
+//
+// These are checked as PREFIXES and take precedence over isAgentOrphanCommName. The point
+// is not that today's allow-list matches them — it does not — but that the allow-list is
+// an exact switch, so the human's desktop app is protected only by that exactness.
+// "claude-desktop" begins with "claude". Loosening the switch to a prefix or substring
+// test, the ordinary edit someone makes to also catch a renamed or wrapped binary, would
+// put every desktop process into a kill set that runs SIGTERM then SIGKILL (hq-0x4v,
+// hq-k643). It was measured doing so: 13 live claude-desktop processes, up ~73h, satisfied
+// every non-action criterion of the zombie detector.
+//
+// So this list is a POSITIVE refusal rather than an accident of matching. Do not delete it
+// to "simplify" the matcher, and do not reorder it after the allow-list.
+var neverAgentCommPrefixes = []string{
+	"claude-desktop", // the human's Claude Desktop app (Electron, many child procs)
+	"claude_desktop",
+	"claudedesktop",
+	"code",   // VS Code / VS Code Insiders
+	"cursor", // Cursor editor itself (cursor-agent below is the CLI agent, and IS ours)
+	"electron",
+}
+
+// isNeverAgentCommName reports whether a ps "comm" value names something we must never
+// kill, regardless of what isAgentOrphanCommName says. Checked FIRST by every caller.
+//
+// "cursor-agent" is a Gas Town runtime and must survive the "cursor" prefix, so exact
+// allow-list members are re-admitted explicitly.
+func isNeverAgentCommName(cmdLower string) bool {
+	switch cmdLower {
+	case "claude", "claude-code", "codex", "opencode", "cursor-agent", "agent", "copilot":
+		// Exact agent runtimes are always permitted, even if a deny prefix matches.
+		return false
+	}
+	for _, p := range neverAgentCommPrefixes {
+		if strings.HasPrefix(cmdLower, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // isAgentOrphanCommName returns true if the ps "comm" field names a runtime we track for
 // TTY-less orphan / zombie cleanup (matches internal/config agent presets).
+//
+// The deny check runs first and is load-bearing: see neverAgentCommPrefixes. If you widen
+// the switch below, the deny list is what keeps the machine owner's desktop alive.
 func isAgentOrphanCommName(cmdLower string) bool {
+	if isNeverAgentCommName(cmdLower) {
+		return false
+	}
 	switch cmdLower {
 	case "claude", "claude-code", "codex", "opencode", "cursor-agent", "agent", "copilot":
 		return true
