@@ -257,7 +257,7 @@ func hasPlugins(dir string) bool {
 // DriftReport describes differences between source and runtime plugins.
 type DriftReport struct {
 	Source  string       `json:"source"`
-	Target string       `json:"target"`
+	Target  string       `json:"target"`
 	Drifted []DriftEntry `json:"drifted,omitempty"`
 	Missing []string     `json:"missing,omitempty"` // in source but not target
 	Extra   []string     `json:"extra,omitempty"`   // in target but not source

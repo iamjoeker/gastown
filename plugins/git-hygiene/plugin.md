@@ -27,24 +27,51 @@ Requires: `gh` CLI installed and authenticated (`gh auth status`).
 
 ## Step 1: Enumerate rig repos
 
-Iterate all undocked rigs to find their repo paths:
+A rig directory is not a git repo — it contains up to two clones, `mayor/rig`
+and `refinery/rig`. `gt rig list --json` publishes them per rig as `repos`
+(plus the labelled `mayor_repo` / `refinery_repo` / `path`). There is no
+singular `repo_path` key, and there never was: reading one is what made this
+plugin skip every rig with exit 0 for months (gt-a7a).
+
+An absent key is a broken contract, not an empty work list, so the two cases
+must stay distinguishable — missing key fails loudly, no clones succeeds
+quietly:
 
 ```bash
-RIG_JSON=$(gt rig list --json 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$RIG_JSON" ]; then
-  echo "SKIP: could not get rig list"
+fail() {
+  echo "ERROR: $*"
+  gt plugin record-run --plugin git-hygiene --result failure \
+    --title "git-hygiene: FAILED" --description "$*" >/dev/null 2>&1 || true
+  exit 1
+}
+
+if ! RIG_JSON=$(gt rig list --json 2>/dev/null); then
+  fail "gt rig list --json failed; cannot enumerate rig repos"
+fi
+if ! echo "$RIG_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  fail "gt rig list --json did not return a JSON array"
+fi
+
+RIG_TOTAL=$(echo "$RIG_JSON" | jq 'length')
+RIGS_WITH_KEY=$(echo "$RIG_JSON" | jq '[.[] | select(has("repos"))] | length')
+if [ "$RIG_TOTAL" -gt 0 ] && [ "$RIGS_WITH_KEY" -eq 0 ]; then
+  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key"
+fi
+
+# One "<rig-name><TAB><repo-path>" line per clone. The rig name has to come
+# from the JSON: every clone is named "rig", so basename() would resolve every
+# rig to "rig".
+RIG_REPOS=$(echo "$RIG_JSON" | jq -r '.[] | . as $rig | (.repos // [])[] | "\($rig.name)\t\(.)"')
+
+if [ -z "$RIG_REPOS" ]; then
+  echo "Nothing to clean: no git clones found across $RIG_TOTAL rig(s)"
+  gt plugin record-run --plugin git-hygiene --result success \
+    --title "git-hygiene: no clones" --description "no clones" >/dev/null 2>&1 || true
   exit 0
 fi
 
-# Extract repo paths for rigs that have them
-RIG_PATHS=$(echo "$RIG_JSON" | jq -r '.[] | select(.repo_path != null and .repo_path != "") | .repo_path // empty' 2>/dev/null)
-if [ -z "$RIG_PATHS" ]; then
-  echo "SKIP: no rigs with repo paths found"
-  exit 0
-fi
-
-RIG_COUNT=$(echo "$RIG_PATHS" | wc -l | tr -d ' ')
-echo "Found $RIG_COUNT rig repo(s) to clean"
+RIG_COUNT=$(echo "$RIG_REPOS" | wc -l | tr -d ' ')
+echo "Found $RIG_COUNT rig repo(s) to clean across $RIG_TOTAL rig(s)"
 ```
 
 ## Step 2: Process each rig repo
@@ -59,7 +86,7 @@ TOTAL_STASHES=0
 TOTAL_GC=0
 ERRORS=()
 
-while IFS= read -r REPO_PATH; do
+while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   [ -z "$REPO_PATH" ] && continue
 
   # Verify it's a git repo
@@ -180,12 +207,21 @@ while IFS= read -r REPO_PATH; do
   TOTAL_REMOTE=$((TOTAL_REMOTE + REMOTE_DELETED))
 
   ### Step 2e: Clear stale stashes
-  echo "  Clearing stashes..."
-  STASH_COUNT=$(git -C "$REPO_PATH" stash list 2>/dev/null | wc -l | tr -d ' ')
+  # `git stash clear` is unrecoverable and mayor/rig is a human's clone, so
+  # this is opt-in per rig. Stashes are always counted and reported.
+  #   gt rig settings set <rig> plugins.git-hygiene.clear_stashes true
+  STASH_COUNT=$(git -C "$REPO_PATH" stash list 2>/dev/null | wc -l | tr -d ' ' || echo 0)
   if [ "$STASH_COUNT" -gt 0 ]; then
-    echo "    Clearing $STASH_COUNT stash(es)"
-    git -C "$REPO_PATH" stash clear 2>/dev/null
-    TOTAL_STASHES=$((TOTAL_STASHES + STASH_COUNT))
+    CLEAR_STASHES=$(gt rig settings show "$RIG_NAME" 2>/dev/null \
+      | jq -r '.plugins["git-hygiene"].clear_stashes // false' 2>/dev/null || echo "false")
+    if [ "$CLEAR_STASHES" = "true" ]; then
+      echo "    Clearing $STASH_COUNT stash(es)"
+      git -C "$REPO_PATH" stash clear 2>/dev/null || true
+      TOTAL_STASHES=$((TOTAL_STASHES + STASH_COUNT))
+    else
+      echo "    $STASH_COUNT stash(es) present, left alone (not opted in)"
+      STASH_COUNT=0
+    fi
   fi
 
   ### Step 2f: Garbage collect
@@ -193,7 +229,7 @@ while IFS= read -r REPO_PATH; do
   git -C "$REPO_PATH" gc --prune=now --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1))
 
   echo "  Done: $LOCAL_MERGED merged, $LOCAL_ORPHAN orphan, $REMOTE_DELETED remote, $STASH_COUNT stash(es)"
-done <<< "$RIG_PATHS"
+done <<< "$RIG_REPOS"
 ```
 
 ## Record Result

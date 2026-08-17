@@ -161,6 +161,42 @@ func rigBeadsPrefix(townRoot, rigPath, rigName string) string {
 	return ""
 }
 
+// rigRepoPaths returns the git clones that live inside a rig directory.
+//
+// A rig is not itself a git repo — it is a directory containing up to two
+// clones, mayor/rig and refinery/rig. Callers that want to run git against a
+// rig need these paths, which is why `gt rig list --json` publishes them.
+//
+// Each returned path is verified to contain a .git entry (a directory for a
+// normal clone, a file for a worktree). Missing or non-git directories are
+// omitted rather than reported, so a caller can trust every returned path.
+// repos is always non-nil so JSON consumers see [] rather than null.
+func rigRepoPaths(rigPath string) (mayorRepo, refineryRepo string, repos []string) {
+	repos = []string{}
+	if rigPath == "" {
+		return "", "", repos
+	}
+
+	if p := filepath.Join(rigPath, "mayor", "rig"); isGitRepoDir(p) {
+		mayorRepo = p
+		repos = append(repos, p)
+	}
+	if p := filepath.Join(rigPath, "refinery", "rig"); isGitRepoDir(p) {
+		refineryRepo = p
+		repos = append(repos, p)
+	}
+
+	return mayorRepo, refineryRepo, repos
+}
+
+// isGitRepoDir reports whether path is the working tree of a git repository.
+// It accepts both a .git directory (normal clone) and a .git file (worktree or
+// submodule checkout).
+func isGitRepoDir(path string) bool {
+	_, err := os.Stat(filepath.Join(path, ".git"))
+	return err == nil
+}
+
 // discoverRigsForTownRoot loads the rigs config for the given town root and
 // returns all registered rigs. Callers that don't yet have a town root
 // should use getAllRigs, which resolves it from the cwd first.

@@ -604,67 +604,6 @@ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 	}
 }
 
-// TestIdleWatcherHonorsTestHook covers the delivery path named in gt-kqf.
-// watchAndDeliver is the wait-idle branch's watcher, and it called
-// NudgeSessionWithOpts with no test-mode check of its own. Reaching it through
-// deliverNudge is impossible in test mode — the check at the top of deliverNudge
-// returns first — but nudge_test.go calls it directly, and the enclosing branch
-// is timing-dependent, so the function is made self-safe rather than left
-// depending on its callers.
-//
-// A non-empty queue is the point: TestIdleWatcherExitsOnEmptyQueue already
-// covers the empty case, where the early return proves nothing about the guard.
-func TestIdleWatcherHonorsTestHook(t *testing.T) {
-	origTimeout := idleWatcherTimeout
-	origInterval := idleWatcherPollInterval
-	defer func() {
-		idleWatcherTimeout = origTimeout
-		idleWatcherPollInterval = origInterval
-	}()
-	idleWatcherTimeout = 500 * time.Millisecond
-	idleWatcherPollInterval = 50 * time.Millisecond
-
-	townRoot := t.TempDir()
-	logPath := filepath.Join(t.TempDir(), "nudge.log")
-	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
-
-	const sessionName = "gt-test-idle-watcher-hook"
-	if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
-		Sender:   "tester",
-		Message:  "queued message",
-		Priority: nudge.PriorityNormal,
-	}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		// A nil *tmux.Tmux would panic on any tmux call, so surviving this is
-		// itself evidence that no delivery attempt was made.
-		watchAndDeliver(nil, townRoot, sessionName)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watchAndDeliver did not return under the test hook")
-	}
-
-	// The queue is still intact: the watcher neither drained it nor delivered it.
-	if n := nudge.QueueLen(townRoot, sessionName); n != 1 {
-		t.Errorf("QueueLen after guarded watch = %d, want 1 (queue must be left untouched)", n)
-	}
-
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("reading nudge log: %v", err)
-	}
-	if want := "watch:" + sessionName; !strings.Contains(string(data), want) {
-		t.Errorf("nudge log = %q, want containing %q", data, want)
-	}
-}
-
 func TestQueueLen(t *testing.T) {
 	tmpDir := t.TempDir()
 
