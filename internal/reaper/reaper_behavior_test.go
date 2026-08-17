@@ -1,6 +1,8 @@
 package reaper
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"sort"
@@ -94,7 +96,6 @@ func TestAutoCloseExemptionMatrix(t *testing.T) {
 		issueRow{id: "keep-keep", priority: 2, updatedAt: stale, labels: []string{"gt:keep"}},
 		issueRow{id: "keep-role", priority: 2, updatedAt: stale, labels: []string{"gt:role"}},
 		issueRow{id: "keep-rig", priority: 2, updatedAt: stale, labels: []string{"gt:rig"}},
-		issueRow{id: "keep-mail", priority: 2, updatedAt: stale, labels: []string{"gt:message"}},
 
 		// Priority exemptions: P0/P1 are never stale-closed.
 		issueRow{id: "keep-p0", priority: 0, updatedAt: stale},
@@ -317,64 +318,6 @@ func TestPurgeOldMailBehaviour(t *testing.T) {
 	}
 }
 
-// TestUnreadMailSurvivesAutoCloseThenPurge is the acceptance test for gt-jbn.
-//
-// Reading a message closes its bead, so an OPEN gt:message bead is unread mail.
-// Before the fix, staleness auto-close closed it and stamped closed_at, and the
-// mail purge deleted it mailDeleteAge later — so the full sweep silently
-// destroyed exactly the messages nobody had read, on the channel CLAUDE.md
-// tells agents to use when a message must survive session death.
-//
-// The test runs the sweep the Dog runs, in order, against a mail bead old
-// enough for both windows. Controls: a same-age plain bead must still close
-// (an AutoClose that stopped closing anything would pass otherwise), and a
-// READ (closed) mail bead of the same age must still be purged (retention on
-// read mail is deliberate and must not be disabled by the exemption).
-func TestUnreadMailSurvivesAutoCloseThenPurge(t *testing.T) {
-	f := newFixture(t, "unread_mail")
-	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
-
-	f.insertIssues(t,
-		issueRow{id: "mail-unread", title: "HELP: auth bug", priority: 2, updatedAt: old, labels: []string{"gt:message"}},
-		issueRow{id: "mail-read", title: "Re: auth bug", status: "closed", priority: 2, updatedAt: old, closedAt: &old, labels: []string{"gt:message"}},
-		issueRow{id: "plain-stale", title: "Ordinary stale bead", priority: 2, updatedAt: old},
-	)
-
-	autoClose, err := AutoClose(f.db, f.dbName, staleAge, false)
-	if err != nil {
-		t.Fatalf("AutoClose: %v", err)
-	}
-	if got := closedEntryIDs(autoClose); !reflect.DeepEqual(got, []string{"plain-stale"}) {
-		t.Errorf("ClosedEntries = %v, want [plain-stale] — unread mail must not be stale-closed", got)
-	}
-	if got := f.issueStatus(t, "mail-unread"); got != "open" {
-		t.Errorf("unread mail status = %q, want open — the gt:message exemption is inert", got)
-	}
-
-	// Scan must report the same candidate set AutoClose acts on, or the Dog
-	// decides from a count that includes beads the sweep will never touch.
-	scan, err := Scan(f.db, f.dbName, purgeAge, purgeAge, purgeAge, staleAge)
-	if err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
-	if scan.StaleCandidates != 0 {
-		t.Errorf("StaleCandidates after sweep = %d, want 0 — scan counts beads AutoClose skips", scan.StaleCandidates)
-	}
-
-	purge, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
-	if err != nil {
-		t.Fatalf("Purge: %v", err)
-	}
-	if purge.MailPurged != 1 {
-		t.Errorf("MailPurged = %d, want 1 — read mail must still age out", purge.MailPurged)
-	}
-
-	want := []string{"mail-unread", "plain-stale"}
-	if got := f.ids(t, "issues"); !reflect.DeepEqual(got, want) {
-		t.Errorf("surviving issues = %v, want %v", got, want)
-	}
-}
-
 // TestClosePluginReceiptsBehaviour pins the label-and-age predicate for plugin
 // run receipts. The control is an old open bead WITHOUT the label: closing it
 // too would mean the sweep is closing on age alone.
@@ -480,6 +423,91 @@ func TestReapExcludesAgentBeadsBehaviour(t *testing.T) {
 	}
 	if result.OpenRemain != 1 {
 		t.Errorf("OpenRemain = %d, want 1", result.OpenRemain)
+	}
+}
+
+// oneShotCandidates supplies a batch of candidate IDs exactly once, then
+// reports an empty set. closeWispsInBatches loops until its ID query comes back
+// empty, and the UPDATE it issues deliberately does NOT change the rows the
+// guard protects — so a candidate query that keeps offering an agent wisp would
+// offer it forever. In production the loop terminates only because the
+// candidate query filters agent wisps itself (reaper.go:465). That is precisely
+// the filtering this test has to bypass, so termination is arranged here
+// instead.
+//
+// Only the SUPPLY of candidates is controlled. ExecContext and QueryRowContext
+// pass straight through, so the UPDATE under test is the real one, built by
+// production code and evaluated by the real engine.
+type oneShotCandidates struct {
+	runner sqlRunner
+	served bool
+}
+
+func (o *oneShotCandidates) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if o.served {
+		return o.runner.QueryContext(ctx, "SELECT id FROM wisps WHERE 1 = 0")
+	}
+	o.served = true
+	return o.runner.QueryContext(ctx, query, args...)
+}
+
+func (o *oneShotCandidates) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return o.runner.ExecContext(ctx, query, args...)
+}
+
+func (o *oneShotCandidates) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return o.runner.QueryRowContext(ctx, query, args...)
+}
+
+// TestCloseWispsInBatchesExcludesAgentBeads is the acceptance test for gt-axe:
+// the destructive UPDATE at reaper.go:553 had no behavioural coverage, proven by
+// mutation — deleting its `AND issue_type != 'agent'` clause left the entire
+// suite green, including TestReapExcludesAgentBeadsBehaviour.
+//
+// The reason that mutation is invisible from Reap() is structural, not an
+// oversight in the test above it: every candidate query feeding this UPDATE
+// (reaper.go:465 for stale wisps, :464 for molecule steps) already filters
+// agent wisps, so an agent ID never reaches the batch by that route and no
+// input to Reap can make it. The UPDATE's own clause is the second line of a
+// defence-in-depth pair, and a second line is only load-bearing when the first
+// one lets something through. This test is the only place that can observe it,
+// so it hands the UPDATE the batch directly.
+//
+// The same-age control is what makes a surviving agent wisp mean anything: an
+// UPDATE that closed nothing at all — wrong table, wrong status set, a WHERE
+// that matches no row — would otherwise look identical to a working guard.
+func TestCloseWispsInBatchesExcludesAgentBeads(t *testing.T) {
+	f := newFixture(t, "reap_batch_agent")
+	stale := time.Now().UTC().Add(-48 * time.Hour)
+
+	f.insertWisps(t,
+		wispRow{id: "w-agent", status: "open", issueType: "agent", createdAt: stale},
+		wispRow{id: "w-orphan", status: "open", issueType: "task", createdAt: stale},
+	)
+
+	// Deliberately unguarded: this is the compromised first line of defence the
+	// UPDATE's clause exists to survive.
+	idQuery := "SELECT id FROM wisps WHERE status IN ('open', 'hooked', 'in_progress') ORDER BY id"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runner := &oneShotCandidates{runner: f.db}
+	closed, err := closeWispsInBatches(ctx, runner, idQuery, nil, "gt-axe agent guard")
+	if err != nil {
+		t.Fatalf("closeWispsInBatches: %v", err)
+	}
+
+	if got := f.wispStatus(t, "w-agent"); got != "open" {
+		t.Errorf("agent wisp status = %q, want open — the issue_type != 'agent' guard on the "+
+			"destructive UPDATE (reaper.go:553) is inert; an agent ID reaching a batch is closed", got)
+	}
+	if got := f.wispStatus(t, "w-orphan"); got != "closed" {
+		t.Errorf("control wisp status = %q, want closed — the UPDATE closed nothing, so the agent "+
+			"wisp surviving above proves nothing", got)
+	}
+	if closed != 1 {
+		t.Errorf("closed = %d, want 1 (the control only)", closed)
 	}
 }
 

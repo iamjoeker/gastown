@@ -1199,7 +1199,7 @@ you consume and destroy another rig's MQ_SUBMIT — that rig's polecat would the
 forever on a merge no refinery ever processes. Never drop `--rig`.
 
 This command:
-1. Watches `~/gt/events/{{rig}}/refinery/` for event files (polling-based)
+1. Watches `$GT_ROOT/events/{{rig}}/refinery/` for event files (polling-based)
 2. Returns IMMEDIATELY when an event is emitted (MERGE_READY, PATROL_WAKE, MQ_SUBMIT)
 3. If no events, times out with exponential backoff:
    - First timeout: 30s
