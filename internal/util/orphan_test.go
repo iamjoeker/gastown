@@ -367,3 +367,49 @@ func TestOrphanedProcess_TownRoot_Populated(t *testing.T) {
 		}
 	}
 }
+
+// TestNeverAgentCommNameProtectsClaudeDesktop is a regression test for hq-0x4v / hq-k643.
+//
+// The human's Claude Desktop was measured satisfying EVERY non-action criterion of the
+// zombie detector: 13 live processes, ~73h old, no tmux pane PID, not children of one.
+// The only thing separating them from a code path that sends SIGTERM then SIGKILL was
+// that isAgentOrphanCommName compares comm EXACTLY, and "claude-desktop" merely begins
+// with "claude".
+//
+// That is protection by accident. This test asserts the protection is EXPLICIT, so it
+// keeps failing even if someone widens the allow-list switch to a prefix or substring
+// test — the ordinary edit made to catch a renamed or wrapped agent binary.
+func TestNeverAgentCommNameProtectsClaudeDesktop(t *testing.T) {
+	mustNeverMatch := []string{
+		"claude-desktop",
+		"claude-desktop-bin",
+		"claude_desktop",
+		"claudedesktop",
+		"code",
+		"cursor",
+		"electron",
+	}
+	for _, name := range mustNeverMatch {
+		if !isNeverAgentCommName(name) {
+			t.Errorf("isNeverAgentCommName(%q) = false, want true — this process would be eligible for SIGKILL", name)
+		}
+		if isAgentOrphanCommName(name) {
+			t.Errorf("isAgentOrphanCommName(%q) = true, want false — desktop/GUI app in the kill set", name)
+		}
+	}
+}
+
+// TestAgentOrphanCommNameStillMatchesRealAgents guards the other direction: the deny list
+// must not swallow a genuine Gas Town runtime. "cursor-agent" is the sharp case — it
+// begins with the denied prefix "cursor" and must still be recognised.
+func TestAgentOrphanCommNameStillMatchesRealAgents(t *testing.T) {
+	mustMatch := []string{"claude", "claude-code", "codex", "opencode", "cursor-agent", "agent", "copilot"}
+	for _, name := range mustMatch {
+		if isNeverAgentCommName(name) {
+			t.Errorf("isNeverAgentCommName(%q) = true, want false — real agent excluded from cleanup", name)
+		}
+		if !isAgentOrphanCommName(name) {
+			t.Errorf("isAgentOrphanCommName(%q) = false, want true — real agent no longer tracked", name)
+		}
+	}
+}
