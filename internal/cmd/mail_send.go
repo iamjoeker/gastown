@@ -108,9 +108,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Set pinned flag
 	msg.Pinned = mailPinned
 
-	// Set wisp flag (ephemeral message) — default false, so mail is durable
-	// unless the sender explicitly opts into --wisp. --permanent still wins
-	// over --wisp for callers that pass both (gt-jbn).
+	// Set wisp flag (ephemeral message) - default true, --permanent overrides
 	msg.Wisp = mailWisp && !mailPermanent
 
 	// Set CC recipients
