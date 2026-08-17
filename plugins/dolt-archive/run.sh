@@ -13,9 +13,27 @@ set -euo pipefail
 DOLT_HOST="${GT_DOLT_HOST:-${DOLT_HOST:-127.0.0.1}}"
 DOLT_PORT="${GT_DOLT_PORT:-${DOLT_PORT:-3307}}"
 DOLT_USER="${DOLT_USER:-root}"
-DOLT_DATA_DIR="${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}"
-JSONL_EXPORT_DIR="$HOME/gt/.dolt-archive/jsonl"
-BACKUP_REPO="$HOME/gt/.dolt-archive/git"
+# Town root. NEVER hardcode $HOME/gt — the town is not necessarily there, and this
+# script previously wrote 80MB of "last-resort recovery layer" JSONL into ~/gt while
+# every reader (e.g. internal/cmd/vitals.go) looked under the real town root. The two
+# never met, so the archive was invisible to the tooling that existed to check it,
+# and deleting the stray ~/gt destroyed the only copy (hq-uwxo / gt-3sz class).
+GT_TOWN_ROOT_RESOLVED="${GT_TOWN_ROOT:-${GT_ROOT:-}}"
+if [[ -z "$GT_TOWN_ROOT_RESOLVED" ]]; then
+  echo "[dolt-archive] FATAL: neither GT_TOWN_ROOT nor GT_ROOT is set." >&2
+  echo "[dolt-archive] Refusing to guess a town root — guessing is what put the" >&2
+  echo "[dolt-archive] archive somewhere nothing read from. Set GT_ROOT and re-run." >&2
+  exit 1
+fi
+if [[ ! -d "$GT_TOWN_ROOT_RESOLVED/.dolt-data" ]]; then
+  echo "[dolt-archive] FATAL: $GT_TOWN_ROOT_RESOLVED/.dolt-data does not exist." >&2
+  echo "[dolt-archive] That is not a town root. Refusing to export." >&2
+  exit 1
+fi
+
+DOLT_DATA_DIR="${DOLT_DATA_DIR:-$GT_TOWN_ROOT_RESOLVED/.dolt-data}"
+JSONL_EXPORT_DIR="$GT_TOWN_ROOT_RESOLVED/.dolt-archive/jsonl"
+BACKUP_REPO="$GT_TOWN_ROOT_RESOLVED/.dolt-archive/git"
 DEFAULT_DBS="auto"
 SKIP_GIT=false
 SKIP_DOLT_PUSH=false
