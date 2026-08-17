@@ -2803,21 +2803,6 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch, baseRef string) bool {
 	return true
 }
 
-// donePurgeMinAge is the minimum age a closed ephemeral bead must reach before
-// `gt done` will delete it. Named and hoisted so the age cannot be dropped from
-// the argv by accident — see gt-fdj for what happened when it was simply absent.
-//
-// Matches doltserver.purgeMinAge and the reaper's default purge_age (168h).
-const donePurgeMinAge = "168h"
-
-// buildDonePurgeArgs returns the argv for the `gt done` purge. Separate so the
-// argv itself is assertable: a test that greps this file for "--older-than"
-// would pass with the flag sitting in a comment, which is the failure mode
-// catalogued in gt-am7.
-func buildDonePurgeArgs() []string {
-	return []string{"purge", "--force", "--quiet", "--older-than", donePurgeMinAge}
-}
-
 // purgeClosedEphemeralBeads removes closed ephemeral beads (wisps) that accumulated
 // during this and prior sessions. Polecat/witness sessions create mol-polecat-work
 // steps, mol-witness-patrol cycles, etc. as wisps. These get closed during normal
@@ -2825,34 +2810,8 @@ func buildDonePurgeArgs() []string {
 // bd ready/list output. (hq-6161m)
 //
 // Best-effort: errors are logged but don't block gt done completion.
-//
-// ⚠️ --older-than IS MANDATORY (gt-fdj). This call passes --force, and `bd purge`
-// applies its age filter only `if olderThan != ""`, so --force WITHOUT an age
-// deletes EVERY closed ephemeral bead in the rig. Note the asymmetry that hid
-// this: purge.go gates on `DryRun: dryRun || !force`, so the OTHER call site
-// (doltserver.PurgeClosedEphemerals, which passes no --force) has only ever
-// previewed. This one is the only path that actually deletes.
-//
-// OBSERVED LIVE 2026-08-17: two `gt done` invocations by beads/polecats/slit
-// destroyed seven closed MR beads, including bd-wisp-940 — a refinery rejection
-// ~11 minutes old, the one category bd-czf says must never be purged.
-//
-//	22:50  gt done #1 -> creates bd-wisp-940, purges 6 historical MRs + a patrol wisp
-//	22:52  refinery rejects bd-wisp-940, so it becomes closed
-//	22:55  gt done #2 -> purges bd-wisp-940
-//
-// The destruction is EVENT-driven, not age-driven: survivors are not safe by
-// recency, they are safe only until the next `gt done`. Any polecat finishing
-// work triggers it, so no dispatch pause protects against it.
-//
-// Wisps are UNVERSIONED and UNBACKED (hq-del4) — no dolt history, wisp_events is
-// dolt_ignore'd and cascades on delete. Every one of these deletions is
-// unrecoverable.
-//
-// Age matches the reaper's purge_age and doltserver.purgeMinAge so the town's
-// destructive paths cannot disagree about "old enough to delete".
 func purgeClosedEphemeralBeads(bd *beads.Beads) {
-	out, err := bd.Run(buildDonePurgeArgs()...)
+	out, err := bd.Run("purge", "--force", "--quiet")
 	if err != nil {
 		// Non-fatal: purge failure shouldn't block session completion
 		fmt.Fprintf(os.Stderr, "Warning: wisp purge failed: %v\n", err)

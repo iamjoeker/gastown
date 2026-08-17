@@ -216,6 +216,57 @@ func TestRigSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRigSettingsPluginsRoundTrip pins the per-rig plugin opt-in store.
+// Settings marshal through the RigSettings struct, so a plugin config that the
+// struct does not model is silently dropped — which left submodule-commit with
+// an opt-in mechanism that could never read back as enabled (gt-a7a).
+func TestRigSettingsPluginsRoundTrip(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings", "config.json")
+
+	original := NewRigSettings()
+	original.Plugins = map[string]map[string]interface{}{
+		"submodule-commit": {
+			"enabled":      true,
+			"push_enabled": false,
+			"allowlist":    []interface{}{"vendor/lib"},
+		},
+		"git-hygiene": {
+			"clear_stashes": true,
+		},
+	}
+
+	if err := SaveRigSettings(path, original); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	loaded, err := LoadRigSettings(path)
+	if err != nil {
+		t.Fatalf("LoadRigSettings: %v", err)
+	}
+
+	sub, ok := loaded.Plugins["submodule-commit"]
+	if !ok {
+		t.Fatalf("plugins[submodule-commit] missing after round trip, got %v", loaded.Plugins)
+	}
+	if enabled, _ := sub["enabled"].(bool); !enabled {
+		t.Errorf("plugins[submodule-commit].enabled = %v, want true", sub["enabled"])
+	}
+	allowlist, ok := sub["allowlist"].([]interface{})
+	if !ok || len(allowlist) != 1 || allowlist[0] != "vendor/lib" {
+		t.Errorf("plugins[submodule-commit].allowlist = %v, want [vendor/lib]", sub["allowlist"])
+	}
+
+	hygiene, ok := loaded.Plugins["git-hygiene"]
+	if !ok {
+		t.Fatalf("plugins[git-hygiene] missing after round trip, got %v", loaded.Plugins)
+	}
+	if clear, _ := hygiene["clear_stashes"].(bool); !clear {
+		t.Errorf("plugins[git-hygiene].clear_stashes = %v, want true", hygiene["clear_stashes"])
+	}
+}
+
 func TestRigSettingsWithCustomMergeQueue(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
