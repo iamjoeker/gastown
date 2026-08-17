@@ -558,7 +558,7 @@ Check convoy completion status.
 Convoys are coordination beads that track multiple issues across rigs. When all tracked issues close, the convoy auto-closes.
 
 **IMPORTANT**: Use `gt convoy` commands (not `bd list`) because convoys are stored in
-town-level HQ beads and the Deacon runs from `$GT_ROOT/deacon/`. The `gt` commands are
+town-level HQ beads and the Deacon runs from ~/gt/deacon/. The `gt` commands are
 town-aware and will find convoys regardless of current directory.
 
 **Step 1: Find open convoys**
