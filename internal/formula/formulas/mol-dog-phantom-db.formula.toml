@@ -52,8 +52,20 @@ Scan the .dolt-data/ directory for phantom database directories.
 
 **1. List all directories in .dolt-data/:**
 ```bash
-ls -d ~/gt/.dolt-data/*/
+ls -d "${GT_ROOT:?GT_ROOT must be set}"/.dolt-data/*/
 ```
+
+This read is NON-DESTRUCTIVE — it only lists. It previously pointed at
+`~/gt/.dolt-data/`, which does not exist on every host, so it listed nothing and
+reported ZERO phantoms unconditionally: a structurally guaranteed all-clear
+rather than a measured one (gt-3sz, same class as gt-kr6).
+
+**Expect this step to start reporting real candidates now that it is un-blinded.
+That is the detector working, not a new fault.** The real directory holds 8
+databases including testrig, testrip and forkrig — exactly the kind of candidate
+this step exists to surface. Confirm each against the phantom condition below
+before acting, and NEVER delete a database directory by hand: use
+`gt dolt cleanup`, which protects the production databases by name.
 
 **2. For each directory, check for phantom condition:**
 A phantom database has:
