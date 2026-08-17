@@ -183,10 +183,20 @@ func findOrCreateTown() (string, error) {
 		return "", err
 	}
 
-	candidates := []string{
+	// Env-provided town root first: these search lists only ever looked at ~/gt and
+	// ~/gastown, so on a town rooted anywhere else (e.g. ~/src/gt) they found
+	// nothing at all. Entries are still validated below, so an unset or wrong env
+	// var costs nothing.
+	candidates := []string{}
+	for _, env := range []string{"GT_TOWN_ROOT", "GT_ROOT"} {
+		if v := os.Getenv(env); v != "" {
+			candidates = append(candidates, v)
+		}
+	}
+	candidates = append(candidates,
 		filepath.Join(home, "gt"),
 		filepath.Join(home, "gastown"),
-	}
+	)
 
 	for _, path := range candidates {
 		if isValidTown(path) {

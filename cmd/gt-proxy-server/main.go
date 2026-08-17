@@ -84,8 +84,15 @@ func main() {
 	}
 
 	if *townRoot == "" {
-		if v := os.Getenv("GT_TOWN"); v != "" {
+		// GT_TOWN was the only name checked here, and NOTHING in the tree sets it --
+		// it appears exactly once, right here, while GT_TOWN_ROOT appears 20 times.
+		// So this escape hatch never fired and always fell through to ~/gt.
+		if v := os.Getenv("GT_TOWN_ROOT"); v != "" {
 			*townRoot = v
+		} else if v := os.Getenv("GT_ROOT"); v != "" {
+			*townRoot = v
+		} else if v := os.Getenv("GT_TOWN"); v != "" {
+			*townRoot = v // legacy name, kept for back-compat
 		} else {
 			*townRoot = filepath.Join(home, "gt")
 		}

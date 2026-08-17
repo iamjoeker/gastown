@@ -111,7 +111,7 @@ func runFeed(cmd *cobra.Command, args []string) error {
 	// Must be in a Gas Town workspace
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace (run from ~/gt or a rig directory)")
+		return fmt.Errorf("not in a Gas Town workspace (run from the town root, $GT_ROOT, or a rig directory)")
 	}
 
 	// Build feed arguments for window mode

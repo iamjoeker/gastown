@@ -164,9 +164,17 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	// Resolve event directory
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
-		// Fallback to ~/gt
-		home, _ := os.UserHomeDir()
-		townRoot = filepath.Join(home, "gt")
+		// Prefer the explicit town-root env vars before guessing ~/gt. The town is
+		// frequently NOT at ~/gt, and guessing is what silently wrote 80MB of archive
+		// into a directory no reader ever looked at (hq-uwxo / gt-3sz).
+		townRoot = os.Getenv("GT_TOWN_ROOT")
+		if townRoot == "" {
+			townRoot = os.Getenv("GT_ROOT")
+		}
+		if townRoot == "" {
+			home, _ := os.UserHomeDir()
+			townRoot = filepath.Join(home, "gt")
+		}
 	}
 	rigName := resolveChannelRig(awaitEventRig, townRoot)
 	eventDir, err := channelevents.EnsureChannelDir(townRoot, rigName, awaitEventChannel)

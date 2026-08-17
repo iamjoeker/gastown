@@ -433,7 +433,7 @@ func runDoltStart(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("\n  Served: %v\n", served)
 		fmt.Printf("  This usually means the database has a stale manifest.\n")
-		fmt.Printf("  Try: %s\n", style.Dim.Render("cd ~/gt/.dolt-data/<db> && dolt fsck --repair"))
+		fmt.Printf("  Try: %s\n", style.Dim.Render("cd \"$GT_ROOT\"/.dolt-data/<db> && dolt fsck --repair"))
 	} else {
 		fmt.Printf("  %s All %d databases verified\n", style.Bold.Render("✓"), len(served))
 	}
@@ -657,7 +657,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 			for _, db := range missing {
 				fmt.Printf("    - %s\n", db)
 			}
-			fmt.Printf("  Try: cd ~/gt/.dolt-data/<db> && dolt fsck --repair\n")
+			fmt.Printf("  Try: cd \"$GT_ROOT\"/.dolt-data/<db> && dolt fsck --repair\n")
 		}
 
 		// Check for orphaned databases
@@ -1298,7 +1298,7 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\n  This usually means the database has a stale manifest from migration.\n")
 			fmt.Printf("  To fix, try:\n")
 			fmt.Printf("    1. Stop the server:  %s\n", style.Dim.Render("gt dolt stop"))
-			fmt.Printf("    2. Repair the DB:    %s\n", style.Dim.Render("cd ~/gt/.dolt-data/<db> && dolt fsck --repair"))
+			fmt.Printf("    2. Repair the DB:    %s\n", style.Dim.Render("cd \"$GT_ROOT\"/.dolt-data/<db> && dolt fsck --repair"))
 			fmt.Printf("    3. Restart:           %s\n", style.Dim.Render("gt dolt start"))
 			return fmt.Errorf("migration incomplete: %d database(s) exist on disk but are not served: %v", len(missing), missing)
 		} else {
