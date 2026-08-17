@@ -128,8 +128,17 @@ func EmitToTown(townRoot, channel, eventType string, payloadPairs []string) (str
 func EmitFromCwd(rigName, channel, eventType string, payloadPairs []string) (string, error) {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
-		home, _ := os.UserHomeDir()
-		townRoot = filepath.Join(home, "gt")
+		// Prefer the explicit town-root env vars before guessing ~/gt. The town is
+		// frequently NOT at ~/gt, and guessing is what silently wrote 80MB of archive
+		// into a directory no reader ever looked at (hq-uwxo / gt-3sz).
+		townRoot = os.Getenv("GT_TOWN_ROOT")
+		if townRoot == "" {
+			townRoot = os.Getenv("GT_ROOT")
+		}
+		if townRoot == "" {
+			home, _ := os.UserHomeDir()
+			townRoot = filepath.Join(home, "gt")
+		}
 	}
 	return emit(townRoot, rigName, channel, eventType, payloadPairs)
 }
