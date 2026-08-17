@@ -21,9 +21,6 @@ const polecatAdmissionReservationTTL = 30 * time.Minute
 
 var acquirePolecatAdmissionFn = acquirePolecatAdmission
 
-// polecatCapacitySnapshot is only fully populated when admission control is on
-// (max > 0). See MarshalJSON for how that is reflected on the wire; the field
-// tags below are not what callers see.
 type polecatCapacitySnapshot struct {
 	Max             int `json:"max"`
 	Working         int `json:"working"`
@@ -38,70 +35,6 @@ type polecatCapacitySnapshot struct {
 
 func (s polecatCapacitySnapshot) occupied() int {
 	return s.capacityUsed + s.Reservations
-}
-
-// measuredPolecatCapacityJSON is the wire form of a snapshot taken while
-// admission control is enabled (max > 0): every field was counted.
-type measuredPolecatCapacityJSON struct {
-	Max             int    `json:"max"`
-	Admission       string `json:"admission"`
-	Measured        bool   `json:"measured"`
-	Working         int    `json:"working"`
-	RecoveryBlocked int    `json:"recovery_blocked"`
-	ReusableIdle    int    `json:"reusable_idle"`
-	PendingMR       int    `json:"pending_mr"`
-	Reservations    int    `json:"reservations"`
-	Free            int    `json:"free"`
-	ActiveSessions  int    `json:"active_sessions"`
-}
-
-// unmeasuredPolecatCapacityJSON is the wire form of a snapshot taken while
-// admission control is disabled (max <= 0). Only max and active_sessions are
-// real; the per-disposition counters are omitted rather than emitted as zeros.
-type unmeasuredPolecatCapacityJSON struct {
-	Max            int    `json:"max"`
-	Admission      string `json:"admission"`
-	Measured       bool   `json:"measured"`
-	ActiveSessions int    `json:"active_sessions"`
-	Note           string `json:"note"`
-}
-
-// MarshalJSON emits the capacity block with an explicit measured/admission
-// discriminator, and omits the per-disposition counters when they were never
-// measured.
-//
-// polecatCapacitySnapshotForTownNoCleanup short-circuits at max <= 0 before it
-// reads rigs.json, lists sessions, or applies any workstate disposition, so
-// Working/RecoveryBlocked/ReusableIdle/PendingMR/Reservations/Free are struct
-// zero values in that mode — not counts of zero. Marshaling them unconditionally
-// told readers "free: 0" (capacity exhausted) when admission was in fact
-// disabled and nothing was being gated, and "recovery_blocked: 0" while
-// polecats needed recovery. The human-readable branch in `gt scheduler status`
-// has always guarded on Max > 0; this keeps the JSON branch honest too. (gt-7yv)
-func (s polecatCapacitySnapshot) MarshalJSON() ([]byte, error) {
-	if s.Max <= 0 {
-		return json.Marshal(unmeasuredPolecatCapacityJSON{
-			Max:            s.Max,
-			Admission:      "disabled",
-			Measured:       false,
-			ActiveSessions: s.ActiveSessions,
-			// Spell out the max rather than writing a "less than" sign:
-			// encoding/json HTML-escapes that into an unreadable <.
-			Note: fmt.Sprintf("direct dispatch (scheduler.max_polecats=%d): admission control is disabled and per-disposition capacity counts are not measured", s.Max),
-		})
-	}
-	return json.Marshal(measuredPolecatCapacityJSON{
-		Max:             s.Max,
-		Admission:       "enabled",
-		Measured:        true,
-		Working:         s.Working,
-		RecoveryBlocked: s.RecoveryBlocked,
-		ReusableIdle:    s.ReusableIdle,
-		PendingMR:       s.PendingMR,
-		Reservations:    s.Reservations,
-		Free:            s.Free,
-		ActiveSessions:  s.ActiveSessions,
-	})
 }
 
 func (s *polecatCapacitySnapshot) addWorking() {
