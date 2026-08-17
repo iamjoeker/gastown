@@ -82,6 +82,77 @@ func TestRecordRunCreatesAndClosesReceipt(t *testing.T) {
 	}
 }
 
+func TestQueryRunsIncludesInfraBeads(t *testing.T) {
+	// Regression test for gt-b7y: plugin run receipts are created with
+	// --ephemeral, which makes bd treat them as infrastructure beads and
+	// omit them from `bd list` unless --include-infra is passed. Without
+	// the flag every read returned [], so `gt plugin history` reported
+	// "No execution history" and cooldown gates never closed even though
+	// the receipts were written correctly.
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd-list-args.log")
+	bdPath := filepath.Join(binDir, "bd")
+	fakeBD := "#!/usr/bin/env bash\n" +
+		"printf '%s\\n' \"$*\" >> \"$BD_ARGS_LOG\"\n" +
+		"case \"$1\" in\n" +
+		"  list) printf '[{\\\"id\\\":\\\"hq-wisp-1\\\",\\\"title\\\":\\\"Plugin run: dolt-backup\\\"," +
+		"\\\"created_at\\\":\\\"2026-08-17T22:57:09Z\\\"," +
+		"\\\"labels\\\":[\\\"type:plugin-run\\\",\\\"plugin:dolt-backup\\\",\\\"result:success\\\"]}]\\n' ;;\n" +
+		"  *) exit 2 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(bdPath, []byte(fakeBD), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_ARGS_LOG", logPath)
+
+	recorder := NewRecorder(townRoot)
+
+	runs, err := recorder.GetRunsSince("dolt-backup", "15m")
+	if err != nil {
+		t.Fatalf("GetRunsSince failed: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("GetRunsSince returned %d runs, want 1", len(runs))
+	}
+	if runs[0].ID != "hq-wisp-1" {
+		t.Errorf("run ID = %q, want hq-wisp-1", runs[0].ID)
+	}
+	if runs[0].Result != ResultSuccess {
+		t.Errorf("run result = %q, want success", runs[0].Result)
+	}
+
+	count, err := recorder.CountRunsSince("dolt-backup", "15m")
+	if err != nil {
+		t.Fatalf("CountRunsSince failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("CountRunsSince = %d, want 1 (a closed gate)", count)
+	}
+
+	last, err := recorder.GetLastRun("dolt-backup")
+	if err != nil {
+		t.Fatalf("GetLastRun failed: %v", err)
+	}
+	if last == nil || last.ID != "hq-wisp-1" {
+		t.Errorf("GetLastRun = %v, want hq-wisp-1", last)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if !strings.Contains(line, "--include-infra") {
+			t.Errorf("bd list invocation missing --include-infra: %s", line)
+		}
+		if !strings.Contains(line, "--all") {
+			t.Errorf("bd list invocation missing --all: %s", line)
+		}
+	}
+}
+
 func TestRunResultConstants(t *testing.T) {
 	if ResultSuccess != "success" {
 		t.Errorf("expected ResultSuccess to be 'success', got %q", ResultSuccess)
