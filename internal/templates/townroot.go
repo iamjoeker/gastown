@@ -12,7 +12,7 @@ var townRootCLAUDEmdRaw string
 
 // TownRootCLAUDEmdVersion is the version of the embedded town-root CLAUDE.md.
 // Increment this when updating the template content with new sections.
-const TownRootCLAUDEmdVersion = 2
+const TownRootCLAUDEmdVersion = 3
 
 // TownRootCLAUDEmd returns the canonical town-root CLAUDE.md content
 // with the CLI command name substituted.
@@ -37,6 +37,13 @@ func TownRootRequiredSections() []TownRootRequiredSection {
 		{
 			Name:    "Communication hygiene",
 			Heading: "### Communication hygiene",
+		},
+		{
+			// gt-emm: recursive grep respects .gitignore, and the town gitignores
+			// every working clone. Agents that don't know this report false
+			// all-clears over exactly the subtrees most likely to be wrong.
+			Name:    "Verification sweeps",
+			Heading: "## Verification Sweeps",
 		},
 	}
 }

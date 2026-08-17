@@ -192,6 +192,9 @@ test-makefile:
 	bash -n plugins/submodule-commit/run.sh
 	bash -n plugins/rig_repos_contract_test.sh
 	bash plugins/rig_repos_contract_test.sh
+	bash -n scripts/town-sweep.sh
+	# Hermetic: builds its fixture under mktemp -d. Never pass --live-control here.
+	bash scripts/town-sweep.sh --self-test
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:
