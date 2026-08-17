@@ -169,6 +169,41 @@ func GetTownBeadsPath(townRoot string) string {
 	return filepath.Join(townRoot, ".beads")
 }
 
+// RoutingWorkDir returns the directory a bd subprocess must run in for bd's own
+// prefix routing to resolve a foreign-prefix bead. Callers that pin BEADS_DIR do
+// not need this; callers that deliberately leave the database to bd do.
+//
+// bd loads routes.jsonl from whichever beads directory the command already
+// resolved to, and derives the town root as that directory's parent
+// (beads cmd/bd/routed.go, resolveViaPrefixRoutingWithAccess). Only the
+// town-level .beads carries routes.jsonl, so a bd invoked from a rig worktree
+// resolves to the rig database, finds no routes, and reports "no issue found"
+// for every prefix the rig does not own — indistinguishable from the bead being
+// absent. That is the failure gt-dno reported for hq-* mail and handoff beads
+// cited from a rig context.
+//
+// Gas Town's own resolver (ResolveBeadsDirForID) walks up to the town root when
+// the current beads directory has no routes, which is why gt commands keep
+// working from a rig worktree while bare bd does not. Routing call sites get the
+// same guarantee by running where the routes actually live.
+//
+// dir is returned unchanged when it already resolves to the routes-bearing
+// directory, or when no reachable town root publishes routes.jsonl — moving cwd
+// without gaining routes would only change which database bd tries first.
+func RoutingWorkDir(dir string) string {
+	if dir == "" {
+		return dir
+	}
+	townRoot := FindTownRoot(dir)
+	if townRoot == "" {
+		return dir
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".beads", RoutesFileName)); err != nil {
+		return dir
+	}
+	return townRoot
+}
+
 // GetPrefixForRig returns the beads prefix for a given rig name.
 // The prefix is returned without the trailing hyphen (e.g., "bd" not "bd-").
 // If the rig is not found in routes, returns "gt" as the default.
