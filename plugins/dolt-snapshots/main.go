@@ -49,7 +49,7 @@ type convoyRow struct {
 func main() {
 	host := flag.String("host", "", "Dolt server host (default: 127.0.0.1)")
 	port := flag.String("port", "", "Dolt server port (default: GT_DOLT_PORT or 3307)")
-	routesFile := flag.String("routes", "", "Path to routes.jsonl (default: ~/gt/.beads/routes.jsonl)")
+	routesFile := flag.String("routes", "", "Path to routes.jsonl (default: $GT_TOWN_ROOT/.beads/routes.jsonl)")
 	dryRun := flag.Bool("dry-run", false, "Show what would be done without making changes")
 	cleanup := flag.Bool("cleanup", false, "Also escalate stale convoy branches for review")
 	watch := flag.Bool("watch", false, "Watch events.jsonl and snapshot immediately on convoy events")
@@ -141,8 +141,29 @@ func resolveRoutesFile(flag string) string {
 	if rf := os.Getenv("ROUTES_FILE"); rf != "" {
 		return rf
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "gt", ".beads", "routes.jsonl")
+	root, _ := townRoot()
+	return filepath.Join(root, ".beads", "routes.jsonl")
+}
+
+// townRoot returns the Gas Town root directory.
+//
+// The explicit env vars come FIRST and ~/gt is only the last-resort guess. This
+// plugin used to jump straight to ~/gt (gt-3sz, hq-uwxo), and the town is
+// frequently rooted elsewhere — on such a host both callers silently read paths
+// that do not exist, so the routes file came up empty and the event watcher
+// never saw an event. The sibling plugins (dolt-archive, dolt-backup) already
+// resolve the root this way; this one was the straggler.
+func townRoot() (string, error) {
+	for _, env := range []string{"GT_TOWN_ROOT", "GT_ROOT"} {
+		if v := os.Getenv(env); v != "" {
+			return v, nil
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine town root: neither GT_TOWN_ROOT nor GT_ROOT is set and home dir is unavailable: %w", err)
+	}
+	return filepath.Join(home, "gt"), nil
 }
 
 // listDatabases returns all non-system databases on the Dolt server.
@@ -594,15 +615,15 @@ type convoyEvent struct {
 	Payload map[string]interface{} `json:"payload"`
 }
 
-// watchEvents tails ~/.events.jsonl and runs a snapshot cycle immediately
-// when convoy lifecycle events are detected. This gives sub-second latency
-// compared to the ~60s deacon patrol polling approach.
+// watchEvents tails the town's .events.jsonl and runs a snapshot cycle
+// immediately when convoy lifecycle events are detected. This gives sub-second
+// latency compared to the ~60s deacon patrol polling approach.
 func watchEvents(host, port, routesFile string, cleanup bool) error {
-	home, err := os.UserHomeDir()
+	root, err := townRoot()
 	if err != nil {
-		return fmt.Errorf("cannot determine home dir: %w", err)
+		return err
 	}
-	eventsPath := filepath.Join(home, "gt", ".events.jsonl")
+	eventsPath := filepath.Join(root, ".events.jsonl")
 
 	file, err := os.Open(eventsPath)
 	if err != nil {
