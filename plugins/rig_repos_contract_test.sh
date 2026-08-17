@@ -22,9 +22,13 @@ FAIL=0
 CLEANUP_DIRS=()
 
 cleanup() {
-  for dir in "${CLEANUP_DIRS[@]:-}"; do
-    [ -n "$dir" ] && rm -rf "$dir"
-  done
+  # Preserve the script's exit status: an EXIT trap's last command would
+  # otherwise become the status the caller (and make) sees.
+  local status=$?
+  if [ "${#CLEANUP_DIRS[@]}" -gt 0 ]; then
+    rm -rf "${CLEANUP_DIRS[@]}"
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -141,15 +145,14 @@ make_repo() {
   git -C "$path" commit -qm "seed"
 }
 
-# new_env builds a fresh sandbox and echoes its root. Callers use
-# $ENV_ROOT/state for fixtures and $ENV_ROOT/town for the fake town.
+# new_env builds a fresh sandbox and sets ENV_ROOT to its path. It must assign
+# rather than echo: a $(new_env) subshell would lose the cleanup registration.
+# Callers use $ENV_ROOT/state for fixtures and $ENV_ROOT/town for the fake town.
 new_env() {
-  local root
-  root=$(mktemp -d)
-  CLEANUP_DIRS+=("$root")
-  mkdir -p "$root/bin" "$root/state/settings" "$root/town"
-  write_fake_commands "$root/bin"
-  printf '%s\n' "$root"
+  ENV_ROOT=$(mktemp -d)
+  CLEANUP_DIRS+=("$ENV_ROOT")
+  mkdir -p "$ENV_ROOT/bin" "$ENV_ROOT/state/settings" "$ENV_ROOT/town"
+  write_fake_commands "$ENV_ROOT/bin"
 }
 
 # run_plugin runs a plugin with the sandbox on PATH and captures output+status.
@@ -170,7 +173,7 @@ PLUGINS=(git-hygiene gitignore-reconcile submodule-commit)
 # from having no work — so nobody noticed for months.
 
 for plugin in "${PLUGINS[@]}"; do
-  ENV_ROOT=$(new_env)
+  new_env
   cat > "$ENV_ROOT/state/rig_list.json" <<'JSON'
 [
   {"name":"alpha","beads_prefix":"al","status":"operational","witness":"running","refinery":"running","polecats":0,"crew":0}
@@ -194,7 +197,7 @@ done
 # same outcome for the operator (nothing done), opposite outcome for the alarm.
 
 for plugin in "${PLUGINS[@]}"; do
-  ENV_ROOT=$(new_env)
+  new_env
   cat > "$ENV_ROOT/state/rig_list.json" <<'JSON'
 [
   {"name":"alpha","beads_prefix":"al","status":"operational","path":"/nonexistent","repos":[]}
@@ -212,7 +215,7 @@ done
 
 # --- Test 3: git-hygiene actually visits every clone -------------------------
 
-ENV_ROOT=$(new_env)
+new_env
 make_repo "$ENV_ROOT/town/alpha/mayor/rig"
 make_repo "$ENV_ROOT/town/alpha/refinery/rig"
 cat > "$ENV_ROOT/state/rig_list.json" <<JSON
@@ -239,7 +242,7 @@ assert_contains "$OUT" "2 repo(s) across 1 rig(s)" "git-hygiene: summary counts 
 # `git stash clear` is unrecoverable and mayor/rig is a human's clone, so the
 # default must be to report rather than destroy.
 
-ENV_ROOT=$(new_env)
+new_env
 make_repo "$ENV_ROOT/town/alpha/mayor/rig"
 printf 'work in progress\n' >> "$ENV_ROOT/town/alpha/mayor/rig/README"
 git -C "$ENV_ROOT/town/alpha/mayor/rig" stash -q
@@ -280,7 +283,7 @@ fi
 
 # --- Test 5: gitignore-reconcile visits clones and names beads usably --------
 
-ENV_ROOT=$(new_env)
+new_env
 make_repo "$ENV_ROOT/town/alpha/mayor/rig"
 REPO="$ENV_ROOT/town/alpha/mayor/rig"
 # A tracked file that a later .gitignore rule now matches, on a non-main branch
@@ -312,7 +315,7 @@ assert_contains "$ENV_ROOT/state/bd.log" "alpha/mayor/rig has" \
 # Every clone path ends in "/rig", so the old basename() lookup asked for a rig
 # literally named "rig" and every opt-in check answered false.
 
-ENV_ROOT=$(new_env)
+new_env
 make_repo "$ENV_ROOT/town/alpha/mayor/rig"
 REPO="$ENV_ROOT/town/alpha/mayor/rig"
 printf '[submodule "vendor/lib"]\n\tpath = vendor/lib\n\turl = https://example.com/lib\n' > "$REPO/.gitmodules"

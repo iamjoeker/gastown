@@ -37,7 +37,7 @@ fi
 RIG_TOTAL=$(echo "$RIG_JSON" | jq 'length')
 RIGS_WITH_KEY=$(echo "$RIG_JSON" | jq '[.[] | select(has("repos"))] | length')
 if [ "$RIG_TOTAL" -gt 0 ] && [ "$RIGS_WITH_KEY" -eq 0 ]; then
-  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key — gt is too old or its schema changed. Refusing to report this as 'nothing to reconcile' (gt-a7a)."
+  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key — gt is too old (rebuild it: gt plugin run rebuild-gt) or its schema changed. Refusing to report this as 'nothing to reconcile' (gt-a7a)."
 fi
 
 RIG_PATHS=$(echo "$RIG_JSON" | jq -r '.[] | (.repos // [])[]')

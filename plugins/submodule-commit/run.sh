@@ -5,7 +5,7 @@
 # submodule on a known branch, pushes with || true (local commit is priority),
 # then updates the parent repo's submodule pointer on main.
 #
-# Opt-in per rig: set plugins.submodule-commit.enabled=true in rig config.
+# Opt-in per rig: gt rig settings set <rig> plugins.submodule-commit.enabled true
 
 set -euo pipefail
 
@@ -42,7 +42,7 @@ fi
 RIG_TOTAL=$(echo "$RIG_JSON" | jq 'length')
 RIGS_WITH_KEY=$(echo "$RIG_JSON" | jq '[.[] | select(has("repos"))] | length')
 if [ "$RIG_TOTAL" -gt 0 ] && [ "$RIGS_WITH_KEY" -eq 0 ]; then
-  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key — gt is too old or its schema changed. Refusing to report this as 'no opt-in rigs' (gt-a7a)."
+  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key — gt is too old (rebuild it: gt plugin run rebuild-gt) or its schema changed. Refusing to report this as 'no opt-in rigs' (gt-a7a)."
 fi
 
 # "<rig-name><TAB><repo-path>" per clone. The rig name must come from the JSON:
