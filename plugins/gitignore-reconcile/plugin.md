@@ -29,21 +29,46 @@ rule was added continue to be tracked until manually untracked.
 
 ## Step 1: Enumerate rig repos
 
+A rig directory is not a git repo — it contains up to two clones, `mayor/rig`
+and `refinery/rig`. `gt rig list --json` publishes them per rig as `repos`.
+There is no singular `repo_path` key, and there never was: reading one is what
+made this plugin skip every rig with exit 0 for months (gt-a7a).
+
+An absent key is a broken contract, not an empty work list, so the two cases
+must stay distinguishable:
+
 ```bash
-RIG_JSON=$(gt rig list --json 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$RIG_JSON" ]; then
-  echo "SKIP: could not get rig list"
-  exit 0
+fail() {
+  echo "ERROR: $*"
+  gt plugin record-run --plugin gitignore-reconcile --result failure \
+    --title "gitignore-reconcile: FAILED" --description "$*" >/dev/null 2>&1 || true
+  exit 1
+}
+
+if ! RIG_JSON=$(gt rig list --json 2>/dev/null); then
+  fail "gt rig list --json failed; cannot enumerate rig repos"
+fi
+if ! echo "$RIG_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  fail "gt rig list --json did not return a JSON array"
 fi
 
-RIG_PATHS=$(echo "$RIG_JSON" | jq -r '.[] | select(.repo_path != null and .repo_path != "") | .repo_path // empty' 2>/dev/null)
+RIG_TOTAL=$(echo "$RIG_JSON" | jq 'length')
+RIGS_WITH_KEY=$(echo "$RIG_JSON" | jq '[.[] | select(has("repos"))] | length')
+if [ "$RIG_TOTAL" -gt 0 ] && [ "$RIGS_WITH_KEY" -eq 0 ]; then
+  fail "gt rig list --json returned $RIG_TOTAL rig(s), none carrying a 'repos' key"
+fi
+
+RIG_PATHS=$(echo "$RIG_JSON" | jq -r '.[] | (.repos // [])[]')
+
 if [ -z "$RIG_PATHS" ]; then
-  echo "SKIP: no rigs with repo paths"
+  echo "Nothing to reconcile: no git clones found across $RIG_TOTAL rig(s)"
+  gt plugin record-run --plugin gitignore-reconcile --result success \
+    --title "gitignore-reconcile: no clones" --description "no clones" >/dev/null 2>&1 || true
   exit 0
 fi
 
 RIG_COUNT=$(echo "$RIG_PATHS" | wc -l | tr -d ' ')
-echo "Checking $RIG_COUNT rig repo(s) for tracked+ignored files"
+echo "Checking $RIG_COUNT rig repo(s) across $RIG_TOTAL rig(s) for tracked+ignored files"
 ```
 
 ## Step 2: For each rig repo, find and untrack gitignored files
@@ -85,7 +110,9 @@ while IFS= read -r REPO_PATH; do
     [ -n "$HAS_POLECATS" ] && REASON="${REASON:+$REASON, }active polecat worktrees"
     [ "$CURRENT_BRANCH" != "main" ] && REASON="${REASON:+$REASON, }not on main ($CURRENT_BRANCH)"
     echo "  SKIP: $REASON — creating chore bead"
-    REPO_NAME=$(basename "$REPO_PATH")
+    # Every clone is named "rig", so basename alone would title every bead
+    # identically. Keep the last three path components.
+    REPO_NAME=$(echo "$REPO_PATH" | awk -F/ 'NF>=3 {print $(NF-2)"/"$(NF-1)"/"$NF; next} {print}')
     bd create "gitignore-reconcile: $REPO_NAME has $FILE_COUNT tracked+ignored file(s)" \
       -t chore \
       -l "plugin:gitignore-reconcile,category:git-hygiene" \

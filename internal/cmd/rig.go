@@ -100,6 +100,15 @@ For each rig, displays:
   - Refinery status (running/stopped)
   - Number of polecats and crew members
 
+The --json output additionally carries filesystem paths, which plugins and
+scripts need in order to operate on a rig's git clones:
+  - path           absolute path to the rig directory
+  - mayor_repo     absolute path to <rig>/mayor/rig, if it is a git clone
+  - refinery_repo  absolute path to <rig>/refinery/rig, if it is a git clone
+  - repos          every git clone above, as a list (empty if the rig has none)
+
+There is deliberately no singular "repo_path": a rig owns more than one clone.
+
 Examples:
   gt rig list          # List all rigs with status
   gt rig list --json   # Output as JSON for scripting`,
@@ -765,10 +774,16 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		Name        string `json:"name"`
 		BeadsPrefix string `json:"beads_prefix"`
 		Status      string `json:"status"`
-		Witness     string `json:"witness"`
-		Refinery    string `json:"refinery"`
-		Polecats    int    `json:"polecats"`
-		Crew        int    `json:"crew"`
+		// Path is the rig directory. Repo paths below are the git clones
+		// inside it; consumers that operate on git need these, not Path.
+		Path         string   `json:"path,omitempty"`
+		MayorRepo    string   `json:"mayor_repo,omitempty"`
+		RefineryRepo string   `json:"refinery_repo,omitempty"`
+		Repos        []string `json:"repos"`
+		Witness      string   `json:"witness"`
+		Refinery     string   `json:"refinery"`
+		Polecats     int      `json:"polecats"`
+		Crew         int      `json:"crew"`
 		// sorting fields (not exported to JSON)
 		sortPrio int
 	}
@@ -780,7 +795,7 @@ func runRigList(cmd *cobra.Command, args []string) error {
 
 		r, err := mgr.GetRig(name)
 		if err != nil {
-			rigs = append(rigs, rigInfo{Name: name, BeadsPrefix: prefix, Status: "error", sortPrio: 99})
+			rigs = append(rigs, rigInfo{Name: name, BeadsPrefix: prefix, Status: "error", Repos: []string{}, sortPrio: 99})
 			continue
 		}
 
@@ -801,15 +816,20 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		}
 
 		summary := r.Summary()
+		mayorRepo, refineryRepo, repos := rigRepoPaths(r.Path)
 		rigs = append(rigs, rigInfo{
-			Name:        name,
-			BeadsPrefix: prefix,
-			Status:      strings.ToLower(opState),
-			Witness:     witnessStatus,
-			Refinery:    refineryStatus,
-			Polecats:    summary.PolecatCount,
-			Crew:        summary.CrewCount,
-			sortPrio:    rigStatePriority(witnessRunning, refineryRunning, opState),
+			Name:         name,
+			BeadsPrefix:  prefix,
+			Status:       strings.ToLower(opState),
+			Path:         r.Path,
+			MayorRepo:    mayorRepo,
+			RefineryRepo: refineryRepo,
+			Repos:        repos,
+			Witness:      witnessStatus,
+			Refinery:     refineryStatus,
+			Polecats:     summary.PolecatCount,
+			Crew:         summary.CrewCount,
+			sortPrio:     rigStatePriority(witnessRunning, refineryRunning, opState),
 		})
 	}
 
