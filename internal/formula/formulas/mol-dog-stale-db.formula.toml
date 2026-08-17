@@ -104,12 +104,30 @@ Escalate instead of attempting cleanup:
 gt escalate -s HIGH "Dolt: {{orphan_count}} orphan databases detected (too many for SQL cleanup)"
 ```
 
-Recommend filesystem cleanup:
+Recommend the sanctioned cleanup command, and NOTHING ELSE:
 ```
-gt dolt stop
-cd ~/gt/.dolt-data && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*
-gt dolt start
+gt dolt cleanup
 ```
+
+`gt dolt cleanup` removes orphan test databases and is documented as safe — it
+protects the production databases by name. Prefer it in every case.
+
+**DO NOT recommend, and DO NOT run, a filesystem `rm -rf` inside the Dolt data
+directory.** This step previously recommended a `cd` into the Dolt data directory
+followed by `rm -rf` over several test-database globs. That text is deliberately
+NOT reproduced here as a runnable line — it is exactly the kind of snippet an
+agent copies out of a formula and executes.
+
+It is prohibited by the town CLAUDE.md in capitals ("NEVER use `rm -rf` on
+`~/.dolt-data/` directories"), and it was harmless here only by accident: `~/gt`
+is not the town root on this host, so the `cd` failed and `&&` short-circuited.
+Repointing that path to the real root — the obviously correct typo fix — would
+have armed an `rm -rf` against the live Dolt data plane (gt-3sz, hq-uwxo). The
+glob is also wider than it looks: an unmatched glob leaves the literal pattern,
+and one mistyped prefix reaches a production database directory.
+
+If `gt dolt cleanup` cannot clear the orphans, ESCALATE. Do not improvise a
+filesystem deletion.
 
 **4. Record results:**
 - Orphans removed (count)

@@ -299,28 +299,46 @@ done
 
 If a dog's tmux session is dead but worktree dirs remain, prune them.
 
+**REPORT ONLY — NO REMOVAL AUTHORITY.** This step detects and reports dead dog
+worktrees. It does NOT delete them. See the warning below before changing that.
+
 ```bash
-# For each dog directory
-for dogdir in ~/gt/deacon/dogs/*/; do
+# For each dog directory. GT_ROOT, not ~/gt — see warning below.
+DEAD_WORKTREES=0
+for dogdir in "${GT_ROOT:?GT_ROOT must be set}"/deacon/dogs/*/; do
+  [ -d "$dogdir" ] || continue
   DOG=$(basename "$dogdir")
   # Check if dog has a live tmux session
   if ! tmux has-session -t "dog-$DOG" 2>/dev/null; then
     # Dog session is dead - check for leftover worktree dirs
     for rigrepo in "$dogdir"*/; do
       [ -d "$rigrepo/.git" ] || continue
-      # Worktree exists but session is dead - prune it
       git -C "$rigrepo" worktree list 2>/dev/null
       echo "Dead dog worktree: $DOG/$(basename "$rigrepo") (session dead)"
-      # Use git worktree remove to clean up properly
-      MAIN_REPO=$(git -C "$rigrepo" rev-parse --git-common-dir 2>/dev/null)
-      if [ -n "$MAIN_REPO" ]; then
-        git worktree remove --force "$rigrepo" 2>/dev/null && \
-          echo "Pruned worktree: $rigrepo"
-      fi
+      DEAD_WORKTREES=$((DEAD_WORKTREES + 1))
     done
   fi
 done
+echo "dead_worktrees=$DEAD_WORKTREES (reported, NOT pruned)"
 ```
+
+If `dead_worktrees` is non-zero, REPORT the count in the patrol digest and, if it
+stays non-zero across several patrols, escalate. Do not delete.
+
+**WHY THIS STEP HAS NO DELETE AUTHORITY (gt-3sz, hq-uwxo).** It used to run
+`git worktree remove --force` over every dead dog's repos. That was harmless only
+by accident: it iterated `~/gt/deacon/dogs/*/`, and `~/gt` is not the town root on
+this host, so the glob matched nothing and the loop body never ran. Repointing the
+path to the real root — the obviously correct typo fix, and one a competent agent
+would make without hesitation — would have force-removed worktrees holding **2 of
+the 3 surviving local copies** of commit `5b6b05e8be92`, the P0 merge record the
+town was holding a GC suspension to protect, and which sits on 0 of 189 remote
+refs. The naive fix WAS the harm.
+
+The path is now correct, so this step actually runs. It is safe to run because it
+only counts. **If you restore deletion here, you re-arm exactly that hazard** —
+a worktree is frequently the only thing holding a commit reachable. Prefer a tag
+(`preserve/*`) plus an explicit human decision over any automated prune.
 
 **5. Report**
 
