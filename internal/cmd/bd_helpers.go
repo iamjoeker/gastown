@@ -98,27 +98,11 @@ func (b *bdCmd) StripBeadsDir() *bdCmd {
 }
 
 // WithRouting strips inherited bd target selectors and does not pin BEADS_DIR,
-// allowing bd prefix routing to choose the target database.
-//
-// Dir still selects the database bd tries first, but routing is only available
-// from the directory that publishes routes.jsonl, so the command runs from there
-// rather than from Dir directly — see beads.RoutingWorkDir. Without that, a
-// routing command issued from a rig worktree silently loses routing entirely and
-// reports every foreign-prefix bead as missing (gt-dno).
+// allowing bd prefix routing to choose the target database. Dir still sets cwd.
 func (b *bdCmd) WithRouting() *bdCmd {
 	b.routing = true
 	b.env = filterEnvKey(b.env, "BEADS_DIR")
 	return b
-}
-
-// workDir returns the cwd the bd subprocess actually runs in. Routing commands
-// are relocated to the routes-bearing directory; every other command runs in the
-// directory the caller named.
-func (b *bdCmd) workDir() string {
-	if !b.routing {
-		return b.dir
-	}
-	return beads.RoutingWorkDir(b.dir)
 }
 
 // Stderr sets the stderr writer for the command.
@@ -166,7 +150,7 @@ func (b *bdCmd) buildEnv() []string {
 			mode = beads.MutationPinned
 		}
 	} else if b.dir != "" {
-		beadsDir = beads.ResolveBeadsDir(b.workDir())
+		beadsDir = beads.ResolveBeadsDir(b.dir)
 		if !b.routing {
 			if mode == beads.ReadOnlyRouting {
 				mode = beads.ReadOnlyPinned
@@ -184,7 +168,7 @@ func (b *bdCmd) buildEnv() []string {
 func (b *bdCmd) Build() *exec.Cmd {
 	args := b.resolvedArgs()
 	cmd := exec.Command("bd", args...)
-	cmd.Dir = b.workDir()
+	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
 	cmd.Stdin = b.stdin
 	cmd.Stderr = b.stderr
@@ -204,7 +188,7 @@ func (b *bdCmd) buildContextCommand(ctx context.Context) *exec.Cmd {
 	args := b.resolvedArgs()
 	cmd := exec.CommandContext(ctx, "bd", args...)
 	util.SetProcessGroup(cmd)
-	cmd.Dir = b.workDir()
+	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
 	cmd.Stdin = b.stdin
 	cmd.Stderr = b.stderr
@@ -242,8 +226,8 @@ func (b *bdCmd) argsDesc() string {
 	if b.beadsDir != "" {
 		desc += fmt.Sprintf(" beads_dir=%s", b.beadsDir)
 	}
-	if dir := b.workDir(); dir != "" {
-		desc += fmt.Sprintf(" cwd=%s", dir)
+	if b.dir != "" {
+		desc += fmt.Sprintf(" cwd=%s", b.dir)
 	}
 	return desc
 }
@@ -300,7 +284,7 @@ func (b *bdCmd) CombinedOutput() ([]byte, error) {
 	args := b.resolvedArgs()
 	cmd := exec.CommandContext(ctx, "bd", args...)
 	util.SetProcessGroup(cmd)
-	cmd.Dir = b.workDir()
+	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
 	cmd.Stdin = b.stdin
 	out, err := cmd.CombinedOutput()
