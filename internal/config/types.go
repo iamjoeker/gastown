@@ -707,16 +707,6 @@ type RigSettings struct {
 	// Values are effort levels: "low", "medium", "high", "max".
 	// Example: {"crew": "max", "witness": "low"}
 	RoleEffort map[string]string `json:"role_effort,omitempty"`
-
-	// Plugins holds per-rig plugin configuration, keyed by plugin name.
-	// The shape of each entry is defined by the plugin that reads it, so this
-	// is deliberately untyped — settings round-trip it unchanged, which is what
-	// lets a plugin be opted in per rig:
-	//
-	//   gt rig settings set <rig> plugins.submodule-commit.enabled true
-	//
-	// Plugins read it back with `gt rig settings show <rig>`.
-	Plugins map[string]map[string]interface{} `json:"plugins,omitempty"`
 }
 
 // CrewConfig represents crew workspace settings for a rig.
