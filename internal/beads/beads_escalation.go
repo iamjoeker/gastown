@@ -215,48 +215,201 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 	return &issue, nil
 }
 
-// AckEscalation acknowledges an escalation bead.
-// Sets acked_by and acked_at fields, adds "acked" label.
-func (b *Beads) AckEscalation(id, ackedBy string) error {
-	target := b.forIssueID(id)
-	// First get current issue to preserve other fields
-	issue, err := target.Show(id)
-	if err != nil {
-		return err
+// EscalationLinkLabelPrefix marks a delivered escalation copy with the ID of the
+// escalation record it belongs to.
+//
+// Every escalation exists as TWO kinds of bead. `gt escalate` creates one
+// ephemeral RECORD (a wisp, carrying the structured severity/reason/closed_by
+// fields — this is the ID printed in the escalation mail body and the one the
+// documented close command takes) and then delivers that escalation as mail,
+// producing one durable COPY per target in the issues table. The copies are the
+// beads `gt escalate list` and the Mayor's queue actually render, and they carry
+// "escalation:<record-id>" plus "thread:<record-id>".
+//
+// Nothing used to reconcile the two, so closing the record left every copy open
+// forever and the queue carried resolved escalations as live HIGHs (gt-4xl).
+const EscalationLinkLabelPrefix = "escalation:"
+
+// EscalationRecordID returns the ID of the escalation record a bead belongs to:
+// the "escalation:<id>" target for a delivered copy, or the bead's own ID when
+// it is the record itself.
+//
+// Note the trailing colon in the prefix — it keeps the fingerprint label
+// ("escalation-fp:...") from being mistaken for a link.
+func EscalationRecordID(issue *Issue) string {
+	if issue == nil {
+		return ""
 	}
-
-	// Verify it's an escalation
-	if !HasLabel(issue, "gt:escalation") {
-		return fmt.Errorf("issue %s is not an escalation bead (missing gt:escalation label)", id)
+	for _, label := range issue.Labels {
+		if id, ok := strings.CutPrefix(label, EscalationLinkLabelPrefix); ok && id != "" && id != issue.ID {
+			return id
+		}
 	}
-
-	// Parse existing fields
-	fields := ParseEscalationFields(issue.Description)
-	fields.AckedBy = ackedBy
-	fields.AckedAt = time.Now().Format(time.RFC3339)
-
-	// Format new description
-	description := FormatEscalationDescription(issue.Title, fields)
-
-	return target.Update(id, UpdateOptions{
-		Description: &description,
-		AddLabels:   []string{"acked"},
-	})
+	return issue.ID
 }
 
-// CloseEscalation closes an escalation bead with a resolution reason.
-// Sets closed_by and closed_reason fields, closes the issue.
-func (b *Beads) CloseEscalation(id, closedBy, reason string) error {
-	target := b.forIssueID(id)
-	// First get current issue to preserve other fields
-	issue, err := target.Show(id)
+// resolveEscalation looks up the bead named by id and the escalation record it
+// belongs to.
+//
+// named is always the bead the caller asked for. record is the bead holding the
+// structured escalation fields, and is nil when the record has already been
+// reaped (records are ephemeral wisps with a TTL, so a long-lived copy can
+// outlive its record). recordID is returned even in that case, since it still
+// identifies the copies belonging to this escalation.
+func (b *Beads) resolveEscalation(id string) (named, record *Issue, recordID string, err error) {
+	named, err = b.forIssueID(id).Show(id)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	// Verify it's an escalation
+	if !HasLabel(named, "gt:escalation") {
+		return nil, nil, "", fmt.Errorf("issue %s is not an escalation bead (missing gt:escalation label)", id)
+	}
+
+	recordID = EscalationRecordID(named)
+	if recordID == named.ID {
+		return named, named, recordID, nil
+	}
+
+	// The caller named a delivered copy — which is what `gt escalate list`
+	// prints, so it is the ID a reader is most likely to have in hand.
+	record, err = b.forIssueID(recordID).Show(recordID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return named, nil, recordID, nil
+		}
+		return nil, nil, "", err
+	}
+	return named, record, recordID, nil
+}
+
+// openEscalationCopies returns the open delivered copies of an escalation record.
+func (b *Beads) openEscalationCopies(recordID string) ([]*Issue, error) {
+	if recordID == "" {
+		return nil, nil
+	}
+	out, err := b.run("list", "--label="+EscalationLinkLabelPrefix+recordID, "--status=open", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	}
+	return issues, nil
+}
+
+// AckEscalation acknowledges an escalation bead.
+// Sets acked_by and acked_at fields on the escalation record, and adds the
+// "acked" label to the record and to every open delivered copy — the copies are
+// what `gt escalate list` renders, so an ack that only touched the record showed
+// up nowhere.
+func (b *Beads) AckEscalation(id, ackedBy string) error {
+	_, record, recordID, err := b.resolveEscalation(id)
 	if err != nil {
 		return err
 	}
 
-	// Verify it's an escalation
-	if !HasLabel(issue, "gt:escalation") {
-		return fmt.Errorf("issue %s is not an escalation bead (missing gt:escalation label)", id)
+	if record != nil {
+		// Parse existing fields
+		fields := ParseEscalationFields(record.Description)
+		fields.AckedBy = ackedBy
+		fields.AckedAt = time.Now().Format(time.RFC3339)
+
+		// Format new description
+		description := FormatEscalationDescription(record.Title, fields)
+
+		if err := b.forIssueID(record.ID).Update(record.ID, UpdateOptions{
+			Description: &description,
+			AddLabels:   []string{"acked"},
+		}); err != nil {
+			return err
+		}
+	}
+
+	copies, err := b.openEscalationCopies(recordID)
+	if err != nil {
+		return fmt.Errorf("finding delivered copies of escalation %s: %w", recordID, err)
+	}
+
+	var failures []string
+	for _, copied := range copies {
+		if record != nil && copied.ID == record.ID {
+			continue
+		}
+		// Only the label: a copy's description is the mail body, not the
+		// structured escalation record, and must not be overwritten.
+		if err := b.forIssueID(copied.ID).Update(copied.ID, UpdateOptions{AddLabels: []string{"acked"}}); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", copied.ID, err))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("escalation record %s acknowledged, but %s: %s",
+			recordID, pluralCopies(len(failures), "could not be marked acked"), strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+// EscalationCloseResult reports every bead a CloseEscalation touched.
+type EscalationCloseResult struct {
+	RecordID string   // the escalation record (an ephemeral wisp, normally)
+	CopyIDs  []string // delivered mail copies closed alongside it
+}
+
+// CloseEscalation closes an escalation with a resolution reason.
+//
+// It closes BOTH halves of the escalation: the record (setting closed_by and
+// closed_reason) and every open delivered copy. Either ID may be passed — the
+// record ID printed in the escalation mail, or the copy ID printed by
+// `gt escalate list` — and the escalation is resolved the same way.
+//
+// Closing an escalation whose record is already closed is not an error: it
+// reconciles the copies that an earlier record-only close left stranded.
+func (b *Beads) CloseEscalation(id, closedBy, reason string) (*EscalationCloseResult, error) {
+	_, record, recordID, err := b.resolveEscalation(id)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &EscalationCloseResult{RecordID: recordID}
+	if record != nil {
+		if err := b.closeEscalationRecord(record, closedBy, reason); err != nil {
+			return nil, fmt.Errorf("closing escalation record %s: %w", record.ID, err)
+		}
+	}
+
+	copies, err := b.openEscalationCopies(recordID)
+	if err != nil {
+		return result, fmt.Errorf("escalation record %s closed, but its delivered copies could not be listed and may stay in the queue: %w", recordID, err)
+	}
+
+	var failures []string
+	for _, copied := range copies {
+		if record != nil && copied.ID == record.ID {
+			continue
+		}
+		if err := b.closeEscalationCopy(copied, reason); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", copied.ID, err))
+			continue
+		}
+		result.CopyIDs = append(result.CopyIDs, copied.ID)
+	}
+	if len(failures) > 0 {
+		return result, fmt.Errorf("escalation record %s closed, but %s and will stay in the queue: %s",
+			recordID, pluralCopies(len(failures), "could not be closed"), strings.Join(failures, "; "))
+	}
+
+	return result, nil
+}
+
+// closeEscalationRecord writes the resolution onto the escalation record and
+// closes it. A record that is already closed is left alone so the caller can
+// still reconcile its copies.
+func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) error {
+	if strings.EqualFold(issue.Status, "closed") {
+		return nil
 	}
 
 	// Parse existing fields
@@ -267,8 +420,10 @@ func (b *Beads) CloseEscalation(id, closedBy, reason string) error {
 	// Format new description
 	description := FormatEscalationDescription(issue.Title, fields)
 
+	target := b.forIssueID(issue.ID)
+
 	// Update description first
-	if err := target.Update(id, UpdateOptions{
+	if err := target.Update(issue.ID, UpdateOptions{
 		Description: &description,
 		AddLabels:   []string{"resolved"},
 	}); err != nil {
@@ -276,8 +431,32 @@ func (b *Beads) CloseEscalation(id, closedBy, reason string) error {
 	}
 
 	// Close the issue
-	_, err = target.run("close", id, "--reason="+reason)
+	_, err := target.run("close", issue.ID, "--reason="+reason)
 	return err
+}
+
+// closeEscalationCopy closes one delivered escalation mail bead.
+//
+// The copy's description is the mail body, not the structured escalation
+// record, so it is labelled but never rewritten. --force is required because
+// the copy is assigned to its recipient (mayor/, typically) and bd refuses to
+// close another agent's bead; the copy is a delivery artifact of the escalation
+// being resolved, not independent work of the recipient's.
+func (b *Beads) closeEscalationCopy(issue *Issue, reason string) error {
+	target := b.forIssueID(issue.ID)
+	if err := target.Update(issue.ID, UpdateOptions{AddLabels: []string{"resolved"}}); err != nil {
+		return err
+	}
+	_, err := target.run("close", issue.ID, "--force", "--reason="+reason)
+	return err
+}
+
+// pluralCopies renders "1 delivered copy <verb>" / "N delivered copies <verb>".
+func pluralCopies(n int, verb string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 delivered copy %s", verb)
+	}
+	return fmt.Sprintf("%d delivered copies %s", n, verb)
 }
 
 // GetEscalationBead retrieves an escalation bead by ID.
@@ -311,7 +490,7 @@ func (b *Beads) ListEscalations() ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return filterEscalationRecords(issues), nil
+	return b.dropResolvedEscalations(filterEscalationRecords(issues)), nil
 }
 
 // ListEscalationsByFingerprint returns open escalation beads matching a stable fingerprint label.
@@ -334,7 +513,7 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return filterEscalationRecords(issues), nil
+	return b.dropResolvedEscalations(filterEscalationRecords(issues)), nil
 }
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
@@ -354,7 +533,45 @@ func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return filterEscalationRecords(issues), nil
+	return b.dropResolvedEscalations(filterEscalationRecords(issues)), nil
+}
+
+// dropResolvedEscalations removes delivered escalation copies whose escalation
+// record has already been closed.
+//
+// A copy is a durable issue and its record is an ephemeral wisp, so closing the
+// record has never propagated to the copy. Without this filter every escalation
+// closed by the documented `gt escalate close <record-id>` stayed in the queue
+// as an open HIGH forever, and `gt escalate stale` would re-escalate resolved
+// escalations up to critical (gt-4xl). New closes now reconcile both halves;
+// this covers the copies stranded before that, with no migration.
+//
+// Fails OPEN: a record that cannot be read — reaped, or Dolt unreachable — keeps
+// its copy listed. Hiding a live escalation is far worse than showing a resolved
+// one, and a missing record is not evidence of resolution.
+func (b *Beads) dropResolvedEscalations(issues []*Issue) []*Issue {
+	closedRecord := make(map[string]bool)
+
+	kept := issues[:0]
+	for _, issue := range issues {
+		recordID := EscalationRecordID(issue)
+		if recordID == "" || recordID == issue.ID {
+			kept = append(kept, issue)
+			continue
+		}
+
+		resolved, checked := closedRecord[recordID]
+		if !checked {
+			record, err := b.forIssueID(recordID).Show(recordID)
+			resolved = err == nil && record != nil && strings.EqualFold(record.Status, "closed")
+			closedRecord[recordID] = resolved
+		}
+		if resolved {
+			continue
+		}
+		kept = append(kept, issue)
+	}
+	return kept
 }
 
 // filterEscalationRecords drops mail-only beads that are not themselves escalations.
