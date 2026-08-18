@@ -25,9 +25,6 @@ var (
 	mqSubmitNoCleanup bool
 	mqSubmitSkipDeps  bool
 	mqSubmitResubmit  bool
-	// mqSubmitAllowClosedIssue is an operator escape for the gt-7qm gate, for
-	// when the source issue's close was itself the mistake.
-	mqSubmitAllowClosedIssue bool
 
 	// Retry flags
 	mqRetryNow bool
@@ -341,7 +338,6 @@ func init() {
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitNoCleanup, "no-cleanup", false, "Don't auto-cleanup after submit (for polecats)")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitSkipDeps, "skip-deps", false, "Skip molecule step dependency check")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitResubmit, "resubmit", false, "Resubmit after a fix (skips dependency check)")
-	mqSubmitCmd.Flags().BoolVar(&mqSubmitAllowClosedIssue, "allow-closed-issue", false, "Create the MR even though the source issue is closed (operator override)")
 
 	// Retry flags
 	mqRetryCmd.Flags().BoolVar(&mqRetryNow, "now", false, "Immediately process instead of waiting for refinery loop")
