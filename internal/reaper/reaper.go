@@ -468,14 +468,10 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
 	}()
 
-	// The `issue_type != 'agent'` clause here is paired with the identical clause
-	// on closeWispsInBatches' UPDATE. Keep both: a candidate this query offers and
-	// the UPDATE declines makes no progress, which the batch loop reports as a
-	// stall (see closeWispsInBatches).
 	moleculeStepIDQuery := fmt.Sprintf(
 		"SELECT w.id FROM wisps w %s WHERE %s AND w.issue_type != 'agent' LIMIT %d",
 		moleculeStepJoin, openWispStatusWhere, DefaultBatchSize)
-	moleculeStepsClosed, stepsStalled, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
+	moleculeStepsClosed, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
 	if err != nil {
 		return nil, err
 	}
@@ -484,28 +480,13 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// Batch UPDATE: select IDs in chunks, update each chunk.
 	// This avoids holding a write lock on the entire table for minutes.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
-	// whereClause carries the same `issue_type != 'agent'` guard as the UPDATE —
-	// see the note on moleculeStepIDQuery above.
 	idQuery := fmt.Sprintf(
 		"SELECT w.id FROM wisps w %s %s WHERE %s LIMIT %d",
 		parentJoin, moleculeStepExcludeJoin, whereClause, DefaultBatchSize)
 
-	totalReaped, staleStalled, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
+	totalReaped, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
 	if err != nil {
 		return nil, err
-	}
-
-	// A stalled batch means a candidate query and the UPDATE disagree about what
-	// is closable. The loop stops rather than re-selecting the same rows forever,
-	// but the disagreement is a bug in the query pair, so surface it.
-	if stalled := stepsStalled + staleStalled; stalled > 0 {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type: "batch_close_no_progress",
-			Message: fmt.Sprintf(
-				"%d candidate wisp(s) were selected for closing but declined by the batch UPDATE — a candidate query and the UPDATE's exclusion clauses have diverged; those wisps were skipped",
-				stalled),
-			Count: stalled,
-		})
 	}
 
 	result.Reaped = totalReaped
@@ -540,31 +521,12 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	return result, nil
 }
 
-// closeWispsInBatches closes wisps in LIMIT-sized chunks, re-running idQuery
-// until it stops yielding work. It returns the number of wisps closed and the
-// size of the batch that made no progress (0 on every healthy run).
-//
-// TERMINATION: the loop ends when a batch comes back empty OR when a non-empty
-// batch closes nothing. The second condition is load-bearing. The UPDATE below
-// carries its own `issue_type != 'agent'` guard, so it can decline rows the
-// candidate query offered — and nothing else in the loop changes those rows, so
-// the next iteration would select exactly the same batch and decline it again,
-// forever. Under Reap's 2-minute context that is a hot SELECT+UPDATE loop
-// against production Dolt followed by a timeout error (gt-m46).
-//
-// Today every candidate query filters agent wisps itself, so no row is ever
-// declined and the loop empties the candidate set normally. That coupling is
-// invisible from either site, and de-duplicating the guard out of a candidate
-// query ("the UPDATE already filters agents") is a plausible future edit.
-// Stopping on lack of progress makes termination independent of it, and covers
-// any UPDATE clause added later that can decline a selected row. Skipping the
-// declined rows under-reaps; the caller reports that as an anomaly.
-func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, queryArgs []interface{}, description string) (closed, stalled int, err error) {
+func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, queryArgs []interface{}, description string) (int, error) {
 	total := 0
 	for {
 		rows, err := runner.QueryContext(ctx, idQuery, queryArgs...)
 		if err != nil {
-			return total, 0, fmt.Errorf("select %s batch: %w", description, err)
+			return total, fmt.Errorf("select %s batch: %w", description, err)
 		}
 
 		var ids []string
@@ -572,18 +534,18 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 			var id string
 			if err := rows.Scan(&id); err != nil {
 				rows.Close()
-				return total, 0, fmt.Errorf("scan %s id: %w", description, err)
+				return total, fmt.Errorf("scan %s id: %w", description, err)
 			}
 			ids = append(ids, id)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return total, 0, fmt.Errorf("read %s ids: %w", description, err)
+			return total, fmt.Errorf("read %s ids: %w", description, err)
 		}
 		rows.Close()
 
 		if len(ids) == 0 {
-			return total, 0, nil
+			return total, nil
 		}
 
 		placeholders := make([]string, len(ids))
@@ -594,23 +556,15 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 		}
 		inClause := strings.Join(placeholders, ",")
 
-		// The `issue_type != 'agent'` guard is defense in depth: the candidate
-		// queries filter agent wisps too. Removing it from either side is not a
-		// safe de-duplication — see TERMINATION above.
 		updateQuery := fmt.Sprintf(
 			"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s) AND status IN ('open', 'hooked', 'in_progress') AND issue_type != 'agent'",
 			inClause)
 		sqlResult, err := runner.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
-			return total, 0, fmt.Errorf("close %s batch: %w", description, err)
+			return total, fmt.Errorf("close %s batch: %w", description, err)
 		}
 
 		affected, _ := sqlResult.RowsAffected()
-		if affected == 0 {
-			// No progress on a non-empty batch. Re-running idQuery would return
-			// the same rows, so stop and report them instead of spinning.
-			return total, len(ids), nil
-		}
 		total += int(affected)
 	}
 }
