@@ -29,6 +29,7 @@ var activityCmd = &cobra.Command{
 	Use:     "activity",
 	GroupID: GroupDiag,
 	Short:   "Emit and view activity events",
+	RunE:    requireSubcommand,
 	Long: `Emit and view activity events for the Gas Town activity feed.
 
 Events are written to ~/gt/.events.jsonl and can be viewed with 'gt feed'.

@@ -70,6 +70,7 @@ var callbacksCmd = &cobra.Command{
 	Use:     "callbacks",
 	GroupID: GroupAgents,
 	Short:   "Handle agent callbacks",
+	RunE:    requireSubcommand,
 	Long: `Handle callbacks from agents during Deacon patrol.
 
 Callbacks are messages sent to the Mayor from:
