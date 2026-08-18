@@ -17,6 +17,7 @@ var beadCmd = &cobra.Command{
 	Aliases: []string{"bd"},
 	GroupID: GroupWork,
 	Short:   "Bead management utilities",
+	RunE:    requireSubcommand,
 	Long: `Utilities for managing beads across repositories.
 
 Provides operations that span multiple beads repositories, such as

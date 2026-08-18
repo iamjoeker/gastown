@@ -26,6 +26,7 @@ var patrolCmd = &cobra.Command{
 	Use:     "patrol",
 	GroupID: GroupDiag,
 	Short:   "Patrol digest management",
+	RunE:    requireSubcommand,
 	Long: `Manage patrol cycle digests.
 
 Patrol cycles (Deacon, Witness, Refinery) create ephemeral per-cycle digests.

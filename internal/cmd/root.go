@@ -416,7 +416,13 @@ func requireSubcommand(cmd *cobra.Command, args []string) error {
 	}
 	unknown := args[0]
 	errMsg := fmt.Sprintf("unknown command %q for %q", unknown, buildCommandPath(cmd))
-	// Use cobra's suggestion engine (Levenshtein + SuggestFor lists)
+	// Use cobra's suggestion engine (Levenshtein + SuggestFor lists).
+	// SuggestionsFor does not apply cobra's default minimum distance — only
+	// cobra's own findSuggestions does — so an unset (zero) distance suggests
+	// nothing but an exact match. Apply the same default cobra would.
+	if cmd.SuggestionsMinimumDistance <= 0 {
+		cmd.SuggestionsMinimumDistance = 2
+	}
 	if suggestions := cmd.SuggestionsFor(unknown); len(suggestions) > 0 {
 		errMsg += "\n\nDid you mean"
 		if len(suggestions) == 1 {
