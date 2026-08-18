@@ -273,6 +273,12 @@ Hung dogs are reported only (Deacon decides per ZFC principle). Stale
 dispatches on a live session are never auto-archived — the session may still
 be mid-execution — they escalate instead.
 
+Archiving a dispatch overrides the beads assignee guard, which would otherwise
+refuse every actor: dispatch mail is assigned to the dog, and the dog is by
+definition not the one reclaiming it. The override is scoped to Deacon
+dispatches addressed to that dog, so no other mail is reachable through it and
+there is no --force flag to pass.
+
 Dispatch alarms escalate at MEDIUM severity, throttled per dog by
 --alarm-cooldown so a persistent problem escalates once per window rather
 than once per patrol cycle.
