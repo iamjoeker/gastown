@@ -3,12 +3,12 @@ package cmd
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -832,18 +832,6 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 // Deduplicates by context ID: different search dirs can resolve to the same
 // underlying beads DB (e.g., when a rig's top-level .beads is a redirect to
 // mayor/rig/.beads), and both paths would otherwise return the same contexts.
-func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
-	records, err := listAllSlingContextRecords(townRoot)
-	if err != nil {
-		return nil, err
-	}
-	all := make([]*beads.Issue, 0, len(records))
-	for _, rec := range records {
-		all = append(all, rec.issue)
-	}
-	return all, nil
-}
-
 // ErrPartialSlingContextScan reports that at least one store could not be
 // scanned. Callers that need a COMPLETE view (idempotency checks such as
 // areScheduled) MUST treat this as failure and fail closed; callers that only
@@ -856,17 +844,24 @@ func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 // into "nothing is scheduled".
 var ErrPartialSlingContextScan = errors.New("planning scan could not read every store; result is incomplete")
 
-// listAllSlingContextRecords names itself in every error it returns ("listing
-// sling contexts: ..."), so callers can surface the failure verbatim instead of
-// re-wrapping it. A partial-scan error also carries which stores were skipped,
-// because "one rig was unreadable" and "the whole scan is broken" call for very
-// different operator responses.
+func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
+	records, err := listAllSlingContextRecords(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	all := make([]*beads.Issue, 0, len(records))
+	for _, rec := range records {
+		all = append(all, rec.issue)
+	}
+	return all, nil
+}
+
 func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	var records []slingContextRecord
 	seen := make(map[string]bool)
 	dirs, err := beadsSearchDirs(townRoot)
 	if err != nil {
-		return nil, fmt.Errorf("listing sling contexts: %w", err)
+		return nil, err
 	}
 	// PER-ENTRY ERROR ISOLATION (hq-v05uw). This loop previously returned on the
 	// first store that errored, so ONE bad .beads directory aborted the ENTIRE
@@ -904,13 +899,13 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	// Total failure is still an error — degrading to "no work found" would hide
 	// a broken scan behind an empty result.
 	if len(dirs) > 0 && len(skipped) == len(dirs) {
-		return nil, fmt.Errorf("listing sling contexts: planning scan failed on ALL %d stores; last: %s", len(dirs), skipped[len(skipped)-1])
+		return nil, fmt.Errorf("planning scan failed on ALL %d stores; last: %s", len(dirs), skipped[len(skipped)-1])
 	}
 	if len(skipped) > 0 {
 		// Records ARE returned so best-effort planning still works, but the
 		// sentinel travels with them so a completeness-sensitive caller can
 		// fail closed instead of trusting an incomplete view (gt-mji1).
-		return records, fmt.Errorf("listing sling contexts: %w (skipped %d of %d: %s)",
+		return records, fmt.Errorf("%w (skipped %d of %d: %s)",
 			ErrPartialSlingContextScan, len(skipped), len(dirs), strings.Join(skipped, ", "))
 	}
 	return records, nil
