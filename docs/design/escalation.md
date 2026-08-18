@@ -78,6 +78,30 @@ Config file: `~/gt/settings/escalation.json`
 
 Escalation beads use `type: escalation` with structured labels for tracking.
 
+### Anatomy: one escalation, two kinds of bead
+
+Every escalation produces **two** kinds of bead, and confusing them is the
+classic way to convince yourself an escalation is resolved when it is not:
+
+| | Record | Delivered copy |
+|---|---|---|
+| Where | `wisps` table (ephemeral, has a TTL) | `issues` table (durable) |
+| ID shape | `hq-wisp-<x>` | `hq-<x>` |
+| How many | exactly one | one per mail target |
+| Carries | the structured `severity:`/`reason:`/`closed_by:` fields | the mail body |
+| Links | — | `escalation:<record-id>`, `thread:<record-id>` |
+| ID printed in | the escalation mail body ("To close: …") | `gt escalate list`, the Mayor's queue |
+
+Both carry `gt:escalation`. **The queue renders the copies, not the record**, so
+resolving an escalation means resolving both halves. `gt escalate close` and
+`gt escalate ack` do that themselves and accept **either** ID — the record ID
+from the mail body or the copy ID from `gt escalate list`. `gt escalate list`
+additionally hides copies whose record is already closed, which covers
+escalations closed before this reconciliation existed (gt-4xl).
+
+Closing a copy directly with `bd close` does not touch the record, and closing
+the record with `bd close` does not touch the copies. Use `gt escalate close`.
+
 ### Label Schema
 
 | Label | Values | Purpose |

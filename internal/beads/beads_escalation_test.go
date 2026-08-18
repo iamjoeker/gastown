@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -463,5 +464,468 @@ exit 0
 	// Sanity: stdin must contain newlines (it's the multi-line description).
 	if !strings.Contains(stdin, "\n") {
 		t.Errorf("expected stdin to be multi-line, got %q", stdin)
+	}
+}
+
+// --- Escalation record/copy reconciliation (gt-4xl) ---------------------------
+//
+// An escalation is two beads: an ephemeral RECORD wisp and one durable mail COPY
+// per target. `gt escalate close` used to write only the record while
+// `gt escalate list` renders only the copies, so a closed escalation stayed in
+// the Mayor's queue as an open HIGH forever and the close reported success.
+
+// escalationStub installs a fake `bd` on PATH that answers `show` and `list`
+// from JSON fixtures and appends every other invocation to a log. It is enough
+// to observe exactly which beads a reconciliation path writes to.
+type escalationStub struct {
+	t       *testing.T
+	dir     string
+	logPath string
+}
+
+func newEscalationStub(t *testing.T) *escalationStub {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "bd.log")
+
+	// Subcommand is the first non-flag arg (bd may be called as
+	// `bd --allow-stale show <id> --json`); the ID is the next non-flag arg.
+	script := `#!/bin/sh
+sub=""
+id=""
+label=""
+for arg in "$@"; do
+  case "$arg" in
+    --label=*)
+      if [ -z "$label" ]; then label="${arg#--label=}"; fi
+      continue
+      ;;
+    -*) continue ;;
+  esac
+  if [ -z "$sub" ]; then sub="$arg"; continue; fi
+  if [ -z "$id" ]; then id="$arg"; fi
+done
+case "$sub" in
+  version) ;;
+  show)
+    f="` + dir + `/show-$id.json"
+    if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi
+    ;;
+  list)
+    f="` + dir + `/list-$(printf '%s' "$label" | tr ':/' '__').json"
+    if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi
+    ;;
+  *)
+    printf '%s\n' "$*" >> "` + logPath + `"
+    ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+
+	return &escalationStub{t: t, dir: dir, logPath: logPath}
+}
+
+// bead registers the JSON `bd show <id>` returns for a bead.
+func (s *escalationStub) bead(issue *Issue) {
+	s.t.Helper()
+	data, err := json.Marshal([]*Issue{issue})
+	if err != nil {
+		s.t.Fatalf("marshal fixture %s: %v", issue.ID, err)
+	}
+	if err := os.WriteFile(filepath.Join(s.dir, "show-"+issue.ID+".json"), data, 0644); err != nil {
+		s.t.Fatalf("write fixture %s: %v", issue.ID, err)
+	}
+}
+
+// list registers the JSON `bd list --label=<label>` returns.
+func (s *escalationStub) list(label string, issues ...*Issue) {
+	s.t.Helper()
+	if issues == nil {
+		issues = []*Issue{}
+	}
+	data, err := json.Marshal(issues)
+	if err != nil {
+		s.t.Fatalf("marshal list fixture %s: %v", label, err)
+	}
+	name := strings.NewReplacer(":", "_", "/", "_").Replace(label)
+	if err := os.WriteFile(filepath.Join(s.dir, "list-"+name+".json"), data, 0644); err != nil {
+		s.t.Fatalf("write list fixture %s: %v", label, err)
+	}
+}
+
+// writes returns every mutating bd invocation, one per line.
+func (s *escalationStub) writes() []string {
+	s.t.Helper()
+	data, err := os.ReadFile(s.logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		s.t.Fatalf("read bd log: %v", err)
+	}
+	var lines []string
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func (s *escalationStub) hasWrite(substrings ...string) bool {
+	s.t.Helper()
+next:
+	for _, line := range s.writes() {
+		for _, want := range substrings {
+			if !strings.Contains(line, want) {
+				continue next
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// escalationRecord builds an escalation record wisp fixture.
+func escalationRecord(id string) *Issue {
+	return &Issue{
+		ID:          id,
+		Title:       "Dolt: server unreachable",
+		Description: FormatEscalationDescription("Dolt: server unreachable", &EscalationFields{Severity: "high", EscalatedBy: "gastown/witness"}),
+		Status:      "open",
+		Labels:      []string{"gt:escalation", "severity:high"},
+	}
+}
+
+// escalationCopy builds a delivered escalation mail bead fixture. Its
+// description is the MAIL BODY, not the structured escalation record.
+func escalationCopy(id, recordID, assignee string) *Issue {
+	return &Issue{
+		ID:          id,
+		Title:       "[HIGH] Dolt: server unreachable",
+		Description: "Escalation ID: " + recordID + "\nSeverity: high\nFrom: gastown/witness",
+		Status:      "open",
+		Assignee:    assignee,
+		Labels: []string{
+			"gt:message", "gt:escalation", "msg-type:escalation",
+			EscalationLinkLabelPrefix + recordID, "thread:" + recordID, "severity:high",
+		},
+	}
+}
+
+func TestEscalationRecordID(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue *Issue
+		want  string
+	}{
+		{
+			name:  "record returns its own ID",
+			issue: escalationRecord("hq-wisp-r1"),
+			want:  "hq-wisp-r1",
+		},
+		{
+			name:  "delivered copy returns the record it belongs to",
+			issue: escalationCopy("hq-c1", "hq-wisp-r1", "mayor/"),
+			want:  "hq-wisp-r1",
+		},
+		{
+			// escalation-fp: is a fingerprint, not a link. A prefix match without
+			// the colon would read it as one and reconcile against a hash.
+			name:  "fingerprint label is not a link",
+			issue: &Issue{ID: "hq-wisp-r2", Labels: []string{"gt:escalation", "escalation-fp:abc123def456"}},
+			want:  "hq-wisp-r2",
+		},
+		{
+			name:  "self-referential link is not a link",
+			issue: &Issue{ID: "hq-wisp-r3", Labels: []string{"escalation:hq-wisp-r3"}},
+			want:  "hq-wisp-r3",
+		},
+		{
+			name:  "nil issue",
+			issue: nil,
+			want:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := EscalationRecordID(tt.issue); got != tt.want {
+				t.Errorf("EscalationRecordID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Closing by the record ID — the ID printed in the escalation mail and in the
+// documented close command — must also close the delivered copies. Before the
+// fix this closed the wisp, printed "✓ Escalation closed", and left the copy
+// open in the Mayor's queue permanently.
+func TestCloseEscalation_ClosesDeliveredCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	copyB := escalationCopy("hq-c2", "hq-wisp-r1", "overseer/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.bead(copyB)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA, copyB)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved: dolt restarted")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+
+	if result.RecordID != "hq-wisp-r1" {
+		t.Errorf("RecordID = %q, want hq-wisp-r1", result.RecordID)
+	}
+	if len(result.CopyIDs) != 2 {
+		t.Errorf("CopyIDs = %v, want both delivered copies", result.CopyIDs)
+	}
+
+	if !stub.hasWrite("close", "hq-wisp-r1", "--reason=resolved: dolt restarted") {
+		t.Errorf("record was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	for _, id := range []string{"hq-c1", "hq-c2"} {
+		// --force: the copy is assigned to its recipient, and the agent
+		// resolving an escalation is rarely that recipient.
+		if !stub.hasWrite("close", id, "--force") {
+			t.Errorf("delivered copy %s was not closed; bd writes:\n%s", id, strings.Join(stub.writes(), "\n"))
+		}
+	}
+}
+
+// A copy's description is the mail body. Rewriting it with the structured
+// escalation format would destroy the delivered message.
+func TestCloseEscalation_DoesNotRewriteCopyDescriptions(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	if _, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved"); err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+
+	for _, line := range stub.writes() {
+		if strings.HasPrefix(line, "update hq-c1") && strings.Contains(line, "--body-file") {
+			t.Errorf("copy description must not be rewritten, got: %q", line)
+		}
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=resolved") {
+		t.Errorf("copy was not labelled resolved; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	// The record does carry the structured fields and must be updated.
+	if !stub.hasWrite("update hq-wisp-r1", "--body-file=-") {
+		t.Errorf("record description was not updated; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// `gt escalate list` prints the COPY's ID, so that is the ID a reader has in
+// hand. Closing by it must resolve the same escalation as closing by the record.
+func TestCloseEscalation_AcceptsDeliveredCopyID(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-c1", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+
+	if result.RecordID != "hq-wisp-r1" {
+		t.Errorf("RecordID = %q, want the record hq-wisp-r1", result.RecordID)
+	}
+	if !stub.hasWrite("close", "hq-wisp-r1") {
+		t.Errorf("record was not closed when named by its copy; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if !stub.hasWrite("close", "hq-c1") {
+		t.Errorf("named copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// Every escalation closed before this fix has a closed record and open copies.
+// Re-running the documented close must reconcile them rather than fail on the
+// already-closed record.
+func TestCloseEscalation_ReconcilesCopiesOfAlreadyClosedRecord(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed"
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "already resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation on an already-closed record: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
+	}
+	if stub.hasWrite("close", "hq-wisp-r1") {
+		t.Errorf("already-closed record must not be closed again; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if !stub.hasWrite("close", "hq-c1") {
+		t.Errorf("stranded copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// A record is an ephemeral wisp with a TTL; a copy can outlive it. Closing must
+// still clear the copy instead of erroring on the missing record.
+func TestCloseEscalation_ClosesCopyWhenRecordWasReaped(t *testing.T) {
+	stub := newEscalationStub(t)
+	copyA := escalationCopy("hq-c1", "hq-wisp-gone", "mayor/")
+	stub.bead(copyA) // no fixture for hq-wisp-gone: bd show returns []
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-gone", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-c1", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation with a reaped record: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
+	}
+}
+
+// A close that leaves a copy open must say so. Reporting success while the
+// escalation stays live in the queue is the defect this fixes.
+func TestCloseEscalation_ReportsCopiesItCouldNotClose(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	stub.bead(record)
+	// The list fixture names a copy that bd show cannot resolve, and closing it
+	// is what fails: the stub's `update` succeeds, so simulate failure by having
+	// no fixture and asserting on the error path via a bd that rejects the ID.
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	// Replace bd with one that fails every close of a copy.
+	failing := `#!/bin/sh
+case "$*" in
+  *"close hq-c1"*) echo "bd: assignee is mayor/, actor is gastown/witness" >&2; exit 1 ;;
+esac
+exec "` + filepath.Join(stub.dir, "bd") + `" "$@"
+`
+	failDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(failDir, "bd"), []byte(failing), 0755); err != nil {
+		t.Fatalf("write failing bd stub: %v", err)
+	}
+	t.Setenv("PATH", failDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved")
+	if err == nil {
+		t.Fatalf("CloseEscalation reported success while hq-c1 stayed open in the queue")
+	}
+	if !strings.Contains(err.Error(), "hq-c1") {
+		t.Errorf("error must name the copy left open, got: %v", err)
+	}
+	if result == nil || result.RecordID != "hq-wisp-r1" {
+		t.Errorf("result must still report the closed record, got %#v", result)
+	}
+}
+
+// The "acked" label is read off the bead `gt escalate list` prints — the copy.
+// Acking only the record showed up nowhere.
+func TestAckEscalation_LabelsDeliveredCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	if err := b.AckEscalation("hq-wisp-r1", "mayor/"); err != nil {
+		t.Fatalf("AckEscalation: %v", err)
+	}
+
+	if !stub.hasWrite("update hq-wisp-r1", "--add-label=acked", "--body-file=-") {
+		t.Errorf("record was not acked; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=acked") {
+		t.Errorf("delivered copy was not marked acked; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	for _, line := range stub.writes() {
+		if strings.HasPrefix(line, "update hq-c1") && strings.Contains(line, "--body-file") {
+			t.Errorf("copy description must not be rewritten, got: %q", line)
+		}
+	}
+}
+
+// Copies stranded by pre-fix closes must drop out of the queue with no
+// migration — but only on positive evidence that the record is closed.
+func TestDropResolvedEscalations(t *testing.T) {
+	stub := newEscalationStub(t)
+
+	closedRecord := escalationRecord("hq-wisp-closed")
+	closedRecord.Status = "closed"
+	openRecord := escalationRecord("hq-wisp-open")
+	stub.bead(closedRecord)
+	stub.bead(openRecord)
+	// hq-wisp-reaped has no fixture: bd show returns [] (ErrNotFound).
+
+	resolved := escalationCopy("hq-resolved", "hq-wisp-closed", "mayor/")
+	live := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	orphan := escalationCopy("hq-orphan", "hq-wisp-reaped", "mayor/")
+	standalone := escalationRecord("hq-wisp-open2")
+
+	b := New(t.TempDir())
+	got := b.dropResolvedEscalations([]*Issue{resolved, live, orphan, standalone})
+
+	var ids []string
+	for _, issue := range got {
+		ids = append(ids, issue.ID)
+	}
+	want := []string{"hq-live", "hq-orphan", "hq-wisp-open2"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Errorf("dropResolvedEscalations() = %v, want %v (a reaped record is not evidence of resolution)", ids, want)
+	}
+}
+
+// ListEscalations is what `gt escalate list`, the Mayor's queue, and
+// `gt escalate stale` all read. A resolved escalation must not appear — stale
+// re-escalation would otherwise bump closed escalations to critical.
+func TestListEscalations_HidesResolvedEscalations(t *testing.T) {
+	stub := newEscalationStub(t)
+	closedRecord := escalationRecord("hq-wisp-closed")
+	closedRecord.Status = "closed"
+	openRecord := escalationRecord("hq-wisp-open")
+	stub.bead(closedRecord)
+	stub.bead(openRecord)
+
+	resolved := escalationCopy("hq-resolved", "hq-wisp-closed", "mayor/")
+	live := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	stub.list("gt:escalation", resolved, live)
+
+	b := New(t.TempDir())
+	got, err := b.ListEscalations()
+	if err != nil {
+		t.Fatalf("ListEscalations: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "hq-live" {
+		var ids []string
+		for _, issue := range got {
+			ids = append(ids, issue.ID)
+		}
+		t.Errorf("ListEscalations() = %v, want only the unresolved escalation hq-live", ids)
 	}
 }
