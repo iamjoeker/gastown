@@ -189,6 +189,9 @@ The Dog uses this to understand the state before deciding what to reap.`,
 					fmt.Printf("  Molecule steps:   %d\n", r.MoleculeStepCandidates)
 				}
 				fmt.Printf("  Purge candidates: %d\n", r.PurgeCandidates)
+				if r.ProtectedFromPurge > 0 {
+					fmt.Printf("  Purge-protected:  %d\n", r.ProtectedFromPurge)
+				}
 				fmt.Printf("  Mail candidates:  %d\n", r.MailCandidates)
 				fmt.Printf("  Stale candidates: %d\n", r.StaleCandidates)
 				fmt.Printf("  Open wisps:       %d\n", r.OpenWisps)
@@ -369,7 +372,7 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalWisps, totalMail int
+			var totalWisps, totalMail, totalProtected int
 			for _, r := range results {
 				prefix := ""
 				if r.DryRun {
@@ -377,19 +380,25 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				}
 				fmt.Printf("%s: %spurged %d wisps, %d mail\n",
 					r.Database, prefix, r.WispsPurged, r.MailPurged)
+				// Report the skip rather than just deleting fewer rows: without
+				// this a protected purge is indistinguishable from a quiet one.
+				if r.WispsProtected > 0 {
+					fmt.Printf("  Protected (skipped): %d\n", r.WispsProtected)
+				}
 				for _, a := range r.Anomalies {
 					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
 				}
 				totalWisps += r.WispsPurged
 				totalMail += r.MailPurged
+				totalProtected += r.WispsProtected
 			}
 			if len(results) > 1 {
 				prefix := ""
 				if reaperDryRun {
 					prefix = "[DRY RUN] "
 				}
-				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail\n",
-					prefix, len(results), totalWisps, totalMail)
+				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail, protected %d wisps\n",
+					prefix, len(results), totalWisps, totalMail, totalProtected)
 			}
 		}
 		return nil
@@ -505,7 +514,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen int
+		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalProtected, totalClosed, totalOpen int
 
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
@@ -560,6 +569,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			} else {
 				totalPurged += purgeResult.WispsPurged
 				totalMailPurged += purgeResult.MailPurged
+				totalProtected += purgeResult.WispsProtected
 			}
 
 			// Auto-close
@@ -590,6 +600,9 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		}
 		fmt.Println()
 		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
+		if totalProtected > 0 {
+			fmt.Printf("  Protected: %d wisps (pinned or protected label)\n", totalProtected)
+		}
 		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
 		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)
 
