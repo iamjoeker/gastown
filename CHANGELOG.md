@@ -9,21 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Dogs now have a durable session log** at
-  `<townRoot>/deacon/dogs/<name>/session.log`, readable with **`gt dog logs
-  [name]`** (gt-wlco). A dog's stdout and stderr went nowhere that outlived the
-  dog: the session runs in a tmux pane that `gt dog done` destroys three seconds
-  later, and nothing was captured to `daemon.log` or to any per-dog file. That
-  made every dog-side diagnostic unobservable *by construction* — the gt-u58w
-  fix duly reported its dispatch-mail cleanup failure to stderr, the report went
-  into the dying pane, and dispatches climbed 230 → 559 across the pack with
-  zero error output reaching a surface anyone could read. `gt dog done`,
-  `gt dog clear` and dog session start/stop now append their outcomes *and*
-  their warnings to the log, which is rotated at 4MB with one backup. Successes
-  are recorded too: a log holding only failures cannot tell a dog that succeeded
-  apart from one that never ran, which is precisely how a leak ran for hours
-  while 190 of 191 plugin runs looked fine.
-
 - **`gt town root`** prints the workspace root on stdout and exits non-zero when
   there is no workspace (gt-cr2), so shell scripts can rely on
   `TOWN_ROOT=$(gt town root) || exit 1`. Resolution is the same as everywhere
@@ -31,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fall back to `$GT_TOWN_ROOT` / `$GT_ROOT`.
 
 ### Fixed
+
+- **`gt dog health-check --auto-clear` no longer kills hung dogs' live sessions**
+  (gt-3rj). The help promised "hung dogs are reported only (Deacon decides per
+  ZFC principle)" while the code killed the tmux session and cleared the work —
+  the flag did *more* than it said, which is the dangerous direction for a
+  contract to break in: an operator reads the help, concludes the flag is safe to
+  run while a hung dog is present, and destroys a session that was merely quiet.
+  Worse, the kill did not even free what the dog was holding: `sessionAlive` was
+  captured before the kill, so the dispatches became orphans that nothing
+  reclaimed — one observed run destroyed a live session and archived zero
+  dispatches. `--auto-clear` now touches dead sessions only. Ending a hung dog is
+  available under the new `--kill-hung` (which requires `--auto-clear`), and that
+  path reclaims the dispatches its kill strands.
 
 - **Plugins no longer build paths out of `gt town`'s help text** (gt-cr2).
   `gt town root` was not a subcommand — Cobra answered it by printing `gt town`'s
