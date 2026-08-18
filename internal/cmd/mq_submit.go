@@ -106,19 +106,32 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 
 	g := git.NewGit(cwd)
 
-	// Get current branch
-	branch := mqSubmitBranch
-	if branch == "" {
-		branch, err = g.CurrentBranch()
-		if err != nil {
-			return fmt.Errorf("getting current branch: %w", err)
-		}
-	}
-
 	// Get configured default branch for this rig
 	defaultBranch := "main" // fallback
 	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
 		defaultBranch = rigCfg.DefaultBranch
+	}
+
+	// Get current branch. A detached worktree makes rev-parse --abbrev-ref HEAD
+	// answer "HEAD", and every check downstream ("is it on origin?", "push it")
+	// then names a ref that cannot exist in refs/heads — so the submission fails
+	// with advice nobody can follow. Resolve a real branch name or say plainly
+	// that there isn't one (gt-e45).
+	branch := mqSubmitBranch
+	if branch == "" {
+		branchRes, resErr := polecat.ResolveWorkingBranch(g, os.Getenv("GT_POLECAT"), defaultBranch)
+		if resErr != nil {
+			return fmt.Errorf("getting current branch: %w", resErr)
+		}
+		if branchRes.Unresolvable() {
+			return fmt.Errorf("cannot submit to the merge queue: %s\n\n"+
+				"There is no branch name to submit, push, or verify — this is not a failed push.\n"+
+				"Name the work first, then re-run: git switch -c <branch>, or pass --branch", branchRes.Reason)
+		}
+		branch = branchRes.Branch
+		if branchRes.Recovered {
+			style.PrintWarning("HEAD is detached — submitting %q, the branch pointing at HEAD", branch)
+		}
 	}
 
 	if branch == defaultBranch || branch == "master" {
