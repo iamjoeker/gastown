@@ -42,6 +42,9 @@ var townCmd = &cobra.Command{
 	Use:   "town",
 	Short: "Town-level operations",
 	Long:  `Commands for town-level operations including session cycling.`,
+	// Without this, Cobra answers `gt town <typo>` by printing help to stdout
+	// and exiting 0 — which let scripts capture help text as data (gt-cr2).
+	RunE: requireSubcommand,
 }
 
 var townNextCmd = &cobra.Command{
