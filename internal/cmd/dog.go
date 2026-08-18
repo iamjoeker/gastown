@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/dog"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -843,23 +844,108 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	sessionID := fmt.Sprintf("hq-dog-%s", name)
 	t := tmux.NewTmux()
 	_ = t.SetRemainOnExit(sessionID, false)
-	fmt.Printf("  Session %s will terminate in 3s\n", sessionID)
+	fmt.Printf("  Session %s will terminate in %s\n", sessionID, dogDoneTerminationDelay)
 
-	// Kill the tmux session after a short delay using a goroutine.
-	// Previous approach used bash -c "sleep 3 && tmux kill-session" which
-	// fails silently on Windows. The goroutine is cross-platform and uses
-	// the tmux package which handles the socket name automatically.
-	go func() {
-		time.Sleep(3 * time.Second)
-		if err := t.KillSession(sessionID); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to kill session %s: %v\n", sessionID, err)
+	// The delay is not dead time: it is the window in which this dog is idle
+	// with a live session, so it is also the window in which a new dispatch can
+	// land on it. Spend the wait watching for that. See waitForDogReassignment.
+	reassigned, stateErr := waitForDogReassignment(mgr, name, dogDoneTerminationDelay, dogDoneReassignPoll)
+	if reassigned {
+		if stateErr != nil {
+			fmt.Fprintf(os.Stderr, "⚠ could not read state for dog %s during shutdown (%v) — leaving session %s up rather than risk killing a fresh dispatch\n",
+				name, stateErr, sessionID)
+			return nil
 		}
-	}()
+		fmt.Printf("  Dog %s was re-assigned during shutdown — leaving session %s up for the new work\n", name, sessionID)
+		fmt.Printf("  New work is already yours: run `%s hook` and `%s mail inbox`\n", cli.Name(), cli.Name())
+		return nil
+	}
 
-	// Wait for the goroutine to finish (the process will exit after kill).
-	time.Sleep(4 * time.Second)
+	// Kill the tmux session. This is a self-kill — the command runs inside the
+	// session it is terminating — so nothing after this reliably executes.
+	if err := t.KillSession(sessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to kill session %s: %v\n", sessionID, err)
+	}
+
+	// Give tmux time to take this process down with the session rather than
+	// racing the shell prompt back into a pane that is about to disappear.
+	time.Sleep(dogDoneKillSettle)
 
 	return nil
+}
+
+// Timings for the shutdown tail of `gt dog done`.
+const (
+	// dogDoneTerminationDelay is how long the dog's session stays up after its
+	// work is cleared, so the agent can see the success output before the
+	// session is killed.
+	dogDoneTerminationDelay = 3 * time.Second
+
+	// dogDoneReassignPoll is how often that wait re-reads the dog's state
+	// looking for a new assignment.
+	dogDoneReassignPoll = 250 * time.Millisecond
+
+	// dogDoneKillSettle is the grace period after kill-session, so the process
+	// goes down with its session instead of returning to a doomed pane.
+	dogDoneKillSettle = time.Second
+)
+
+// dogStateReader reads back a dog's live state. *dog.Manager satisfies it.
+type dogStateReader interface {
+	Get(name string) (*dog.Dog, error)
+}
+
+// dogHoldsWork reports whether the dog is holding an assignment right now.
+//
+// The error is returned alongside a held=true verdict rather than instead of
+// it: a state file that cannot be read must not be treated as "idle, safe to
+// kill". Callers get both so they can say which one happened.
+func dogHoldsWork(mgr dogStateReader, name string) (bool, error) {
+	d, err := mgr.Get(name)
+	if err != nil {
+		return true, err
+	}
+	return d.State != dog.StateIdle || d.Work != "", nil
+}
+
+// waitForDogReassignment waits up to delay for the dog to be handed new work,
+// re-reading its state every poll interval and returning as soon as an
+// assignment appears.
+//
+// This is the guard for gt-p2e7. `gt dog done` clears the dog's work and THEN
+// kills its session, and between those two acts the dog is idle with a live
+// session — precisely the shape `gt dog dispatch` looks for. A dispatch landing
+// in that window is assigned, its mail is sent, and because the session is up,
+// planDispatchDelivery makes the mail notification the delivery and starts
+// nothing. Then this command's kill lands and destroys the agent that was about
+// to do the work. The dispatch stays open, the dog stays in StateWorking, and
+// the work product — a dolt backup, a file on disk — never appears. Nothing
+// errors, because nothing failed: each half did exactly its job.
+//
+// A dog that is still idle when the wait ends is safe to terminate. One that is
+// working is not, and the asymmetry is what decides the fail direction:
+// leaving a session up costs an idle agent that the health check reports as an
+// orphan and reaps, while killing one costs the dispatch outright, silently,
+// with no error anywhere. State that cannot be read fails the same way.
+func waitForDogReassignment(mgr dogStateReader, name string, delay, poll time.Duration) (bool, error) {
+	if poll <= 0 {
+		poll = dogDoneReassignPoll
+	}
+	deadline := time.Now().Add(delay)
+	for {
+		held, err := dogHoldsWork(mgr, name)
+		if held {
+			return true, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, nil
+		}
+		if remaining > poll {
+			remaining = poll
+		}
+		time.Sleep(remaining)
+	}
 }
 
 func splitPathComponents(path string) []string {
@@ -1233,21 +1319,28 @@ type dispatchDelivery struct {
 // wording can fix it.
 //
 // The fix is to let exactly one path deliver:
-//   - session down: we are about to start it, so its startup prompt is the
+//   - no live agent: we are about to start one, so its startup prompt is the
 //     delivery and the mail rides silently.
-//   - session up: the mail's notification is the delivery and we start nothing.
+//   - live agent: the mail's notification is the delivery and we start nothing.
 //
-// A failed liveness probe is treated as "up", because the two errors are not
+// The input must be a liveness verdict (SessionManager.HasLiveAgent), not mere
+// session existence. A session whose agent has died reads as "up" to
+// has-session, which would route the delivery to the mail notification AND —
+// since EnsureRunning now replaces such a session — hand the same instruction to
+// a startup prompt, restoring the exact double delivery this function exists to
+// prevent (gt-p2e7). Both callers gate on the same verdict for that reason.
+//
+// A failed liveness probe is treated as "live", because the two errors are not
 // symmetric: a redundant nudge at a dead session is a no-op, while a
 // suppressed nudge at a live one strands the dispatch until it is reaped.
-func planDispatchDelivery(sessionRunning bool, probeErr error) dispatchDelivery {
+func planDispatchDelivery(agentAlive bool, probeErr error) dispatchDelivery {
 	if probeErr != nil {
 		return dispatchDelivery{
 			suppressMailNotify: false,
 			reason:             fmt.Sprintf("session liveness unknown (%v) — notifying via mail", probeErr),
 		}
 	}
-	if sessionRunning {
+	if agentAlive {
 		return dispatchDelivery{
 			suppressMailNotify: false,
 			reason:             "session already running — mail notification delivers",
@@ -1433,7 +1526,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	// start nothing.
 	t := tmux.NewTmux()
 	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
-	plan := planDispatchDelivery(sessMgr.IsRunning(targetDog.Name))
+	plan := planDispatchDelivery(sessMgr.HasLiveAgent(targetDog.Name))
 
 	// Create and send mail message with plugin instructions
 	dogAddress := dog.DogAddress(targetDog.Name)
