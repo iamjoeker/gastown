@@ -16,7 +16,6 @@ var checkpointCmd = &cobra.Command{
 	Use:     "checkpoint",
 	GroupID: GroupDiag,
 	Short:   "Manage session checkpoints for crash recovery",
-	RunE:    requireSubcommand,
 	Long: `Manage checkpoints for polecat session crash recovery.
 
 Checkpoints capture the current work state so that if a session crashes,

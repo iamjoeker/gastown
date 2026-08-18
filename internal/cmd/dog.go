@@ -29,6 +29,8 @@ var (
 	dogForce          bool
 	dogRemoveAll      bool
 	dogCallAll        bool
+	dogLogsLines      int
+	dogLogsPath       bool
 
 	// Dispatch flags
 	dogDispatchPlugin string
@@ -52,7 +54,6 @@ var dogCmd = &cobra.Command{
 	Aliases: []string{"dogs"},
 	GroupID: GroupAgents,
 	Short:   "Manage dogs (cross-rig infrastructure workers)",
-	RunE:    requireSubcommand,
 	Long: `Manage dogs - reusable workers for infrastructure and cleanup.
 
 CATS VS DOGS:
@@ -217,6 +218,28 @@ Examples:
 	RunE: runDogStatus,
 }
 
+var dogLogsCmd = &cobra.Command{
+	Use:   "logs [name]",
+	Short: "Show a dog's durable session log",
+	Long: `Show a dog's durable session log.
+
+A dog's tmux pane is destroyed seconds after it finishes, so anything printed
+there is gone before an operator can read it. Dog-side outcomes and warnings are
+therefore appended to <townRoot>/deacon/dogs/<name>/session.log, which survives
+the session. This command reads it.
+
+Without a name argument, auto-detects the current dog from the working directory
+(must be run from within a dog's worktree).
+
+Examples:
+  gt dog logs alpha
+  gt dog logs alpha -n 200
+  gt dog logs              # Auto-detect from cwd
+  gt dog logs alpha --path # Print the log path only`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runDogLogs,
+}
+
 var dogDispatchCmd = &cobra.Command{
 	Use:   "dispatch --plugin <name>",
 	Short: "Dispatch plugin execution to a dog",
@@ -326,6 +349,10 @@ func init() {
 	// Status flags
 	dogStatusCmd.Flags().BoolVar(&dogStatusJSON, "json", false, "Output as JSON")
 
+	// Logs flags
+	dogLogsCmd.Flags().IntVarP(&dogLogsLines, "lines", "n", 50, "Number of trailing lines to show (0 = all)")
+	dogLogsCmd.Flags().BoolVar(&dogLogsPath, "path", false, "Print the log file path instead of its contents")
+
 	// Dispatch flags
 	dogDispatchCmd.Flags().StringVar(&dogDispatchPlugin, "plugin", "", "Plugin name to dispatch (required)")
 	dogDispatchCmd.Flags().StringVar(&dogDispatchRig, "rig", "", "Limit plugin search to specific rig")
@@ -351,6 +378,7 @@ func init() {
 	dogCmd.AddCommand(dogClearCmd)
 	dogCmd.AddCommand(dogDoneCmd)
 	dogCmd.AddCommand(dogStatusCmd)
+	dogCmd.AddCommand(dogLogsCmd)
 	dogCmd.AddCommand(dogDispatchCmd)
 	dogCmd.AddCommand(dogHealthCheckCmd)
 
@@ -764,12 +792,17 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 	// Returning the dog to idle without archiving it leaves a dispatch
 	// assigned to a dog that is no longer executing it — an orphan by
 	// construction. Fail the dispatch with the work.
-	if err := closePluginMails(name); err != nil {
+	closed, err := closePluginMails(name)
+	reportClosedPluginMails(mgr, name, closed)
+	if err != nil {
 		// Non-fatal: the dog still goes idle. But it MUST be visible — a silent
-		// failure here is what let dispatch mail accumulate unbounded (gt-u58w).
-		fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+		// failure here is what let dispatch mail accumulate unbounded (gt-u58w),
+		// and stderr alone is not visible for a dog (gt-wlco).
+		dogWarn(mgr, name, "%v", err)
 	}
 	mgr.ClearDispatchAlarm(name)
+
+	dogRecord(mgr, name, "dog clear: work=%q cleared, dog now idle (force=%v)", d.Work, dogForce)
 
 	fmt.Printf("✓ Cleared dog %s (now idle)\n", name)
 	if d.Work != "" {
@@ -784,28 +817,14 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	var name string
+	name := ""
 	if len(args) > 0 {
 		name = args[0]
 	} else {
-		// Auto-detect dog from cwd
-		// Dog worktrees are at ~/gt/deacon/dogs/<name>/<rig>/
-		cwd, err := os.Getwd()
+		var err error
+		name, err = detectDogNameFromCwd()
 		if err != nil {
-			return fmt.Errorf("getting cwd: %w", err)
-		}
-
-		// Look for /deacon/dogs/<name>/ in path
-		parts := splitPathComponents(cwd)
-		for i := 0; i < len(parts)-1; i++ {
-			if parts[i] == "dogs" && i > 0 && parts[i-1] == "deacon" {
-				name = parts[i+1]
-				break
-			}
-		}
-
-		if name == "" {
-			return fmt.Errorf("could not detect dog name from cwd: %s\nRun from a dog worktree or specify name: gt dog done <name>", cwd)
+			return fmt.Errorf("%w\nRun from a dog worktree or specify name: gt dog done <name>", err)
 		}
 	}
 
@@ -817,13 +836,17 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	// Always close accumulated plugin mails, even if dog is already idle.
 	// Plugin dispatch mails accumulate across sessions and must be cleaned up
 	// regardless of current work state.
-	if err := closePluginMails(name); err != nil {
+	closed, err := closePluginMails(name)
+	reportClosedPluginMails(mgr, name, closed)
+	if err != nil {
 		// Non-fatal: the dog still goes idle. But it MUST be visible — a silent
-		// failure here is what let dispatch mail accumulate unbounded (gt-u58w).
-		fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+		// failure here is what let dispatch mail accumulate unbounded (gt-u58w),
+		// and stderr alone is not visible for a dog (gt-wlco).
+		dogWarn(mgr, name, "%v", err)
 	}
 
 	if d.State == dog.StateIdle && d.Work == "" {
+		dogRecord(mgr, name, "dog done: already idle with no work")
 		fmt.Printf("Dog %s is already idle with no work\n", name)
 		return nil
 	}
@@ -831,6 +854,8 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	if err := mgr.ClearWork(name); err != nil {
 		return fmt.Errorf("clearing work for dog %s: %w", name, err)
 	}
+
+	dogRecord(mgr, name, "dog done: work=%q complete, dog returned to kennel (idle)", d.Work)
 
 	fmt.Printf("✓ Dog %s returned to kennel (idle)\n", name)
 
@@ -949,6 +974,110 @@ func waitForDogReassignment(mgr dogStateReader, name string, delay, poll time.Du
 	}
 }
 
+func runDogLogs(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("finding town root: %w", err)
+	}
+
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	} else {
+		name, err = detectDogNameFromCwd()
+		if err != nil {
+			return fmt.Errorf("%w\nRun from a dog worktree or specify name: gt dog logs <name>", err)
+		}
+	}
+
+	path := dog.SessionLogPath(townRoot, name)
+	if dogLogsPath {
+		fmt.Println(path)
+		return nil
+	}
+
+	lines, err := dog.ReadSessionLog(townRoot, name, dogLogsLines)
+	if err != nil {
+		return err
+	}
+	if len(lines) == 0 {
+		// An empty log is a real answer, not an error: the dog has run nothing
+		// worth recording. Say which file was checked so the operator does not
+		// have to guess whether they looked in the right place.
+		fmt.Printf("No session log entries for dog %s (%s)\n", name, path)
+		return nil
+	}
+
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	return nil
+}
+
+// detectDogNameFromCwd resolves the dog whose worktree contains the current
+// directory. Dog worktrees live at <townRoot>/deacon/dogs/<name>/<rig>/.
+func detectDogNameFromCwd() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getting cwd: %w", err)
+	}
+
+	parts := splitPathComponents(cwd)
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] == "dogs" && i > 0 && parts[i-1] == "deacon" {
+			return parts[i+1], nil
+		}
+	}
+	return "", fmt.Errorf("could not detect dog name from cwd: %s", cwd)
+}
+
+// dogWarn reports a dog-side problem to BOTH stderr and the dog's durable
+// session log.
+//
+// Never use bare fmt.Fprintf(os.Stderr, ...) for a dog-side diagnostic. A dog's
+// pane is destroyed seconds after `gt dog done`, so stderr is a write-only
+// surface: gt-u58w's fix printed its cleanup failure there and no operator ever
+// saw it while the leak it reported grew from 230 to 559 (gt-wlco). stderr still
+// gets the message for the human who is attached right now; the session log is
+// what anyone reads afterwards.
+func dogWarn(mgr *dog.Manager, name, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(os.Stderr, "⚠ %s\n", msg)
+	logToDogSession(mgr, name, "WARN "+msg)
+}
+
+// dogRecord appends an outcome to the dog's session log without printing it.
+// Successes are recorded too: "we can see what was sent and never what
+// happened" is the gap, and a log that holds only failures cannot distinguish a
+// dog that succeeded from one that never ran.
+func dogRecord(mgr *dog.Manager, name, format string, args ...any) {
+	logToDogSession(mgr, name, fmt.Sprintf(format, args...))
+}
+
+// reportClosedPluginMails prints and records the dispatch-mail cleanup count.
+// Zero is not reported: dogs commonly finish with an empty inbox.
+func reportClosedPluginMails(mgr *dog.Manager, name string, closed int) {
+	if closed <= 0 {
+		return
+	}
+	fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
+	dogRecord(mgr, name, "dispatch-mail cleanup: archived %d mail(s)", closed)
+}
+
+// logToDogSession writes one entry to the dog's durable log, best-effort.
+//
+// A logging failure falls back to stderr rather than being swallowed — a log
+// that has silently stopped recording is exactly the failure mode this whole
+// mechanism exists to end.
+func logToDogSession(mgr *dog.Manager, name, msg string) {
+	if mgr == nil {
+		return
+	}
+	if err := mgr.LogEvent(name, "%s", msg); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not record to %s session log: %v\n", name, err)
+	}
+}
+
 func splitPathComponents(path string) []string {
 	if path == "" {
 		return nil
@@ -970,23 +1099,25 @@ func splitPathComponents(path string) []string {
 // reported success while 230+ dispatches accumulated across the pack. Callers must
 // surface the returned error; they must NOT abort on it, because a dog stuck
 // non-idle is worse than a dog with stale inbox mail.
-func closePluginMails(dogName string) error {
+//
+// Reporting is the caller's job, not this function's — the count and the error
+// both have to reach the dog's durable session log, and only the caller holds the
+// Manager that owns it (gt-wlco). Returns the number of mails archived, which is
+// meaningful even when err is non-nil (a partial cleanup).
+func closePluginMails(dogName string) (int, error) {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		// Not in a Gas Town workspace. This is a legitimate skip, not a failure,
 		// but say so rather than returning an indistinguishable nil.
-		return fmt.Errorf("skipped dispatch-mail cleanup for %s: not in a Gas Town workspace: %w", dogName, err)
+		return 0, fmt.Errorf("skipped dispatch-mail cleanup for %s: not in a Gas Town workspace: %w", dogName, err)
 	}
 
 	insp := newMailDispatchInspector(townRoot)
 	closed, err := insp.Reclaim(dogName)
-	if closed > 0 {
-		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
-	}
 	if err != nil {
-		return fmt.Errorf("dispatch-mail cleanup incomplete for %s (%d archived): %w", dogName, closed, err)
+		return closed, fmt.Errorf("dispatch-mail cleanup incomplete for %s (%d archived): %w", dogName, closed, err)
 	}
-	return nil
+	return closed, nil
 }
 
 // mailDispatchInspector implements dog.DispatchInspector over the mail router.

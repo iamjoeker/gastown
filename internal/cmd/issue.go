@@ -13,7 +13,6 @@ var issueCmd = &cobra.Command{
 	Use:     "issue",
 	GroupID: GroupConfig,
 	Short:   "Manage current issue for status line display",
-	RunE:    requireSubcommand,
 	Long: `Manage the current issue displayed in the tmux status line.
 
 Sets, clears, or shows the active issue ID stored in the tmux session
