@@ -413,3 +413,120 @@ func TestAgentOrphanCommNameStillMatchesRealAgents(t *testing.T) {
 		}
 	}
 }
+
+// TestACPTownRootCandidates covers the town-root resolution that decides which
+// ACP processes get protected from the orphan/zombie scans. It used to check
+// only ~/gt, so on a host whose town is rooted elsewhere the protection set was
+// always empty and live ACP agents were kill-eligible (gt-3sz).
+func TestACPTownRootCandidates(t *testing.T) {
+	t.Run("honors GT_TOWN_ROOT and GT_ROOT", func(t *testing.T) {
+		t.Setenv("GT_TOWN_ROOT", "/town")
+		t.Setenv("GT_ROOT", "/root")
+
+		got := acpTownRootCandidates()
+		if len(got) < 2 || got[0] != "/town" || got[1] != "/root" {
+			t.Fatalf("acpTownRootCandidates() = %v, want it to start with /town then /root", got)
+		}
+	})
+
+	t.Run("keeps ~/gt as a candidate", func(t *testing.T) {
+		t.Setenv("GT_TOWN_ROOT", "/town")
+		t.Setenv("GT_ROOT", "")
+
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Skip("no home dir")
+		}
+		want := filepath.Join(home, "gt")
+
+		// Widening, not replacing: a host whose town really is at ~/gt must not
+		// be blinded by this fix.
+		for _, dir := range acpTownRootCandidates() {
+			if dir == want {
+				return
+			}
+		}
+		t.Fatalf("acpTownRootCandidates() = %v, want it to include %q", acpTownRootCandidates(), want)
+	})
+
+	t.Run("de-duplicates", func(t *testing.T) {
+		t.Setenv("GT_TOWN_ROOT", "/town")
+		t.Setenv("GT_ROOT", "/town")
+
+		got := acpTownRootCandidates()
+		seen := make(map[string]bool)
+		for _, dir := range got {
+			if seen[dir] {
+				t.Fatalf("acpTownRootCandidates() = %v, contains duplicate %q", got, dir)
+			}
+			seen[dir] = true
+		}
+	})
+
+	t.Run("never returns an empty string", func(t *testing.T) {
+		t.Setenv("GT_TOWN_ROOT", "")
+		t.Setenv("GT_ROOT", "")
+
+		for _, dir := range acpTownRootCandidates() {
+			if dir == "" {
+				t.Fatal("acpTownRootCandidates() returned an empty candidate; it would resolve to a relative path")
+			}
+		}
+	})
+}
+
+// TestGetACPSessionPIDs_HonorsTownRoot is the regression test for gt-3sz: the
+// pid file is read from the configured town root, not from ~/gt. Under the old
+// code this returned an empty set on every host whose town is rooted elsewhere,
+// leaving the ACP proxy and its children eligible for the orphan/zombie kill.
+func TestGetACPSessionPIDs_HonorsTownRoot(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+		t.Fatalf("creating mayor dir: %v", err)
+	}
+	// Use our own PID: it is guaranteed alive, so the liveness check passes.
+	self := os.Getpid()
+	pidFile := filepath.Join(mayorDir, "mayor-acp.pid")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(self)+"\n"), 0o644); err != nil {
+		t.Fatalf("writing pid file: %v", err)
+	}
+
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", "")
+
+	if got := getACPSessionPIDs(); !got[self] {
+		t.Errorf("getACPSessionPIDs() = %v, want it to protect pid %d from %s", got, self, pidFile)
+	}
+}
+
+// TestGetACPSessionPIDs_SkipsDeadPID guards the other direction: a stale pid
+// file must not seed the protection set with a PID that is no longer running.
+func TestGetACPSessionPIDs_SkipsDeadPID(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+		t.Fatalf("creating mayor dir: %v", err)
+	}
+	// Spawn and reap a process so we hold a PID that is certainly gone.
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("cannot spawn helper process: %v", err)
+	}
+	dead := cmd.Process.Pid
+	if processExists(dead) {
+		t.Skip("PID reused too quickly to test the dead-PID path")
+	}
+
+	pidFile := filepath.Join(mayorDir, "mayor-acp.pid")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(dead)+"\n"), 0o644); err != nil {
+		t.Fatalf("writing pid file: %v", err)
+	}
+
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", "")
+
+	if got := getACPSessionPIDs(); got[dead] {
+		t.Errorf("getACPSessionPIDs() = %v, want it to skip dead pid %d", got, dead)
+	}
+}
