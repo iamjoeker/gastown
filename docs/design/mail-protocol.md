@@ -263,6 +263,35 @@ mayor/                # Town-level Mayor
 deacon/               # Town-level Deacon
 ```
 
+### CC Copies
+
+`gt mail send X --cc Y` assigns the message bead to X and labels it `cc:Y`. Y's
+inbox picks it up through the CC label, so one bead is delivered to several
+inboxes. That has two consequences worth knowing:
+
+**A CC copy is not yours to act on.** The obligation belongs to the assignee.
+`gt mail inbox` marks CC copies `(cc)` and names the addressee; `gt mail read`
+prints a `CC:` header and says who the message is addressed to. Correct delivery
+of a CC copy has been reported as a misroute before that rendering existed.
+
+**A CC copy is cleared, not closed.** Only the assignee can close the bead — the
+beads ownership guard refuses anyone else, correctly. Clearing a CC copy instead
+adds `cc-cleared:<your-identity>` and leaves status and assignee untouched, so
+the assignee's obligation is unaffected and no `--force` is needed:
+
+```bash
+gt mail archive <msg-id>   # as the cc'd party: clears your copy only
+```
+
+The label is per-recipient, so each CC'd party clears its own copy
+independently. `gt mail archive --force` is not diverted: it still closes the
+record, which is one agent overriding another's ownership check — rarely right.
+
+CC copies are counted apart from addressed mail in the inbox header
+(`5 messages, 2 unread, 4 cc (1 unread)`), so the headline number keeps meaning
+"work addressed to me". Unread notifications still cover CC copies: reading one
+is legitimate, only clearing it was broken. See gt-58s.
+
 ## Protocol Flows
 
 ### Polecat Completion Flow
