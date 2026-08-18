@@ -2474,6 +2474,46 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 	}
 }
 
+// closeAttachedWorkMolecule closes the ephemeral molecule (wisp) attached to a
+// bead, including its step descendants, and reports whether the molecule root
+// reached a closed state.
+//
+// The molecule is per-dispatch scaffolding: once the session that was running it
+// is over, nothing will ever advance it again. Leaving it open leaks the root
+// plus one wisp per formula step (8 for mol-polecat-work), which the next dog
+// run then has to reap (gt-pkw).
+//
+// Order matters: step children close first, then the wisp root. bd close does
+// not cascade, and the root blocks on its open steps.
+//
+// Returns (moleculeID, ok). ok is true when there was nothing to close, when the
+// molecule closed, or when it was already gone; false only when the root survived
+// an error — in which case the caller must not close a bead that depends on it.
+func closeAttachedWorkMolecule(bd *beads.Beads, hookedBead *beads.Issue) (string, bool) {
+	attachment := beads.ParseAttachmentFields(hookedBead)
+	if attachment == nil || attachment.AttachedMolecule == "" {
+		return "", true
+	}
+	moleculeID := attachment.AttachedMolecule
+
+	if n := closeDescendants(bd, moleculeID); n > 0 {
+		fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, moleculeID)
+	}
+
+	// Force-close the root: ForceCloseWithReason handles any status (hooked,
+	// open, in_progress) and records the reason + session for attribution.
+	// Same pattern as gt mol burn/squash (#1879).
+	if closeErr := bd.ForceCloseWithReason("done", moleculeID); closeErr != nil {
+		if errors.Is(closeErr, beads.ErrNotFound) {
+			// Already burned/reaped by another path — nothing left to leak.
+			return moleculeID, true
+		}
+		fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", moleculeID, closeErr)
+		return moleculeID, false
+	}
+	return moleculeID, true
+}
+
 // updateAgentStateOnDone closes the hooked work bead and reports cleanup status.
 // Uses issueID directly to find the hooked bead instead of reading the agent bead's
 // hook_bead slot (hq-l6mm5: direct bead tracking).
@@ -2577,12 +2617,31 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 		if hookBd == nil {
 			hookBd = bd
 		}
-		if hookedBead, err := hookBd.Show(hookedBeadID); err == nil && !beads.IssueStatus(hookedBead.Status).IsTerminal() {
+		if hookedBead, err := hookBd.Show(hookedBeadID); err == nil {
+			// BUG FIX (gt-pkw): The hooked bead being already closed does NOT mean
+			// there is nothing left to clean up. A polecat that closes its own bead
+			// before running gt done — the documented "nothing to implement" path,
+			// and what every workflow step bead (*-wfs-*) does — used to skip this
+			// entire block and leave its work molecule plus every step wisp open
+			// forever. Nothing else collects them: the witness orphan sweep only
+			// inspects hooked/in_progress beads, so a closed bead's molecule is
+			// invisible to it. Each dog run therefore leaked ~9 wisps that the next
+			// run had to reap, which is why the wisp count never converged.
+			//
+			// The bead is done, so only the molecule needs closing here.
+			if beads.IssueStatus(hookedBead.Status).IsTerminal() {
+				closeAttachedWorkMolecule(hookBd, hookedBead)
+				goto doneStateUpdate
+			}
+
 			// Guard: never close a rig identity bead. Polecats dispatched with the
 			// rig bead as their hook (via mol-polecat-work) must not close permanent
 			// infrastructure. Skip close and fall through to idle state update.
+			// The molecule still closes: it is this dispatch's scaffolding, not
+			// infrastructure, and the rig bead never closes to trigger cleanup later.
 			if beads.HasLabel(hookedBead, "gt:rig") {
 				fmt.Fprintf(os.Stderr, "Note: hooked bead %s is a rig identity bead (gt:rig) — skipping close\n", hookedBeadID)
+				closeAttachedWorkMolecule(hookBd, hookedBead)
 				goto doneStateUpdate
 			}
 
@@ -2596,35 +2655,16 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 				goto doneStateUpdate
 			}
 
-			// BUG FIX: Close attached molecule (wisp) BEFORE closing hooked bead.
+			// Close attached molecule (wisp) BEFORE closing hooked bead.
 			// When using formula-on-bead (gt sling formula --on bead), the base bead
-			// has attached_molecule pointing to the wisp. Without this fix, gt done
-			// only closed the hooked bead, leaving the wisp orphaned.
+			// has attached_molecule pointing to the wisp. Without this, gt done would
+			// only close the hooked bead, leaving the wisp orphaned.
 			// Order matters: wisp closes -> unblocks base bead -> base bead closes.
-			attachment := beads.ParseAttachmentFields(hookedBead)
-			if attachment != nil && attachment.AttachedMolecule != "" {
-				// Close molecule step descendants before closing the wisp root.
-				// bd close doesn't cascade — without this, open/in_progress steps
-				// from the molecule stay stuck forever after gt done completes.
-				// Order: step children -> wisp root -> base bead.
-				if n := closeDescendants(hookBd, attachment.AttachedMolecule); n > 0 {
-					fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachment.AttachedMolecule)
-				}
-
-				// Close the wisp root with --force and audit reason.
-				// ForceCloseWithReason handles any status (hooked, open, in_progress)
-				// and records the reason + session for attribution.
-				// Same pattern as gt mol burn/squash (#1879).
-				if closeErr := hookBd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
-					if !errors.Is(closeErr, beads.ErrNotFound) {
-						fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, closeErr)
-						// Don't try to close hookedBeadID - it may still be blocked.
-						// But DO clear hooks and update agent state (goto doneStateUpdate)
-						// so the polecat isn't stuck in 'working' state (za-o9e).
-						goto doneStateUpdate
-					}
-					// Not found = already burned/deleted by another path, continue
-				}
+			if _, molClosed := closeAttachedWorkMolecule(hookBd, hookedBead); !molClosed {
+				// Don't try to close hookedBeadID - it may still be blocked.
+				// But DO clear hooks and update agent state (goto doneStateUpdate)
+				// so the polecat isn't stuck in 'working' state (za-o9e).
+				goto doneStateUpdate
 			}
 
 			// Acceptance criteria gate: skip close if criteria are unchecked.
