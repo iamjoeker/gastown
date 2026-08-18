@@ -40,6 +40,7 @@ var (
 	// Health-check flags
 	dogHealthJSON          bool
 	dogHealthAutoClear     bool
+	dogHealthKillHung      bool
 	dogHealthMaxInactivity time.Duration
 	dogHealthStaleDispatch time.Duration
 	dogHealthAlarmCooldown time.Duration
@@ -279,6 +280,11 @@ definition not the one reclaiming it. The override is scoped to Deacon
 dispatches addressed to that dog, so no other mail is reachable through it and
 there is no --force flag to pass.
 
+--auto-clear never touches a live session. To end a hung dog's session you
+must ask for it by name with --kill-hung (which requires --auto-clear): it
+kills the tmux session, returns the dog to idle, and archives the dispatches
+the kill strands. Use it only when the Deacon has judged the dog dead.
+
 Dispatch alarms escalate at MEDIUM severity, throttled per dog by
 --alarm-cooldown so a persistent problem escalates once per window rather
 than once per patrol cycle.
@@ -293,6 +299,7 @@ Examples:
   gt dog health-check alpha
   gt dog health-check --json
   gt dog health-check --auto-clear
+  gt dog health-check --auto-clear --kill-hung
   gt dog health-check --max-inactivity 1h
   gt dog health-check --stale-dispatch 15m --alarm-cooldown 1h`,
 	Args: cobra.MaximumNArgs(1),
@@ -328,7 +335,8 @@ func init() {
 
 	// Health-check flags
 	dogHealthCheckCmd.Flags().BoolVar(&dogHealthJSON, "json", false, "Output as JSON")
-	dogHealthCheckCmd.Flags().BoolVar(&dogHealthAutoClear, "auto-clear", false, "Auto-clear zombie dogs")
+	dogHealthCheckCmd.Flags().BoolVar(&dogHealthAutoClear, "auto-clear", false, "Auto-clear zombie dogs (dead sessions only — never kills a live one)")
+	dogHealthCheckCmd.Flags().BoolVar(&dogHealthKillHung, "kill-hung", false, "With --auto-clear, also kill hung dogs' LIVE sessions (Deacon's call)")
 	dogHealthCheckCmd.Flags().DurationVar(&dogHealthMaxInactivity, "max-inactivity", 10*time.Minute, "Max inactivity before considering hung")
 	dogHealthCheckCmd.Flags().DurationVar(&dogHealthStaleDispatch, "stale-dispatch", dog.DefaultStaleDispatchAfter, "Alarm on dispatches open longer than this")
 	dogHealthCheckCmd.Flags().DurationVar(&dogHealthAlarmCooldown, "alarm-cooldown", dog.DefaultDispatchAlarmCooldown, "Minimum interval between dispatch alarms for the same dog")
@@ -1094,8 +1102,15 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// --kill-hung is a modifier on the clearing behaviour, not a mode of its
+	// own. Refusing the combination is louder than silently ignoring it: the
+	// operator asked to destroy something and deserves to know it won't happen.
+	if dogHealthKillHung && !dogHealthAutoClear {
+		return fmt.Errorf("--kill-hung requires --auto-clear")
+	}
+
 	tm := tmux.NewTmux()
-	hc := dog.NewHealthChecker(mgr, tm)
+	hc := dog.NewHealthChecker(mgr, tm).WithKillHung(dogHealthKillHung)
 
 	// Dispatch inspection turns "the session is gone" into "and here are the
 	// N dispatches it was holding". Without a town root we can't reach the
