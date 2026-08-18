@@ -253,6 +253,62 @@ type sqlRunner interface {
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
+// writeSession is a single pooled connection reserved for one write sequence,
+// with autocommit disabled on it.
+//
+// Every reaper write path follows the same shape: disable autocommit, run the
+// UPDATE/DELETE batches, COMMIT to flush the SQL transaction into the Dolt
+// working set, then CALL DOLT_COMMIT on that working set. @@autocommit is a
+// SESSION variable, so all four steps must run on the SAME session.
+//
+// Issuing them on the *sql.DB pool does not guarantee that: database/sql hands
+// each call whatever connection is free. The batches and the COMMIT can land on
+// sessions that were never switched to autocommit=0, which makes the flushing
+// COMMIT a no-op, leaves a mid-sequence failure partially committed instead of
+// rolled back, and lets the restoring "SET @@autocommit = 1" repair a connection
+// that was never changed while the one that was stays at 0 for whoever picks it
+// up next. This stayed latent only because the reaper's pool normally settles to
+// a single connection (gt-gjh).
+type writeSession struct {
+	conn      *sql.Conn
+	committed bool
+}
+
+// beginWriteSession pins a connection out of the pool and disables autocommit on
+// it. Callers must defer release.
+func beginWriteSession(ctx context.Context, db *sql.DB) (*writeSession, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pin connection: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("disable autocommit: %w", err)
+	}
+	return &writeSession{conn: conn}, nil
+}
+
+// commit flushes the SQL transaction into the Dolt working set. With
+// autocommit=0 the batched changes sit in the transaction buffer; DOLT_COMMIT
+// operates on the working set, so without this it sees "nothing to commit".
+func (s *writeSession) commit(ctx context.Context) error {
+	if _, err := s.conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	s.committed = true
+	return nil
+}
+
+// release rolls back anything the session left uncommitted, restores autocommit
+// on that same session, and returns the connection to the pool.
+func (s *writeSession) release() {
+	if !s.committed {
+		_, _ = s.conn.ExecContext(context.Background(), "ROLLBACK")
+	}
+	_, _ = s.conn.ExecContext(context.Background(), "SET @@autocommit = 1")
+	_ = s.conn.Close()
+}
+
 // HasReaperSchema checks whether the database has the tables required for reaper
 // operations (wisps and issues). Returns false (no error) when tables are missing
 // — callers use this to skip databases that have incomplete beads schema (e.g.
@@ -451,22 +507,12 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		return result, nil
 	}
 
-	conn, err := db.Conn(ctx)
+	session, err := beginWriteSession(ctx, db)
 	if err != nil {
-		return nil, fmt.Errorf("pin connection: %w", err)
+		return nil, err
 	}
-	defer conn.Close()
-
-	if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
-	}
-	sqlCommitted := false
-	defer func() {
-		if !sqlCommitted {
-			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		}
-		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	defer session.release()
+	conn := session.conn
 
 	moleculeStepIDQuery := fmt.Sprintf(
 		"SELECT w.id FROM wisps w %s WHERE %s AND w.issue_type != 'agent' LIMIT %d",
@@ -493,14 +539,9 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	totalClosed := totalReaped + moleculeStepsClosed
 
 	if totalClosed > 0 {
-		// Flush the SQL transaction to the Dolt working set before DOLT_COMMIT.
-		// With autocommit=0, UPDATE changes are in the SQL transaction buffer,
-		// not the Dolt working set. DOLT_COMMIT operates on the working set,
-		// so without this COMMIT it sees "nothing to commit".
-		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		if err := session.commit(ctx); err != nil {
 			return result, fmt.Errorf("sql commit: %w", err)
 		}
-		sqlCommitted = true
 		commitMsg := fmt.Sprintf("reaper: close %d wisps in %s", totalClosed, dbName)
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// "nothing to commit" is expected when the reaper reverts dirty working
@@ -627,12 +668,11 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		return digestTotal, anomalies, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return 0, nil, fmt.Errorf("disable autocommit: %w", err)
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return 0, nil, err
 	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	defer session.release()
 
 	// Batch delete — simple status+age filter, no parent check needed for purge.
 	idQuery := fmt.Sprintf(
@@ -640,22 +680,22 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables)
+	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables)
 	if err != nil {
-		return totalDeleted, anomalies, err
+		// release rolls the batch back, so nothing was purged.
+		return 0, anomalies, err
 	}
 
 	if totalDeleted > 0 {
-		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		if err := session.commit(ctx); err != nil {
 			anomalies = append(anomalies, Anomaly{
 				Type:    "sql_commit_failed",
-				Message: fmt.Sprintf("sql commit after purge failed: %v", err),
+				Message: fmt.Sprintf("sql commit after purge failed, deletes rolled back: %v", err),
 			})
-			return totalDeleted, anomalies, nil
+			return 0, anomalies, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal — log but continue.
 			anomalies = append(anomalies, Anomaly{
 				Type:    "dolt_commit_failed",
@@ -691,30 +731,29 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 		return count, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return 0, fmt.Errorf("disable autocommit: %w", err)
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return 0, err
 	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	defer session.release()
 
 	idQuery := fmt.Sprintf(
 		"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message' LIMIT %d",
 		dbName, dbName, DefaultBatchSize)
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, mailCutoff, "issues", auxTables)
+	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, mailCutoff, "issues", auxTables)
 	if err != nil {
-		return totalDeleted, err
+		// release rolls the batch back, so nothing was purged.
+		return 0, err
 	}
 
 	if totalDeleted > 0 {
-		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-			return totalDeleted, fmt.Errorf("sql commit: %w", err)
+		if err := session.commit(ctx); err != nil {
+			return 0, fmt.Errorf("sql commit: %w", err)
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal.
 		}
 	}
@@ -829,12 +868,11 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	defer session.release()
 
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
@@ -845,38 +883,41 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	updateQuery := fmt.Sprintf(
 		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW(), close_reason = 'stale:auto-closed by reaper' WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
+	if _, err := session.conn.ExecContext(ctx, updateQuery, args...); err != nil {
 		return nil, fmt.Errorf("auto-close: %w", err)
 	}
 
+	if err := session.commit(ctx); err != nil {
+		// release rolls the UPDATE back, so nothing was closed.
+		result.ClosedEntries = nil
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "sql_commit_failed",
+			Message: fmt.Sprintf("sql commit after auto-close failed, closures rolled back: %v", err),
+		})
+		return result, nil
+	}
 	result.Closed = len(ids)
 
-	if len(ids) > 0 {
-		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+	commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
+	if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		// "nothing to commit" is expected when the updated tables are dolt_ignored.
+		if !isNothingToCommit(err) {
 			result.Anomalies = append(result.Anomalies, Anomaly{
-				Type:    "sql_commit_failed",
-				Message: fmt.Sprintf("sql commit after auto-close failed: %v", err),
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after auto-close failed: %v", err),
 			})
-			return result, nil
-		}
-		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// "nothing to commit" is expected when the updated tables are dolt_ignored.
-			if !isNothingToCommit(err) {
-				result.Anomalies = append(result.Anomalies, Anomaly{
-					Type:    "dolt_commit_failed",
-					Message: fmt.Sprintf("dolt commit after auto-close failed: %v", err),
-				})
-			}
 		}
 	}
 
 	return result, nil
 }
 
-// batchDeleteRows deletes rows from a primary table and its auxiliary tables in batches.
-func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
+// batchDeleteRows deletes rows from a primary table and its auxiliary tables in
+// batches. It takes a sqlRunner rather than a *sql.DB so callers can hand it the
+// connection they pinned for the write sequence — every batch must run on the
+// session that disabled autocommit, or the deletes commit one at a time and the
+// caller's flushing COMMIT has nothing to flush (gt-gjh).
+func batchDeleteRows(ctx context.Context, db sqlRunner, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
 	totalDeleted := 0
 	for {
 		idRows, err := db.QueryContext(ctx, idQuery, cutoffArg)
@@ -997,12 +1038,11 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	defer session.release()
 
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
@@ -1013,20 +1053,22 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 	updateQuery := fmt.Sprintf(
 		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
+	if _, err := session.conn.ExecContext(ctx, updateQuery, args...); err != nil {
 		return nil, fmt.Errorf("close plugin receipts: %w", err)
 	}
 
 	// Flush and commit.
-	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+	if err := session.commit(ctx); err != nil {
+		// release rolls the UPDATE back, so nothing was closed.
+		result.Closed = 0
 		result.Anomalies = append(result.Anomalies, Anomaly{
 			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin receipt close failed: %v", err),
+			Message: fmt.Sprintf("sql commit after plugin receipt close failed, closures rolled back: %v", err),
 		})
 		return result, nil
 	}
 	commitMsg := fmt.Sprintf("reaper: close %d plugin receipts in %s", len(ids), dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+	if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 		if !isNothingToCommit(err) {
 			result.Anomalies = append(result.Anomalies, Anomaly{
 				Type:    "dolt_commit_failed",
@@ -1085,12 +1127,11 @@ func ClosePluginDispatches(db *sql.DB, dbName string, maxAge time.Duration, dryR
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	defer session.release()
 
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
@@ -1101,20 +1142,22 @@ func ClosePluginDispatches(db *sql.DB, dbName string, maxAge time.Duration, dryR
 	updateQuery := fmt.Sprintf(
 		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
+	if _, err := session.conn.ExecContext(ctx, updateQuery, args...); err != nil {
 		return nil, fmt.Errorf("close plugin dispatches: %w", err)
 	}
 
 	// Flush and commit.
-	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+	if err := session.commit(ctx); err != nil {
+		// release rolls the UPDATE back, so nothing was closed.
+		result.Closed = 0
 		result.Anomalies = append(result.Anomalies, Anomaly{
 			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin dispatch close failed: %v", err),
+			Message: fmt.Sprintf("sql commit after plugin dispatch close failed, closures rolled back: %v", err),
 		})
 		return result, nil
 	}
 	commitMsg := fmt.Sprintf("reaper: close %d plugin dispatches in %s", len(ids), dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+	if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 		if !isNothingToCommit(err) {
 			result.Anomalies = append(result.Anomalies, Anomaly{
 				Type:    "dolt_commit_failed",
