@@ -813,24 +813,8 @@ gt mq post-merge <rig> <mr-bead-id> --skip-branch-delete  # open PR exists
 
 The MR bead ID was in the MERGE_READY message or find via:
 ```bash
-gt mq list <rig> --status open --worker <polecat-name>
+bd list --type=merge-request --status=open | grep <polecat-name>
 ```
-
-> ⚠️ **Do NOT look up MR beads with a `bd list` merge-request type filter.**
-> MR beads live in the RIG store, but on any rig with `beads.role=contributor`
-> (or a contributor role inferred from the origin URL) `bd list` routes to the
-> CONTRIBUTOR PLANNING store instead — a different database. It does not error;
-> it prints "No issues found". Measured on the beads rig 2026-08-17: for the
-> identical closed-MR query, the `bd list` form returned 0 while
-> `gt mq list beads --status closed` returned 6 real MR beads (bd-wisp-bmg,
-> dwo, log, ppo, 9rt, 7m0). So that form is structurally incapable of ever
-> finding an MR bead here, and its empty result reads exactly like a clean
-> queue. `gt mq` is the authoritative reader for the merge queue — use it
-> everywhere. Note also that `bd list`'s routing note goes to stderr, so piping
-> it to `grep` hides even that hint.
->
-> *The dangerous literal is deliberately not written out here — an audit
-> grepping for it must not match this warning.*
 
 Verify the command output shows all steps succeeded (✓ for each).
 
@@ -1108,49 +1092,16 @@ Assess whether this session should continue or hand off to a fresh one.
 
 **Gather signals:**
 
-1. **Process memory** — check YOUR OWN RSS, i.e. the pane process:
+1. **Process memory** — check your own RSS:
 ```bash
-PANE_PID=$(tmux list-panes -t "$(tmux display-message -p '#S')" -F '#{pane_pid}' | head -1)
-echo "RSS: $(( $(ps -o rss= -p "$PANE_PID" | tr -d ' ') / 1024 )) MB   (pid $PANE_PID)"
+ps -o rss= -p $$   # KB — divide by 1024 for MB
 ```
-> ⚠️ **Do NOT measure the caller's own PID** (the shell-PID variable). That shell
-> is spawned fresh for EACH TOOL CALL — it reports ~6.5 MB forever. Measured
-> 2026-08-17: the old form read 6.6 MB while the pane process held 457 MB, a 69x
-> understatement, so against a 1 GB threshold the gate was structurally incapable
-> of EVER firing. Agents reported "RSS 6.5MB / healthy" in patrol summaries and
-> handoffs for as long as it existed; those were readings of an empty pipe.
-> (hq-qruwz / hq-hwx4q)
->
-> *The dangerous literal is deliberately not written out here — an audit grepping
-> for it must not match this warning. See the note at the foot of this step.*
 
-2. **Session age** — how long has THIS claude process been running:
+2. **Session age** — how long has this tmux session been running:
 ```bash
-PANE_PID=$(tmux list-panes -t "$(tmux display-message -p '#S')" -F '#{pane_pid}' | head -1)
-echo "Session age: $(( $(ps -o etimes= -p "$PANE_PID" | tr -d ' ') / 3600 ))h"
+CREATED=$(tmux display-message -t $(tmux display-message -p '#S') -p '#{session_created}')
+echo "Session age: $(( ($(date +%s) - CREATED) / 3600 ))h"
 ```
-> ⚠️ **Do NOT use the tmux session-creation timestamp.** It measures the tmux
-> WINDOW, not the agent. Already misfired: a refinery handed off citing "9.7h"
-> when its own process was 2.5h old and the tmux window was 9.68h — an exact
-> match to the window, to the minute. Because the window's age only grows, each
-> successor reads over-threshold at its first check and hands off immediately: a
-> ratchet converging on a handoff loop that burns a fresh session per cycle and
-> merges nothing.
->
-> **It is INTERMITTENTLY correct, which is worse than always wrong.** `gt`
-> respawns in place sometimes and recreates the session other times — the SAME
-> agent does both. So the timestamp resets occasionally, the watcher passes a spot
-> check, and it silently misses the majority. An always-wrong instrument gets
-> caught; this one does not. The pane pid changes on BOTH paths, which is why it
-> is the correct thing to read.
->
-> **This is not a new finding — `mol-deacon-patrol` has carried the canonical
-> write-up since 2026-08-02**, with paired measurements (dn-refinery respawned:
-> session_created 03:38:13 vs pane start 04:31:57; dn-witness never restarted:
-> 03:37:56 vs 03:37:55) and a delta classifier for reading the last transition
-> off current state. Consult it before re-deriving; two independent derivations in
-> two files is how they drift apart, and the older one has the measurements.
-> (hq-qruwz / hq-hwx4q)
 
 3. **Context usage** — your internal sense of how much context you've consumed.
 Are you losing track of earlier conversation? Getting verbose? Repeating yourself?
@@ -1197,19 +1148,8 @@ gt mail archive <message-id>
 
 Look for open MR beads with no corresponding branch:
 ```bash
-gt mq list <rig> --status open --verify
+bd list --type=merge-request --status=open
 ```
-
-`--verify` marks branches that no longer exist as MISSING, which is the
-condition this step is looking for.
-
-> ⚠️ **Do NOT substitute the `bd list` merge-request type filter here.**
-> See the warning in merge-push Step 2: on a contributor-routed rig that form
-> reads the contributor planning store, not the rig store, and returns "No issues
-> found" unconditionally. This orphan sweep would then report a clean result
-> without having examined a single MR bead — the same failure shape as the RSS
-> gate in context-check (hq-hwx4q): an instrument that cannot fire, whose silence
-> is mistaken for an all-clear.
 
 For each open MR bead:
 1. Check if branch exists: `git ls-remote origin refs/heads/<branch>`
@@ -1291,11 +1231,8 @@ The idle counter was auto-incremented. Continue to next patrol cycle
 starting a new patrol cycle. This is the designed yield point — do NOT skip it.
 
 ```
-1. Check RSS of the PANE PROCESS, never `$$` (see context-check step above):
-   PANE_PID=$(tmux list-panes -t "$(tmux display-message -p '#S')" -F '#{pane_pid}' | head -1)
-   ps -o rss= -p "$PANE_PID"   # KB; divide by 1024 for MB
-2. Check session age via `ps -o etimes= -p "$PANE_PID"`, NOT session_created
-   (see context-check step instructions above for why both matter)
+1. Check RSS: ps -o rss= -p $$  (KB; divide by 1024 for MB)
+2. Check session age (see context-check step instructions above)
 3. Use your internal sense of context: are you forgetting earlier conversation?
 ```
 
