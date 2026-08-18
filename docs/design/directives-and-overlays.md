@@ -10,10 +10,8 @@
 ## Problem
 
 The MEOW stack embeds formulas and role templates in the binary — intentionally
-centralized for consistency. Formula *files* can be replaced wholesale at rig or
-town scope (see [Editing a Formula File Directly](#editing-a-formula-file-directly)),
-but that is an all-or-nothing fork of an entire formula, and it offers no way at
-all to state a policy that spans every formula a role runs.
+centralized for consistency, but leaving no override path. Operators cannot
+customize agent behavior at the rig or town level.
 
 **Concrete failure:** Multiple crew members autonomously posted `gh pr review`
 comments on GitHub during PR review tasks. The formula says "post to GitHub,"
@@ -277,73 +275,11 @@ only to that specific step in that specific formula.
 
 Both are needed: directives for broad guardrails, overlays for surgical fixes.
 
-### Editing a Formula File Directly
+### Why Not Modify Formulas Directly?
 
-Formulas are embedded in the Go binary, but the embedded copy is the **last**
-tier of a three-tier lookup, not the only copy. `ResolveFormulaContent()` in
-`internal/formula/embed.go` resolves a formula name in this order:
-
-| Tier | Location | Shadows |
-|------|----------|---------|
-| 1. Rig | `<townRoot>/<rig>/.beads/formulas/<name>.formula.toml` | town, embedded |
-| 2. Town | `<townRoot>/.beads/formulas/<name>.formula.toml` | embedded |
-| 3. Embedded | compiled into `gt` from `internal/formula/formulas/` | — |
-
-`gt install` provisions the embedded corpus down to the town's
-`.beads/formulas/`, and `gt doctor --fix` provisions it into a rig's
-`.beads/formulas/` when a patrol formula is missing. So on any installed town a
-**disk copy already exists and is what agents actually run** — tier 3 is a
-fallback that a normal install never reaches.
-
-Two consequences follow, and they only make sense together. Reading the first
-one alone is the trap.
-
-**1. A formula edit needs no rebuild, and a rebuild does not undo it.**
-`gt prime` calls `ResolveFormulaContent()` on every render
-(`internal/cmd/prime_molecule.go`), so an edit to the acting disk copy is live
-for the next agent that primes. There is no compile step in that path.
-
-The converse is the part that bites: rebuilding and redeploying `gt` changes
-only tier 3, which the edited tier-1/tier-2 file goes on shadowing. Shipping a
-fix in the embedded corpus does **not** reach a town whose disk copy overrides
-it, and a rebuild does **not** restore a formula someone edited. Verify by
-checksum, not by build SHA.
-
-**2. The edit is sticky — usually.** `gt install`'s `ProvisionFormulas()` skips
-any file that already exists, so it never clobbers an edit. `UpdateFormulas()`
-(behind `gt upgrade` and `gt doctor --fix`) compares three hashes — embedded,
-as-installed from `.installed.json`, and current-on-disk — and branches:
-
-- **Tracked in `.installed.json` and changed** → status `modified`. Skipped, for
-  good. Your edit survives every future update, and that formula silently stops
-  receiving upstream fixes.
-- **Not in `.installed.json`** → status `untracked`, and it is **overwritten**
-  with the embedded version. A formula file dropped in by hand, or one predating
-  hash tracking, is *not* protected. Run `gt doctor` and check the `formulas`
-  check before relying on an edit surviving.
-
-Also note the asymmetry: `CheckFormulaHealth()` and `UpdateFormulas()` are only
-ever called against the **town** root (`internal/doctor/formula_check.go`,
-`internal/cmd/upgrade.go`).
-A tier-1 **rig** formula file is never health-checked and never updated — an
-edit there is permanent and invisible to `gt doctor`.
-
-### Why Directives and Overlays, Then?
-
-Editing the formula file works, but it forks an entire formula to change one
-step, and — per consequence 2 — opts that formula out of upstream updates.
-Directives and overlays are the surgical alternatives:
-
-- An **overlay** rewrites named steps and leaves the rest of the formula
-  tracking upstream, so `gt doctor` can still tell you when a step ID goes stale.
-- A **directive** applies to a role across *every* formula it runs, which no
-  single formula edit can express.
-
-Both are external config files with no `.installed.json` relationship at all, so
-neither can be clobbered by an update or leave a formula stranded on an old
-version. Reach for a formula file edit when you genuinely want a different
-formula; reach for an overlay when you want the shipped formula with one step
-changed.
+Formulas are embedded in the Go binary. Modifying them requires rebuilding
+and redeploying. Directives and overlays are external config files that take
+effect immediately on the next `gt prime`.
 
 ### Architectural Harmony
 
@@ -367,8 +303,6 @@ changed.
 
 | File | Purpose |
 |------|---------|
-| `internal/formula/embed.go` | Three-tier formula file resolution (`ResolveFormulaContent`), provisioning, and update/skip rules |
-| `internal/doctor/formula_check.go` | `formulas` doctor check — reports `ok`/`outdated`/`modified`/`untracked` (town scope only) |
 | `internal/config/directives.go` | Directive loader (`LoadRoleDirective`) |
 | `internal/config/directives_test.go` | Directive tests |
 | `internal/formula/overlay.go` | Overlay loader and applier |
