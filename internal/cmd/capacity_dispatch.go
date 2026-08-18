@@ -842,12 +842,29 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	// PER-ENTRY ERROR ISOLATION (hq-v05uw). This loop previously returned on the
+	// first store that errored, so ONE bad .beads directory aborted the ENTIRE
+	// town-wide planning pass and no rig got dispatched. Measured: 36 aborted
+	// passes across four days (08-02, 08-14, 08-16, 08-17) from three different
+	// paths and two different causes. Critically, 9 of those 36 aborted on the
+	// town's OWN registered stores (forkrig, and the town root itself) — not on
+	// stray directories — so gating the scan on "is this registered?" does not
+	// fix it. On 08-17 a single directory holding 0 issues, 0 wisps and 0 events
+	// took down dispatch for every rig for 1h25m.
+	//
+	// A failing store is now logged and SKIPPED so the other rigs still plan.
+	// The failure is NOT swallowed: it goes to stderr, and if EVERY store fails
+	// we still return an error, because a scan that silently finds nothing is
+	// indistinguishable from a town with no work.
+	var skipped []string
 	for _, dir := range dirs {
 		beadsDir := beads.ResolveBeadsDir(dir)
 		b := beads.NewWithBeadsDir(dir, beadsDir)
 		contexts, err := b.ListOpenSlingContexts()
 		if err != nil {
-			return nil, fmt.Errorf("listing sling contexts in %s: %w", beadsDir, err)
+			fmt.Fprintf(os.Stderr, "⚠ planning scan: skipping %s: %v\n", beadsDir, err)
+			skipped = append(skipped, beadsDir)
+			continue
 		}
 		for _, ctx := range contexts {
 			key := beadsDir + "\x00" + ctx.ID
@@ -857,6 +874,11 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 			seen[key] = true
 			records = append(records, slingContextRecord{issue: ctx, workDir: dir, beadsDir: beadsDir})
 		}
+	}
+	// Total failure is still an error — degrading to "no work found" would hide
+	// a broken scan behind an empty result.
+	if len(dirs) > 0 && len(skipped) == len(dirs) {
+		return nil, fmt.Errorf("planning scan failed on ALL %d stores; last: %s", len(dirs), skipped[len(skipped)-1])
 	}
 	return records, nil
 }
