@@ -143,11 +143,32 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	if m.mgr != nil {
 		if err := m.mgr.SetState(dogName, StateWorking); err != nil {
 			// Log but don't fail - session is running, state sync is best-effort
-			fmt.Fprintf(os.Stderr, "warning: failed to set dog %s state to working: %v\n", dogName, err)
+			m.warn(dogName, "failed to set dog %s state to working: %v", dogName, err)
 		}
 	}
 
+	m.record(dogName, "session start: %s (work=%q)", sessionID, opts.WorkDesc)
+
 	return nil
+}
+
+// warn reports a session-lifecycle problem to stderr and to the dog's durable
+// session log. stderr alone reaches only whoever is watching at this instant
+// (gt-wlco); the log is what anyone reads afterwards.
+func (m *SessionManager) warn(dogName, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+	m.record(dogName, "%s", "WARN "+msg)
+}
+
+// record appends to the dog's durable session log, best-effort.
+func (m *SessionManager) record(dogName, format string, args ...any) {
+	if m.mgr == nil {
+		return
+	}
+	if err := m.mgr.LogEvent(dogName, format, args...); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not record to %s session log: %v\n", dogName, err)
+	}
 }
 
 // Stop terminates a dog session.
@@ -169,15 +190,20 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 	}
 
 	if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+		// record, not warn: the error is returned, so the caller owns the visible
+		// half of the report. The log entry is the half that outlives the pane.
+		m.record(dogName, "WARN killing session %s: %v", sessionID, err)
 		return fmt.Errorf("killing session: %w", err)
 	}
 
 	// Update persistent state to idle so dog is available for reassignment
 	if m.mgr != nil {
 		if err := m.mgr.SetState(dogName, StateIdle); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to set dog %s state to idle: %v\n", dogName, err)
+			m.warn(dogName, "failed to set dog %s state to idle: %v", dogName, err)
 		}
 	}
+
+	m.record(dogName, "session stop: %s terminated (force=%v)", sessionID, force)
 
 	return nil
 }

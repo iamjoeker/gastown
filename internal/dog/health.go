@@ -54,7 +54,6 @@ type HealthChecker struct {
 	dispatch   DispatchInspector
 	staleAfter time.Duration
 	cooldown   time.Duration
-	killHung   bool
 	now        func() time.Time
 }
 
@@ -80,19 +79,6 @@ func (hc *HealthChecker) WithDispatch(insp DispatchInspector, staleAfter, cooldo
 	if cooldown > 0 {
 		hc.cooldown = cooldown
 	}
-	return hc
-}
-
-// WithKillHung opts in to destroying the live session of a hung dog during
-// auto-clear.
-//
-// It is off by default and deliberately separate from autoClear. A hung dog's
-// session is ALIVE — the agent may be mid-execution rather than finished — so
-// ending it is a judgement call reserved for the Deacon (ZFC principle), not
-// something a routine clear-the-orphans run should do as a side effect. Only
-// an operator who asks for it by name gets it.
-func (hc *HealthChecker) WithKillHung(kill bool) *HealthChecker {
-	hc.killHung = kill
 	return hc
 }
 
@@ -155,26 +141,19 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 
 		case tmux.AgentHung:
 			// Hung: process alive but no tmux activity for maxInactivity.
-			// The session is still LIVE, so autoClear alone reports and stops —
-			// the agent may be thinking rather than finished, and ending it is
-			// the Deacon's call (ZFC). Killing requires the explicit killHung
-			// opt-in, which is the only path that touches a live session.
+			// If autoClear is on, kill and reclaim — the dog almost certainly
+			// finished its work but failed to call `gt dog done`.
 			result.NeedsAttention = true
-			if autoClear && hc.killHung {
-				if err := hc.checker.KillSession(session); err == nil {
-					// The session we diagnosed no longer exists, so the
-					// dispatches it was holding are orphans now — say so, or
-					// this kill strands the very work it was meant to free.
-					sessionAlive = false
-				}
+			if autoClear {
+				_ = hc.checker.KillSession(session)
 				if err := hc.mgr.ClearWork(d.Name); err == nil {
 					result.AutoCleared = true
-					result.Recommendation = "hung dog cleared (--kill-hung: idle prompt, session killed)"
+					result.Recommendation = "hung dog auto-cleared (idle prompt, session killed)"
 				} else {
-					result.Recommendation = "hung: kill-hung failed: " + err.Error()
+					result.Recommendation = "hung: auto-clear failed: " + err.Error()
 				}
 			} else {
-				result.Recommendation = "hung: agent alive but no tmux activity (reported only; use --kill-hung to end it)"
+				result.Recommendation = "hung: agent alive but no tmux activity"
 			}
 
 		default: // SessionHealthy — status.String() already set above

@@ -38,7 +38,10 @@ func TestClosePluginMailsReturnsErrorOutsideWorkspace(t *testing.T) {
 		t.Fatalf("chdir: %v", err)
 	}
 
-	gotErr := closePluginMails("alpha")
+	gotClosed, gotErr := closePluginMails("alpha")
+	if gotClosed != 0 {
+		t.Errorf("closePluginMails archived %d mails outside a workspace; want 0", gotClosed)
+	}
 	if gotErr == nil {
 		t.Fatal("closePluginMails returned nil outside a Gas Town workspace. " +
 			"That is the gt-u58w defect: the caller cannot distinguish 'cleaned up' " +
