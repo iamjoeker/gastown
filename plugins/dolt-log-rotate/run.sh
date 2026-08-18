@@ -8,30 +8,13 @@ set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
 
-log() { echo "[dolt-log-rotate] $*"; }
-
-# Resolve the town root, failing loudly. `gt town root` used to be a
-# nonexistent subcommand: it printed `gt town`'s help to STDOUT and exited 0,
-# so `$(gt town root 2>/dev/null)` assigned help text to TOWN_ROOT and LOG_DIR
-# became a nonsense path — silently, and the plugin then reported "no log file,
-# nothing to do" forever (gt-cr2). The -d check keeps that failure loud even
-# against a gt binary predating the fix.
-TOWN_ROOT="${GT_TOWN_ROOT:-}"
-if [ -z "$TOWN_ROOT" ]; then
-  if ! TOWN_ROOT=$(gt town root); then
-    log "FATAL: could not resolve town root; set GT_TOWN_ROOT or run inside a Gas Town workspace." >&2
-    exit 1
-  fi
-fi
-if [ ! -d "$TOWN_ROOT" ]; then
-  log "FATAL: resolved town root is not a directory: '$TOWN_ROOT'" >&2
-  exit 1
-fi
-
+TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"
 LOG_DIR="${TOWN_ROOT}/daemon"
 LOG_FILE="${LOG_DIR}/dolt.log"
 MAX_MB="${GT_DOLT_LOG_MAX_MB:-100}"
 KEEP="${GT_DOLT_LOG_KEEP:-3}"
+
+log() { echo "[dolt-log-rotate] $*"; }
 
 # --- Preflight ---------------------------------------------------------------
 

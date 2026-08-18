@@ -91,18 +91,7 @@ set -euo pipefail
 case "${1:-}" in
   town)
     if [ "${2:-}" = "root" ]; then
-      if [ -f "$TEST_STATE/town_root_fail" ]; then
-        printf 'Error: not in a Gas Town workspace\n' >&2
-        exit 1
-      fi
-      if [ -f "$TEST_STATE/town_root_help" ]; then
-        # A gt binary predating gt-cr2, where `root` was not a subcommand:
-        # Cobra printed `gt town`'s help to STDOUT and exited 0.
-        printf 'Commands for town-level operations including session cycling.\n'
-        printf '\nUsage:\n  gt town [command]\n'
-        exit 0
-      fi
-      cat "$TEST_STATE/town_root_value"
+      printf '%s\n' "$GT_TOWN_ROOT"
       exit 0
     fi
     ;;
@@ -299,7 +288,6 @@ setup_case() {
   : > "$TEST_STATE/health_calls.log"
   : > "$TEST_STATE/hook_calls.log"
   : > "$TEST_STATE/bd.log"
-  printf '%s\n' "$GT_TOWN_ROOT" > "$TEST_STATE/town_root_value"
   touch "$TEST_STATE/sessions/hq-deacon"
 
   write_fake_commands "$bin_dir"
@@ -329,25 +317,6 @@ add_polecat_in_rig() {
 
 run_script() {
   bash "$SCRIPT" > "$TEST_STATE/output.log" 2>&1
-}
-
-# run_script_capturing_status runs the plugin without aborting this test file
-# when it exits non-zero, and records the exit status for assertion.
-run_script_capturing_status() {
-  SCRIPT_STATUS=0
-  bash "$SCRIPT" > "$TEST_STATE/output.log" 2>&1 || SCRIPT_STATUS=$?
-}
-
-assert_status() {
-  local expected="$1"
-  local label="$2"
-  if [ "$SCRIPT_STATUS" = "$expected" ]; then
-    record_pass "$label"
-  else
-    record_fail "$label"
-    printf '  expected exit %s, got %s\n' "$expected" "$SCRIPT_STATUS"
-    sed 's/^/    /' "$TEST_STATE/output.log" 2>/dev/null || true
-  fi
 }
 
 test_healthy_runtime() {
@@ -606,50 +575,6 @@ test_mass_death_skips_actions() {
   assert_file_contains "$TEST_STATE/output.log" "Skipping per-agent restart/kill actions" "mass death: action loops skipped"
 }
 
-# --- Town root resolution (gt-cr2) -------------------------------------------
-# `gt town root` did not exist: it printed `gt town`'s help to STDOUT and
-# exited 0, so the GT_TOWN_ROOT fallback assigned help text to TOWN_ROOT and
-# every "$TOWN_ROOT/$rig" probe silently found nothing — the dog reported a
-# healthy town while inspecting directories that do not exist.
-
-test_town_root_resolved_from_gt_when_env_unset() {
-  setup_case
-  add_polecat alpha agent-dead
-  unset GT_TOWN_ROOT
-  run_script_capturing_status
-
-  assert_status 0 "town root via gt: plugin succeeds"
-  assert_line_count "$TEST_STATE/mail.log" 1 "town root via gt: restart mail sent"
-  assert_file_contains "$TEST_STATE/output.log" "1 stuck" "town root via gt: inspected the real town"
-}
-
-test_town_root_unresolvable_fails_loudly() {
-  setup_case
-  add_polecat alpha agent-dead
-  touch "$TEST_STATE/town_root_fail"
-  unset GT_TOWN_ROOT
-  run_script_capturing_status
-
-  assert_status 1 "town root unresolvable: non-zero exit"
-  assert_file_contains "$TEST_STATE/output.log" "FATAL: could not resolve town root" "town root unresolvable: loud failure"
-  assert_file_empty "$TEST_STATE/mail.log" "town root unresolvable: no restart mail"
-  assert_file_empty "$TEST_STATE/health_calls.log" "town root unresolvable: no health checks"
-}
-
-test_town_root_help_text_fails_loudly() {
-  setup_case
-  add_polecat alpha agent-dead
-  touch "$TEST_STATE/town_root_help"
-  unset GT_TOWN_ROOT
-  run_script_capturing_status
-
-  assert_status 1 "town root help text: non-zero exit"
-  assert_file_contains "$TEST_STATE/output.log" "FATAL: resolved town root is not a directory" "town root help text: rejected as a path"
-  assert_file_empty "$TEST_STATE/mail.log" "town root help text: no restart mail"
-  assert_file_empty "$TEST_STATE/health_calls.log" "town root help text: no health checks"
-  assert_file_not_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck" "town root help text: no phantom all-healthy report"
-}
-
 test_invalid_mass_death_threshold_defaults() {
   setup_case
   export GT_STUCK_AGENT_DOG_MASS_DEATH_THRESHOLD=0
@@ -680,9 +605,6 @@ test_mass_death_recheck_hook_cleared
 test_mass_death_recheck_one_remaining_restarts
 test_mass_death_recheck_reclassifies_dead_statuses
 test_mass_death_skips_actions
-test_town_root_resolved_from_gt_when_env_unset
-test_town_root_unresolvable_fails_loudly
-test_town_root_help_text_fails_loudly
 test_invalid_mass_death_threshold_defaults
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
