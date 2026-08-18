@@ -797,7 +797,9 @@ func beadsScopeHint(database, townRoot string) string {
 		return ""
 	}
 
-	return fmt.Sprintf("    Gas Town town beads use database hq. Use `bd -C %s <cmd>` for hq-* beads; do not use `bd --global`, which targets Beads' beads_global database.\n", gtconfig.ShellQuote(townRoot))
+	quoted := gtconfig.ShellQuote(townRoot)
+	return fmt.Sprintf("    Gas Town town beads use database hq. Use `bd -C %s <cmd>` to read hq-* beads; do not use `bd --global`, which targets Beads' beads_global database.\n"+
+		"    `bd -C` only sets BEADS_DIR — it does not chdir, and your maintainer/contributor role is still read from the current directory. To write hq-* beads, `cd %s` first.\n", quoted, quoted)
 }
 
 func netJoinHostPort(host string, port int) string {

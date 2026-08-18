@@ -134,6 +134,22 @@ func TestBeadsScopeHint_HQWarnsAgainstGlobal(t *testing.T) {
 	}
 }
 
+// bd -C never chdirs (it only sets BEADS_DIR), while the maintainer/contributor
+// role that write routing also depends on is read from the process working
+// directory. The hint must not leave `bd -C` looking like a general substitute
+// for being in the town root.
+func TestBeadsScopeHint_HQDistinguishesReadFromWrite(t *testing.T) {
+	townRoot := filepath.Join(string(filepath.Separator), "custom", "town root")
+	quoted := gtconfig.ShellQuote(townRoot)
+	hint := beadsScopeHint("hq", townRoot)
+
+	for _, want := range []string{"to read hq-* beads", "does not chdir", "BEADS_DIR", "cd " + quoted} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("beadsScopeHint() missing %q in:\n%s", want, hint)
+		}
+	}
+}
+
 func TestBeadsScopeHint_NonHQEmpty(t *testing.T) {
 	if hint := beadsScopeHint("gastown", "/custom/town"); hint != "" {
 		t.Fatalf("beadsScopeHint() = %q, want empty", hint)

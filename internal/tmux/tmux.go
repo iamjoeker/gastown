@@ -3544,30 +3544,6 @@ func (t *Tmux) IsIdle(session string) bool {
 	return false
 }
 
-// IsBusy reports whether a session's pane shows positive evidence that the
-// agent is mid-turn. It is NOT the negation of IsIdle: IsIdle answers "is this
-// session parked at the prompt?" and returns false whenever it cannot tell,
-// while IsBusy returns true only when the busy indicator is actually on screen.
-//
-// The asymmetry is deliberate. IsBusy exists for callers that must not destroy
-// or reclaim a session that is still generating (gt-5tg), so an unreadable pane,
-// a dead session, or a non-agent session must read as "no evidence of work"
-// rather than as a blocker — otherwise every rig without tmux would stall.
-// Callers get a one-way guarantee: true means the agent was demonstrably
-// mid-turn at capture time; false means only that nothing proved it was.
-func (t *Tmux) IsBusy(session string) bool {
-	lines, err := t.CapturePaneLines(session, 5)
-	if err != nil {
-		return false
-	}
-	for _, line := range lines {
-		if hasBusyIndicator(line) {
-			return true
-		}
-	}
-	return false
-}
-
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
