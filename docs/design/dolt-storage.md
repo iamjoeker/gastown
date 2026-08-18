@@ -74,16 +74,10 @@ pointing to `gt dolt start`.
 
 ## Gas Town Scope vs `bd --global`
 
-Gas Town's town-level beads are the `hq` database. Read them by running direct
-`bd` commands from the town root (`~/gt`) or with `bd -C ~/gt ...`. Direct `bd`
-commands from rig worktrees use that rig's `.beads` redirect and database, so do
-not assume an `hq-*` ID will retarget the command.
-
-The two forms are not equivalent for writes. `bd -C` does not change directory
-— it only sets `BEADS_DIR` — while Beads detects your maintainer/contributor
-role from the process working directory, which `-C` never moves. Writes route on
-both inputs together, so `cd ~/gt` before creating or updating an `hq-*` bead
-rather than relying on `-C`. See [Beads Routing](../reference.md#beads-routing).
+Gas Town's town-level beads are the `hq` database. Access them by running
+direct `bd` commands from the town root (`~/gt`) or with `bd -C ~/gt ...`.
+Direct `bd` commands from rig worktrees use that rig's `.beads` redirect and
+database, so do not assume an `hq-*` ID will retarget the command.
 
 Do not use `bd --global` for Gas Town town beads. In Beads, `--global`
 means the standalone shared-server database named `beads_global`; it does
