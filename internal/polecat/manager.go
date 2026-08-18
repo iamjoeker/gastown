@@ -2862,7 +2862,7 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 // completion sequence (gt-5tg).
 //
 // Positive evidence only: no tmux, no session, or an unreadable pane all return
-// false, matching the behaviour callers had before this check existed.
+// false, matching the behavior callers had before this check existed.
 func (m *Manager) SessionBusy(name string) bool {
 	if m.tmux == nil {
 		return false

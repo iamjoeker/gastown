@@ -2978,7 +2978,7 @@ const donePurgeMinAge = "168h"
 // buildDonePurgeArgs returns the argv for the `gt done` purge. Separate so the
 // argv itself is assertable: a test that greps this file for "--older-than"
 // would pass with the flag sitting in a comment, which is the failure mode
-// catalogued in gt-am7.
+// cataloged in gt-am7.
 func buildDonePurgeArgs() []string {
 	return []string{"purge", "--force", "--quiet", "--older-than", donePurgeMinAge}
 }

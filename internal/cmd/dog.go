@@ -1187,7 +1187,7 @@ type dispatchDelivery struct {
 //
 // Two mechanisms can put text into a dog's pane: router.Send's background
 // notification goroutine, and the startup prompt handed to a newly launched
-// agent. They are independent and unsynchronised — the nudge lock serialises
+// agent. They are independent and unsynchronised — the nudge lock serializes
 // nudge against nudge and cannot see a startup prompt at all. When both fire
 // at one pane the notification's idle probe reads a just-booted agent as idle
 // and types into a turn that is already in flight; the Enter interrupts it and
@@ -1386,7 +1386,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	// prompt. When both happen for the same pane, the notification's
 	// WaitForIdle sees a freshly-booted agent as idle and types into a turn
 	// that is already in flight — the second delivery interrupts the first and
-	// the instruction is destroyed. The nudge lock serialises nudge against
+	// the instruction is destroyed. The nudge lock serializes nudge against
 	// nudge; it cannot see a startup prompt.
 	//
 	// So exactly one path delivers: if we are about to start the session, its

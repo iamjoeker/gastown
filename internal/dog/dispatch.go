@@ -36,7 +36,7 @@ type DispatchMailbox interface {
 	Archive(id string) error
 }
 
-// DispatchScan summarises the open dispatch mail sitting in a dog's inbox.
+// DispatchScan summarizes the open dispatch mail sitting in a dog's inbox.
 type DispatchScan struct {
 	// Open is the number of open dispatch messages.
 	Open int `json:"open"`

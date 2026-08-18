@@ -29,7 +29,7 @@ const (
 	// Issues stale longer than this are auto-closed.
 	//
 	// 30 DAYS, NOT 7 (gt-zjb). This was 7*24 — the 7-day pattern from the two
-	// constants above applied one line too far, where both neighbours are
+	// constants above applied one line too far, where both neighbors are
 	// legitimately 7 days. That made the daemon auto-close issues 4.3x more
 	// aggressively than every documented surface says:
 	//
