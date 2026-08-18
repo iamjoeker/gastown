@@ -181,7 +181,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 
 	port := d.doltServerPort()
 	dryRun := config.DryRun
-	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalAutoClosed int
+	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalProtected, totalAutoClosed int
 
 	// Step 2: Reap
 	reapErrors := 0
@@ -248,6 +248,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 		totalPurged += result.WispsPurged
 		totalMailPurged += result.MailPurged
+		totalProtected += result.WispsProtected
 		for _, a := range result.Anomalies {
 			d.logger.Printf("wisp_reaper: %s: ANOMALY: %s", dbName, a.Message)
 		}
@@ -353,8 +354,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	if totalMoleculeSteps > 0 {
 		summary += fmt.Sprintf(" molecule_steps_closed=%d", totalMoleculeSteps)
 	}
-	summary += fmt.Sprintf(" purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	summary += fmt.Sprintf(" purged=%d protected=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalPurged, totalProtected, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
 	d.logger.Printf("%s", summary)
 	mol.closeStep("report")
 }
