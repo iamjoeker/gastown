@@ -2952,9 +2952,12 @@ func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 		[]byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"rig-b"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "rig-b", ".dolt"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	// setupDoltDB writes .dolt/noms/manifest as well as the .dolt/ directory.
+	// A bare .dolt/ is not enough: listDatabasesLocal treats a database
+	// directory with no manifest as corrupted and skips it, which would make
+	// rig-b look broken too and turn the "exactly one broken rig" assertion
+	// into an accident of fixture shape.
+	setupDoltDB(t, doltDataDir, "rig-b")
 
 	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
