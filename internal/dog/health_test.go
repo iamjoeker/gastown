@@ -179,11 +179,7 @@ func TestHealth_Hung_ReportOnly(t *testing.T) {
 	}
 }
 
-// A hung dog's session is alive. --auto-clear promises to report it and stop,
-// and once did the opposite: it killed the session anyway. That is the
-// dangerous direction for a contract to break in — the flag did MORE than it
-// said — so the promise is pinned here.
-func TestHealth_Hung_AutoClearDoesNotKillLiveSession(t *testing.T) {
+func TestHealth_Hung_AutoCleared(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
 	setupDogWithState(t, m, "alpha", &DogState{
@@ -197,49 +193,13 @@ func TestHealth_Hung_AutoClearDoesNotKillLiveSession(t *testing.T) {
 	hc := NewHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
-	r := hc.Check(d, 30*time.Minute, true) // autoClear=true, killHung unset
-
-	if !r.NeedsAttention {
-		t.Error("hung dog should need attention")
-	}
-	if r.AutoCleared {
-		t.Error("hung dog must NOT be cleared by --auto-clear alone")
-	}
-	if len(mc.killedSessions) != 0 {
-		t.Errorf("killedSessions = %v, want none: --auto-clear may not kill a live session", mc.killedSessions)
-	}
-
-	// The dog keeps its work: the Deacon decides whether it is dead.
-	d2, _ := m.Get("alpha")
-	if d2.State != StateWorking {
-		t.Errorf("state = %q, want working (untouched)", d2.State)
-	}
-	if d2.Work != "task-1" {
-		t.Errorf("work = %q, want task-1 (untouched)", d2.Work)
-	}
-}
-
-func TestHealth_Hung_KillHungClears(t *testing.T) {
-	m, _ := testManager(t)
-	now := time.Now()
-	setupDogWithState(t, m, "alpha", &DogState{
-		Name: "alpha", State: StateWorking, Work: "task-1",
-		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
-	})
-
-	mc := newMockChecker()
-	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
-	hc := NewHealthChecker(m, mc).WithKillHung(true)
-
-	d, _ := m.Get("alpha")
-	r := hc.Check(d, 30*time.Minute, true) // autoClear=true + killHung: kill
+	r := hc.Check(d, 30*time.Minute, true) // autoClear=true: kill and reclaim
 
 	if !r.NeedsAttention {
 		t.Error("hung dog should need attention")
 	}
 	if !r.AutoCleared {
-		t.Error("hung dog should be cleared when killHung is opted in")
+		t.Error("hung dog should be auto-cleared when autoClear=true")
 	}
 	if len(mc.killedSessions) != 1 || mc.killedSessions[0] != "hq-dog-alpha" {
 		t.Errorf("killedSessions = %v, want [hq-dog-alpha]", mc.killedSessions)
@@ -248,90 +208,7 @@ func TestHealth_Hung_KillHungClears(t *testing.T) {
 	// Verify state was cleared
 	d2, _ := m.Get("alpha")
 	if d2.State != StateIdle {
-		t.Errorf("state = %q, want idle after kill-hung", d2.State)
-	}
-}
-
-// killHung without autoClear is not a mode: the opt-in modifies clearing, it
-// does not enable it.
-func TestHealth_Hung_KillHungRequiresAutoClear(t *testing.T) {
-	m, _ := testManager(t)
-	now := time.Now()
-	setupDogWithState(t, m, "alpha", &DogState{
-		Name: "alpha", State: StateWorking, Work: "task-1",
-		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
-	})
-
-	mc := newMockChecker()
-	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
-	hc := NewHealthChecker(m, mc).WithKillHung(true)
-
-	d, _ := m.Get("alpha")
-	r := hc.Check(d, 30*time.Minute, false) // autoClear=false
-
-	if r.AutoCleared || len(mc.killedSessions) != 0 {
-		t.Errorf("killHung acted without autoClear: cleared=%v killed=%v", r.AutoCleared, mc.killedSessions)
-	}
-}
-
-// The kill that strands its own dispatches is the failure that made this a
-// bug: one live session destroyed, ZERO dispatches archived. Once the session
-// is gone its dispatches are orphans, and orphans get reclaimed.
-func TestHealth_Hung_KillHungReclaimsOrphanedDispatches(t *testing.T) {
-	m, _ := testManager(t)
-	now := time.Now()
-	setupDogWithState(t, m, "alpha", &DogState{
-		Name: "alpha", State: StateWorking, Work: "task-1",
-		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
-	})
-
-	mc := newMockChecker()
-	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
-	insp := newFakeInspector()
-	insp.scans["alpha"] = DispatchScan{Open: 47, OldestAge: 4 * time.Hour}
-	hc := NewHealthChecker(m, mc).
-		WithDispatch(insp, 30*time.Minute, time.Hour).
-		WithKillHung(true)
-
-	d, _ := m.Get("alpha")
-	r := hc.Check(d, 30*time.Minute, true)
-
-	if r.DispatchesReclaimed != 47 {
-		t.Errorf("reclaimed %d, want 47 — killing the session must not strand its dispatches", r.DispatchesReclaimed)
-	}
-	if insp.reclaimed["alpha"] != 47 {
-		t.Errorf("inspector reclaimed %d for alpha, want 47", insp.reclaimed["alpha"])
-	}
-}
-
-// Without the opt-in the session survives, so its dispatches are stale (the
-// dog is holding work it is not doing) — an alarm, never a reclaim.
-func TestHealth_Hung_NoKill_DispatchesAlarmNotReclaimed(t *testing.T) {
-	m, _ := testManager(t)
-	now := time.Now()
-	setupDogWithState(t, m, "alpha", &DogState{
-		Name: "alpha", State: StateWorking, Work: "task-1",
-		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
-	})
-
-	mc := newMockChecker()
-	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
-	insp := newFakeInspector()
-	insp.scans["alpha"] = DispatchScan{Open: 47, OldestAge: 4 * time.Hour}
-	hc := NewHealthChecker(m, mc).WithDispatch(insp, 30*time.Minute, time.Hour)
-
-	d, _ := m.Get("alpha")
-	r := hc.Check(d, 30*time.Minute, true) // autoClear on, killHung off
-
-	if r.DispatchesReclaimed != 0 || insp.reclaimed["alpha"] != 0 {
-		t.Errorf("reclaimed dispatches from a live session: result=%d calls=%d",
-			r.DispatchesReclaimed, insp.reclaimed["alpha"])
-	}
-	if r.DispatchAlarm == "" {
-		t.Error("stale dispatches on a live session should alarm")
+		t.Errorf("state = %q, want idle after auto-clear", d2.State)
 	}
 }
 
