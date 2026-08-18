@@ -2398,6 +2398,51 @@ func TestShouldSendEscape_CaptureErrorSuppressesEscape(t *testing.T) {
 	}
 }
 
+// TestIsBusy_LivePane confirms IsBusy's one-way contract against a real pane:
+// true only while the busy indicator is actually rendered. Recovery decisions
+// hang off this (gt-5tg), so an idle pane must never read as working.
+func TestIsBusy_LivePane(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-is-busy-" + t.Name()
+
+	_ = tm.KillSession(session)
+	if err := tm.NewSession(session, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(session) }()
+
+	if tm.IsBusy(session) {
+		out, _ := tm.CapturePane(session, 20)
+		t.Fatalf("IsBusy on idle pane = true, want false; pane:\n%s", out)
+	}
+
+	// The typed command line itself carries the marker, so detection does not
+	// depend on the command executing.
+	if err := tm.SendKeys(session, "echo esc to interrupt"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !tm.IsBusy(session) {
+		if time.Now().After(deadline) {
+			out, _ := tm.CapturePane(session, 20)
+			t.Fatalf("IsBusy did not detect busy indicator within timeout; pane:\n%s", out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// A session that cannot be read is not evidence of work. IsBusy must answer
+// false there, or every rig without a readable pane would stall reuse — the
+// reason it is not simply !IsIdle.
+func TestIsBusy_CaptureErrorIsNotBusy(t *testing.T) {
+	tm := newTestTmux(t)
+
+	if tm.IsBusy("missing-session-for-busy-check") {
+		t.Fatal("IsBusy on missing target = true, want false")
+	}
+}
+
 // TestBusyIndicators pins the centralized busy-indicator source of truth so a
 // change to the upstream-coupled status string is intentional and reviewed
 // rather than accidental (gastownhall/gastown#4240).

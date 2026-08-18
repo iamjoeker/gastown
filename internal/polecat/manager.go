@@ -2314,7 +2314,7 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 }
 
 func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
-	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown}
+	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown, SessionBusy: m.SessionBusy(name)}
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""
@@ -2854,6 +2854,24 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		Branch:    branchName,
 		Issue:     issueID,
 	}, nil
+}
+
+// SessionBusy reports whether the polecat's tmux session is demonstrably
+// mid-turn right now. It is the live counterpart to the bead-derived facts in
+// WorkstateInput, which lag the session by a minute or two through the
+// completion sequence (gt-5tg).
+//
+// Positive evidence only: no tmux, no session, or an unreadable pane all return
+// false, matching the behaviour callers had before this check existed.
+func (m *Manager) SessionBusy(name string) bool {
+	if m.tmux == nil {
+		return false
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	if running, err := m.tmux.HasSession(sessionName); err != nil || !running {
+		return false
+	}
+	return m.tmux.IsBusy(sessionName)
 }
 
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
