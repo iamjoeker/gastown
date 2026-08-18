@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"fmt"
 	"os"
 	"os/exec"
@@ -423,8 +424,13 @@ func beadsForContextRecord(rec slingContextRecord) *beads.Beads {
 // Called explicitly before the dispatch cycle to separate cleanup from querying.
 func cleanupStaleContexts(townRoot string) error {
 	contexts, err := listAllSlingContextRecords(townRoot)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrPartialSlingContextScan) {
 		return err
+	}
+	if errors.Is(err, ErrPartialSlingContextScan) {
+		// Best-effort planning: proceed with the stores we could read (hq-v05uw),
+		// but say so. Completeness-sensitive callers fail closed instead (gt-mji1).
+		fmt.Fprintf(os.Stderr, "⚠ %v — planning continues on the readable stores\n", err)
 	}
 
 	// First pass: close invalid and circuit-broken contexts, collect work bead IDs
@@ -579,8 +585,11 @@ func groupBeadIDsByResolvedBeadsDir(townRoot string, ids []string) map[string][]
 
 func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, error) {
 	contexts, err := listAllSlingContextRecords(townRoot)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrPartialSlingContextScan) {
 		return nil, err
+	}
+	if errors.Is(err, ErrPartialSlingContextScan) {
+		fmt.Fprintf(os.Stderr, "⚠ %v — planning continues on the readable stores\n", err)
 	}
 	if len(contexts) == 0 {
 		return nil, nil
@@ -823,6 +832,18 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 // Deduplicates by context ID: different search dirs can resolve to the same
 // underlying beads DB (e.g., when a rig's top-level .beads is a redirect to
 // mayor/rig/.beads), and both paths would otherwise return the same contexts.
+// ErrPartialSlingContextScan reports that at least one store could not be
+// scanned. Callers that need a COMPLETE view (idempotency checks such as
+// areScheduled) MUST treat this as failure and fail closed; callers that only
+// need best-effort planning may ignore it and use the records returned.
+//
+// gt-mji1: the per-store isolation added for hq-v05uw made partial failures
+// return a nil error, which silently removed areScheduled's fail-closed path —
+// a partial scan looked authoritative and the scheduler would re-dispatch work
+// it could not prove was unscheduled. Isolating a failure must not convert it
+// into "nothing is scheduled".
+var ErrPartialSlingContextScan = errors.New("planning scan could not read every store; result is incomplete")
+
 func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 	records, err := listAllSlingContextRecords(townRoot)
 	if err != nil {
@@ -879,6 +900,13 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	// a broken scan behind an empty result.
 	if len(dirs) > 0 && len(skipped) == len(dirs) {
 		return nil, fmt.Errorf("planning scan failed on ALL %d stores; last: %s", len(dirs), skipped[len(skipped)-1])
+	}
+	if len(skipped) > 0 {
+		// Records ARE returned so best-effort planning still works, but the
+		// sentinel travels with them so a completeness-sensitive caller can
+		// fail closed instead of trusting an incomplete view (gt-mji1).
+		return records, fmt.Errorf("%w (skipped %d of %d: %s)",
+			ErrPartialSlingContextScan, len(skipped), len(dirs), strings.Join(skipped, ", "))
 	}
 	return records, nil
 }
