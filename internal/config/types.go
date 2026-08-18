@@ -359,6 +359,19 @@ type DaemonThresholds struct {
 	// DeaconGracePeriod is time to wait after starting Deacon before checking heartbeat (default "5m").
 	DeaconGracePeriod string `json:"deacon_grace_period,omitempty"`
 
+	// PatrolWakeEnabled controls whether the daemon wakes patrol agents
+	// (witnesses, refineries, the Deacon) whose turn has ended at an empty
+	// prompt (default true). Turning it off stops those loops from being
+	// restarted at all — a stopped agent stays stopped while every status
+	// surface still reports it running.
+	PatrolWakeEnabled *bool `json:"patrol_wake_enabled,omitempty"`
+
+	// PatrolWakeCooldown is the minimum interval between wakes of the same
+	// patrol session (default "5m"). It bounds repeat wakes of an agent that
+	// does not come back; a wake that lands makes the agent active again, so
+	// the cooldown does not gate the normal case.
+	PatrolWakeCooldown string `json:"patrol_wake_cooldown,omitempty"`
+
 	// PressureCPUThreshold is the per-core load average above which new
 	// non-infrastructure spawns are deferred. Disabled by default (0).
 	// Recommended starting value: 3.0 (only trips under severe load).
