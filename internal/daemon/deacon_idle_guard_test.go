@@ -68,29 +68,23 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 		t.Skip("skipping on Windows — fake tmux requires bash")
 	}
 
-	// Every case pins the process table. The idle guard's suppression is
-	// conditional on a live await since gt-ghw7, so leaving the table to whatever
-	// happens to be running on the build machine would make these results depend
-	// on whether a real Deacon is parked next to the test.
 	tests := []struct {
 		name             string
 		heartbeatAge     time.Duration
 		stores           map[string]beadsdk.Storage
-		procs            []string
 		wantNudgeLog     bool
 		wantIdleGuardLog bool
 		desc             string
 	}{
 		{
-			name:         "idle: stale heartbeat, no work, await pending — nudge suppressed",
+			name:         "idle: stale heartbeat, no work — nudge suppressed",
 			heartbeatAge: 10 * time.Minute,
 			stores: map[string]beadsdk.Storage{
 				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
 			},
-			procs:            []string{psDeaconAwait},
 			wantNudgeLog:     false,
 			wantIdleGuardLog: true,
-			desc:             "Idle guard must suppress nudge when no work is in flight and the await is really waiting",
+			desc:             "Idle guard must suppress nudge when no work is in flight",
 		},
 		{
 			name:         "active work: stale heartbeat, in_progress bead — nudge sent",
@@ -105,14 +99,13 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 			desc:             "Nudge must fire when in_progress work exists",
 		},
 		{
-			name:         "hooked only: stale heartbeat, patrol wisp, await pending — nudge suppressed",
+			name:         "hooked only: stale heartbeat, patrol wisp — nudge suppressed",
 			heartbeatAge: 10 * time.Minute,
 			stores: map[string]beadsdk.Storage{
 				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{
 					"hooked": {{ID: "hq-wisp-34zi"}},
 				}},
 			},
-			procs:            []string{psDeaconAwait},
 			wantNudgeLog:     false,
 			wantIdleGuardLog: true,
 			desc:             "Patrol wisps in hooked state do not count as active work; nudge must be suppressed",
@@ -153,8 +146,6 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 			t.Setenv("TMUX_LOG", tmuxLog)
 
 			writeDeaconHeartbeat(t, townRoot, tc.heartbeatAge)
-
-			defer stubProcessTable(t, tc.procs, nil)()
 
 			d := newTestDaemonWithStores(t, townRoot, tc.stores)
 

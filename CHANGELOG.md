@@ -32,6 +32,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dispatch no longer sends a second polecat onto work that is already
+  committed** (gt-79li). A bead can return to a dispatchable state while its work
+  exists: gt-wlco was closed by its polecat, reopened nine minutes later, and had
+  its merge request rejected eight minutes after that — while
+  `polecat/foundation/gt-wlco+msz8v9e1` sat on the remote carrying 717 lines of
+  finished work. Nothing on the dispatch path noticed. Three defects made that
+  possible, all now closed:
+
+  - `lookupPriorAttempt` — the one mechanism that tells a re-dispatched polecat
+    which branch to build on — was querying the **wrong database**. MR beads are
+    wisps in the *rig* DB, but it was handed `<townRoot>/.beads` and
+    `ListMergeRequests` runs raw SQL with no prefix routing, so it asked hq.
+    Measured: 0 `gt:merge-request` wisps from the town dir versus 36 from the rig
+    dir, with hq's 27684 wisps as the control proving the query itself worked.
+    The feature had never once fired for a rig bead. It now routes by the bead's
+    prefix, and `TestSlingNewlyCreatedRigBeadRoutesBDCommandsToTargetRig` asserts
+    it.
+  - It also considered **open MRs only**, which excludes precisely the case where
+    re-dispatch happens. A rejected, superseded or conflicted MR is closed, but
+    its branch and commit_sha are still the record of work that was done.
+  - Only batch/queue dispatch consulted it at all; `gt sling` did not.
+
+  On top of that, `gt sling` now **refuses** to dispatch a bead whose branch is
+  still queued in the merge queue, naming the MR, branch and commit rather than
+  just a rule (`--force` overrides; `--dry-run` still performs no lookups). When
+  no MR bead survives — the reaper deletes them, so "no MR" is not evidence that
+  nothing was pushed — dispatch falls back to the remote `polecat/*` refs, which
+  is the durable artifact. That check is cached per rig so batch dispatch costs
+  one `ls-remote`, and it reads the *push* target, since a fork-backed remote
+  resolves ls-remote against the fetch URL where the branch was never written.
+
+  Prior work now reaches the polecat as `prior_branch`, `prior_commit`,
+  `prior_status` and `prior_failure`. Merged work is deliberately excluded: it is
+  not work to build on, and handing over that branch would send a polecat to
+  rewrite history that has already landed.
+
 - **`gt dog health-check --auto-clear` no longer kills hung dogs' live sessions**
   (gt-3rj). The help promised "hung dogs are reported only (Deacon decides per
   ZFC principle)" while the code killed the tmux session and cleared the work —

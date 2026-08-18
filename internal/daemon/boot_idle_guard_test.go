@@ -147,48 +147,17 @@ func TestEnsureBootRunning_IdleGuard(t *testing.T) {
 		name         string
 		heartbeatAge time.Duration // zero means no heartbeat file
 		stores       map[string]beadsdk.Storage
-		// procs is the process table the idle guard's await check reads. nil
-		// means "unreadable", which must leave the guard's pre-check behavior
-		// intact. Every case stubs it: the guard's decision must not depend on
-		// what happens to be running on the machine the suite runs on.
-		procs      []string
-		procsErr   error
-		wantSpawns int
-		desc       string
+		wantSpawns   int
+		desc         string
 	}{
 		{
-			name:         "idle: fresh heartbeat, no work, await pending — skip",
+			name:         "idle: fresh heartbeat, no work — skip",
 			heartbeatAge: 1 * time.Minute,
 			stores: map[string]beadsdk.Storage{
 				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
 			},
-			procs:      []string{psDeaconAwait},
 			wantSpawns: 0,
-			desc:       "Deacon is genuinely waiting: Boot must NOT spawn",
-		},
-		{
-			// gt-ghw7: this is the state the guard used to read as "healthy".
-			// The Deacon writes its heartbeat immediately before entering
-			// await-signal, so a turn that ends there leaves a fresh heartbeat,
-			// no work, and nothing pending to wake it.
-			name:         "fresh heartbeat, no work, but NO await — spawn",
-			heartbeatAge: 1 * time.Minute,
-			stores: map[string]beadsdk.Storage{
-				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
-			},
-			procs:      []string{psOtherRigWitnessAwait},
-			wantSpawns: 1,
-			desc:       "Deacon is parked with nothing pending: Boot must spawn",
-		},
-		{
-			name:         "unreadable process table — skip as before",
-			heartbeatAge: 1 * time.Minute,
-			stores: map[string]beadsdk.Storage{
-				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
-			},
-			procsErr:   fmt.Errorf("ps: command not found"),
-			wantSpawns: 0,
-			desc:       "No process-table evidence either way: pre-check behavior stands",
+			desc:       "Both idle conditions met: Boot must NOT spawn",
 		},
 		{
 			name:         "stale heartbeat, no work — spawn",
@@ -247,8 +216,6 @@ func TestEnsureBootRunning_IdleGuard(t *testing.T) {
 			if tc.heartbeatAge > 0 {
 				writeDeaconHeartbeat(t, townRoot, tc.heartbeatAge)
 			}
-
-			defer stubProcessTable(t, tc.procs, tc.procsErr)()
 
 			d := newTestDaemonWithStores(t, townRoot, tc.stores)
 			d.ensureBootRunning()

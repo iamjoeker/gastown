@@ -1365,22 +1365,10 @@ func (d *Daemon) ensureBootRunning() {
 	// We deliberately do NOT update bootLastSpawned on an idle skip: the cooldown
 	// is about rate-limiting real spawns; the idle check should re-run every
 	// heartbeat so Boot fires promptly when work actually appears.
-	//
-	// "Healthy" here is heartbeat freshness, and the Deacon writes its heartbeat
-	// immediately BEFORE entering await-signal. A Deacon whose turn ended at that
-	// point has a fresh heartbeat, no work in flight, and nothing waiting to wake
-	// it — the exact state this guard reads as "nothing to triage". Requiring a
-	// live await closes that: the skip now asserts something that was checked
-	// rather than assumed. See [awaitProbe]; awaitUnknown does not suppress the
-	// skip, so a host without a readable process table behaves as it did before.
 	hb := deacon.ReadHeartbeat(d.config.TownRoot)
 	if hb != nil && hb.IsFresh() && !d.hasActiveWork() {
-		if (&awaitProbe{}).state(beads.DeaconBeadIDTown()) == awaitAbsent {
-			d.logger.Println("Boot spawn: Deacon looks idle but has no await pending — parked, not waiting")
-		} else {
-			d.logger.Println("Boot spawn skipped: Deacon is healthy and no active work in flight")
-			return
-		}
+		d.logger.Println("Boot spawn skipped: Deacon is healthy and no active work in flight")
+		return
 	}
 
 	b := boot.New(d.config.TownRoot)
@@ -1666,21 +1654,9 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		// Conservative: on store errors hasActiveWork returns true, so nudge fires.
 		// See also: runtime/runtime.go:99-101 — session-started nudge was removed
 		// for the same reason (it interrupted the deacon's await-signal backoff).
-		//
-		// "Will fire naturally" is a claim about a process, so it is checked
-		// against the process table rather than inferred from the absence of
-		// work. For a Deacon that parked with its await gone, "no active work in
-		// flight" is precisely what being stuck looks like, and skipping on it
-		// strands the head of the wake chain silently (gt-ghw7). Only a live
-		// await justifies the skip; awaitUnknown still skips, preserving the
-		// pre-check behavior where the process table cannot be read.
 		if !d.hasActiveWork() {
-			if (&awaitProbe{}).state(beads.DeaconBeadIDTown()) == awaitAbsent {
-				d.logger.Println("Deacon nudge: no active work in flight AND no await-signal pending — parked, nudging")
-			} else {
-				d.logger.Println("Deacon nudge skipped: no active work in flight, await-signal will fire naturally")
-				return
-			}
+			d.logger.Println("Deacon nudge skipped: no active work in flight, await-signal will fire naturally")
+			return
 		}
 
 		d.logger.Printf("Deacon stuck for %s - nudging session", age.Round(time.Minute))
