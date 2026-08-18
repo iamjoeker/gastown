@@ -172,6 +172,19 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 
+	// Guard against duplicate work: an open MR means this bead's branch is
+	// already queued to merge (gt-79li). Uses explicitForce so the dead-agent
+	// auto-force above cannot silently bypass it — a dead polecat is exactly
+	// how a bead ends up open while its MR is still queued.
+	prior, err := checkPriorWorkGuard(townRoot, params.BeadID, explicitForce)
+	if err != nil {
+		result.ErrMsg = "open merge request"
+		return result, err
+	}
+	if notice := describePriorAttempt(prior); notice != "" {
+		fmt.Printf("  %s %s\n", style.Dim.Render("↻"), notice)
+	}
+
 	// Send LIFECYCLE:Shutdown to the witness when force-stealing a bead from a
 	// live polecat. Without this, the old polecat becomes a zombie — still running
 	// but unaware it lost its hook. Mirrors the same logic in runSling (sling.go).
@@ -316,13 +329,10 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 
 		// GH#gt-zqvj: Inject prior attempt context when re-dispatching an issue
-		// that already has an open MR from a previous polecat. The new polecat
-		// gets the old branch name so it can cherry-pick prior work instead of
+		// that already has an MR from a previous polecat. The new polecat gets
+		// the old branch name so it can cherry-pick prior work instead of
 		// starting from scratch.
-		if priorVars := lookupPriorAttempt(beadsDir, params.BeadID); len(priorVars) > 0 {
-			allVars = append(allVars, priorVars...)
-			fmt.Printf("  %s Prior attempt found — context injected for polecat\n", style.Dim.Render("↻"))
-		}
+		allVars = append(allVars, priorAttemptVars(prior)...)
 		varsForAttachment = append([]string(nil), allVars...)
 		formulaVarsForAttachment = strings.Join(allVars, "\n")
 		formulaResult, err := InstantiateFormulaOnBead(context.Background(), params.FormulaName, params.BeadID, info.Title, hookWorkDir, townRoot, true, allVars)
