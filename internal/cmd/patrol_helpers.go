@@ -244,6 +244,14 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 	// Create the patrol wisp (root only — steps are read inline at prime time,
 	// not tracked as individual DB rows). Child wisps are reserved for pour=true
 	// formulas like releases where checkpoint recovery matters.
+	//
+	// `bd mol current <root>` therefore reports "0/0 steps" for a patrol wisp,
+	// and `bd query parent=<root>` returns nothing. That is correct, not an
+	// empty shell (gt-u2u): the patrol formulas declare no `pour`, so the
+	// steps live in the wisp description (see renderPatrolWispDescription
+	// below) and outputDeaconPatrolContext renders the full checklist inline on
+	// every `gt prime`. Materializing them as rows instead would put ~26 wisps
+	// per cycle back into the DB — the orphan flood gt-92jh removed.
 	spawnArgs := []string{"mol", "wisp", "create", protoID, "--root-only", "--actor", cfg.RoleName}
 	for _, v := range cfg.ExtraVars {
 		spawnArgs = append(spawnArgs, "--var", v)

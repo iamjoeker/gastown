@@ -472,15 +472,8 @@ func init() {
 	mailSendCmd.Flags().BoolVar(&mailNoNotify, "no-notify", false, "Suppress auto-nudge notification to recipient")
 	mailSendCmd.MarkFlagsMutuallyExclusive("notify", "no-notify")
 	mailSendCmd.Flags().BoolVar(&mailPinned, "pinned", false, "Pin message (for handoff context that persists)")
-	// Mail is durable by default (gt-jbn). Wisps are age-GC reclaimable: a wisp
-	// that sits unread never gets touched, so its updated_at never moves and it
-	// becomes eligible for `bd mol wisp gc --age` deletion sooner than one being
-	// worked. Defaulting mail to wisp meant unread mail was the mail most likely
-	// to be deleted, silently, on the channel agents are told to use when a
-	// message MUST survive a session. Protocol/lifecycle traffic is still stored
-	// ephemerally — Router.shouldBeWisp auto-detects it by subject.
-	mailSendCmd.Flags().BoolVar(&mailWisp, "wisp", false, "Send as wisp (ephemeral, age-GC reclaimable, not synced to git)")
-	mailSendCmd.Flags().BoolVar(&mailPermanent, "permanent", false, "Send as permanent (default; kept for compatibility, overrides --wisp)")
+	mailSendCmd.Flags().BoolVar(&mailWisp, "wisp", true, "Send as wisp (ephemeral, default)")
+	mailSendCmd.Flags().BoolVar(&mailPermanent, "permanent", false, "Send as permanent (not ephemeral, synced to remote)")
 	mailSendCmd.Flags().StringVar(&mailTo, "to", "", "Recipient address (alternative to positional argument)")
 	mailSendCmd.Flags().StringVar(&mailFrom, "from", "", "Override sender address (for relay/bridge use)")
 	mailSendCmd.Flags().BoolVar(&mailSendSelf, "self", false, "Send to self (auto-detect from cwd)")

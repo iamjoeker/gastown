@@ -359,19 +359,12 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Same caveat: issues/dependencies tables may live on a separate Dolt instance.
 	// Convoys excluded to mirror AutoClose (hq-jnap): convoy lifecycle is
 	// tracked-bead-status driven, never staleness driven.
-	// The protected-label exclusion mirrors AutoClose too, so the count the Dog
-	// reads is the count AutoClose would actually close — it previously omitted
-	// the label filter and over-reported (gt-jbn).
 	staleQuery := `
 		SELECT COUNT(*) FROM issues i
 		WHERE i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
 		AND i.issue_type NOT IN ('epic', 'convoy')
-		AND i.id NOT IN (
-			SELECT DISTINCT l.issue_id FROM labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent', 'gt:message')
-		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
 			INNER JOIN issues dep ON d.depends_on_issue_id = dep.id
@@ -757,17 +750,8 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			-- wisp-side "issue_type != 'agent'" guard; and role_type is EMPTY on
 			-- every agent bead, so keying on role_type would be equally inert.
 			-- The gt:agent LABEL is the only populated discriminator.
-			--
-			-- gt:message exempts UNREAD MAIL (gt-jbn). Reading a message closes
-			-- its bead, so an OPEN gt:message bead is by definition one nobody
-			-- has read. Auto-closing it stamps closed_at, and purgeOldMail then
-			-- deletes it mailDeleteAge later — so staleness closure was a silent
-			-- delete path for exactly the mail nobody had read yet, on a channel
-			-- documented as surviving session death. Mail that HAS been read is
-			-- already closed and is still purged on the normal retention window;
-			-- daemon plugin dispatches are closed by ClosePluginDispatches.
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent', 'gt:message')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
