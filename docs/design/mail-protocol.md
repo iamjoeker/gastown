@@ -366,7 +366,7 @@ Witness-N ──┘
 
 Agents overuse mail for routine communication, generating permanent beads and
 Dolt commits for messages that should be ephemeral. Every `gt mail send` creates
-a durable bead in Dolt -- a permanent record with its own commit in the git-like
+a wisp bead in Dolt -- a permanent record with its own commit in the git-like
 history. This is a critical pollution source.
 
 ### The Two Channels
@@ -379,38 +379,11 @@ history. This is a critical pollution source.
 - Limitation: if the target session is dead, the nudge is lost
 
 **`gt mail send` (persistent, for structured protocol messages only)**
-- Creates a durable issue bead in the Dolt database
+- Creates a bead (wisp) in the Dolt database
 - Generates at least one Dolt commit (the write)
 - Persists across session restarts -- survives agent death
 - Suitable for: HANDOFF context, MERGE_READY/MERGED protocol, escalations, HELP
   requests, anything that MUST survive session death
-
-### Durability, wisps, and GC
-
-Mail is durable by default. Two exceptions store a message as an ephemeral
-*wisp* instead, and wisps ARE reclaimable by age (`bd mol wisp gc --age`, the
-reaper's reap+purge):
-
-1. `gt mail send --wisp` -- explicit opt-in.
-2. Protocol/lifecycle subjects, auto-detected by `Router.shouldBeWisp`:
-   `POLECAT_STARTED`, `POLECAT_DONE`, `WORK_DONE`, `START_WORK`, `NUDGE`,
-   `LIFECYCLE:`, `MERGED`, `MERGE_READY`, `MERGE_FAILED`. These are
-   fire-and-forget signals with no value once acted on.
-
-Everything else -- HANDOFF, HELP, escalations, ordinary agent-to-agent mail --
-is a plain issue bead and is never age-reclaimed.
-
-Reading a message closes its bead, so an OPEN mail bead is unread mail. Unread
-mail is exempt from the reaper's staleness auto-close: closing it would stamp
-`closed_at` and hand it to the mail purge a retention window later, which would
-delete, silently, exactly the messages nobody had read yet. Read (closed) mail
-is still purged on the normal retention window (`gt reaper purge --mail-age`,
-7d by default).
-
-`gt mail send --wisp` was the default until gt-jbn. It made every message
-age-GC eligible, and unread mail aged fastest -- an unread message is never
-touched, so its `updated_at` never moves and it entered the delete window before
-any message being actively worked.
 
 ### The Rule
 
