@@ -16,33 +16,6 @@ bd -C ~/gt show hq-abc                       # Town-level beads
 bd -C ~/gt/wyvern/mayor/rig show wyv-123     # Wyvern rig beads
 ```
 
-### `bd -C` is not `git -C`
-
-Beads documents `-C` as "change to this directory before running the command
-(like git -C)". **It does not change directory.** It resolves the argument to a
-`.beads` directory and sets `BEADS_DIR` for that one invocation; the process
-working directory never moves.
-
-That distinction is invisible for reads and load-bearing for writes, because
-Beads resolves a write target from *two* inputs:
-
-| Input | Comes from | Moved by `-C`? |
-|-------|-----------|----------------|
-| The store that is opened (and the `routing.*` keys read out of it) | `BEADS_DIR` | yes |
-| Your user role (maintainer vs. contributor) | the process working directory | **no** |
-
-A write is diverted to a planning store only when both line up: the role
-detected from your cwd is contributor *and* the store opened via `-C` carries
-`routing.mode=auto` with a `routing.contributor` path. Change one and the other
-moves silently, which is why single-variable rules about `-C` ("`-C` is
-ignored", "`-C` is honoured", "it depends on whether the target is a repo") all
-fail to reproduce.
-
-**Rule of thumb**: use `-C` freely for reads (`show`, `list`). For anything that
-writes (`create`, `update`, `close`, `mail send`), real-`cd` into the owning
-root instead of passing `-C`, then confirm the row landed where you expected. A
-`bd create` success banner is not evidence of which database took the row.
-
 **How it works**: Routes are defined in `~/gt/.beads/routes.jsonl`. Each rig's
 prefix maps to its beads location (the mayor's clone in that rig).
 
@@ -55,8 +28,8 @@ prefix maps to its beads location (the mayor's clone in that rig).
 Debug routing: `BD_DEBUG_ROUTING=1 bd -C <owning-root> show <id>`
 
 `bd --global` is not Gas Town's town database. In Beads it targets a separate
-shared-server database named `beads_global`; run `bd -C ~/gt ...` to read
-town-level Gas Town beads, and `cd ~/gt` before writing them.
+shared-server database named `beads_global`; run `bd -C ~/gt ...` for
+town-level Gas Town beads.
 
 ## Configuration
 
