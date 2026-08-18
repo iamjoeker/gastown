@@ -266,6 +266,15 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		mrIssue = existingMR
 		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
 	} else {
+		// gt-7qm: refuse to create an MR against a source issue that is already
+		// closed. Deduping above still returns pre-existing MRs, so this gates
+		// creation only — it never invalidates an MR that is already in flight.
+		if !mqSubmitAllowClosedIssue {
+			if err := validateOpenSourceIssueForMR(issueID, sourceIssue); err != nil {
+				return err
+			}
+		}
+
 		// Create MR bead (ephemeral wisp - will be cleaned up after merge)
 		mrIssue, err = bd.Create(beads.CreateOptions{
 			Title:       title,

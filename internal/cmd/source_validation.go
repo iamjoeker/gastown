@@ -55,6 +55,40 @@ func validateConcreteSourceIssue(issueID string, issue *beads.Issue) error {
 	return nil
 }
 
+// closedSourceIssueRefusal explains why no merge request may be created against
+// issueID. Empty means the source issue still holds live work.
+//
+// gt-7qm: MR creation had no open-source-issue precondition. A polecat
+// respawned onto an already-closed bead, correctly found nothing to do in the
+// repo, submitted anyway, the refinery rejected the empty MR, and the cycle
+// repeated across polecat deaths. Rejecting downstream answers the symptom and
+// the answer regenerates the question — the precondition belongs at the
+// producer, where it terminates the loop.
+func closedSourceIssueRefusal(issueID string, issue *beads.Issue) string {
+	if issue == nil {
+		return "" // missing sources are validateConcreteSourceIssue's business
+	}
+	status := beads.IssueStatus(strings.ToLower(strings.TrimSpace(issue.Status)))
+	if !status.IsTerminal() {
+		return ""
+	}
+	return fmt.Sprintf("source issue %s is %s — a merge request needs open work to carry", issueID, status)
+}
+
+// validateOpenSourceIssueForMR is the erroring form of closedSourceIssueRefusal,
+// for callers that abort rather than complete without an MR.
+func validateOpenSourceIssueForMR(issueID string, issue *beads.Issue) error {
+	refusal := closedSourceIssueRefusal(issueID, issue)
+	if refusal == "" {
+		return nil
+	}
+	return fmt.Errorf("%s.\n"+
+		"A closed issue means the work is done or abandoned; either way there is nothing to merge.\n"+
+		"If work genuinely remains: bd update %s --status=open, then resubmit.\n"+
+		"Operator override (use only when the close was itself the mistake): --allow-closed-issue",
+		refusal, issueID)
+}
+
 func validateMergeRequestSource(mr *beads.Issue, expectedIssueID string, expectedIssue *beads.Issue) error {
 	if mr == nil {
 		return fmt.Errorf("merge request is missing")
