@@ -128,14 +128,6 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("bead %s is already %s to %s\nUse --force to override", beadID, info.Status, info.Assignee)
 	}
 
-	// Guard against queueing work that is already in the merge queue (gt-79li).
-	// Mirrors the same guard in runSling and executeSling; without it a bead
-	// reopened while its MR is still queued can be scheduled for a second
-	// polecat that redoes committed work.
-	if _, err := checkPriorWorkGuard(townRoot, beadID, opts.Force); err != nil {
-		return err
-	}
-
 	if opts.Formula != "" {
 		if err := verifyFormulaExists(opts.Formula, filepath.Dir(rigBeadsDir), townRoot); err != nil {
 			return fmt.Errorf("formula %q not found: %w", opts.Formula, err)
