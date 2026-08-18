@@ -50,12 +50,6 @@ const (
 	DefaultBootIdleSuppression             = 15 * time.Minute
 	DefaultDeaconGracePeriod               = 5 * time.Minute
 
-	// Patrol wake defaults. Enabled by default: a patrol agent whose turn has
-	// ended cannot restart itself, so without this the loop simply stops and
-	// every status surface keeps reporting "running".
-	DefaultPatrolWakeEnabled  = true
-	DefaultPatrolWakeCooldown = 5 * time.Minute
-
 	// Pressure check defaults — fully opt-in. All zero = disabled.
 	// Configure in settings/config.json under operational.daemon to enable.
 	// Example: {"pressure_cpu_threshold": 3.0, "pressure_mem_threshold_gb": 0.5}
@@ -399,24 +393,6 @@ func (d *DaemonThresholds) BootIdleSuppressionD() time.Duration {
 		return ParseDurationOrDefault(d.BootIdleSuppression, DefaultBootIdleSuppression)
 	}
 	return DefaultBootIdleSuppression
-}
-
-// PatrolWakeEnabledV reports whether the daemon should wake patrol agents whose
-// turn has ended at an empty prompt. Defaults to true.
-func (d *DaemonThresholds) PatrolWakeEnabledV() bool {
-	if d != nil && d.PatrolWakeEnabled != nil {
-		return *d.PatrolWakeEnabled
-	}
-	return DefaultPatrolWakeEnabled
-}
-
-// PatrolWakeCooldownD returns the configured or default minimum interval
-// between wakes of the same patrol session.
-func (d *DaemonThresholds) PatrolWakeCooldownD() time.Duration {
-	if d != nil {
-		return ParseDurationOrDefault(d.PatrolWakeCooldown, DefaultPatrolWakeCooldown)
-	}
-	return DefaultPatrolWakeCooldown
 }
 
 // DeaconGracePeriodD returns the configured or default deacon grace period.

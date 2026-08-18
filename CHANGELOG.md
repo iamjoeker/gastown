@@ -7,31 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Patrol agents no longer stop silently between cycles** (gt-blj). A Witness,
-  Refinery, or Deacon executes only inside a turn, and its `await-signal` /
-  `await-event` call is a child of that turn — so when the turn ends, nothing is
-  left running and the agent sits at an empty prompt indefinitely. Every status
-  surface reported `running` throughout, because the agent-bead heartbeat and the
-  open patrol wisp are both downstream of the same missing process. The daemon
-  now reads each patrol agent's pane every heartbeat and wakes the ones whose
-  turn has ended (`operational.daemon.patrol_wake_enabled`, default on;
-  `patrol_wake_cooldown`, default `5m`). It keys on the pane rather than on wisp
-  age or await-process absence — both of which read the same for a stopped agent
-  and a healthy one mid-work — and scopes the busy-marker scan to the composer
-  so an agent's own transcript cannot mask its state. See
-  `docs/concepts/turn-boundaries.md`.
-
-### Changed
-
-- **`gt witness status`, `gt refinery status` and `gt rig list` report turn
-  state** alongside session state (gt-blj), so `running` can no longer read as
-  healthy while the patrol loop is stopped: `Witness: ● running (turn ended)`.
-  New JSON field `turn` (`witness_turn` / `refinery_turn` in `gt rig list`) with
-  values `active`, `ended`, `stranded`, `unknown`. `running` keeps its existing
-  meaning — the tmux session is alive.
-
 ## [1.2.1] - 2026-06-06
 
 ### Fixed

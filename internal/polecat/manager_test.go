@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,26 @@ import (
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+// beadsPrefixCounter numbers the beads prefixes handed out by
+// uniqueBeadsPrefix. Package level so every test in the run gets a distinct
+// value, and monotonic so `-count=N` repeats do not collide with themselves.
+var beadsPrefixCounter atomic.Int32
+
+// uniqueBeadsPrefix returns a beads prefix no other test in this run uses.
+//
+// bd names its Dolt database after the prefix, and the tests in this package
+// share one Dolt container. Every test that called bd.Init("gt") was therefore
+// claiming the same database: the first to run stamped its project ID into it,
+// and the next one — with a fresh metadata.json under its own t.TempDir() —
+// was refused with PROJECT IDENTITY MISMATCH. That made the package
+// order-dependent. Which test failed depended on which ran first, and running
+// any of them alone passed, so a filtered re-run "cleared" a failure that a
+// full-package run still had.
+func uniqueBeadsPrefix(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("pc%d", beadsPrefixCounter.Add(1))
+}
 
 func TestHasSubmittableWorkForWorkstateUsesBranchTargetStatus(t *testing.T) {
 	repo := setupManagerSquashPreservedRepo(t)
@@ -1405,7 +1426,7 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 		testutil.RequireDoltContainer(t)
 		port, _ := strconv.Atoi(testutil.DoltContainerPort())
 		bd := beads.NewIsolatedWithPort(mayorRig, port)
-		if err := bd.Init("gt"); err != nil {
+		if err := bd.Init(uniqueBeadsPrefix(t)); err != nil {
 			t.Fatalf("bd init: %v", err)
 		}
 	} else {
@@ -1755,7 +1776,7 @@ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 		testutil.RequireDoltContainer(t)
 		port, _ := strconv.Atoi(testutil.DoltContainerPort())
 		bd := beads.NewIsolatedWithPort(mayorRig, port)
-		if err := bd.Init("gt"); err != nil {
+		if err := bd.Init(uniqueBeadsPrefix(t)); err != nil {
 			t.Fatalf("bd init: %v", err)
 		}
 	} else {
@@ -1901,7 +1922,7 @@ func TestAddWithOptions_SettingsInstalledInPolecatsDir(t *testing.T) {
 		testutil.RequireDoltContainer(t)
 		port, _ := strconv.Atoi(testutil.DoltContainerPort())
 		bd := beads.NewIsolatedWithPort(mayorRig, port)
-		if err := bd.Init("gt"); err != nil {
+		if err := bd.Init(uniqueBeadsPrefix(t)); err != nil {
 			t.Fatalf("bd init: %v", err)
 		}
 	} else {

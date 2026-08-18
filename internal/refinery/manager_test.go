@@ -2,11 +2,13 @@ package refinery
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,26 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
 )
+
+// beadsPrefixCounter numbers the beads prefixes handed out by
+// uniqueBeadsPrefix. Package level so every test in the run gets a distinct
+// value, and monotonic so `-count=N` repeats do not collide with themselves.
+var beadsPrefixCounter atomic.Int32
+
+// uniqueBeadsPrefix returns a beads prefix no other test in this run uses.
+//
+// bd names its Dolt database after the prefix, and the tests in this package
+// share one Dolt container. Every test that called b.Init("gt") was therefore
+// claiming the same database: the first to run stamped its project ID into it,
+// and every test after it — each with a fresh metadata.json under its own
+// t.TempDir(), and so a fresh project ID — was refused at the first query with
+// PROJECT IDENTITY MISMATCH. Twelve tests in this package failed that way, and
+// which one survived was decided by run order rather than by anything they
+// assert. Running any of them alone passed.
+func uniqueBeadsPrefix(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("rf%d", beadsPrefixCounter.Add(1))
+}
 
 func setupTestRegistry(t *testing.T) {
 	t.Helper()
@@ -419,7 +441,7 @@ func TestManager_Queue_FiltersClosedMergeRequests(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable in test environment: %v", err)
 	}
 
@@ -534,7 +556,7 @@ func TestManager_PostMerge_ClosesMRAndSourceIssue(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
@@ -584,7 +606,7 @@ func TestManager_RejectMR_ClearsMatchingActiveMR(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
@@ -630,7 +652,7 @@ func TestManager_PostMerge_ClearsMatchingActiveMRAndClosesSource(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
@@ -676,7 +698,7 @@ func TestManager_PostMerge_ClosesWorkBeadFromAgentFallbackBeforeActiveMRClear(t 
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
@@ -730,7 +752,7 @@ func TestManager_PostMerge_AlreadyClosedMRRetriesActiveMRCleanup(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
@@ -778,7 +800,7 @@ func TestManager_TerminalCloseDoesNotClearNewerActiveMR(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
@@ -816,7 +838,7 @@ func TestManager_PostMerge_AlreadyClosedMR(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 
