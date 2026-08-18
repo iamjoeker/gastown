@@ -2289,7 +2289,21 @@ func (m *Manager) FindIdlePolecat() (*Polecat, error) {
 		return nil, err
 	}
 	for _, p := range polecats {
-		if p.State == StateIdle && m.reuseDecisionForPolecat(p.Name, p.State).Reusable {
+		// StateDone counts as reusable alongside StateIdle (gt-2uqy). A polecat
+		// that finished its work sits in StateDone until its own idle transition
+		// lands, and that window is long — measured 2026-08-18, ALL 26 idle
+		// polecats in gastown were StateDone and ZERO were StateIdle, so this
+		// lookup returned nil on every sling and `gt sling <rig>` spawned a fresh
+		// worktree every single time. The pool grew to 29 (758M) and then hit the
+		// 30-slot cap, which BLOCKED DISPATCH OF A P0 data-loss bead until 21
+		// polecats were reclaimed by hand.
+		//
+		// The Reusable check below is unchanged and still does the real gating —
+		// it is computed by DecideWorkstate, which already treats StateDone as a
+		// normal finished state (see workstate.go: "StateDone ... falls through to
+		// the real predicate checks"). This only stops the state filter from
+		// discarding those candidates before that check ever runs.
+		if (p.State == StateIdle || p.State == StateDone) && m.reuseDecisionForPolecat(p.Name, p.State).Reusable {
 			return p, nil
 		}
 	}
