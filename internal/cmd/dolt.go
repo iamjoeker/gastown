@@ -616,7 +616,13 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		// Load state for more details
 		state, err := doltserver.LoadState(townRoot)
 		if err == nil && !state.StartedAt.IsZero() {
-			fmt.Printf("  Started: %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
+			// Prefer the live process's start time over gt's record of when it
+			// launched Dolt — the record survives a restart by anyone else and
+			// would overstate uptime (gt-pdd).
+			startedAt, _ := doltserver.ResolveStartedAt(pid, state.StartedAt)
+			fmt.Printf("  Started: %s (up %s)\n",
+				startedAt.Format("2006-01-02 15:04:05"),
+				time.Since(startedAt).Round(time.Second))
 			fmt.Printf("  Port: %d\n", state.Port)
 			fmt.Printf("  Data dir: %s\n", state.DataDir)
 			if len(state.Databases) > 0 {
@@ -851,6 +857,11 @@ func runDoltDump(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Dolt diagnostic snapshot (non-fatal)\n")
 	fmt.Printf("  Live PID:   %d\n", pid)
+	if started, ok := doltserver.ProcessStartTime(pid); ok {
+		fmt.Printf("  Live start: %s (up %s)\n",
+			started.Format("2006-01-02 15:04:05"),
+			time.Since(started).Round(time.Second))
+	}
 	fmt.Printf("  Port:       %d\n", config.Port)
 	fmt.Printf("  Data dir:   %s\n", config.DataDir)
 	fmt.Printf("  Log file:   %s\n", config.LogFile)
@@ -875,7 +886,13 @@ func runDoltDump(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println()
 		if !state.StartedAt.IsZero() {
-			fmt.Printf("    Started:   %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
+			fmt.Printf("    Started:   %s", state.StartedAt.Format("2006-01-02 15:04:05"))
+			// The recorded start time is when gt launched Dolt. If the live
+			// process started later, someone else restarted the server.
+			if started, ok := doltserver.ProcessStartTime(pid); ok && started.Sub(state.StartedAt).Abs() > time.Minute {
+				fmt.Printf(" (stale; live process started %s)", started.Format("2006-01-02 15:04:05"))
+			}
+			fmt.Println()
 		}
 		if state.DataDir != "" {
 			fmt.Printf("    Data dir:  %s\n", state.DataDir)

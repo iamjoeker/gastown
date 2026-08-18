@@ -178,7 +178,7 @@ func TestFormatInjectOutput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			output := formatInjectOutput(tt.messages, nil)
+			output := formatInjectOutput(tt.messages)
 
 			for _, want := range tt.wantContains {
 				if !strings.Contains(output, want) {

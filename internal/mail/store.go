@@ -133,17 +133,17 @@ func (m *Mailbox) storeCloseInDir(id string) error {
 	return nil
 }
 
-// storeAddLabel adds a label using the in-process store.
-func (m *Mailbox) storeAddLabel(id, label string) error {
+// storeMarkReadOnly adds a "read" label using the in-process store.
+func (m *Mailbox) storeMarkReadOnly(id string) error {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
 
-	err := m.store.AddLabel(ctx, id, label, "")
+	err := m.store.AddLabel(ctx, id, "read", "")
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return ErrMessageNotFound
 		}
-		return fmt.Errorf("store add label %s: %w", label, err)
+		return fmt.Errorf("store mark read: %w", err)
 	}
 	return nil
 }
