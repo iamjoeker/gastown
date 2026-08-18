@@ -650,23 +650,12 @@ func refreshPIDStateFromLiveInfo(townRoot string, config *Config, pid int) (bool
 		state = &State{}
 	}
 	if state.PID != pid || !state.Running || state.Port != config.Port || state.DataDir != config.DataDir {
-		// A different PID means the server we recorded is gone and a new one
-		// took its place — restarted by something other than 'gt dolt start'.
-		// Re-derive the start time from the live process so uptime doesn't keep
-		// counting from the dead one (gt-pdd).
-		restarted := state.PID != pid
 		state.PID = pid
 		state.Running = true
 		state.Port = config.Port
 		state.DataDir = config.DataDir
-		if restarted || state.StartedAt.IsZero() {
-			if started, ok := ProcessStartTime(pid); ok {
-				state.StartedAt = started
-			} else {
-				// No OS start time available: now is an understatement of
-				// uptime, but never the overstatement a stale value gives.
-				state.StartedAt = time.Now()
-			}
+		if state.StartedAt.IsZero() {
+			state.StartedAt = time.Now()
 		}
 		if err := SaveState(townRoot, state); err != nil {
 			return changed, err
