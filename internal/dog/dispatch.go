@@ -36,14 +36,6 @@ type DispatchMailbox interface {
 	Archive(id string) error
 }
 
-// DispatchForcer is the optional half of DispatchMailbox that can override the
-// beads ownership guard on close. *mail.Mailbox implements it via SetForceClose;
-// ReclaimDispatchMail uses it when present. See ReclaimDispatchMail for why
-// reclamation is entitled to the override.
-type DispatchForcer interface {
-	SetForceClose(force bool)
-}
-
 // DispatchScan summarizes the open dispatch mail sitting in a dog's inbox.
 type DispatchScan struct {
 	// Open is the number of open dispatch messages.
@@ -131,25 +123,6 @@ func ScanDispatchMail(mb DispatchMailbox, dogAddress string, now time.Time) (Dis
 // This is what makes session death fail a dispatch instead of orphaning it:
 // once the assignee's session is gone the dispatch can never be executed by
 // that dog, so leaving it open only hides the failure.
-//
-// Reclamation overrides the beads ownership guard, because the guard cannot see
-// what the filter below already proved. bd compares actor to assignee verbatim
-// and refuses a mismatch, and the close path here passes no --actor at all, so
-// the actor is whatever the surrounding agent resolves to and the assignee is
-// always the dog's mail address. Nothing that reclaims makes those equal: the
-// Deacon sends the dispatch, the dog is assigned it, and a health check
-// reclaims on behalf of a dog whose session is already dead.
-//
-// So the guard refused every actor and the cleanup could never succeed.
-// Measured 2026-08-18: 582 dispatches open across the four dogs, none ever
-// closed by `gt dog done` — every closed dispatch in the database bears one
-// bulk timestamp from a single sweep — while the open ones were re-injected
-// into each dog's context on every prompt (gt-u58w).
-//
-// The override is safe because it is scoped by IsDispatchMail: only a "Plugin: "
-// message sent by the Deacon or the daemon and addressed to exactly this dog is
-// ever passed to Archive. Anything else — a human's mail, a CC copy, another
-// dog's dispatch — is skipped before the force is ever relevant.
 func ReclaimDispatchMail(mb DispatchMailbox, dogAddress string) (int, error) {
 	if mb == nil {
 		return 0, nil
@@ -160,14 +133,6 @@ func ReclaimDispatchMail(mb DispatchMailbox, dogAddress string) (int, error) {
 		return 0, fmt.Errorf("listing mailbox for %s: %w", dogAddress, err)
 	}
 
-	if f, ok := mb.(DispatchForcer); ok {
-		f.SetForceClose(true)
-		// Scoped to this reclaim: the mailbox may outlive the call, and nothing
-		// outside this filtered loop has established the ownership the override
-		// trades on.
-		defer f.SetForceClose(false)
-	}
-
 	archived := 0
 	var firstErr error
 	for _, msg := range messages {
@@ -176,64 +141,13 @@ func ReclaimDispatchMail(mb DispatchMailbox, dogAddress string) (int, error) {
 		}
 		if err := mb.Archive(msg.ID); err != nil {
 			if firstErr == nil {
-				firstErr = archiveFailure(msg.ID, err)
+				firstErr = fmt.Errorf("archiving %s: %w", msg.ID, err)
 			}
 			continue
 		}
 		archived++
 	}
 	return archived, firstErr
-}
-
-// archiveFailure describes a failed dispatch archive without repeating advice
-// the reader cannot act on.
-//
-// bd's ownership refusal ends with "reclaim or use --force to override", and gt
-// surfaced that sentence verbatim out of `gt dog health-check --auto-clear` — a
-// command that has no --force flag. Operators (the Mayor, the Witness, the
-// Deacon) each hit the refusal and each went looking for a flag that does not
-// exist (gt-u58w). Reclamation now applies the override itself, so a refusal
-// that survives it is not something the caller can force their way past; saying
-// otherwise sends the next reader down the same dead end.
-func archiveFailure(id string, err error) error {
-	if !mail.IsOwnershipRefusal(err) {
-		return fmt.Errorf("archiving %s: %w", id, err)
-	}
-	return &dispatchArchiveRefusal{
-		msg: fmt.Sprintf("archiving %s: %s (reclamation already overrode the ownership guard, "+
-			"so this refusal is a beads-side failure, not an operator step)",
-			id, stripForceAdvice(err.Error())),
-		err: err,
-	}
-}
-
-// dispatchArchiveRefusal restates an ownership refusal while keeping the
-// original error wrapped for callers that inspect it.
-type dispatchArchiveRefusal struct {
-	msg string
-	err error
-}
-
-func (e *dispatchArchiveRefusal) Error() string { return e.msg }
-func (e *dispatchArchiveRefusal) Unwrap() error { return e.err }
-
-// stripForceAdvice removes a trailing "--force" suggestion from a bd refusal.
-//
-// bd separates the advice with ";" ("...actor is %q; reclaim or use --force to
-// override"). Matching the flag and cutting at the ";" that precedes it keeps
-// working if bd rewords the advice around it, and leaves the text untouched
-// when there is no clause boundary to cut at — a mangled diagnostic would be
-// worse than a redundant one.
-func stripForceAdvice(text string) string {
-	i := strings.Index(text, "--force")
-	if i < 0 {
-		return text
-	}
-	semi := strings.LastIndex(text[:i], ";")
-	if semi < 0 {
-		return text
-	}
-	return strings.TrimSpace(text[:semi])
 }
 
 // dispatchAlarmState is the on-disk record of the last alarm raised for a dog.
