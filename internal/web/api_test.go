@@ -695,6 +695,22 @@ func TestParseMailInboxText_UnreadMarker(t *testing.T) {
 	}
 }
 
+func TestParseMailInboxText_CCCopyAddresseeIsNotTheSender(t *testing.T) {
+	// The inbox names the addressee on cc copies (gt-58s); that suffix must not
+	// be folded into From.
+	input := "📬 Inbox:\n1. ● Clearance (cc)\n      hq-wisp-1 from deacon/, to beads/refinery\n      2026-08-18 01:31"
+	msgs := parseMailInboxText(input)
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1", len(msgs))
+	}
+	if msgs[0].From != "deacon/" {
+		t.Errorf("From = %q, want %q", msgs[0].From, "deacon/")
+	}
+	if msgs[0].ID != "hq-wisp-1" {
+		t.Errorf("ID = %q, want %q", msgs[0].ID, "hq-wisp-1")
+	}
+}
+
 // --- groupIntoThreads tests ---
 
 func TestGroupIntoThreads_SingleMessages(t *testing.T) {

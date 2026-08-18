@@ -47,7 +47,7 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 
 	// Load the inbox once. The inject path needs unread messages later, and
 	// calling Count() followed by ListUnread() doubles bd/Dolt reads.
-	messages, _, unread, err := loadInboxSnapshot(mailbox, false)
+	messages, counts, err := loadInboxSnapshot(mailbox, mailbox, false)
 	if err != nil {
 		if mailCheckInject {
 			fmt.Fprintf(os.Stderr, "gt mail check: inbox load error for %s: %v\n", address, err)
@@ -55,6 +55,10 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 		}
 		return fmt.Errorf("loading inbox: %w", err)
 	}
+
+	// Unread notification covers cc copies too: a cc'd recipient should still
+	// read the message. Only *clearing* it was the broken half (gt-58s).
+	unread := counts.Unread()
 
 	// JSON output
 	if mailCheckJSON {
@@ -92,7 +96,7 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 
 		if unread > 0 {
 			messages = filterUnreadMessages(messages)
-			fmt.Print(formatInjectOutput(messages))
+			fmt.Print(formatInjectOutput(messages, mailbox))
 			// Ack after output so message is delivered before being marked acked.
 			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
 				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
@@ -126,7 +130,11 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 // formatInjectOutput builds the system-reminder text for inject mode.
 // It separates messages into three tiers (urgent, high, normal/low) and
 // formats them with priority-appropriate framing for the agent.
-func formatInjectOutput(messages []*mail.Message) string {
+//
+// cc may be nil. When supplied, cc copies are labeled with their addressee: an
+// agent that cannot tell a cc from a message addressed to it has already
+// reported correct delivery as a misroute (gt-58s).
+func formatInjectOutput(messages []*mail.Message, cc ccClassifier) string {
 	var urgent, high, normal []*mail.Message
 	for _, msg := range messages {
 		switch msg.Priority {
@@ -146,14 +154,14 @@ func formatInjectOutput(messages []*mail.Message) string {
 		b.WriteString("<system-reminder>\n")
 		fmt.Fprintf(&b, "URGENT: %d urgent message(s) require immediate attention.\n\n", len(urgent))
 		for _, msg := range urgent {
-			fmt.Fprintf(&b, "- %s from %s: %s\n", msg.ID, msg.From, msg.Subject)
+			b.WriteString(injectMessageLine(msg, cc))
 		}
 		// Show high-priority messages separately so their "process before idle"
 		// framing is preserved even when urgent messages are present.
 		if len(high) > 0 {
 			fmt.Fprintf(&b, "\nAlso %d high-priority message(s) — process before going idle:\n", len(high))
 			for _, msg := range high {
-				fmt.Fprintf(&b, "- %s from %s: %s\n", msg.ID, msg.From, msg.Subject)
+				b.WriteString(injectMessageLine(msg, cc))
 			}
 		}
 		if len(normal) > 0 {
@@ -166,7 +174,7 @@ func formatInjectOutput(messages []*mail.Message) string {
 		b.WriteString("<system-reminder>\n")
 		fmt.Fprintf(&b, "You have %d high-priority message(s) in your inbox.\n\n", len(high))
 		for _, msg := range high {
-			fmt.Fprintf(&b, "- %s from %s: %s\n", msg.ID, msg.From, msg.Subject)
+			b.WriteString(injectMessageLine(msg, cc))
 		}
 		if len(normal) > 0 {
 			fmt.Fprintf(&b, "\n(Plus %d additional message(s).)\n", len(normal))
@@ -179,7 +187,7 @@ func formatInjectOutput(messages []*mail.Message) string {
 		b.WriteString("<system-reminder>\n")
 		fmt.Fprintf(&b, "You have %d unread message(s) in your inbox.\n\n", len(normal))
 		for _, msg := range normal {
-			fmt.Fprintf(&b, "- %s from %s: %s\n", msg.ID, msg.From, msg.Subject)
+			b.WriteString(injectMessageLine(msg, cc))
 		}
 		b.WriteString("\nContinue your current task. When it completes, check these messages\n")
 		b.WriteString("before going idle: 'gt mail inbox'\n")
@@ -187,4 +195,14 @@ func formatInjectOutput(messages []*mail.Message) string {
 	}
 
 	return b.String()
+}
+
+// injectMessageLine renders one message for the injected reminder, naming the
+// addressee when the reader is only cc'd so a cc is not mistaken for work
+// assigned to them.
+func injectMessageLine(msg *mail.Message, cc ccClassifier) string {
+	if cc != nil && cc.IsCCOnly(msg) {
+		return fmt.Sprintf("- %s from %s: %s (cc — addressed to %s)\n", msg.ID, msg.From, msg.Subject, msg.To)
+	}
+	return fmt.Sprintf("- %s from %s: %s\n", msg.ID, msg.From, msg.Subject)
 }
