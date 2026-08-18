@@ -96,6 +96,7 @@ func TestAutoCloseExemptionMatrix(t *testing.T) {
 		issueRow{id: "keep-keep", priority: 2, updatedAt: stale, labels: []string{"gt:keep"}},
 		issueRow{id: "keep-role", priority: 2, updatedAt: stale, labels: []string{"gt:role"}},
 		issueRow{id: "keep-rig", priority: 2, updatedAt: stale, labels: []string{"gt:rig"}},
+		issueRow{id: "keep-mail", priority: 2, updatedAt: stale, labels: []string{"gt:message"}},
 
 		// Priority exemptions: P0/P1 are never stale-closed.
 		issueRow{id: "keep-p0", priority: 0, updatedAt: stale},
@@ -315,6 +316,64 @@ func TestPurgeOldMailBehaviour(t *testing.T) {
 		if got := f.issueIDs(t, table); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s issue_ids = %v, want %v", table, got, want)
 		}
+	}
+}
+
+// TestUnreadMailSurvivesAutoCloseThenPurge is the acceptance test for gt-jbn.
+//
+// Reading a message closes its bead, so an OPEN gt:message bead is unread mail.
+// Before the fix, staleness auto-close closed it and stamped closed_at, and the
+// mail purge deleted it mailDeleteAge later — so the full sweep silently
+// destroyed exactly the messages nobody had read, on the channel CLAUDE.md
+// tells agents to use when a message must survive session death.
+//
+// The test runs the sweep the Dog runs, in order, against a mail bead old
+// enough for both windows. Controls: a same-age plain bead must still close
+// (an AutoClose that stopped closing anything would pass otherwise), and a
+// READ (closed) mail bead of the same age must still be purged (retention on
+// read mail is deliberate and must not be disabled by the exemption).
+func TestUnreadMailSurvivesAutoCloseThenPurge(t *testing.T) {
+	f := newFixture(t, "unread_mail")
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+
+	f.insertIssues(t,
+		issueRow{id: "mail-unread", title: "HELP: auth bug", priority: 2, updatedAt: old, labels: []string{"gt:message"}},
+		issueRow{id: "mail-read", title: "Re: auth bug", status: "closed", priority: 2, updatedAt: old, closedAt: &old, labels: []string{"gt:message"}},
+		issueRow{id: "plain-stale", title: "Ordinary stale bead", priority: 2, updatedAt: old},
+	)
+
+	autoClose, err := AutoClose(f.db, f.dbName, staleAge, false)
+	if err != nil {
+		t.Fatalf("AutoClose: %v", err)
+	}
+	if got := closedEntryIDs(autoClose); !reflect.DeepEqual(got, []string{"plain-stale"}) {
+		t.Errorf("ClosedEntries = %v, want [plain-stale] — unread mail must not be stale-closed", got)
+	}
+	if got := f.issueStatus(t, "mail-unread"); got != "open" {
+		t.Errorf("unread mail status = %q, want open — the gt:message exemption is inert", got)
+	}
+
+	// Scan must report the same candidate set AutoClose acts on, or the Dog
+	// decides from a count that includes beads the sweep will never touch.
+	scan, err := Scan(f.db, f.dbName, purgeAge, purgeAge, purgeAge, staleAge)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.StaleCandidates != 0 {
+		t.Errorf("StaleCandidates after sweep = %d, want 0 — scan counts beads AutoClose skips", scan.StaleCandidates)
+	}
+
+	purge, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if purge.MailPurged != 1 {
+		t.Errorf("MailPurged = %d, want 1 — read mail must still age out", purge.MailPurged)
+	}
+
+	want := []string{"mail-unread", "plain-stale"}
+	if got := f.ids(t, "issues"); !reflect.DeepEqual(got, want) {
+		t.Errorf("surviving issues = %v, want %v", got, want)
 	}
 }
 
