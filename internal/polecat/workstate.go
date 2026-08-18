@@ -14,6 +14,7 @@ const (
 // classify a polecat consistently across list, recovery, witness, and capacity.
 type WorkstateInput struct {
 	State                          State
+	SessionBusy                    bool
 	HookBead                       string
 	CleanupStatus                  CleanupStatus
 	IgnoreCleanupStatus            bool
@@ -57,6 +58,32 @@ type WorkstateDisposition struct {
 
 // DecideWorkstate returns the canonical disposition for a polecat.
 func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
+	// Session liveness outranks every bead-derived fact below (gt-5tg).
+	//
+	// Every other input here is read from the agent bead and from git, and both
+	// are written EARLY in the completion sequence: `gt done` records agent_state
+	// and clears the work bead before it pushes, submits the MR, and exits. For
+	// the one-to-two minutes between those writes and the session actually
+	// ending, the bead says the polecat is finished while the pane still shows
+	// the agent mid-turn — so the predicates below all pass and the verdict comes
+	// out SAFE_TO_NUKE. That was reproduced 3/3 on two polecats inside seven
+	// minutes, and it is the window in which a polecat's output exists in the
+	// fewest places: it is still closing beads, writing notes, and pushing.
+	//
+	// SessionBusy carries positive evidence (Tmux.IsBusy) that the agent is
+	// generating right now. When it is set, no bead-state disposition is
+	// meaningful, so report WORKING — the same disposition StateWorking gets
+	// below — and let the caller re-check once the pane goes quiet. An unknown
+	// or unreadable session leaves this false and behaviour is unchanged.
+	if in.SessionBusy {
+		return WorkstateDisposition{
+			Verdict:              WorkstateVerdictWorking,
+			Reason:               "session-busy",
+			CountsTowardCapacity: true,
+			Blockers:             []string{"session_state=busy (agent mid-turn)"},
+		}
+	}
+
 	if in.ActiveMRBlocker != "" && !in.PushFailed && !in.MRFailed && in.State == StateDone {
 		return WorkstateDisposition{
 			Verdict:     WorkstateVerdictPendingMR,
