@@ -625,16 +625,11 @@ func parseMailInboxText(output string) []MailMessage {
 				current.Subject = rest
 			}
 		} else if current != nil && current.ID == "" && strings.Contains(trimmed, " from ") {
-			// Parse "id from sender", or "id from sender, to addressee" for a cc
-			// copy — the addressee suffix is not part of the sender.
+			// Parse "id from sender"
 			parts := strings.SplitN(trimmed, " from ", 2)
 			if len(parts) == 2 {
 				current.ID = strings.TrimSpace(parts[0])
-				sender := strings.TrimSpace(parts[1])
-				if idx := strings.Index(sender, ", to "); idx >= 0 {
-					sender = strings.TrimSpace(sender[:idx])
-				}
-				current.From = sender
+				current.From = strings.TrimSpace(parts[1])
 			}
 		} else if current != nil && current.Timestamp == "" && (strings.Contains(trimmed, "-") || strings.Contains(trimmed, ":")) {
 			current.Timestamp = trimmed
