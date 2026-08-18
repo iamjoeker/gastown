@@ -18,6 +18,142 @@
     };
 
     // ============================================
+    // REFRESH PAUSE + STALENESS TRACKING
+    // ============================================
+    // The dashboard suspends HTMX re-renders while a panel is expanded or a
+    // detail view/modal is open, so content is not yanked out from under
+    // someone mid-read. That pause used to DROP any SSE update that arrived
+    // during it: the panel silently froze, never caught up on collapse, and was
+    // pixel-identical to a live one. Reading a panel closely was exactly what
+    // stopped it updating, and nothing on screen said so.
+    //
+    // The pause now DEFERS instead of dropping. Suppressed updates are counted,
+    // surfaced in the header as a staleness badge, and flushed the instant the
+    // pause lifts.
+    //
+    // pauseRefresh is an accessor rather than a plain flag because two dozen
+    // handlers scattered through this file assign to it directly. Routing every
+    // assignment through one setter means the resume flush cannot be forgotten
+    // at a new call site.
+    var _paused = false;
+    var pendingUpdates = 0;
+    var lastRenderedAt = Date.now();
+    var stalenessTicker = null;
+
+    Object.defineProperty(window, 'pauseRefresh', {
+        configurable: true,
+        get: function() { return _paused; },
+        set: function(value) {
+            var next = !!value;
+            if (next === _paused) return;
+            _paused = next;
+            if (!next) flushPendingUpdates();
+            renderStaleness();
+        }
+    });
+
+    // Ask HTMX to re-fetch the dashboard now. Returns false if HTMX or the
+    // dashboard root is not present (during teardown, or in a bare test page).
+    function triggerDashboardRefresh() {
+        var dashboard = document.getElementById('dashboard-main');
+        if (!dashboard || typeof htmx === 'undefined') return false;
+        htmx.trigger(dashboard, 'sse:dashboard-update');
+        return true;
+    }
+
+    // Called on the paused -> live transition. Clears the counter first so the
+    // htmx:afterSwap that follows does not re-enter this.
+    function flushPendingUpdates() {
+        if (pendingUpdates === 0) return;
+        pendingUpdates = 0;
+        triggerDashboardRefresh();
+    }
+
+    // Record an update that arrived while paused, instead of discarding it.
+    function deferUpdate() {
+        pendingUpdates++;
+        renderStaleness();
+    }
+    window.gtDeferredUpdateCount = function() { return pendingUpdates; };
+
+    function formatAge(ms) {
+        var secs = Math.max(0, Math.round(ms / 1000));
+        if (secs < 60) return secs + 's';
+        var mins = Math.floor(secs / 60);
+        if (mins < 60) return mins + 'm';
+        return Math.floor(mins / 60) + 'h' + (mins % 60) + 'm';
+    }
+
+    function formatClock(ts) {
+        var d = new Date(ts);
+        return ('0' + d.getHours()).slice(-2) + ':' +
+               ('0' + d.getMinutes()).slice(-2) + ':' +
+               ('0' + d.getSeconds()).slice(-2);
+    }
+
+    // The header lives inside the swapped region, so the badge element is
+    // rebuilt on demand and re-rendered from htmx:afterSwap.
+    function renderStaleness() {
+        // Panel-level marker: body classes survive the morph swap, and the CSS
+        // hangs the marker off the expanded panel's own heading.
+        document.body.classList.toggle('refresh-paused', _paused);
+        document.body.classList.toggle('updates-pending', _paused && pendingUpdates > 0);
+
+        var info = document.getElementById('refresh-info');
+        if (!info) {
+            scheduleStalenessTicker();
+            return;
+        }
+
+        var badge = document.getElementById('staleness-badge');
+        if (!badge) {
+            badge = document.createElement('button');
+            badge.id = 'staleness-badge';
+            badge.type = 'button';
+            badge.className = 'staleness-badge';
+            badge.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                // Explicit operator request: refresh now, even while expanded.
+                pendingUpdates = 0;
+                triggerDashboardRefresh();
+                renderStaleness();
+            });
+            info.appendChild(badge);
+        }
+
+        if (!_paused) {
+            badge.hidden = true;
+            badge.textContent = '';
+            badge.removeAttribute('title');
+            scheduleStalenessTicker();
+            return;
+        }
+
+        var detail = pendingUpdates > 0
+            ? pendingUpdates + ' update' + (pendingUpdates === 1 ? '' : 's') + ' pending'
+            : 'no updates missed';
+        badge.hidden = false;
+        badge.textContent = '⏸ Paused · ' + detail + ' · as of ' + formatClock(lastRenderedAt) +
+                            ' (' + formatAge(Date.now() - lastRenderedAt) + ' ago)';
+        badge.title = 'Live updates are held while a panel or detail view is open. ' +
+                      'Click to refresh now, or close the panel to resume.';
+        badge.classList.toggle('staleness-badge-stale', pendingUpdates > 0);
+        scheduleStalenessTicker();
+    }
+
+    // While paused the "as of" age keeps growing with no swaps to redraw it, so
+    // tick it forward. The ticker only runs while paused.
+    function scheduleStalenessTicker() {
+        if (_paused && !stalenessTicker) {
+            stalenessTicker = setInterval(renderStaleness, 5000);
+        } else if (!_paused && stalenessTicker) {
+            clearInterval(stalenessTicker);
+            stalenessTicker = null;
+        }
+    }
+
+    // ============================================
     // SSE (Server-Sent Events) CONNECTION
     // ============================================
     window.sseConnected = false;
@@ -39,12 +175,12 @@
         });
 
         evtSource.addEventListener('dashboard-update', function(e) {
-            if (window.pauseRefresh) return;
-            // Trigger HTMX to re-fetch the dashboard
-            var dashboard = document.getElementById('dashboard-main');
-            if (dashboard && typeof htmx !== 'undefined') {
-                htmx.trigger(dashboard, 'sse:dashboard-update');
+            if (window.pauseRefresh) {
+                // Defer, do not drop: the update is owed and is shown as owed.
+                deferUpdate();
+                return;
             }
+            triggerDashboardRefresh();
         });
 
         evtSource.onerror = function() {
@@ -150,6 +286,10 @@
         if (window.refreshReadyPanel) window.refreshReadyPanel();
         // Update connection status indicator after morph
         updateConnectionStatus(window.sseConnected ? 'live' : 'reconnecting');
+        // The content on screen is now current, and the header (badge included)
+        // was just replaced by the morph, so restamp and redraw.
+        lastRenderedAt = Date.now();
+        renderStaleness();
     });
 
     // ============================================
