@@ -8,12 +8,22 @@ set -euo pipefail
 
 log() { echo "[stuck-agent-dog] $*"; }
 
+# Resolve the town root, failing loudly. `gt town root` used to be a
+# nonexistent subcommand: it printed `gt town`'s help to STDOUT and exited 0,
+# so this branch succeeded with help text in TOWN_ROOT and every
+# "$TOWN_ROOT/$rig" probe below silently found nothing — the dog reported a
+# healthy town while checking directories that do not exist (gt-cr2). The -d
+# check keeps that failure loud even against a gt binary predating the fix.
 TOWN_ROOT="${GT_TOWN_ROOT:-}"
 if [ -z "$TOWN_ROOT" ]; then
-  if ! TOWN_ROOT=$(gt town root 2>/dev/null); then
-    log "SKIP: could not resolve town root"
-    exit 0
+  if ! TOWN_ROOT=$(gt town root); then
+    log "FATAL: could not resolve town root; set GT_TOWN_ROOT or run inside a Gas Town workspace." >&2
+    exit 1
   fi
+fi
+if [ ! -d "$TOWN_ROOT" ]; then
+  log "FATAL: resolved town root is not a directory: '$TOWN_ROOT'" >&2
+  exit 1
 fi
 
 integer_or_default() {
