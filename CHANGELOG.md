@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dogs now have a durable session log** at
+  `<townRoot>/deacon/dogs/<name>/session.log`, readable with **`gt dog logs
+  [name]`** (gt-wlco). A dog's stdout and stderr went nowhere that outlived the
+  dog: the session runs in a tmux pane that `gt dog done` destroys three seconds
+  later, and nothing was captured to `daemon.log` or to any per-dog file. That
+  made every dog-side diagnostic unobservable *by construction* — the gt-u58w
+  fix duly reported its dispatch-mail cleanup failure to stderr, the report went
+  into the dying pane, and dispatches climbed 230 → 559 across the pack with
+  zero error output reaching a surface anyone could read. `gt dog done`,
+  `gt dog clear` and dog session start/stop now append their outcomes *and*
+  their warnings to the log, which is rotated at 4MB with one backup. Successes
+  are recorded too: a log holding only failures cannot tell a dog that succeeded
+  apart from one that never ran, which is precisely how a leak ran for hours
+  while 190 of 191 plugin runs looked fine.
+
 - **`gt town root`** prints the workspace root on stdout and exits non-zero when
   there is no workspace (gt-cr2), so shell scripts can rely on
   `TOWN_ROOT=$(gt town root) || exit 1`. Resolution is the same as everywhere
