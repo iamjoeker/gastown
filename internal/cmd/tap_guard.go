@@ -12,7 +12,6 @@ import (
 var tapGuardCmd = &cobra.Command{
 	Use:   "guard",
 	Short: "Block forbidden operations (PreToolUse hook)",
-	RunE:  requireSubcommand,
 	Long: `Block forbidden operations via Claude Code PreToolUse hooks.
 
 Guard commands exit with code 2 to BLOCK tool execution when a policy

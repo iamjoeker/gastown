@@ -91,9 +91,6 @@ Branch naming conventions:
 - Keep functions focused and small
 - Add comments for non-obvious logic
 - Include tests for new functionality
-- Exit 0 must mean the requested effect occurred, never just that the command
-  ran — see [Silent Success](docs/guides/silent-success.md) for the rule, the
-  reviewer checklist, and why this class survives review
 
 ## Design Philosophy
 

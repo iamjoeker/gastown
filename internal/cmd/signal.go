@@ -13,7 +13,6 @@ var signalCmd = &cobra.Command{
 	Use:     "signal",
 	GroupID: GroupAgents,
 	Short:   "Claude Code hook signal handlers",
-	RunE:    requireSubcommand,
 	Long: `Signal handlers for Claude Code hooks.
 
 These commands are designed to be called by Claude Code's hooks system,
