@@ -1739,6 +1739,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			mrID = existingMR.ID
 			fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
 			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
+		} else if closedRefusal := closedSourceIssueRefusal(issueID, sourceIssueForNoMerge); closedRefusal != "" {
+			// gt-7qm: no MR against an already-closed source issue. Creating one
+			// spawns an unbounded submit/reject loop that survives the polecat's
+			// death: respawn → nothing to do → empty MR → refinery rejects →
+			// respawn. This is a refusal, not a failure — mrFailed stays false so
+			// the hook clears and the session retires instead of being recovered
+			// into the next turn of the same loop.
+			style.PrintWarning("%s", closedRefusal)
+			fmt.Printf("  Skipping MR creation — completing without merge request.\n")
+			fmt.Printf("  Nothing is lost: branch %s is pushed to origin.\n", branch)
+			fmt.Printf("  If work genuinely remains, reopen %s and run:\n", issueID)
+			fmt.Printf("    gt mq submit --branch %s --issue %s\n", branch, issueID)
+			notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, closedRefusal)
+			goto notifyWitness
 		} else {
 			// Build MR bead title and description
 			title := fmt.Sprintf("Merge: %s", issueID)
@@ -2072,6 +2086,36 @@ func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
 		style.PrintWarning("could not notify witness about skipped close: %v", err)
 	} else {
 		fmt.Printf("%s Witness notified: DONE_CLOSE_SKIPPED\n", style.Bold.Render("✓"))
+	}
+}
+
+// notifyDoneMRRefused tells the witness that gt done declined to create a merge
+// request because the source issue was already closed (gt-7qm). The polecat is
+// nuked moments later, so this must survive its session: mail, not a nudge.
+func notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, reason string) {
+	if townRoot == "" || rigName == "" || issueID == "" {
+		return
+	}
+	if sender == "" {
+		sender = fmt.Sprintf("%s/polecat", rigName)
+	}
+
+	router := mail.NewRouter(townRoot)
+	defer router.WaitPendingNotifications()
+	msg := &mail.Message{
+		To:      fmt.Sprintf("%s/witness", rigName),
+		From:    sender,
+		Subject: fmt.Sprintf("DONE_MR_REFUSED: %s", issueID),
+		Body: fmt.Sprintf("gt done created no merge request for %s.\n\nReason: %s\n\n"+
+			"Branch %s is pushed to origin and holds whatever was committed.\n"+
+			"If work genuinely remains, reopen %s and run:\n  gt mq submit --branch %s --issue %s\n\n"+
+			"Do NOT re-dispatch %s while it is closed — that is the loop this gate exists to stop.",
+			issueID, reason, branch, issueID, branch, issueID, issueID),
+	}
+	if err := router.Send(msg); err != nil {
+		style.PrintWarning("could not notify witness about refused MR: %v", err)
+	} else {
+		fmt.Printf("%s Witness notified: DONE_MR_REFUSED\n", style.Bold.Render("✓"))
 	}
 }
 
