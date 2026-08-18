@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gt dog health-check --auto-clear` no longer kills hung dogs' live sessions**
+  (gt-3rj). The help promised "hung dogs are reported only (Deacon decides per
+  ZFC principle)" while the code killed the tmux session and cleared the work —
+  the flag did *more* than it said, which is the dangerous direction for a
+  contract to break in: an operator reads the help, concludes the flag is safe to
+  run while a hung dog is present, and destroys a session that was merely quiet.
+  Worse, the kill did not even free what the dog was holding: `sessionAlive` was
+  captured before the kill, so the dispatches became orphans that nothing
+  reclaimed — one observed run destroyed a live session and archived zero
+  dispatches. `--auto-clear` now touches dead sessions only. Ending a hung dog is
+  available under the new `--kill-hung` (which requires `--auto-clear`), and that
+  path reclaims the dispatches its kill strands.
+
 - **Plugins no longer build paths out of `gt town`'s help text** (gt-cr2).
   `gt town root` was not a subcommand — Cobra answered it by printing `gt town`'s
   help to *stdout* and exiting 0, so the `2>/dev/null` in
