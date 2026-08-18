@@ -52,15 +52,6 @@ type HealthReport struct {
 // Tier 3 (embedded): compiled into the binary
 //
 // Either townRoot or rigName may be empty; those tiers are skipped.
-//
-// Consequence worth stating explicitly, because it has been rediscovered the
-// hard way more than once: because tiers 1 and 2 are read from disk on every
-// call, editing a provisioned formula file takes effect on the next gt prime
-// with no rebuild. The converse also holds — rebuilding gt only changes tier 3,
-// which an edited disk copy goes on shadowing, so shipping a fix in the
-// embedded corpus does not reach a town that has a disk copy. See
-// docs/design/directives-and-overlays.md ("Editing a Formula File Directly")
-// for which edits survive UpdateFormulas and which get silently overwritten.
 func ResolveFormulaContent(name, townRoot, rigName string) ([]byte, error) {
 	filename := name
 	if !hasFormulaSuffix(filename) {

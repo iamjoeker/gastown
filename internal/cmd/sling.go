@@ -638,6 +638,24 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
 	}
 
+	// Guard against duplicate work: an open MR means this bead's branch is
+	// already queued to merge (gt-79li). Checked against slingForce here — the
+	// dead-agent auto-force below runs later and must not bypass this.
+	//
+	// Skipped under --dry-run, which is contractually lookup-free (it must not
+	// issue bd list/sql or hit the network); nothing is dispatched there, so no
+	// duplicate work can result from not checking.
+	var priorAttemptForSling *priorAttempt
+	if !slingDryRun {
+		priorAttemptForSling, err = checkPriorWorkGuard(townRoot, beadID, slingForce)
+		if err != nil {
+			return err
+		}
+		if notice := describePriorAttempt(priorAttemptForSling); notice != "" {
+			fmt.Printf("%s %s\n", style.Dim.Render("↻"), notice)
+		}
+	}
+
 	originalStatus := info.Status
 	originalAssignee := info.Assignee
 	force := slingForce // local copy to avoid mutating package-level flag
@@ -951,9 +969,15 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		if parts := strings.SplitN(targetAgent, "/", 2); len(parts) >= 1 && parts[0] != "" {
 			rigCmdVars := loadRigCommandVars(townRoot, parts[0])
 			slingVars = append(rigCmdVars, slingVars...)
-			varsForAttachment = append([]string(nil), slingVars...)
-			formulaVarsForAttachment = strings.Join(slingVars, "\n")
 		}
+
+		// Tell a re-dispatched polecat which branch already carries work for
+		// this bead, so it builds on it instead of restarting (gt-79li).
+		// executeSling does the same; single-sling previously did not.
+		slingVars = append(slingVars, priorAttemptVars(priorAttemptForSling)...)
+
+		varsForAttachment = append([]string(nil), slingVars...)
+		formulaVarsForAttachment = strings.Join(slingVars, "\n")
 
 		result, err := InstantiateFormulaOnBead(ctx, formulaName, beadID, info.Title, hookWorkDir, townRoot, false, slingVars)
 		if err != nil {

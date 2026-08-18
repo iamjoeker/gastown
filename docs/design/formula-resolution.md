@@ -1,33 +1,17 @@
 # Formula Resolution Architecture
 
-> **Status: three-tier resolution is IMPLEMENTED and live.** The rig > town >
-> embedded order described below is what `gt prime` actually executes today, via
-> `formula.ResolveFormulaContent()` in `internal/formula/embed.go`. Do not read
-> the tier table as aspirational — a disk copy at `.beads/formulas/` shadows the
-> binary's embedded formula, with no rebuild involved. Still planned: the
-> `--tier` / `--resolve` flags, tier labels in `formula list`, Mol Mall
-> integration, and HOP federation.
->
-> For the operational consequences of editing a resolved formula file — what
-> survives a rebuild, and when `gt upgrade` will silently overwrite your edit —
-> see [Editing a Formula File Directly](directives-and-overlays.md#editing-a-formula-file-directly).
+> **Status: Partially implemented** — Basic formula resolution works. Tier enforcement, Mol Mall integration, and HOP federation are planned.
 
 > Where formulas live, how they're found, and how they'll scale to Mol Mall
 
 ## The Problem
 
-Formulas exist in multiple locations:
+Formulas currently exist in multiple locations with no clear precedence:
 - `internal/formula/formulas/` (source of truth, embedded in binary)
 - `.beads/formulas/` (provisioned at runtime by `gt install`)
 - Crew directories have their own `.beads/formulas/` (diverging copies)
 
-For the formula text `gt prime` renders to an agent, the precedence below is now
-enforced in code. What is still unclear is `bd`'s own lookup, which `gt formula
-list`/`show` delegate to and which uses a **different, four-entry** search order
-(run `bd formula list --help` for the authoritative list). Two different
-resolvers can therefore disagree about which file "the" formula is — so when
-auditing a live town, checksum the file that `ResolveFormulaContent()` would
-pick rather than the first copy you find.
+When an agent runs `bd cook mol-polecat-work`, which version do they get?
 
 ## Design Goals
 
@@ -66,56 +50,31 @@ TIER 3: SYSTEM (embedded)
 
 ### Resolution Algorithm
 
-As implemented in `formula.ResolveFormulaContent()`
-(`internal/formula/embed.go`). Note that the rig tier is an explicit
-`townRoot` + `rigName` join, **not** a walk-up from the working directory — the
-caller supplies both, and a tier is skipped when its input is empty:
-
 ```go
-func ResolveFormulaContent(name, townRoot, rigName string) ([]byte, error) {
-    filename := name + ".formula.toml" // if not already suffixed
-
-    // Tier 1: rig-level (most specific)
-    if townRoot != "" && rigName != "" {
-        path := filepath.Join(townRoot, rigName, ".beads", "formulas", filename)
-        if content, err := os.ReadFile(path); err == nil {
-            return content, nil
+func ResolveFormula(name string, cwd string) (Formula, Tier, error) {
+    // Tier 1: Project-level (walk up from cwd to find .beads/formulas/)
+    if projectDir := findProjectRoot(cwd); projectDir != "" {
+        path := filepath.Join(projectDir, ".beads", "formulas", name+".formula.toml")
+        if f, err := loadFormula(path); err == nil {
+            return f, TierProject, nil
         }
     }
 
-    // Tier 2: town-level
-    if townRoot != "" {
-        path := filepath.Join(townRoot, ".beads", "formulas", filename)
-        if content, err := os.ReadFile(path); err == nil {
-            return content, nil
-        }
+    // Tier 2: Town-level
+    townDir := getTownRoot() // ~/gt or $GT_HOME
+    path := filepath.Join(townDir, ".beads", "formulas", name+".formula.toml")
+    if f, err := loadFormula(path); err == nil {
+        return f, TierTown, nil
     }
 
-    // Tier 3: embedded (system fallback)
-    return GetEmbeddedFormulaContent(name)
+    // Tier 3: Embedded (system)
+    if f, err := loadEmbeddedFormula(name); err == nil {
+        return f, TierSystem, nil
+    }
+
+    return nil, 0, ErrFormulaNotFound
 }
 ```
-
-Because tier 1 is a plain join rather than a walk-up, a formula file sitting in
-a crew or polecat worktree's own `.beads/formulas/` is **not** on this path and
-never resolves. Only the rig root's copy counts.
-
-### This Is Not the Only Resolver
-
-`gt prime` (`internal/cmd/prime_molecule.go`) is the sole production caller of
-`ResolveFormulaContent()`. Other paths resolve differently, and the differences
-are load-bearing:
-
-| Path | Resolver | Order |
-|------|----------|-------|
-| `gt prime` step rendering | `ResolveFormulaContent()` | rig → town → embedded |
-| `bd cook` at sling time | `bd`'s own search (gt shells out); `internal/cmd/sling_helpers.go` extracts the embedded copy to a temp file only if `bd` finds nothing | `bd formula list --help` |
-| `compose.expand` sub-formulas | `formula.loadFormulaByName()` | **embedded first**, then search paths |
-| `gt formula list` / `show` | delegated to `bd` | `bd formula list --help` |
-
-The `compose.expand` inversion is the surprising one: an expansion formula
-pulled in by another formula takes the *embedded* copy even when a disk override
-exists. Unifying these onto one resolver is unfinished work.
 
 ### Why This Order
 
