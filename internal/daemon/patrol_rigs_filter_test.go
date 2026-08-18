@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -46,5 +47,37 @@ func TestGetPatrolRigs_FiltersNonOperationalRigs(t *testing.T) {
 	want := []string{}
 	if !slices.Equal(got, want) {
 		t.Fatalf("getPatrolRigs() = %v, want %v (all rigs excluded when Dolt unavailable - fail-safe)", got, want)
+	}
+}
+
+// getPatrolRigs is memoized per heartbeat tick: several steps need the same
+// list and each computation shells out to `bd show` once per rig. The cache
+// must be cleared when the tick's rig caches are invalidated, or a rig docked
+// between ticks would keep getting agents started.
+func TestGetPatrolRigs_MemoizedPerTickAndInvalidated(t *testing.T) {
+	d := &Daemon{
+		config:              &Config{TownRoot: t.TempDir()},
+		logger:              log.New(io.Discard, "", 0),
+		knownRigsCache:      []string{},
+		knownRigsCacheValid: true,
+	}
+
+	if got := d.getPatrolRigs("witness"); len(got) != 0 {
+		t.Fatalf("getPatrolRigs() = %v, want empty (no rigs known)", got)
+	}
+	if _, cached := d.patrolRigsCache["witness"]; !cached {
+		t.Error("getPatrolRigs() did not populate the per-tick cache")
+	}
+
+	// Poison the cache: a second call in the same tick must return it verbatim
+	// rather than recomputing.
+	d.patrolRigsCache["witness"] = []string{"cached-rig"}
+	if got := d.getPatrolRigs("witness"); !slices.Equal(got, []string{"cached-rig"}) {
+		t.Errorf("getPatrolRigs() = %v, want the cached value within a tick", got)
+	}
+
+	d.invalidateKnownRigsCache()
+	if d.patrolRigsCache != nil {
+		t.Errorf("invalidateKnownRigsCache() left patrolRigsCache = %v, want nil", d.patrolRigsCache)
 	}
 }

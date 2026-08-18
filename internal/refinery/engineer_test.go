@@ -294,7 +294,7 @@ func setupEngineerTerminalCloseTest(t *testing.T, activeMR string) (*Engineer, *
 	port, _ := strconv.Atoi(testutil.DoltContainerPort())
 	rigPath := t.TempDir()
 	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
+	if err := b.Init("gt"); err != nil {
 		t.Skipf("bd init unavailable: %v", err)
 	}
 

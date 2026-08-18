@@ -360,8 +360,13 @@ func runRefineryStop(cmd *cobra.Command, args []string) error {
 
 // RefineryStatusOutput is the JSON output format for refinery status.
 type RefineryStatusOutput struct {
-	Running     bool   `json:"running"`
-	RigName     string `json:"rig_name"`
+	Running bool   `json:"running"`
+	RigName string `json:"rig_name"`
+	// Turn is the agent's turn state when Running: "active", "ended",
+	// "stranded", or "unknown". Running reports only that the tmux session is
+	// alive; a refinery whose turn has ended is running and not processing the
+	// queue.
+	Turn        string `json:"turn,omitempty"`
 	Session     string `json:"session,omitempty"`
 	QueueLength int    `json:"queue_length"`
 }
@@ -381,6 +386,12 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 	running, _ := mgr.IsRunning()
 	sessionInfo, _ := mgr.Status() // may be nil if not running
 
+	// A live session says nothing about whether the merge-queue loop is in motion.
+	turn := ""
+	if running {
+		turn = agentTurn(tmux.NewTmux(), session.RefinerySessionName(session.PrefixFor(rigName)))
+	}
+
 	// Get queue from beads
 	queue, _ := mgr.Queue()
 	queueLen := len(queue)
@@ -390,6 +401,7 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 		output := RefineryStatusOutput{
 			Running:     running,
 			RigName:     rigName,
+			Turn:        turn,
 			QueueLength: queueLen,
 		}
 		if sessionInfo != nil {
@@ -405,6 +417,9 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 
 	if running {
 		fmt.Printf("  State: %s\n", style.Bold.Render("● running"))
+		if rendered := renderAgentTurn(turn); rendered != "" {
+			fmt.Printf("  Turn:  %s\n", rendered)
+		}
 		if sessionInfo != nil {
 			fmt.Printf("  Session: %s\n", sessionInfo.Name)
 		}

@@ -74,7 +74,7 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	// generating right now. When it is set, no bead-state disposition is
 	// meaningful, so report WORKING — the same disposition StateWorking gets
 	// below — and let the caller re-check once the pane goes quiet. An unknown
-	// or unreadable session leaves this false and behaviour is unchanged.
+	// or unreadable session leaves this false and behavior is unchanged.
 	if in.SessionBusy {
 		return WorkstateDisposition{
 			Verdict:              WorkstateVerdictWorking,

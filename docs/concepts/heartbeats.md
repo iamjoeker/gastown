@@ -53,3 +53,9 @@ refreshed its session heartbeat while the file store aged past threshold).
   '#{window_activity}'`) before escalating — a live session with a stale
   store is *heartbeat-write divergence*, not a stuck agent. The
   stuck-agent-dog plugin does this since hq-qxl9.
+- **None of these stores detects a patrol agent whose turn simply ended.** All
+  three report an agent that stopped between cycles exactly as they report a
+  healthy one on a long working turn, because store 3 and the open patrol wisp
+  are both downstream of the same `await-signal` process. See
+  [Turn Boundaries](turn-boundaries.md) for the signal that is not confounded
+  and for what restarts a stopped agent.

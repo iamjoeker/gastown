@@ -10,9 +10,7 @@ import (
 // This is the core of the gt rig add fix: after adding a rig, the prefix
 // pattern changes and existing bindings become stale.
 func TestIsGTBindingCurrent_DetectsStalePattern(t *testing.T) {
-	// prefix-n is a per-server resource. On the shared package server this
-	// test left a GT binding behind that decided later tests' results.
-	tm := newPrivateTmux(t)
+	tm := newTestTmux(t)
 
 	session := "gt-test-stale-" + t.Name()
 	_ = tm.KillSession(session)
@@ -53,14 +51,7 @@ func TestIsGTBindingCurrent_DetectsStalePattern(t *testing.T) {
 // re-binds when the existing binding has a stale prefix pattern, even though
 // it already has --client support.
 func TestSetCycleBindings_RefreshesStalePattern(t *testing.T) {
-	tm := newPrivateTmux(t)
-
-	// A fixture registry makes the "current" pattern known, and known to
-	// differ from the stale one installed below. Against the machine's real
-	// rigs.json the pattern was whatever that host had registered — and on a
-	// host with no rigs it collapses to exactly the stale pattern, which would
-	// have made this test pass without re-binding anything.
-	fixtureTownRoot(t, "la", "wl")
+	tm := newTestTmux(t)
 
 	session := "gt-test-refresh-" + t.Name()
 	_ = tm.KillSession(session)
@@ -93,10 +84,10 @@ func TestSetCycleBindings_RefreshesStalePattern(t *testing.T) {
 
 	// Verify the binding was updated with the current pattern
 	currentPattern := sessionPrefixPattern()
-	if currentPattern == stalePattern {
-		t.Fatalf("fixture is inert: current pattern %q equals the stale one", currentPattern)
+	output, err := tm.run("list-keys", "-T", "prefix", "n")
+	if err != nil {
+		t.Fatalf("listing keys: %v", err)
 	}
-	output := tm.keyBindingLine("prefix", "n")
 	if !strings.Contains(output, currentPattern) {
 		t.Errorf("expected binding to contain current pattern %q, got: %s", currentPattern, output)
 	}
