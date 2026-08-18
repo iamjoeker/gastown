@@ -47,8 +47,10 @@ When backoff parameters are provided, the effective timeout is calculated as:
   min(base * multiplier^idle_cycles, max)
 
 The idle_cycles value is read from the agent bead's "idle" label, enabling
-exponential backoff that persists across invocations. When a signal is
-received, the caller should reset idle:0 on the agent bead.
+exponential backoff that persists across invocations. On timeout the counter
+is incremented; when a signal is received it is reset to 0 by this command,
+so the backoff collapses back to the base interval on real activity. Callers
+do not need to reset it themselves.
 
 EXIT CODES:
   0 - Signal received or timeout (check output for which)
@@ -66,7 +68,7 @@ EXAMPLES:
     --backoff-base 30s --backoff-mult 2 --backoff-max 15m
 
   # On timeout, the agent bead's idle:N label is auto-incremented
-  # On signal, caller should reset: gt agents state gt-gastown-witness --set idle=0
+  # On signal, the idle:N label is automatically reset to idle:0
 
   # Quiet mode (no output, for scripting)
   gt mol await-signal --timeout 30s --quiet`,
@@ -91,6 +93,25 @@ type AwaitSignalResult struct {
 	Signal      string        `json:"signal,omitempty"`      // the line that woke us (if signal)
 	IdleCycles  int           `json:"idle_cycles,omitempty"` // current idle cycle count (after update)
 	EffortLevel string        `json:"effort_level"`          // "full" or "abbreviated"
+	// BackoffAtCap reports that the wait was as long as --backoff-max allows,
+	// i.e. the agent is parked at the cap and cannot back off any further.
+	// Without this, a maximally-backed-off agent is indistinguishable from a
+	// healthy briefly-idle one in both output and logs (gt-609).
+	BackoffAtCap bool `json:"backoff_at_cap,omitempty"`
+}
+
+// backoffAtCap reports whether the effective timeout has reached the configured
+// --backoff-max, meaning further idle cycles cannot lengthen the wait.
+// Returns false when backoff is not configured (simple --timeout mode).
+func backoffAtCap(fullTimeout time.Duration) bool {
+	if awaitSignalBackoffBase == "" || awaitSignalBackoffMax == "" {
+		return false
+	}
+	maxDur, err := time.ParseDuration(awaitSignalBackoffMax)
+	if err != nil || maxDur <= 0 {
+		return false
+	}
+	return fullTimeout >= maxDur
 }
 
 func init() {
@@ -230,6 +251,11 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	result.Elapsed = time.Since(startTime)
 
+	// Surface "parked at the backoff cap" so a maximally-backed-off agent is
+	// distinguishable from a healthy briefly-idle one. Only meaningful on
+	// timeout — a signal resets the counter, so the next wait is back at base.
+	result.BackoffAtCap = result.Reason == "timeout" && backoffAtCap(fullTimeout)
+
 	// On timeout, increment idle cycles and clear backoff window
 	if result.Reason == "timeout" && awaitSignalAgentBead != "" {
 		newIdleCycles := idleCycles + 1
@@ -258,8 +284,25 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 					style.Dim.Render("⚠"), err)
 			}
 		}
-		// Report current idle cycles (caller should reset)
-		result.IdleCycles = idleCycles
+		// Reset idle cycles — a signal means real activity arrived, so the
+		// backoff window must collapse back to the base interval. This is done
+		// here rather than delegated to the caller: await-event already resets
+		// in code (molecule_await_event.go), and relying on every patrol formula
+		// to run "gt agents state --set idle=0" made the counter a ratchet
+		// whenever that prose step was missed (gt-609).
+		//
+		// result.IdleCycles is already 0 (zero value); it is only restored to
+		// the pre-signal count if the write fails, so the reported value never
+		// claims a reset that did not land.
+		if idleCycles > 0 {
+			if err := setAgentIdleCycles(awaitSignalAgentBead, beadsDir, 0); err != nil {
+				if !awaitSignalQuiet {
+					fmt.Printf("%s Failed to reset agent bead idle count: %v\n",
+						style.Dim.Render("⚠"), err)
+				}
+				result.IdleCycles = idleCycles
+			}
+		}
 		// Clear the backoff window — woken by real activity
 		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	}
@@ -300,6 +343,11 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 			} else {
 				fmt.Printf("%s Timeout after %v (no activity)\n",
 					style.Dim.Render("⏱"), result.Elapsed.Round(time.Millisecond))
+			}
+			if result.BackoffAtCap {
+				fmt.Printf("%s Backoff is AT CAP (%s) — waits cannot grow further. "+
+					"If work is arriving, this agent is sleeping through it.\n",
+					style.Bold.Render("⚠"), awaitSignalBackoffMax)
 			}
 		}
 
