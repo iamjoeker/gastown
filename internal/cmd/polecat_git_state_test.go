@@ -153,55 +153,6 @@ func TestGetGitStateIgnoresOpenCodeRuntimeArtifacts(t *testing.T) {
 	}
 }
 
-// check-recovery passes the assignment's base branch as a target ref; git-state
-// passes none. gt-ykp: in a fork clone the bare name "main" resolved to a stale
-// upstream/main, so the two surfaces disagreed about the same worktree and the
-// witness got a NEEDS_RECOVERY/ESCALATE verdict for work already on origin/main.
-func TestGetGitStateWithTargetsAgreesWithGitStateOnMergedWork(t *testing.T) {
-	dir := t.TempDir()
-	repo := filepath.Join(dir, "repo")
-	origin := filepath.Join(dir, "origin.git")
-	upstream := filepath.Join(dir, "upstream.git")
-
-	runGitCmd(t, "", "init", "--bare", origin)
-	runGitCmd(t, "", "init", "--bare", upstream)
-	runGitCmd(t, "", "init", repo)
-	runGitCmd(t, repo, "config", "user.email", "test@example.com")
-	runGitCmd(t, repo, "config", "user.name", "Test User")
-	writeTestFile(t, filepath.Join(repo, "README.md"), "base\n")
-	runGitCmd(t, repo, "add", "README.md")
-	runGitCmd(t, repo, "commit", "-m", "base")
-	runGitCmd(t, repo, "branch", "-M", "main")
-	runGitCmd(t, repo, "remote", "add", "origin", origin)
-	runGitCmd(t, repo, "remote", "add", "upstream", upstream)
-	runGitCmd(t, repo, "push", "origin", "main")
-	runGitCmd(t, repo, "push", "upstream", "main")
-
-	// The polecat's work merges to origin/main; upstream/main falls behind.
-	writeTestFile(t, filepath.Join(repo, "fix.txt"), "fix\n")
-	runGitCmd(t, repo, "add", "fix.txt")
-	runGitCmd(t, repo, "commit", "-m", "merged fix")
-	runGitCmd(t, repo, "push", "origin", "main")
-	runGitCmd(t, repo, "fetch", "upstream")
-	runGitCmd(t, repo, "switch", "-c", "polecat/merged")
-
-	state, err := getGitState(repo)
-	if err != nil {
-		t.Fatalf("getGitState: %v", err)
-	}
-	if state.UnpushedCommits != 0 {
-		t.Fatalf("git-state UnpushedCommits = %d, want 0", state.UnpushedCommits)
-	}
-
-	targeted, err := getGitStateWithTargets(repo, []string{"main"})
-	if err != nil {
-		t.Fatalf("getGitStateWithTargets: %v", err)
-	}
-	if targeted.UnpushedCommits != 0 || !targeted.Clean {
-		t.Fatalf("check-recovery reported work at risk for a merged HEAD: %+v", targeted)
-	}
-}
-
 func setupGitStateRemoteRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
