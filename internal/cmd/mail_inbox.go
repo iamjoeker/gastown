@@ -55,7 +55,7 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 
 	// Load the inbox once. Count() and ListUnread() both call List(), so using
 	// them here doubles the bd/Dolt reads on the hot patrol path.
-	messages, counts, err := loadInboxSnapshot(mailbox, mailbox, mailInboxUnread)
+	messages, total, unread, err := loadInboxSnapshot(mailbox, mailInboxUnread)
 	if err != nil {
 		return fmt.Errorf("listing messages: %w", err)
 	}
@@ -70,10 +70,9 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Human-readable output. CC copies are reported apart from the addressed
-	// count so the headline number keeps meaning "work addressed to me" (gt-58s).
-	fmt.Printf("%s Inbox: %s (%s)\n\n",
-		style.Bold.Render("📬"), address, counts.Summary())
+	// Human-readable output
+	fmt.Printf("%s Inbox: %s (%d messages, %d unread)\n\n",
+		style.Bold.Render("📬"), address, total, unread)
 
 	if len(messages) == 0 {
 		fmt.Printf("  %s\n", style.Dim.Render("(no messages)"))
@@ -84,13 +83,6 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 		readMarker := "●"
 		if msg.Read {
 			readMarker = "○"
-		}
-		// A CC copy is someone else's obligation. Rendering it identically to an
-		// addressed message has already produced false misroute reports, because
-		// the To: line lives in the body and is invisible here (gt-58s).
-		ccMarker := ""
-		if mailbox.IsCCOnly(msg) {
-			ccMarker = " " + style.Dim.Render("(cc)")
 		}
 		typeMarker := ""
 		if msg.Type != "" && msg.Type != mail.TypeNotification {
@@ -107,19 +99,10 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 
 		// Show 1-based index for easy reference with 'gt mail read <n>'
 		indexStr := style.Dim.Render(fmt.Sprintf("%d.", i+1))
-		fmt.Printf("  %s %s %s%s%s%s%s\n", indexStr, readMarker, msg.Subject, typeMarker, priorityMarker, wispMarker, ccMarker)
-		if ccMarker != "" {
-			// Name the addressee: a cc reader needs to know whose message this is
-			// before deciding whether to act on it.
-			fmt.Printf("      %s from %s, to %s\n",
-				style.Dim.Render(msg.ID),
-				msg.From,
-				msg.To)
-		} else {
-			fmt.Printf("      %s from %s\n",
-				style.Dim.Render(msg.ID),
-				msg.From)
-		}
+		fmt.Printf("  %s %s %s%s%s%s\n", indexStr, readMarker, msg.Subject, typeMarker, priorityMarker, wispMarker)
+		fmt.Printf("      %s from %s\n",
+			style.Dim.Render(msg.ID),
+			msg.From)
 		fmt.Printf("      %s\n",
 			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04")))
 	}
@@ -131,75 +114,30 @@ type inboxLister interface {
 	List() ([]*mail.Message, error)
 }
 
-// ccClassifier reports whether a message reached this inbox as a CC copy.
-type ccClassifier interface {
-	IsCCOnly(msg *mail.Message) bool
-}
-
-// inboxCounts separates messages addressed to this inbox from CC copies.
-//
-// The inbox count is the town's main "do I have unprocessed work" signal, and
-// mol-witness-patrol expects it near-empty. A CC copy is someone else's
-// obligation, so counting it in the headline number makes that signal read high
-// for work the reader cannot act on or clear. See gt-58s.
-type inboxCounts struct {
-	Addressed       int
-	AddressedUnread int
-	CC              int
-	CCUnread        int
-}
-
-// Unread returns every unread message, cc copies included. Reading a cc copy is
-// legitimate work; only clearing it was broken.
-func (c inboxCounts) Unread() int {
-	return c.AddressedUnread + c.CCUnread
-}
-
-// Summary renders the counts for the inbox header. CC copies appear only when
-// present, so the common case reads exactly as it always has.
-func (c inboxCounts) Summary() string {
-	summary := fmt.Sprintf("%d messages, %d unread", c.Addressed, c.AddressedUnread)
-	if c.CC > 0 {
-		summary += fmt.Sprintf(", %d cc (%d unread)", c.CC, c.CCUnread)
-	}
-	return summary
-}
-
-func loadInboxSnapshot(mailbox inboxLister, cc ccClassifier, unreadOnly bool) ([]*mail.Message, inboxCounts, error) {
+func loadInboxSnapshot(mailbox inboxLister, unreadOnly bool) ([]*mail.Message, int, int, error) {
 	allMessages, err := mailbox.List()
 	if err != nil {
-		return nil, inboxCounts{}, err
+		return nil, 0, 0, err
 	}
 	if allMessages == nil {
 		allMessages = make([]*mail.Message, 0)
 	}
 
-	counts := countInboxMessages(allMessages, cc)
+	total, unread := countInboxMessages(allMessages)
 	if unreadOnly {
-		return filterUnreadMessages(allMessages), counts, nil
+		return filterUnreadMessages(allMessages), total, unread, nil
 	}
-	return allMessages, counts, nil
+	return allMessages, total, unread, nil
 }
 
-func countInboxMessages(messages []*mail.Message, cc ccClassifier) inboxCounts {
-	var counts inboxCounts
+func countInboxMessages(messages []*mail.Message) (total, unread int) {
+	total = len(messages)
 	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		if cc != nil && cc.IsCCOnly(msg) {
-			counts.CC++
-			if !msg.Read {
-				counts.CCUnread++
-			}
-			continue
-		}
-		counts.Addressed++
-		if !msg.Read {
-			counts.AddressedUnread++
+		if msg != nil && !msg.Read {
+			unread++
 		}
 	}
-	return counts
+	return total, unread
 }
 
 func filterUnreadMessages(messages []*mail.Message) []*mail.Message {
@@ -285,19 +223,10 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s %s%s%s\n\n", style.Bold.Render("Subject:"), msg.Subject, typeStr, priorityStr)
 	fmt.Printf("From: %s\n", msg.From)
 	fmt.Printf("To: %s\n", msg.To)
-	if len(msg.CC) > 0 {
-		fmt.Printf("CC: %s\n", strings.Join(msg.CC, ", "))
-	}
 	// Zone label: mail renders local time while bd renders UTC. Correlating the
 	// two is routine and the offset was silently carried as an error.
 	fmt.Printf("Date: %s\n", msg.Timestamp.Local().Format("2006-01-02 15:04:05 MST"))
 	fmt.Printf("ID: %s\n", style.Dim.Render(msg.ID))
-	// Correct delivery of a cc copy has already been misreported as a misroute,
-	// because nothing distinguished it from a message addressed to the reader.
-	if mailbox.IsCCOnly(msg) {
-		fmt.Printf("%s\n", style.Dim.Render(
-			fmt.Sprintf("(you are cc'd; this message is addressed to %s — delivery is correct, and it is theirs to act on)", msg.To)))
-	}
 
 	if msg.ThreadID != "" {
 		fmt.Printf("Thread: %s\n", style.Dim.Render(msg.ThreadID))
@@ -447,17 +376,10 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 	// can be cleared without manual surgery. See aa-6hv.
 	archived := 0
 	gcd := 0
-	ccCleared := 0
 	var errMsgs []string
 	for _, msgID := range args {
-		result, err := mailbox.DeleteWithResult(msgID)
+		err := mailbox.Delete(msgID)
 		switch {
-		case err == nil && result == mail.DeleteCCCleared:
-			// The bead stays open and stays the assignee's: only this
-			// recipient's cc copy left the inbox (gt-58s).
-			ccCleared++
-			fmt.Printf("  %s %s: cc copy cleared; the message itself remains open for its assignee\n",
-				style.Dim.Render("note"), msgID)
 		case err == nil:
 			archived++
 		case errors.Is(err, mail.ErrMessageNotFound):
@@ -466,27 +388,20 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 				style.Dim.Render("note"), msgID)
 		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, err))
-			if mail.IsOwnershipRefusal(err) {
-				// Naming only the refusal leaves the reader with no next step.
-				fmt.Printf("  %s %s is addressed to another agent — only its assignee can close it.\n",
-					style.Dim.Render("hint"), msgID)
-				fmt.Printf("  %s If you expected a cc copy, this message carries no cc label for %s.\n",
-					style.Dim.Render("hint"), address)
-			}
 		}
 	}
 
 	// Report results
 	if len(errMsgs) > 0 {
 		fmt.Printf("%s Archived %d/%d messages\n",
-			style.Bold.Render("⚠"), archived+gcd+ccCleared, len(args))
+			style.Bold.Render("⚠"), archived+gcd, len(args))
 		for _, e := range errMsgs {
 			fmt.Printf("  Error: %s\n", e)
 		}
 		return fmt.Errorf("failed to archive %d messages", len(errMsgs))
 	}
 
-	total := archived + gcd + ccCleared
+	total := archived + gcd
 	if total == 1 {
 		fmt.Printf("%s Message archived\n", style.Bold.Render("✓"))
 	} else {

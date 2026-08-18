@@ -397,19 +397,32 @@ func runEscalateClose(cmd *cobra.Command, args []string) error {
 	}
 
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
-	if err := bd.CloseEscalation(escalationID, closedBy, escalateCloseReason); err != nil {
+	result, err := bd.CloseEscalation(escalationID, closedBy, escalateCloseReason)
+	if err != nil {
+		if result != nil {
+			// Partial close: the error already spells out which half landed and
+			// which beads are still live in the queue.
+			return err
+		}
 		return fmt.Errorf("closing escalation: %w", err)
 	}
 
 	// Log to activity feed
 	_ = events.LogFeed(events.TypeEscalationClosed, closedBy, map[string]interface{}{
-		"escalation_id": escalationID,
+		"escalation_id": result.RecordID,
 		"closed_by":     closedBy,
 		"reason":        escalateCloseReason,
+		"copies_closed": strings.Join(result.CopyIDs, ","),
 	})
 
-	fmt.Printf("%s Escalation closed: %s\n", style.Bold.Render("✓"), escalationID)
+	fmt.Printf("%s Escalation closed: %s\n", style.Bold.Render("✓"), result.RecordID)
 	fmt.Printf("  Reason: %s\n", escalateCloseReason)
+	// The delivered copies are what the queue renders, so say plainly that they
+	// went with it — a close that only touched the record used to report success
+	// while leaving the escalation live in the Mayor's queue (gt-4xl).
+	if len(result.CopyIDs) > 0 {
+		fmt.Printf("  Cleared from queue: %s\n", strings.Join(result.CopyIDs, ", "))
+	}
 	return nil
 }
 

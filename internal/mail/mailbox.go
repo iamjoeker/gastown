@@ -213,15 +213,12 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	}
 
 	// Deduplicate messages across queries (assignee + CC + wisps may overlap).
-	// Assignee results are appended first so a message that is both addressed and
-	// CC'd to this identity is treated as addressed, and CC dismissal cannot hide
-	// work this identity actually owns (gt-58s).
 	seen := make(map[string]bool)
 	messages := make([]*Message, 0, len(assignee.messages)+len(cc.messages)+len(wisps.messages))
 	messages = appendBeadsMessages(messages, seen, assignee.messages, true)
-	messages = appendBeadsMessages(messages, seen, filterClearedCC(cc.messages, identities), false)
+	messages = appendBeadsMessages(messages, seen, cc.messages, false)
 	if wisps.err == nil {
-		messages = appendWispMessages(messages, seen, wisps.messages, identities)
+		messages = appendWispMessages(messages, seen, wisps.messages)
 	}
 
 	return messages, nil
@@ -307,7 +304,7 @@ func appendBeadsMessages(messages []*Message, seen map[string]bool, msgs []Beads
 	return messages
 }
 
-func appendWispMessages(messages []*Message, seen map[string]bool, wisps []wispQueryMessage, identities []string) []*Message {
+func appendWispMessages(messages []*Message, seen map[string]bool, wisps []wispQueryMessage) []*Message {
 	for i := range wisps {
 		wisp := &wisps[i]
 		bm := &wisp.message
@@ -315,7 +312,7 @@ func appendWispMessages(messages []*Message, seen map[string]bool, wisps []wispQ
 			continue
 		}
 		include := wisp.assigneeMatch && (bm.Status == "open" || bm.Status == "hooked")
-		include = include || (wisp.ccMatch && !ccClearedFor(bm, identities) && bm.Status == "open")
+		include = include || (wisp.ccMatch && bm.Status == "open")
 		if include {
 			seen[bm.ID] = true
 			messages = append(messages, bm.ToMessage())
@@ -600,15 +597,10 @@ func (m *Mailbox) MarkRead(id string) error {
 }
 
 func (m *Mailbox) markReadBeads(id string) error {
-	if err := m.acknowledgeDeliveryForPrimary(id, nil); err != nil {
+	if err := m.acknowledgeDeliveryForPrimary(id); err != nil {
 		return err
 	}
-	return m.closeMessage(id)
-}
 
-// closeMessage closes a message bead, resolving the beads directory from the
-// bead ID prefix.
-func (m *Mailbox) closeMessage(id string) error {
 	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
 	err := m.closeInDir(id, primary)
@@ -692,26 +684,16 @@ func (m *Mailbox) MarkReadOnly(id string) error {
 }
 
 func (m *Mailbox) markReadOnlyBeads(id string) error {
-	if err := m.acknowledgeDeliveryForPrimary(id, nil); err != nil {
+	if err := m.acknowledgeDeliveryForPrimary(id); err != nil {
 		return err
 	}
 
-	// Add "read" label to mark as read without closing
-	return m.addLabel(id, "read")
-}
-
-// addLabel adds a label to a message bead, resolving the beads directory from
-// the bead ID prefix and falling back to the home DB for cross-rig IDs.
-//
-// Labels are metadata on the mail record, not a change of ownership: adding one
-// does not close the bead, reassign it, or otherwise touch the assignee's
-// obligation. That is what lets a CC'd recipient clear its own copy.
-func (m *Mailbox) addLabel(id, label string) error {
 	if m.store != nil {
-		return m.storeAddLabel(id, label)
+		return m.storeMarkReadOnly(id)
 	}
 
-	args := []string{"label", "add", id, label}
+	// Add "read" label to mark as read without closing
+	args := []string{"label", "add", id, "read"}
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
 
 	ctx, cancel := bdWriteCtx()
@@ -740,9 +722,7 @@ func (m *Mailbox) addLabel(id, label string) error {
 	return nil
 }
 
-// acknowledgeDeliveryForPrimary acks delivery for a message addressed to this
-// mailbox. Pass an already-fetched msg to reuse it; nil fetches one.
-func (m *Mailbox) acknowledgeDeliveryForPrimary(id string, msg *Message) error {
+func (m *Mailbox) acknowledgeDeliveryForPrimary(id string) error {
 	if m.legacy {
 		return nil
 	}
@@ -750,12 +730,9 @@ func (m *Mailbox) acknowledgeDeliveryForPrimary(id string, msg *Message) error {
 		return m.storeAcknowledgeDeliveryForPrimary(id)
 	}
 
-	if msg == nil {
-		fetched, err := m.Get(id)
-		if err != nil {
-			return err
-		}
-		msg = fetched
+	msg, err := m.Get(id)
+	if err != nil {
+		return err
 	}
 	if msg == nil || msg.DeliveryState == "" || AddressToIdentity(msg.To) != m.identity {
 		return nil
@@ -889,54 +866,12 @@ func (m *Mailbox) markUnreadLegacy(id string) error {
 	return m.rewriteLegacy(messages)
 }
 
-// Delete removes a message from this inbox.
-//
-// For a message addressed to this mailbox, that means closing the bead. For a CC
-// copy it means dismissing this recipient's copy only: the bead belongs to the
-// To: recipient, the ownership guard correctly refuses to let anyone else close
-// it, and without this branch a CC'd recipient had no legitimate way to clear
-// its inbox at all. See gt-58s.
+// Delete removes a message.
 func (m *Mailbox) Delete(id string) error {
-	_, err := m.DeleteWithResult(id)
-	return err
-}
-
-// DeleteResult describes how a message left the inbox, so callers can report
-// accurately without a second lookup.
-type DeleteResult int
-
-const (
-	// DeleteClosed means the message bead was closed (it was addressed here).
-	DeleteClosed DeleteResult = iota
-	// DeleteCCCleared means only this recipient's CC copy was dismissed; the
-	// bead remains open and still belongs to its assignee.
-	DeleteCCCleared
-)
-
-// DeleteWithResult removes a message from this inbox and reports which path it
-// took. See Delete for the CC-copy rationale.
-func (m *Mailbox) DeleteWithResult(id string) (DeleteResult, error) {
 	if m.legacy {
-		return DeleteClosed, m.deleteLegacy(id)
+		return m.deleteLegacy(id)
 	}
-
-	// One lookup serves both decisions: whether this is a CC copy to dismiss, and
-	// the delivery ack that precedes a close. Its failure is the same failure the
-	// close path would report (the ack fetches the same message), including the
-	// ErrMessageNotFound that callers treat as "already gone".
-	msg, err := m.Get(id)
-	if err != nil {
-		return DeleteClosed, err
-	}
-	// --force is an explicit decision to close the record itself, so it is not
-	// diverted to a CC dismissal.
-	if !m.forceClose && m.IsCCOnly(msg) {
-		return DeleteCCCleared, m.DismissCC(id)
-	}
-	if ackErr := m.acknowledgeDeliveryForPrimary(id, msg); ackErr != nil {
-		return DeleteClosed, ackErr
-	}
-	return DeleteClosed, m.closeMessage(id)
+	return m.MarkRead(id) // beads: just acknowledge/close
 }
 
 func (m *Mailbox) deleteLegacy(id string) error {
