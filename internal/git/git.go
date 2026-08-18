@@ -2865,19 +2865,9 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		}
 	}
 
-	// Witnesses are consulted only after the candidates above fail to prove
-	// preservation, and only to answer "is this work durable somewhere" — never
-	// to report a count. See the witness loop below (gt-ykp).
-	var witnesses []string
-
 	for _, target := range nonEmptyUnique(targets) {
-		refs := g.resolveComparisonRefs(target, remote)
-		if len(refs) == 0 {
-			continue
-		}
-		candidates = append(candidates, refs[0])
-		if includeExactBranch {
-			witnesses = append(witnesses, refs[1:]...)
+		if ref, ok := g.resolveComparisonRef(target, remote); ok {
+			candidates = append(candidates, ref)
 		}
 	}
 
@@ -2889,17 +2879,10 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		}
 	}
 
-	defaultRefs := []string{remote + "/" + g.RemoteDefaultBranch(), remote + "/main", remote + "/master"}
 	if !hasEvidence {
-		for _, ref := range defaultRefs {
+		for _, ref := range []string{remote + "/" + g.RemoteDefaultBranch(), remote + "/main", remote + "/master"} {
 			if resolved, ok := g.resolveComparisonRef(ref, remote); ok {
 				candidates = append(candidates, resolved)
-			}
-		}
-	} else if includeExactBranch {
-		for _, ref := range defaultRefs {
-			if resolved, ok := g.resolveComparisonRef(ref, remote); ok {
-				witnesses = append(witnesses, resolved)
 			}
 		}
 	}
@@ -2929,32 +2912,6 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 			result = candidate
 		}
 	}
-
-	// No candidate proved preservation. Before reporting work at risk, ask whether
-	// HEAD is already durable on some other ref the caller's target could name —
-	// a fork clone resolves the bare target "main" to a stale upstream/main and
-	// would otherwise report commits already merged into origin/main as unpushed,
-	// which is the loudest witness verdict on a clean sandbox (gt-ykp).
-	tried := make(map[string]bool, len(candidates))
-	for _, ref := range candidates {
-		tried[ref] = true
-	}
-	for _, ref := range nonEmptyUnique(witnesses) {
-		// Only a remote-tracking ref proves durability. A local branch that happens
-		// to contain HEAD dies with the sandbox, so it witnesses nothing.
-		if tried[ref] || !g.isRemoteTrackingRef(ref) {
-			continue
-		}
-		witness, err := g.preservationAgainstRef(ref)
-		if err != nil || !witness.Preserved {
-			continue
-		}
-		if witness.Evidence == "" {
-			witness.Evidence = "comparison_ref"
-		}
-		return witness, nil
-	}
-
 	if result.ComparisonBase != "" {
 		return result, nil
 	}
@@ -2980,37 +2937,16 @@ func (g *Git) refContainsHead(ref string) (bool, error) {
 }
 
 func (g *Git) resolveComparisonRef(ref, remote string) (string, bool) {
-	resolved := g.resolveComparisonRefs(ref, remote)
-	if len(resolved) == 0 {
-		return "", false
-	}
-	return resolved[0], true
-}
-
-// resolveComparisonRefs returns every ref the given target name resolves to, in
-// preference order. Only the first is the target proper; the rest matter because
-// one bare name (say "main") can name several real refs — upstream/main,
-// origin/main, and a local main — that need not agree.
-func (g *Git) resolveComparisonRefs(ref, remote string) []string {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return nil
+		return "", false
 	}
-	var resolved []string
 	for _, candidate := range comparisonRefCandidates(ref, remote) {
 		if ok, err := g.RefExists(candidate); err == nil && ok {
-			resolved = append(resolved, candidate)
+			return candidate, true
 		}
 	}
-	return resolved
-}
-
-func (g *Git) isRemoteTrackingRef(ref string) bool {
-	full, err := g.run("rev-parse", "--symbolic-full-name", ref)
-	if err != nil {
-		return false
-	}
-	return strings.HasPrefix(strings.TrimSpace(full), "refs/remotes/")
+	return "", false
 }
 
 func comparisonRefCandidates(ref, remote string) []string {
