@@ -486,13 +486,13 @@ func TestReapExcludesAgentBeadsBehaviour(t *testing.T) {
 }
 
 // oneShotCandidates supplies a batch of candidate IDs exactly once, then
-// reports an empty set. closeWispsInBatches loops until its ID query comes back
-// empty, and the UPDATE it issues deliberately does NOT change the rows the
-// guard protects — so a candidate query that keeps offering an agent wisp would
-// offer it forever. In production the loop terminates only because the
-// candidate query filters agent wisps itself (reaper.go:465). That is precisely
-// the filtering this test has to bypass, so termination is arranged here
-// instead.
+// reports an empty set. The UPDATE closeWispsInBatches issues deliberately does
+// NOT change the rows the guard protects, so a candidate query that keeps
+// offering an agent wisp keeps offering it after the UPDATE declines it. The
+// no-progress break added for gt-m46 stops that loop, but termination here does
+// not depend on it: cutting the supply keeps this test measuring the UPDATE's
+// guard and nothing else. TestCloseWispsInBatchesStopsWithoutProgress covers
+// the break itself.
 //
 // Only the SUPPLY of candidates is controlled. ExecContext and QueryRowContext
 // pass straight through, so the UPDATE under test is the real one, built by
@@ -552,9 +552,12 @@ func TestCloseWispsInBatchesExcludesAgentBeads(t *testing.T) {
 	defer cancel()
 
 	runner := &oneShotCandidates{runner: f.db}
-	closed, err := closeWispsInBatches(ctx, runner, idQuery, nil, "gt-axe agent guard")
+	closed, stalled, err := closeWispsInBatches(ctx, runner, idQuery, nil, "gt-axe agent guard")
 	if err != nil {
 		t.Fatalf("closeWispsInBatches: %v", err)
+	}
+	if stalled != 0 {
+		t.Errorf("stalled = %d, want 0 — the first batch closed the control, so it made progress", stalled)
 	}
 
 	if got := f.wispStatus(t, "w-agent"); got != "open" {
@@ -568,6 +571,122 @@ func TestCloseWispsInBatchesExcludesAgentBeads(t *testing.T) {
 	if closed != 1 {
 		t.Errorf("closed = %d, want 1 (the control only)", closed)
 	}
+}
+
+// countingCandidates passes every statement straight through to the real
+// engine and counts the candidate queries. An unguarded candidate query is
+// naturally repeating — nothing the batch loop does changes which rows it
+// selects — so no rigging is needed to reproduce the livelock; only the count
+// is added, to tell "stopped because it noticed no progress" apart from
+// "stopped for some unrelated reason".
+type countingCandidates struct {
+	runner sqlRunner
+	calls  int
+}
+
+func (c *countingCandidates) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	c.calls++
+	return c.runner.QueryContext(ctx, query, args...)
+}
+
+func (c *countingCandidates) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return c.runner.ExecContext(ctx, query, args...)
+}
+
+func (c *countingCandidates) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return c.runner.QueryRowContext(ctx, query, args...)
+}
+
+// TestCloseWispsInBatchesStopsWithoutProgress is the regression test for gt-m46:
+// closeWispsInBatches terminated only on an empty candidate set, never on "the
+// UPDATE closed nothing". A candidate query that offers a row the UPDATE's
+// `issue_type != 'agent'` clause declines therefore produced a hot
+// SELECT+UPDATE loop against Dolt until Reap's 2-minute context expired.
+//
+// Termination is what is under test, so a livelocking loop must FAIL rather
+// than hang: the context below is short, and a spinning loop surfaces as a
+// context error out of QueryContext instead of the nil error asserted here.
+//
+// The second case is the control. A break placed one line too early — before
+// any UPDATE, or after the first iteration unconditionally — passes the first
+// case while reaping nothing, which is how this guard would go inert.
+func TestCloseWispsInBatchesStopsWithoutProgress(t *testing.T) {
+	stale := time.Now().UTC().Add(-48 * time.Hour)
+	// Deliberately unguarded, the way a de-duplicated candidate query would be:
+	// this is the edit whose blast radius gt-m46 is about.
+	const idQuery = "SELECT id FROM wisps WHERE status IN ('open', 'hooked', 'in_progress') ORDER BY id"
+
+	t.Run("every candidate declined", func(t *testing.T) {
+		f := newFixture(t, "reap_batch_stall")
+		f.insertWisps(t,
+			wispRow{id: "w-agent-1", status: "open", issueType: "agent", createdAt: stale},
+			wispRow{id: "w-agent-2", status: "open", issueType: "agent", createdAt: stale},
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		runner := &countingCandidates{runner: f.db}
+		closed, stalled, err := closeWispsInBatches(ctx, runner, idQuery, nil, "gt-m46 stall")
+		if err != nil {
+			t.Fatalf("closeWispsInBatches: %v — a batch the UPDATE declines must end the loop, "+
+				"not spin until the context expires", err)
+		}
+
+		if runner.calls != 1 {
+			t.Errorf("candidate queries = %d, want 1 — the loop re-selected a batch it had already "+
+				"failed to close", runner.calls)
+		}
+		if closed != 0 {
+			t.Errorf("closed = %d, want 0 — the UPDATE declines agent wisps", closed)
+		}
+		if stalled != 2 {
+			t.Errorf("stalled = %d, want 2 — the declined batch must be reported, not silently dropped", stalled)
+		}
+		for _, id := range []string{"w-agent-1", "w-agent-2"} {
+			if got := f.wispStatus(t, id); got != "open" {
+				t.Errorf("agent wisp %s status = %q, want open", id, got)
+			}
+		}
+	})
+
+	t.Run("stops only after progress stops", func(t *testing.T) {
+		f := newFixture(t, "reap_batch_stall_control")
+		f.insertWisps(t,
+			wispRow{id: "w-agent", status: "open", issueType: "agent", createdAt: stale},
+			wispRow{id: "w-task", status: "open", issueType: "task", createdAt: stale},
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		runner := &countingCandidates{runner: f.db}
+		closed, stalled, err := closeWispsInBatches(ctx, runner, idQuery, nil, "gt-m46 stall control")
+		if err != nil {
+			t.Fatalf("closeWispsInBatches: %v", err)
+		}
+
+		// First batch closes w-task; the second offers only w-agent, which the
+		// UPDATE declines. Stopping before that second batch would mean the break
+		// fires on any iteration, not on the absence of progress.
+		if runner.calls != 2 {
+			t.Errorf("candidate queries = %d, want 2 — the loop must keep going while rows are "+
+				"still being closed", runner.calls)
+		}
+		if closed != 1 {
+			t.Errorf("closed = %d, want 1 (the control wisp)", closed)
+		}
+		if stalled != 1 {
+			t.Errorf("stalled = %d, want 1 (the declined agent wisp)", stalled)
+		}
+		if got := f.wispStatus(t, "w-task"); got != "closed" {
+			t.Errorf("control wisp status = %q, want closed — the loop stopped before closing anything, "+
+				"so the termination assertions above prove nothing", got)
+		}
+		if got := f.wispStatus(t, "w-agent"); got != "open" {
+			t.Errorf("agent wisp status = %q, want open", got)
+		}
+	})
 }
 
 func closedEntryIDs(result *AutoCloseResult) []string {
