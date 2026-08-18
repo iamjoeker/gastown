@@ -689,6 +689,175 @@ func TestCloseWispsInBatchesStopsWithoutProgress(t *testing.T) {
 	})
 }
 
+// TestWritePathsPinTheirSession is the acceptance test for gt-gjh.
+//
+// Every reaper write path disables autocommit, runs its UPDATE/DELETE batches,
+// COMMITs to flush them into the Dolt working set, then CALLs DOLT_COMMIT.
+// @@autocommit is SESSION-scoped, so all four steps have to run on one session.
+// Five of the six paths issued them on the *sql.DB pool instead, which hands out
+// whatever connection is free.
+//
+// The row-level outcome does not distinguish the two: statements that run with
+// autocommit still on commit themselves one at a time, so the wisps still vanish
+// and the issues still close. That is why the bug survived a green suite. What
+// differs is INVISIBLE from the client — which session each statement landed on
+// — so the assertion is made from inside the engine: the DOLT_COMMIT stub
+// records @@autocommit as its OWN session reports it. 0 means the procedure ran
+// on the session that was prepared for it; 1 means the preparation happened
+// somewhere else and the flushing COMMIT before it flushed nothing.
+//
+// The pool is put in fresh-session-per-statement mode first, because a
+// sequential caller on a normal pool keeps getting the same connection back and
+// cannot observe the difference at all (see freshSessionPerStatement).
+//
+// Reap is included even though it was already correct: it is the positive
+// control. If the instrument could not report 0 for a path that does pin its
+// connection, a 0 from the repaired paths would prove nothing. Each case also
+// asserts its row-level effect, so a path that silently stopped doing anything
+// cannot pass by issuing no commits at all.
+func TestWritePathsPinTheirSession(t *testing.T) {
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	oldPtr := old
+	hour := time.Hour
+
+	cases := []struct {
+		name  string
+		db    string
+		seed  func(t *testing.T, f *fixture)
+		run   func(t *testing.T, f *fixture)
+		check func(t *testing.T, f *fixture)
+	}{
+		{
+			name: "Reap",
+			db:   "pin_reap",
+			seed: func(t *testing.T, f *fixture) {
+				f.insertWisps(t, wispRow{id: "w-stale", wispType: "step", createdAt: old})
+			},
+			run: func(t *testing.T, f *fixture) {
+				if _, err := Reap(f.db, f.dbName, staleAge, false); err != nil {
+					t.Fatalf("Reap: %v", err)
+				}
+			},
+			check: func(t *testing.T, f *fixture) {
+				if got := f.wispStatus(t, "w-stale"); got != "closed" {
+					t.Errorf("w-stale status = %q, want closed", got)
+				}
+			},
+		},
+		{
+			name: "purgeClosedWisps",
+			db:   "pin_purge_wisps",
+			seed: func(t *testing.T, f *fixture) {
+				f.insertWisps(t, wispRow{id: "w-purge", status: "closed", wispType: "step", createdAt: old, closedAt: &oldPtr})
+			},
+			run: func(t *testing.T, f *fixture) {
+				if _, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false); err != nil {
+					t.Fatalf("Purge: %v", err)
+				}
+			},
+			check: func(t *testing.T, f *fixture) {
+				if got := f.ids(t, "wisps"); len(got) != 0 {
+					t.Errorf("surviving wisps = %v, want none", got)
+				}
+			},
+		},
+		{
+			name: "purgeOldMail",
+			db:   "pin_purge_mail",
+			seed: func(t *testing.T, f *fixture) {
+				f.insertIssues(t, issueRow{id: "mail-old", status: "closed", priority: 2,
+					updatedAt: old, closedAt: &oldPtr, labels: []string{"gt:message"}})
+			},
+			run: func(t *testing.T, f *fixture) {
+				if _, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false); err != nil {
+					t.Fatalf("Purge: %v", err)
+				}
+			},
+			check: func(t *testing.T, f *fixture) {
+				if got := f.ids(t, "issues"); len(got) != 0 {
+					t.Errorf("surviving issues = %v, want none", got)
+				}
+			},
+		},
+		{
+			name: "AutoClose",
+			db:   "pin_autoclose",
+			seed: func(t *testing.T, f *fixture) {
+				f.insertIssues(t, issueRow{id: "hq-stale", priority: 2, updatedAt: old})
+			},
+			run: func(t *testing.T, f *fixture) {
+				if _, err := AutoClose(f.db, f.dbName, staleAge, false); err != nil {
+					t.Fatalf("AutoClose: %v", err)
+				}
+			},
+			check: func(t *testing.T, f *fixture) {
+				if got := f.issueStatus(t, "hq-stale"); got != "closed" {
+					t.Errorf("hq-stale status = %q, want closed", got)
+				}
+			},
+		},
+		{
+			name: "ClosePluginReceipts",
+			db:   "pin_receipts",
+			seed: func(t *testing.T, f *fixture) {
+				f.insertIssues(t, issueRow{id: "receipt-old", priority: 2, updatedAt: old,
+					labels: []string{"type:plugin-run"}})
+			},
+			run: func(t *testing.T, f *fixture) {
+				if _, err := ClosePluginReceipts(f.db, f.dbName, hour, false); err != nil {
+					t.Fatalf("ClosePluginReceipts: %v", err)
+				}
+			},
+			check: func(t *testing.T, f *fixture) {
+				if got := f.issueStatus(t, "receipt-old"); got != "closed" {
+					t.Errorf("receipt-old status = %q, want closed", got)
+				}
+			},
+		},
+		{
+			name: "ClosePluginDispatches",
+			db:   "pin_dispatches",
+			seed: func(t *testing.T, f *fixture) {
+				f.insertIssues(t, issueRow{id: "dispatch-old", title: "Plugin: stuck-agent-dog", priority: 2,
+					updatedAt: old, labels: []string{"gt:message", "from:daemon"}})
+			},
+			run: func(t *testing.T, f *fixture) {
+				if _, err := ClosePluginDispatches(f.db, f.dbName, hour, false); err != nil {
+					t.Fatalf("ClosePluginDispatches: %v", err)
+				}
+			},
+			check: func(t *testing.T, f *fixture) {
+				if got := f.issueStatus(t, "dispatch-old"); got != "closed" {
+					t.Errorf("dispatch-old status = %q, want closed", got)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.db)
+			tc.seed(t, f)
+			f.freshSessionPerStatement()
+
+			tc.run(t, f)
+			tc.check(t, f)
+
+			calls := f.doltCommitCalls()
+			if len(calls) != 1 {
+				t.Fatalf("DOLT_COMMIT calls = %+v, want exactly one — with no commit the "+
+					"autocommit assertion below would be vacuous", calls)
+			}
+			if calls[0].autocommit != "0" {
+				t.Errorf("DOLT_COMMIT ran with @@autocommit = %q, want \"0\" — %s issued its "+
+					"session setup on the pool, so the commit landed on a session that was "+
+					"never switched and the COMMIT before it flushed nothing (gt-gjh)",
+					calls[0].autocommit, tc.name)
+			}
+		})
+	}
+}
+
 func closedEntryIDs(result *AutoCloseResult) []string {
 	ids := make([]string, 0, len(result.ClosedEntries))
 	for _, entry := range result.ClosedEntries {
