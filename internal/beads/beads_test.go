@@ -3,6 +3,7 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1949,6 +1950,106 @@ func TestWrapError(t *testing.T) {
 				t.Errorf("wrapError(%q) = %v, want %v", tt.stderr, err, tt.wantErr)
 			}
 		}
+	}
+}
+
+// TestWrapErrorWithOutputFallsBackToStdout covers gt-k3h: bd writes some
+// failures as a JSON payload on stdout and exits non-zero with an empty stderr,
+// which used to surface to operators as a bare "exit status 1".
+func TestWrapErrorWithOutputFallsBackToStdout(t *testing.T) {
+	b := New("/test")
+	exitErr := errors.New("exit status 1")
+
+	tests := []struct {
+		name        string
+		stderr      string
+		stdout      string
+		wantErr     error
+		wantMessage string
+	}{
+		{
+			name:        "json error payload on stdout",
+			stdout:      `{"error":"database not initialized: issue_prefix config is missing"}`,
+			wantMessage: "bd create: database not initialized: issue_prefix config is missing",
+		},
+		{
+			name:        "payload behind bd warnings",
+			stdout:      "warning: beads.role not configured (GH#2950).\n" + `{"error":"database not initialized"}` + "\n",
+			wantMessage: "bd create: database not initialized",
+		},
+		{
+			name:        "pretty printed payload",
+			stdout:      "{\n  \"error\": \"database not initialized\"\n}",
+			wantMessage: "bd create: database not initialized",
+		},
+		{
+			name:    "not-found classification reaches stdout payloads",
+			stdout:  `{"error":"issue gt-xyz not found"}`,
+			wantErr: ErrNotFound,
+		},
+		{
+			name:        "stderr still wins when present",
+			stderr:      "real stderr failure",
+			stdout:      `{"error":"stdout payload"}`,
+			wantMessage: "bd create: real stderr failure",
+		},
+		{
+			name:        "unstructured stdout is still better than exit status 1",
+			stdout:      "could not reach the dolt server\n",
+			wantMessage: "bd create: could not reach the dolt server",
+		},
+		{
+			name: "unstructured stdout is never classified as not found",
+			// A plain listing that merely contains the phrase must not be
+			// mistaken for a lookup failure.
+			stdout:      "gt-1: file not found handler is broken",
+			wantMessage: "bd create: gt-1: file not found handler is broken",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := b.wrapErrorWithOutput(exitErr, tt.stderr, tt.stdout, []string{"create"})
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("wrapErrorWithOutput = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err == nil || err.Error() != tt.wantMessage {
+				t.Fatalf("wrapErrorWithOutput = %v, want %q", err, tt.wantMessage)
+			}
+		})
+	}
+}
+
+// TestWrapErrorWithOutputBoundsStdout keeps an arbitrarily large bd output from
+// becoming an arbitrarily large error string.
+func TestWrapErrorWithOutputBoundsStdout(t *testing.T) {
+	b := New("/test")
+	huge := strings.Repeat("x", maxBDOutputInError*3)
+
+	err := b.wrapErrorWithOutput(errors.New("exit status 1"), "", huge, []string{"list"})
+	if err == nil {
+		t.Fatal("wrapErrorWithOutput returned nil")
+	}
+	if len(err.Error()) > maxBDOutputInError+100 {
+		t.Fatalf("error length = %d, want bounded near %d", len(err.Error()), maxBDOutputInError)
+	}
+	if !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("error should mark truncation: %v", err)
+	}
+}
+
+// TestWrapErrorWithOutputEmptyOutputsWrapExitError verifies the original
+// behavior survives when bd says nothing at all on either stream.
+func TestWrapErrorWithOutputEmptyOutputsWrapExitError(t *testing.T) {
+	b := New("/test")
+	exitErr := errors.New("exit status 1")
+
+	err := b.wrapErrorWithOutput(exitErr, "", "", []string{"create"})
+	if !errors.Is(err, exitErr) {
+		t.Fatalf("wrapErrorWithOutput = %v, want wrapped %v", err, exitErr)
 	}
 }
 
