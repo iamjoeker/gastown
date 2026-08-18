@@ -288,12 +288,18 @@ var beadsFixtureDDL = []string{
 		depends_on_wisp_id varchar(255),
 		depends_on_external varchar(255)
 	)`,
+	// pinned is nullable with default 0, matching production
+	// (`describe wisps` on the live server: pinned tinyint(1) YES '' 0).
+	// Nullable is load-bearing for the purge guard, which must COALESCE it —
+	// a NOT NULL column here would let a guard that reads `pinned = 0`
+	// directly pass this fixture and skip NULL-pinned rows in production.
 	`CREATE TABLE wisps (
 		id varchar(255) NOT NULL PRIMARY KEY,
 		title varchar(500) NOT NULL DEFAULT '',
 		status varchar(32) NOT NULL DEFAULT 'open',
 		issue_type varchar(32) NOT NULL DEFAULT 'task',
 		wisp_type varchar(32),
+		pinned tinyint(1) DEFAULT 0,
 		created_at datetime NOT NULL,
 		closed_at datetime
 	)`,
@@ -382,6 +388,13 @@ type wispRow struct {
 	wispType  string
 	createdAt time.Time
 	closedAt  *time.Time
+	// pinned mirrors the wisps.pinned column an incident responder sets by hand
+	// to protect one record. nil leaves it SQL NULL, which is a state real rows
+	// reach and which a guard must treat as "not pinned" rather than as unknown.
+	pinned *bool
+	// labels populates wisp_labels, the table the purge type-guard reads.
+	// Note the column is issue_id, not wisp_id.
+	labels []string
 }
 
 func (f *fixture) insertWisps(t *testing.T, rows ...wispRow) {
@@ -393,13 +406,25 @@ func (f *fixture) insertWisps(t *testing.T, rows ...wispRow) {
 		if r.issueType == "" {
 			r.issueType = "task"
 		}
+		var pinned interface{}
+		if r.pinned != nil {
+			pinned = *r.pinned
+		}
 		if _, err := f.db.Exec(
-			"INSERT INTO wisps (id, title, status, issue_type, wisp_type, created_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-			r.id, r.id, r.status, r.issueType, nullString(r.wispType), r.createdAt, r.closedAt); err != nil {
+			"INSERT INTO wisps (id, title, status, issue_type, wisp_type, pinned, created_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			r.id, r.id, r.status, r.issueType, nullString(r.wispType), pinned, r.createdAt, r.closedAt); err != nil {
 			t.Fatalf("insert wisp %s: %v", r.id, err)
+		}
+		for _, label := range r.labels {
+			if _, err := f.db.Exec(
+				"INSERT INTO wisp_labels (issue_id, label) VALUES (?, ?)", r.id, label); err != nil {
+				t.Fatalf("label wisp %s with %s: %v", r.id, label, err)
+			}
 		}
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 // insertWispAux gives a wisp one row in each auxiliary table, so purge's
 // auxiliary cleanup has something to remove (or wrongly remove).

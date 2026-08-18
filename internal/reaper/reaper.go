@@ -99,14 +99,18 @@ func DiscoverDatabases(host string, port int) []string {
 
 // ScanResult holds the results of scanning a database for reaper candidates.
 type ScanResult struct {
-	Database               string    `json:"database"`
-	ReapCandidates         int       `json:"reap_candidates"`
-	MoleculeStepCandidates int       `json:"molecule_step_candidates,omitempty"`
-	PurgeCandidates        int       `json:"purge_candidates"`
-	MailCandidates         int       `json:"mail_candidates"`
-	StaleCandidates        int       `json:"stale_candidates"`
-	OpenWisps              int       `json:"open_wisps"`
-	Anomalies              []Anomaly `json:"anomalies,omitempty"`
+	Database               string `json:"database"`
+	ReapCandidates         int    `json:"reap_candidates"`
+	MoleculeStepCandidates int    `json:"molecule_step_candidates,omitempty"`
+	PurgeCandidates        int    `json:"purge_candidates"`
+	MailCandidates         int    `json:"mail_candidates"`
+	StaleCandidates        int    `json:"stale_candidates"`
+	OpenWisps              int    `json:"open_wisps"`
+	// ProtectedFromPurge counts closed wisps past purge_age that purge will
+	// NOT delete because they are pinned or carry a protected label. They are
+	// excluded from PurgeCandidates, so the two never double-count.
+	ProtectedFromPurge int       `json:"protected_from_purge,omitempty"`
+	Anomalies          []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ReapResult holds the results of a reap operation.
@@ -121,11 +125,15 @@ type ReapResult struct {
 
 // PurgeResult holds the results of a purge operation.
 type PurgeResult struct {
-	Database    string    `json:"database"`
-	WispsPurged int       `json:"wisps_purged"`
-	MailPurged  int       `json:"mail_purged"`
-	DryRun      bool      `json:"dry_run,omitempty"`
-	Anomalies   []Anomaly `json:"anomalies,omitempty"`
+	Database    string `json:"database"`
+	WispsPurged int    `json:"wisps_purged"`
+	MailPurged  int    `json:"mail_purged"`
+	// WispsProtected counts closed wisps past purge_age that were skipped
+	// because they are pinned or carry a protected label. Reported so a purge
+	// that declines to delete says so, rather than looking like a smaller purge.
+	WispsProtected int       `json:"wisps_protected,omitempty"`
+	DryRun         bool      `json:"dry_run,omitempty"`
+	Anomalies      []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -220,6 +228,65 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 }
 
 const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
+
+// protectedWispLabels lists labels whose wisps purge must never delete,
+// whatever their age, status, or caller.
+//
+// gt:merge-request is here because "closed" is not a proxy for "worthless" for
+// this one type, and that is a property of the type rather than of the caller
+// (gt-nmg). A merge-request wisp closed WITHOUT merging is the only record that
+// the work did not land, and it carries the rejection rationale. On 2026-08-17
+// seven closed MR beads on the beads rig were deleted eleven minutes after
+// closure, including one such rejection; the reasoning is unrecoverable
+// (gt-6dp). Wisps are unversioned and unbacked — there is no dolt history to
+// restore from, so an age bound alone only delays that outcome: a merge queue
+// that stalls for a week produces exactly the record this protects.
+//
+// THE COST IS REAL AND DELIBERATE: these rows now accumulate without bound.
+// Measured on the gastown database 2026-08-18, MR wisps close at roughly 25/day
+// on one busy rig, so this trades unbounded growth for recoverability. That is
+// the trade gt-nmg argues for explicitly, on the grounds that the growth is
+// merely expensive while the deletion is final. It is not free, and it wants a
+// retention policy that archives before deleting rather than a bigger age bound
+// — filed separately. The "Protected (skipped): N" line the purge now prints is
+// what keeps the accumulation visible instead of silent.
+//
+// Anything added here must be a type whose closed rows are evidence, not
+// residue. It is not a place to park beads that are merely inconvenient to lose.
+var protectedWispLabels = []string{"gt:merge-request"}
+
+// purgeProtectWhere returns a WHERE fragment, for queries that alias wisps as
+// "w", selecting only rows purge is permitted to delete.
+//
+// Two independent guards:
+//
+//   - pinned — the column an incident responder can set by hand
+//     (`bd sql "update wisps set pinned=1 where id=..."`) to protect a specific
+//     record right now. bd purge already honours it; this path did not, so a
+//     responder who pinned a record was protected from one deleter and not the
+//     other (gt-nmg). COALESCE because the column is nullable.
+//   - protectedWispLabels — protection by type, which needs nobody to have
+//     anticipated the specific record.
+//
+// Deliberately an uncorrelated NOT IN over wisp_labels, mirroring the stale-issue
+// query, rather than a correlated EXISTS: the correlated form on this table is
+// what cost O(n*m) and produced the CPU spikes in gt-wvd2.
+//
+// Callers must apply this to the counting query AND the deleting query, or scan
+// reports candidates purge will never take. It is also what keeps
+// batchDeleteRows terminating: it re-runs its id query until it returns nothing,
+// so a row that is selected but not deletable would spin forever. Excluding
+// protected rows from selection — rather than declining them at DELETE time —
+// is what makes that impossible.
+func purgeProtectWhere() string {
+	quoted := make([]string, len(protectedWispLabels))
+	for i, label := range protectedWispLabels {
+		quoted[i] = "'" + label + "'"
+	}
+	return fmt.Sprintf(
+		"COALESCE(w.pinned, 0) = 0 AND w.id NOT IN (SELECT DISTINCT pl.issue_id FROM wisp_labels pl WHERE pl.label IN (%s))",
+		strings.Join(quoted, ", "))
+}
 
 // closedMoleculeStepSubquery selects step-wisps whose parent molecule has already closed.
 // wisp_dependencies.issue_id is the child; depends_on_wisp_id is the parent molecule.
@@ -391,13 +458,22 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
 
-	// Count purge candidates: closed wisps past purge_age.
-	// No parent check needed — closed wisps past the delete age are unconditionally purgeable.
+	// Count purge candidates: closed wisps past purge_age that are not protected.
+	// No parent check needed — closed wisps past the delete age are purgeable.
 	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m) query
 	// cost with 1800+ closed wisps, leading to CPU spikes and connection timeouts (gt-wvd2).
-	purgeQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ?"
+	// purgeProtectWhere must match purgeClosedWisps exactly, or this reports rows
+	// purge will never delete — the same scan/act divergence the reap count guards against.
+	purgeQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + purgeProtectWhere()
 	if err := db.QueryRowContext(ctx, purgeQuery, now.Add(-purgeAge)).Scan(&result.PurgeCandidates); err != nil {
 		return nil, fmt.Errorf("count purge candidates: %w", err)
+	}
+
+	// Count what the protection held back. Reported separately so a shrinking
+	// purge count reads as "protected N", not as "there was less to do".
+	protectedQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND NOT (" + purgeProtectWhere() + ")"
+	if err := db.QueryRowContext(ctx, protectedQuery, now.Add(-purgeAge)).Scan(&result.ProtectedFromPurge); err != nil {
+		return nil, fmt.Errorf("count purge-protected wisps: %w", err)
 	}
 
 	// Count mail candidates.
@@ -661,11 +737,12 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	purged, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
+	purged, protected, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
 	result.WispsPurged = purged
+	result.WispsProtected = protected
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
 	// Purge old mail.
@@ -678,21 +755,32 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	return result, nil
 }
 
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (int, []Anomaly, error) {
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (int, int, []Anomaly, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	deleteCutoff := time.Now().UTC().Add(-purgeAge)
 	var anomalies []Anomaly
+	protectWhere := purgeProtectWhere()
+
+	// Count what protection holds back, before anything is deleted. Taken from
+	// the same status+age window as the digest, so the pair partitions the
+	// window: every closed wisp past the cutoff is either purged or reported
+	// protected, and neither number can quietly absorb the other.
+	var protectedTotal int
+	protectedQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND NOT (" + protectWhere + ")"
+	if err := db.QueryRowContext(ctx, protectedQuery, deleteCutoff).Scan(&protectedTotal); err != nil {
+		return 0, 0, nil, fmt.Errorf("count protected wisps: %w", err)
+	}
 
 	// Digest: count by wisp_type.
-	// No parent check — closed wisps past the delete age are unconditionally purgeable.
+	// No parent check — closed unprotected wisps past the delete age are purgeable.
 	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
 	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
-	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype"
+	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + protectWhere + " GROUP BY wtype"
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
-		return 0, nil, fmt.Errorf("digest query: %w", err)
+		return 0, protectedTotal, nil, fmt.Errorf("digest query: %w", err)
 	}
 	digestTotal := 0
 	for rows.Next() {
@@ -700,36 +788,38 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		var cnt int
 		if err := rows.Scan(&wtype, &cnt); err != nil {
 			rows.Close()
-			return 0, nil, fmt.Errorf("digest scan: %w", err)
+			return 0, protectedTotal, nil, fmt.Errorf("digest scan: %w", err)
 		}
 		digestTotal += cnt
 	}
 	rows.Close()
 
 	if digestTotal == 0 {
-		return 0, anomalies, nil
+		return 0, protectedTotal, anomalies, nil
 	}
 
 	if dryRun {
-		return digestTotal, anomalies, nil
+		return digestTotal, protectedTotal, anomalies, nil
 	}
 
 	session, err := beginWriteSession(ctx, db)
 	if err != nil {
-		return 0, nil, err
+		return 0, protectedTotal, nil, err
 	}
 	defer session.release()
 
-	// Batch delete — simple status+age filter, no parent check needed for purge.
+	// Batch delete — status+age filter plus the protection, no parent check needed.
+	// The protection MUST be in this query and not applied after selection: see
+	// purgeProtectWhere on why filtering at DELETE time would not terminate.
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
-		DefaultBatchSize)
+		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
+		protectWhere, DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
 	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
-		return 0, anomalies, err
+		return 0, protectedTotal, anomalies, err
 	}
 
 	if totalDeleted > 0 {
@@ -738,7 +828,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 				Type:    "sql_commit_failed",
 				Message: fmt.Sprintf("sql commit after purge failed, deletes rolled back: %v", err),
 			})
-			return 0, anomalies, nil
+			return 0, protectedTotal, anomalies, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
 		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
@@ -750,7 +840,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		}
 	}
 
-	return totalDeleted, anomalies, nil
+	return totalDeleted, protectedTotal, anomalies, nil
 }
 
 func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {
