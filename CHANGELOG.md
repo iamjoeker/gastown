@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`gt town root`** prints the workspace root on stdout and exits non-zero when
+  there is no workspace (gt-cr2), so shell scripts can rely on
+  `TOWN_ROOT=$(gt town root) || exit 1`. Resolution is the same as everywhere
+  else in gt: walk up from the current directory for `mayor/town.json`, then
+  fall back to `$GT_TOWN_ROOT` / `$GT_ROOT`.
+
 ### Fixed
+
+- **Plugins no longer build paths out of `gt town`'s help text** (gt-cr2).
+  `gt town root` was not a subcommand — Cobra answered it by printing `gt town`'s
+  help to *stdout* and exiting 0, so the `2>/dev/null` in
+  `TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"` did nothing: the
+  command substitution succeeded and assigned several lines of help text to a
+  path variable. `rebuild-gt`, `dolt-log-rotate` and `stuck-agent-dog` then
+  derived nonsense paths from it and silently did nothing — masked wherever
+  `GT_TOWN_ROOT` happened to be set in the plugin environment, a live bug
+  wherever it was not. The subcommand now exists, the three plugins abort with a
+  `FATAL` message when the resolved root is not a directory (so an older `gt`
+  binary fails loudly rather than silently), and `gt town` rejects unknown
+  subcommands instead of printing help and exiting 0.
 
 - **Patrol agents no longer stop silently between cycles** (gt-blj). A Witness,
   Refinery, or Deacon executes only inside a turn, and its `await-signal` /
