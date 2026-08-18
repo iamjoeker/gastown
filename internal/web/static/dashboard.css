@@ -81,6 +81,53 @@
             content: "○ ";
         }
 
+        /* Staleness badge: shown only while live updates are held, so a paused
+           panel can never look like a live one. */
+        .staleness-badge {
+            font-family: inherit;
+            font-size: 0.75rem;
+            margin-left: 10px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            border: 1px solid var(--yellow);
+            background: transparent;
+            color: var(--yellow);
+            cursor: pointer;
+        }
+
+        .staleness-badge:hover {
+            background: var(--yellow);
+            color: var(--bg-dark);
+        }
+
+        /* Updates are actually waiting — escalate from "held" to "behind". */
+        .staleness-badge-stale {
+            border-color: var(--orange);
+            color: var(--orange);
+        }
+
+        .staleness-badge-stale:hover {
+            background: var(--orange);
+            color: var(--bg-dark);
+        }
+
+        .staleness-badge[hidden] {
+            display: none;
+        }
+
+        /* Mark the panel that is actually frozen, not just the page header. */
+        body.refresh-paused .panel.expanded .panel-header h2::after {
+            content: " ⏸ paused";
+            font-size: 0.75rem;
+            font-weight: 400;
+            color: var(--yellow);
+        }
+
+        body.updates-pending .panel.expanded .panel-header h2::after {
+            content: " ⏸ paused — new data waiting";
+            color: var(--orange);
+        }
+
         /* Grid layout for panels - auto-fit responsive */
         .panels {
             display: grid;
