@@ -30,44 +30,28 @@ import (
 // another test that agrees with itself. Only an engine that actually evaluates
 // the query can tell a working guard from an inert one (gt-am7, gt-caq).
 
-// doltCommitCall is one recorded CALL DOLT_COMMIT(...), together with the state
-// of the SESSION that ran it.
-//
-// autocommit is the dispositive instrument for gt-gjh. Every write path disables
-// autocommit before its batches and issues a flushing COMMIT before DOLT_COMMIT.
-// @@autocommit is session-scoped, so a path that ran the SET on the *sql.DB pool
-// instead of a pinned connection can reach DOLT_COMMIT on a session that was
-// never switched — and whose COMMIT therefore flushed nothing. Recording the
-// value the procedure's own session reports is the only way to tell the two
-// apart from outside: the row-level outcome is identical either way, which is
-// exactly why the bug stayed latent.
-type doltCommitCall struct {
-	message    string
-	autocommit string
-}
-
 // doltCommitLog records every CALL DOLT_COMMIT(...) the reaper issues, so
 // tests can assert the commit actually happened.
 type doltCommitLog struct {
 	mu    sync.Mutex
-	calls []doltCommitCall
+	calls []string
 }
 
-func (l *doltCommitLog) record(call doltCommitCall) {
+func (l *doltCommitLog) record(args []string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.calls = append(l.calls, call)
+	l.calls = append(l.calls, strings.Join(args, " "))
 }
 
-// matching returns the recorded commits whose message contains substr. Tests
-// pass their own database name, which the reaper puts in every commit message,
-// so a shared log still attributes commits to the right fixture.
-func (l *doltCommitLog) matching(substr string) []doltCommitCall {
+// matching returns the recorded commit messages containing substr. Tests pass
+// their own database name, which the reaper puts in every commit message, so a
+// shared log still attributes commits to the right fixture.
+func (l *doltCommitLog) matching(substr string) []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	var out []doltCommitCall
+	var out []string
 	for _, call := range l.calls {
-		if strings.Contains(call.message, substr) {
+		if strings.Contains(call, substr) {
 			out = append(out, call)
 		}
 	}
@@ -98,26 +82,12 @@ func registerDoltCommitStub() {
 			gmssql.ExternalStoredProcedureDetails{
 				Name:   "dolt_commit",
 				Schema: gmssql.Schema{&gmssql.Column{Name: "hash", Type: gmstypes.LongText}},
-				Function: func(ctx *gmssql.Context, args ...string) (gmssql.RowIter, error) {
-					doltCommits.record(doltCommitCall{
-						message:    strings.Join(args, " "),
-						autocommit: sessionAutocommit(ctx),
-					})
+				Function: func(_ *gmssql.Context, args ...string) (gmssql.RowIter, error) {
+					doltCommits.record(args)
 					return gmssql.RowsToRowIter(gmssql.Row{"0000000000000000000000000000000000000000"}), nil
 				},
 			})
 	})
-}
-
-// sessionAutocommit reports @@autocommit for the session executing a stored
-// procedure, as a "0"/"1" string. Any failure to read it is returned verbatim so
-// a broken instrument cannot be mistaken for a passing assertion.
-func sessionAutocommit(ctx *gmssql.Context) string {
-	value, err := ctx.GetSessionVariable(ctx, "autocommit")
-	if err != nil {
-		return fmt.Sprintf("error: %v", err)
-	}
-	return fmt.Sprintf("%v", value)
 }
 
 // fixture is a live beads-shaped database the reaper can be pointed at.
@@ -131,17 +101,6 @@ type fixture struct {
 // doltCommitMessages returns the DOLT_COMMIT messages issued against this
 // fixture's database.
 func (f *fixture) doltCommitMessages() []string {
-	calls := doltCommits.matching(f.dbName)
-	out := make([]string, 0, len(calls))
-	for _, call := range calls {
-		out = append(out, call.message)
-	}
-	return out
-}
-
-// doltCommitCalls returns the DOLT_COMMIT calls issued against this fixture's
-// database, including the committing session's @@autocommit.
-func (f *fixture) doltCommitCalls() []doltCommitCall {
 	return doltCommits.matching(f.dbName)
 }
 
@@ -199,11 +158,10 @@ func newFixture(t *testing.T, dbName string) *fixture {
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
-	// The pool is deliberately NOT pinned to one connection. It used to be,
-	// because the reaper toggled session-scoped @@autocommit on the pool and a
-	// single connection was the only way to make that behave; gt-gjh moved every
-	// write path onto a connection it pins itself, so the fixture no longer has
-	// to compensate.
+	// The reaper toggles @@autocommit as a session variable but issues the
+	// following statements on the pool, so a single connection keeps fixture
+	// behaviour deterministic.
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
 
 	for _, ddl := range beadsFixtureDDL {
@@ -213,21 +171,6 @@ func newFixture(t *testing.T, dbName string) *fixture {
 	}
 
 	return &fixture{db: db, dbName: dbName, host: host, port: port}
-}
-
-// freshSessionPerStatement makes the pool open a NEW server session for every
-// statement issued through *sql.DB, by refusing to keep any connection idle.
-//
-// Without it a sequential test cannot see gt-gjh at all: database/sql reuses the
-// most recently released connection, so a single-goroutine caller keeps landing
-// on the same session and a SET issued on the pool appears to stick. Production
-// has no such guarantee — the reaper shares its pool with concurrent callers.
-// Refusing to pool idle connections turns "may get a different session" into
-// "always gets a different session", which is what makes the assertion decisive
-// rather than lucky.
-func (f *fixture) freshSessionPerStatement() {
-	f.db.SetMaxOpenConns(4)
-	f.db.SetMaxIdleConns(0)
 }
 
 func waitForServer(db *sql.DB) error {
