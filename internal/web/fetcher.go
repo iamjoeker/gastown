@@ -738,7 +738,7 @@ func (f *LiveConvoyFetcher) fetchMergeRequestsForRig(rigName string) ([]MergeQue
 		if issue == nil {
 			continue
 		}
-		// bd list does not reliably honour the status filter; re-check here the
+		// bd list does not reliably honor the status filter; re-check here the
 		// way gt mq list does.
 		if !strings.EqualFold(issue.Status, "open") {
 			continue
@@ -788,7 +788,7 @@ func mergeQueueRowFromMR(issue *beads.Issue, fields *beads.MRFields, rigName str
 	row.URL = fields.PRURL
 	row.Number = fields.PRNumber
 
-	// A conflict retry is the one queue-level signal we can colour without
+	// A conflict retry is the one queue-level signal we can color without
 	// asking GitHub anything.
 	if fields.RetryCount > 0 {
 		row.ColorClass = "mq-red"
