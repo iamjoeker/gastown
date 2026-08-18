@@ -782,8 +782,14 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		Repos        []string `json:"repos"`
 		Witness      string   `json:"witness"`
 		Refinery     string   `json:"refinery"`
-		Polecats     int      `json:"polecats"`
-		Crew         int      `json:"crew"`
+		// WitnessTurn/RefineryTurn are the agents' turn states when running:
+		// "active", "ended", "stranded", or "unknown". Witness/Refinery report
+		// only that the tmux session is alive; an agent whose turn has ended is
+		// running and not patrolling.
+		WitnessTurn  string `json:"witness_turn,omitempty"`
+		RefineryTurn string `json:"refinery_turn,omitempty"`
+		Polecats     int    `json:"polecats"`
+		Crew         int    `json:"crew"`
 		// sorting fields (not exported to JSON)
 		sortPrio int
 	}
@@ -807,12 +813,16 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		refineryRunning, _ := t.HasSession(refinerySession)
 
 		witnessStatus := "stopped"
+		witnessTurn := ""
 		if witnessRunning {
 			witnessStatus = "running"
+			witnessTurn = agentTurn(t, witnessSession)
 		}
 		refineryStatus := "stopped"
+		refineryTurn := ""
 		if refineryRunning {
 			refineryStatus = "running"
+			refineryTurn = agentTurn(t, refinerySession)
 		}
 
 		summary := r.Summary()
@@ -827,6 +837,8 @@ func runRigList(cmd *cobra.Command, args []string) error {
 			Repos:        repos,
 			Witness:      witnessStatus,
 			Refinery:     refineryStatus,
+			WitnessTurn:  witnessTurn,
+			RefineryTurn: refineryTurn,
 			Polecats:     summary.PolecatCount,
 			Crew:         summary.CrewCount,
 			sortPrio:     rigStatePriority(witnessRunning, refineryRunning, opState),
@@ -873,7 +885,8 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Printf("   Witness: %s %s  Refinery: %s %s\n",
-			witnessIcon, ri.Witness, refineryIcon, ri.Refinery)
+			witnessIcon, annotateRunning(ri.Witness, ri.WitnessTurn),
+			refineryIcon, annotateRunning(ri.Refinery, ri.RefineryTurn))
 		fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
 		fmt.Println()
 	}
