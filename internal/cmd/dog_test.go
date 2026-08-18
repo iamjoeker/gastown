@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -461,5 +463,80 @@ func TestDogFormatTimeAgo_ZeroTime(t *testing.T) {
 	got := dogFormatTimeAgo(time.Time{})
 	if got != "(unknown)" {
 		t.Errorf("dogFormatTimeAgo(zero) = %q, want '(unknown)'", got)
+	}
+}
+
+// =============================================================================
+// Dispatch delivery path (gt-rt8: double-delivery race)
+// =============================================================================
+
+// Exactly one path may deliver a dispatch into a dog's pane. Two deliveries
+// interrupt each other and destroy the instruction.
+func TestPlanDispatchDelivery(t *testing.T) {
+	tests := []struct {
+		name            string
+		sessionRunning  bool
+		probeErr        error
+		wantSuppress    bool
+		wantReasonMatch string
+	}{
+		{
+			name:            "session down: startup prompt delivers, mail stays silent",
+			sessionRunning:  false,
+			wantSuppress:    true,
+			wantReasonMatch: "startup prompt",
+		},
+		{
+			name:            "session up: mail notification delivers",
+			sessionRunning:  true,
+			wantSuppress:    false,
+			wantReasonMatch: "already running",
+		},
+		{
+			name:            "probe failed: fail toward notifying, never toward silence",
+			sessionRunning:  false,
+			probeErr:        errors.New("tmux server unreachable"),
+			wantSuppress:    false,
+			wantReasonMatch: "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := planDispatchDelivery(tt.sessionRunning, tt.probeErr)
+			if got.suppressMailNotify != tt.wantSuppress {
+				t.Errorf("suppressMailNotify = %v, want %v", got.suppressMailNotify, tt.wantSuppress)
+			}
+			if !strings.Contains(got.reason, tt.wantReasonMatch) {
+				t.Errorf("reason = %q, want it to mention %q", got.reason, tt.wantReasonMatch)
+			}
+		})
+	}
+}
+
+// The specific regression: dispatching to a dog with no session must not also
+// queue a mail nudge, because the nudge lands mid-startup-turn and interrupts
+// the instruction the startup prompt just delivered.
+func TestPlanDispatchDelivery_NoDoubleDeliveryOnColdStart(t *testing.T) {
+	plan := planDispatchDelivery(false, nil)
+	if !plan.suppressMailNotify {
+		t.Fatal("cold start must suppress the mail notification: the startup prompt is the delivery")
+	}
+}
+
+// =============================================================================
+// Dispatch alarm escalation
+// =============================================================================
+
+func TestDogRaiseDispatchAlarms_SkipsResultsWithoutAlarms(t *testing.T) {
+	results := []dog.DogHealthResult{
+		{Name: "alpha", NeedsAttention: false},
+		{Name: "bravo", NeedsAttention: true, OpenDispatches: 3}, // needs attention, but cooldown suppressed the alarm
+	}
+
+	// No result carries a DispatchAlarm, so nothing should be escalated and
+	// no external command should be run.
+	if raised := dogRaiseDispatchAlarms(results); len(raised) != 0 {
+		t.Errorf("raised %v, want none", raised)
 	}
 }

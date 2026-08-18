@@ -1322,37 +1322,9 @@ func (g *Git) skipWorktreeFiles() map[string]bool {
 	return result
 }
 
-// DetachedHeadName is what `git rev-parse --abbrev-ref HEAD` prints when HEAD is
-// detached. Git refuses to create refs/heads/HEAD, so this name can never be a
-// real branch: seeing it always means "HEAD is detached", never "the branch is
-// called HEAD" (gt-e45).
-const DetachedHeadName = "HEAD"
-
 // CurrentBranch returns the current branch name.
-//
-// On a detached HEAD this returns the literal string "HEAD", which is not a
-// pushable branch name. Callers that go on to push, build a refspec, or verify
-// a branch on a remote must not use this value directly — see
-// polecat.ResolveWorkingBranch, which never yields "HEAD" (gt-e45).
 func (g *Git) CurrentBranch() (string, error) {
 	return g.run("rev-parse", "--abbrev-ref", "HEAD")
-}
-
-// BranchesPointingAt returns the local branches whose tip is exactly rev.
-// Used to recover the working branch name of a detached worktree: when HEAD is
-// detached at a commit that a branch still points at, that branch is the work.
-func (g *Git) BranchesPointingAt(rev string) ([]string, error) {
-	out, err := g.run("for-each-ref", "--format=%(refname:short)", "--points-at", rev, "refs/heads/")
-	if err != nil {
-		return nil, err
-	}
-	var branches []string
-	for _, line := range strings.Split(out, "\n") {
-		if name := strings.TrimSpace(line); name != "" {
-			branches = append(branches, name)
-		}
-	}
-	return branches, nil
 }
 
 // DefaultBranch returns the default branch name (what HEAD points to).
