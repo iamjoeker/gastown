@@ -513,7 +513,6 @@ exit /b 0
 	gotHook := false
 	gotMetadata := false
 	gotReviewOnlyMetadata := false
-	gotPriorWorkLookup := false
 	assertTargetRig := func(kind, dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args string) {
 		t.Helper()
 		if dir != wantDir {
@@ -564,15 +563,6 @@ exit /b 0
 			assertTargetRig("target DB check", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
 		case strings.Contains(args, "sql SELECT DISTINCT wisp_dependencies.issue_id"):
 			assertTargetRig("molecule dep check", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
-		case strings.Contains(args, "gt:merge-request"):
-			// Prior-work lookup (gt-79li) — both halves of it: the issues-table
-			// `bd list` and the wisps-table `bd sql`, since MR beads are wisps.
-			// The point of the lookup is that MR beads live
-			// in the TARGET RIG database, not the town's — a town-rooted lookup
-			// returns zero MRs forever and lets a second polecat redo committed
-			// work. Assert the routing, don't just tolerate the command.
-			gotPriorWorkLookup = true
-			assertTargetRig("prior-work MR lookup", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
 		case strings.Contains(args, "formula show "):
 			gotFormulaShow = true
 			assertTargetRig("formula show", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
@@ -615,9 +605,9 @@ exit /b 0
 		}
 	}
 
-	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotReviewCook || gotBondCount < 2 || !gotHook || !gotMetadata || !gotReviewOnlyMetadata || !gotPriorWorkLookup {
-		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v formulaShow=%v polecatCook=%v reviewCook=%v bondCount=%d hook=%v metadata=%v reviewOnlyMetadata=%v priorWorkLookup=%v (log: %q)",
-			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotReviewCook, gotBondCount, gotHook, gotMetadata, gotReviewOnlyMetadata, gotPriorWorkLookup, string(logBytes))
+	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotReviewCook || gotBondCount < 2 || !gotHook || !gotMetadata || !gotReviewOnlyMetadata {
+		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v formulaShow=%v polecatCook=%v reviewCook=%v bondCount=%d hook=%v metadata=%v reviewOnlyMetadata=%v (log: %q)",
+			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotReviewCook, gotBondCount, gotHook, gotMetadata, gotReviewOnlyMetadata, string(logBytes))
 	}
 	if firstReviewOnlyMetadataIndex == -1 || lastHookIndex == -1 || firstReviewOnlyMetadataIndex > lastHookIndex {
 		t.Fatalf("review-only metadata must be stored before raw hook assignment: metadataIndex=%d hookIndex=%d log: %q", firstReviewOnlyMetadataIndex, lastHookIndex, string(logBytes))

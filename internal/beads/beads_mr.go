@@ -91,24 +91,8 @@ func (b *Beads) findMRForBranch(branch string, skipClosed bool) (*Issue, error) 
 // matches the given issue ID. Used to find prior attempts when re-dispatching
 // an issue and to supersede old MRs when a new one is created.
 func (b *Beads) FindOpenMRsForIssue(issueID string) ([]*Issue, error) {
-	return b.FindMRsForIssue(issueID, false)
-}
-
-// FindMRsForIssue returns merge-request beads whose source_issue matches the
-// given issue ID. When includeClosed is false only open MRs are returned.
-//
-// Closed MRs matter for re-dispatch (gt-79li). An MR that was rejected,
-// superseded, or conflicted is closed, but its branch and commit_sha are still
-// the record of work that was actually done and pushed. Looking at open MRs
-// alone reports "no prior attempt" for exactly the case where a bead gets
-// re-dispatched, so the next polecat redoes committed work from scratch.
-func (b *Beads) FindMRsForIssue(issueID string, includeClosed bool) ([]*Issue, error) {
-	status := "open"
-	if includeClosed {
-		status = "all"
-	}
 	issues, err := b.ListMergeRequests(ListOptions{
-		Status: status,
+		Status: "open",
 		Label:  "gt:merge-request",
 	})
 	if err != nil {
