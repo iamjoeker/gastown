@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/formula"
@@ -83,66 +82,52 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unsupported role for patrol report: %q", roleName)
 	}
 
-	return reportPatrolCycle(cfg, patrolReportSummary, patrolReportSteps, autoSpawnPatrol)
-}
-
-// reportPatrolCycle closes the role's current patrol cycle (if one is still
-// open) and starts the next one via spawn. Split out from runPatrolReport so
-// the close/spawn sequencing is testable without role detection.
-func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(PatrolConfig) (string, error)) error {
 	// Find the active patrol
 	patrolID, _, hasPatrol, findErr := findActivePatrol(cfg)
 	if findErr != nil {
-		// Discovery itself failed (transient bd trouble). Do NOT spawn — a
-		// duplicate root is worse than a skipped cycle.
 		return fmt.Errorf("finding active patrol: %w", findErr)
 	}
+	if !hasPatrol {
+		return fmt.Errorf("no active patrol found for %s", cfg.RoleName)
+	}
 
+	// Close the current patrol root with the summary
 	b := cfg.Beads
 	if b == nil {
 		b = beads.New(cfg.BeadsDir)
 	}
 
 	// Build step audit checklist
-	stepAudit := buildStepAudit(cfg.PatrolMolName, stepsFlag)
+	stepAudit := buildStepAudit(cfg.PatrolMolName, patrolReportSteps)
 
-	// Print the step audit for visibility, whether or not there is a root to
-	// record it on.
-	fmt.Println(stepAudit)
-
-	if hasPatrol {
-		// Update the description with the patrol summary and step audit
-		desc := fmt.Sprintf("Patrol report: %s\n\n%s", summary, stepAudit)
-		if err := b.Update(patrolID, beads.UpdateOptions{
-			Description: &desc,
-		}); err != nil {
-			style.PrintWarning("could not update patrol summary: %v", err)
-		}
-
-		// Close all descendant wisps first (recursive), then the patrol root.
-		// Without this, every patrol cycle leaks ~10 orphan wisps into the DB.
-		// If descendants can't be closed, abort so patrol retries next cycle (gt-7lx3).
-		closed, closeDescErr := forceCloseDescendants(b, patrolID)
-		if closeDescErr != nil {
-			return fmt.Errorf("closing descendants of patrol %s (closed %d): %w", patrolID, closed, closeDescErr)
-		}
-
-		// Close the patrol root
-		if err := b.ForceCloseWithReason("patrol cycle complete: "+summary, patrolID); err != nil {
-			return fmt.Errorf("closing patrol %s: %w", patrolID, err)
-		}
-
-		fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
-	} else {
-		// No open root to close — usually because closing the final step
-		// auto-closed the root out from under us. That is not a reason to
-		// stall the chain: the whole job of `patrol report` is to start the
-		// next cycle, so carry on and start it (gt-u2u).
-		style.PrintWarning("no active patrol found for %s — recording summary only, starting next cycle anyway", cfg.RoleName)
+	// Update the description with the patrol summary and step audit
+	desc := fmt.Sprintf("Patrol report: %s\n\n%s", patrolReportSummary, stepAudit)
+	if err := b.Update(patrolID, beads.UpdateOptions{
+		Description: &desc,
+	}); err != nil {
+		style.PrintWarning("could not update patrol summary: %v", err)
 	}
 
+	// Print the step audit for visibility
+	fmt.Println(stepAudit)
+
+	// Close all descendant wisps first (recursive), then the patrol root.
+	// Without this, every patrol cycle leaks ~10 orphan wisps into the DB.
+	// If descendants can't be closed, abort so patrol retries next cycle (gt-7lx3).
+	closed, closeDescErr := forceCloseDescendants(b, patrolID)
+	if closeDescErr != nil {
+		return fmt.Errorf("closing descendants of patrol %s (closed %d): %w", patrolID, closed, closeDescErr)
+	}
+
+	// Close the patrol root
+	if err := b.ForceCloseWithReason("patrol cycle complete: "+patrolReportSummary, patrolID); err != nil {
+		return fmt.Errorf("closing patrol %s: %w", patrolID, err)
+	}
+
+	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
+
 	// Start next cycle
-	newPatrolID, err := spawn(cfg)
+	newPatrolID, err := autoSpawnPatrol(cfg)
 	if err != nil {
 		if newPatrolID != "" {
 			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
@@ -153,10 +138,8 @@ func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(P
 	}
 
 	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
-	fmt.Println(style.Dim.Render("  Root-only wisp: steps are read inline from " + cfg.PatrolMolName +
-		" at prime time, so `bd mol current` reports 0/0. Run `" + cli.Name() + " prime` for the checklist."))
 	if cfg.RoleName == "deacon" {
-		stampDeaconHeartbeatOnReport(cfg.BeadsDir, summary)
+		stampDeaconHeartbeatOnReport(cfg.BeadsDir, patrolReportSummary)
 	}
 	return nil
 }
