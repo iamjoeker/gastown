@@ -223,8 +223,12 @@ func TestWitnessActionFor(t *testing.T) {
 		"NEEDS_RECOVERY":  "escalate",
 		"NEEDS_MQ_SUBMIT": "escalate",
 		"PENDING_MR":      "leave-alone",
-		"":                "restart",
-		"SOME_NEW_STATE":  "restart",
+		// A mid-turn agent is not a slot to reclaim: restart preserves the
+		// worktree but throws away the context of a polecat that is very likely
+		// running `gt done` right now (gt-5tg).
+		"WORKING":        "leave-alone",
+		"":               "restart",
+		"SOME_NEW_STATE": "restart",
 	}
 
 	for verdict, want := range tests {
