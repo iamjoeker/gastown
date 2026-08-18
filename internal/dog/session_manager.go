@@ -183,9 +183,48 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 }
 
 // IsRunning checks if a dog session is active.
+//
+// This answers "does the tmux session exist", which is NOT the same question as
+// "can anything in it do work" — a session whose agent process has died still
+// answers yes. Dispatch decisions must use HasLiveAgent instead.
 func (m *SessionManager) IsRunning(dogName string) (bool, error) {
 	sessionID := m.SessionName(dogName)
 	return m.tmux.HasSession(sessionID)
+}
+
+// HasLiveAgent reports whether the dog's session exists AND an agent process is
+// alive inside it.
+//
+// This is the verdict dispatch must gate on, not IsRunning. A dog session
+// outlives its agent: the pane is still there, tmux still lists the session, and
+// has-session still says yes, but nothing in it can read mail or run a plugin.
+// Delivering into that session destroys the dispatch silently (gt-p2e7) — the
+// nudge is typed at a corpse, the mail stays open, the dog stays in
+// StateWorking, and the work product never appears. Dogs are the one agent
+// whose output is a file on disk rather than a branch or a bead, so nothing
+// downstream notices the miss; six dolt backups went missing in a single day
+// before anyone tallied artifacts against dispatches.
+//
+// An error means the liveness probe itself failed. It is returned rather than
+// folded into the bool so callers can distinguish "confirmed dead" from
+// "unknown" — those two warrant opposite actions, and only one of them is safe
+// to kill a session over.
+func (m *SessionManager) HasLiveAgent(dogName string) (bool, error) {
+	sessionID := m.SessionName(dogName)
+
+	running, err := m.tmux.HasSession(sessionID)
+	if err != nil {
+		return false, fmt.Errorf("checking session: %w", err)
+	}
+	if !running {
+		return false, nil
+	}
+
+	alive, err := m.tmux.IsAgentAliveChecked(sessionID)
+	if err != nil {
+		return false, fmt.Errorf("checking agent liveness in %s: %w", sessionID, err)
+	}
+	return alive, nil
 }
 
 // Status returns detailed status for a dog session.
@@ -238,17 +277,39 @@ func (m *SessionManager) GetPane(dogName string) (string, error) {
 	return pane, nil
 }
 
-// EnsureRunning ensures a dog session is running, starting it if needed.
-// Returns the pane ID.
+// EnsureRunning ensures a dog session has a live agent in it, starting one if
+// needed. Returns the pane ID.
+//
+// The gate is HasLiveAgent, not IsRunning: a session that exists but has lost
+// its agent must be replaced, not reused, or the dispatch about to be delivered
+// into it is destroyed (gt-p2e7). Start already handles the replacement
+// correctly — KillExistingSession(checkAlive=true) tears down a session whose
+// agent is dead and refuses one whose agent is alive — it was simply never
+// reached, because mere existence looked like health.
 func (m *SessionManager) EnsureRunning(dogName string, opts SessionStartOptions) (string, error) {
-	running, err := m.IsRunning(dogName)
-	if err != nil {
-		return "", err
+	live, probeErr := m.HasLiveAgent(dogName)
+	if probeErr != nil {
+		// Liveness unknown. Starting here would mean tearing down a session on
+		// the strength of a probe that just failed, so leave it alone and let
+		// GetPane report whether there is anything to deliver into. Callers that
+		// plan a delivery path treat an unknown probe as "up" for the same
+		// reason: a redundant nudge at a dead session is a no-op, a suppressed
+		// one at a live session strands the dispatch.
+		return m.GetPane(dogName)
 	}
 
-	if !running {
-		if err := m.Start(dogName, opts); err != nil {
-			return "", err
+	if !live {
+		if startErr := m.Start(dogName, opts); startErr != nil {
+			// Start refuses to displace a session whose agent is alive, and it
+			// reports that refusal as ErrSessionRunning — but it maps EVERY
+			// KillExistingSession failure to that same error, so "a live agent
+			// beat us here" and "the kill failed" are indistinguishable from the
+			// error alone. Only the first is safe to continue on, so re-probe
+			// instead of trusting the label.
+			live, probeErr = m.HasLiveAgent(dogName)
+			if probeErr != nil || !live {
+				return "", startErr
+			}
 		}
 	}
 
