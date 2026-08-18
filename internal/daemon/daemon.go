@@ -102,12 +102,6 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	bootLastSpawned time.Time
 
-	// lastPatrolWake records when each patrol session was last woken by
-	// wakeStoppedPatrolAgents, keyed by tmux session name. Enforces the
-	// per-session wake cooldown.
-	// Only accessed from heartbeat loop goroutine - no sync needed.
-	lastPatrolWake map[string]time.Time
-
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
 
@@ -147,13 +141,6 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	knownRigsCache      []string
 	knownRigsCacheValid bool
-
-	// patrolRigsCache memoizes getPatrolRigs per patrol for the duration of a
-	// single heartbeat tick. Each computation runs a `bd show` per rig, and
-	// several steps per tick need the same list. Invalidated with
-	// knownRigsCache at the start of each heartbeat.
-	// Only accessed from heartbeat loop goroutine - no sync needed.
-	patrolRigsCache map[string][]string
 
 	// legacySocketCleanupOnce ensures upgrade cleanup only runs once per daemon
 	// lifetime, before any patrol agent can be started on the current socket.
@@ -966,12 +953,6 @@ func (d *Daemon) heartbeat(state *State) {
 		// Kill leftover refinery sessions from before patrol was disabled. (hq-2mstj)
 		d.killRefinerySessions()
 	}
-
-	// 5.5. Wake patrol agents whose turn ended at an empty prompt.
-	// Runs after the ensure*Running steps so it only ever looks at sessions
-	// that are already up: a live session is exactly the case those steps
-	// cannot help with, since they see "already running" and stop there.
-	d.wakeStoppedPatrolAgents()
 
 	// 6. Ensure Mayor is running (restart if dead)
 	d.ensureMayorRunning()
@@ -2172,7 +2153,6 @@ func (d *Daemon) getKnownRigs() []string {
 func (d *Daemon) invalidateKnownRigsCache() {
 	d.knownRigsCache = nil
 	d.knownRigsCacheValid = false
-	d.patrolRigsCache = nil
 }
 
 // readKnownRigsFromDisk reads and parses mayor/rigs.json.
@@ -2201,27 +2181,7 @@ func (d *Daemon) readKnownRigsFromDisk() []string {
 // If the patrol config specifies a rigs filter, only those rigs are returned.
 // Otherwise, all known rigs are returned. In both cases, non-operational
 // rigs (parked/docked) are filtered out at list-building time. (Fixes upstream #2082)
-//
-// Memoized for the duration of a heartbeat tick, alongside knownRigsCache and
-// invalidated with it. Each call otherwise runs a `bd show` per rig to check the
-// docked label, and more than one step per tick needs this list. Caching also
-// keeps each exclusion logged once per tick rather than once per caller — a log
-// where every event appears twice is one where nobody can tell a repeat from a
-// recurrence.
 func (d *Daemon) getPatrolRigs(patrol string) []string {
-	if rigs, ok := d.patrolRigsCache[patrol]; ok {
-		return rigs
-	}
-
-	rigs := d.computePatrolRigs(patrol)
-	if d.patrolRigsCache == nil {
-		d.patrolRigsCache = make(map[string][]string)
-	}
-	d.patrolRigsCache[patrol] = rigs
-	return rigs
-}
-
-func (d *Daemon) computePatrolRigs(patrol string) []string {
 	configRigs := GetPatrolRigs(d.patrolConfig, patrol)
 	var candidates []string
 	if len(configRigs) > 0 {

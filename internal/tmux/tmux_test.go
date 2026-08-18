@@ -2629,23 +2629,20 @@ func TestGetKeyBinding_NoExistingBinding(t *testing.T) {
 }
 
 func TestGetKeyBinding_CapturesDefaultBinding(t *testing.T) {
-	tm := newTestTmux(t)
+	// A server of this test's own: prefix-n is a shared, mutable resource, and
+	// on the package server whichever binding test ran first decided the
+	// answer here. It previously reported a pass by skipping.
+	tm := newPrivateTmux(t)
 
 	// Query the default tmux binding for prefix-n (next-window).
-	// This works without a running tmux server because list-keys
-	// returns builtin defaults. Skip if already a GT binding (e.g.,
-	// when running inside an active gastown session).
 	result := tm.getKeyBinding("prefix", "n")
-	if result == "" && tm.isGTBinding("prefix", "n") {
-		t.Skip("prefix-n is already a GT binding in this environment")
-	}
 	if result != "next-window" {
 		t.Errorf("expected 'next-window' for default prefix-n binding, got %q", result)
 	}
 }
 
 func TestGetKeyBinding_CapturesDefaultBindingWithArgs(t *testing.T) {
-	tm := newTestTmux(t)
+	tm := newPrivateTmux(t)
 
 	// prefix-s is "choose-tree -Zs" by default — tests multi-word command parsing
 	result := tm.getKeyBinding("prefix", "s")
@@ -2655,13 +2652,7 @@ func TestGetKeyBinding_CapturesDefaultBindingWithArgs(t *testing.T) {
 }
 
 func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
-	tm := newTestTmux(t)
-
-	// Bootstrap the isolated server (bind-key requires a running server)
-	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
-		t.Fatalf("bootstrap session: %v", err)
-	}
-	defer tm.KillSession("gt-test-bootstrap")
+	tm := newPrivateTmux(t)
 
 	// Set a GT-style if-shell binding (contains both "if-shell" and "gt ")
 	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
@@ -2680,13 +2671,7 @@ func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
 }
 
 func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
-	tm := newTestTmux(t)
-
-	// Bootstrap the isolated server (bind-key requires a running server)
-	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
-		t.Fatalf("bootstrap session: %v", err)
-	}
-	defer tm.KillSession("gt-test-bootstrap")
+	tm := newPrivateTmux(t)
 
 	// Set a user binding that doesn't contain "gt "
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2705,13 +2690,7 @@ func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
 }
 
 func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
-	tm := newTestTmux(t)
-
-	// Bootstrap the isolated server (bind-key requires a running server)
-	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
-		t.Fatalf("bootstrap session: %v", err)
-	}
-	defer tm.KillSession("gt-test-bootstrap")
+	tm := newPrivateTmux(t)
 
 	// A plain user binding should NOT be detected as GT
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2734,13 +2713,7 @@ func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
 }
 
 func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
-	tm := newTestTmux(t)
-
-	// Bootstrap the isolated server (bind-key requires a running server)
-	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
-		t.Fatalf("bootstrap session: %v", err)
-	}
-	defer tm.KillSession("gt-test-bootstrap")
+	tm := newPrivateTmux(t)
 
 	// Set a custom user binding on F11
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "custom-user-cmd")
@@ -2753,7 +2726,7 @@ func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
 		"display-message custom-user-cmd")
 
 	// Record the binding after first configuration
-	firstRaw, _ := tm.run("list-keys", "-T", "prefix", "F11")
+	firstRaw := tm.keyBindingLine("prefix", "F11")
 
 	// isGTBinding should return true, causing Set*Binding to skip
 	if !tm.isGTBinding("prefix", "F11") {
@@ -2770,55 +2743,29 @@ func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
 }
 
 func TestSessionPrefixPattern_WithTownRoot(t *testing.T) {
-	// Point at the real town root if available; otherwise skip.
-	townRoot := os.Getenv("GT_ROOT")
-	if townRoot == "" {
-		t.Skip("GT_ROOT not set; skipping live rigs.json test")
-	}
-	pattern := sessionPrefixPattern()
-	// With a real rigs.json, pattern must include at least gt, hq, and
-	// whatever other rigs are registered.
-	if !strings.Contains(pattern, "gt") {
-		t.Errorf("pattern %q missing 'gt'", pattern)
-	}
-	if !strings.Contains(pattern, "hq") {
-		t.Errorf("pattern %q missing 'hq'", pattern)
-	}
-	// Verify it's a sorted alternation.
-	if !strings.HasPrefix(pattern, "^(") || !strings.HasSuffix(pattern, ")-") {
-		t.Errorf("pattern %q has unexpected format", pattern)
+	// A rigs.json this test owns. Reading the machine's real town made this
+	// test assert only that the pattern contained "gt" and "hq" — which it
+	// always does, registry or not — and skip outright where GT_ROOT was
+	// unset, so it never actually checked that rigs.json was consulted.
+	fixtureTownRoot(t, "la", "wl")
+
+	if got, want := sessionPrefixPattern(), "^(gt|hq|la|wl)-"; got != want {
+		t.Errorf("sessionPrefixPattern() = %q, want %q", got, want)
 	}
 }
 
 func TestSessionPrefixPattern_FallsBackToGTTownRoot(t *testing.T) {
 	// When GT_ROOT is empty but GT_TOWN_ROOT is set, sessionPrefixPattern
 	// should use GT_TOWN_ROOT to discover rig prefixes.
-	townRoot := os.Getenv("GT_ROOT")
-	if townRoot == "" {
-		townRoot = os.Getenv("GT_TOWN_ROOT")
-	}
-	if townRoot == "" {
-		t.Skip("neither GT_ROOT nor GT_TOWN_ROOT set; skipping")
-	}
+	fixtureTownRoot(t, "la", "wl")
+	townRoot := os.Getenv("GT_TOWN_ROOT")
 
-	// Clear GT_ROOT, set GT_TOWN_ROOT — simulates daemon startup env.
+	// Clear GT_ROOT, keep GT_TOWN_ROOT — simulates daemon startup env.
 	t.Setenv("GT_ROOT", "")
 	t.Setenv("GT_TOWN_ROOT", townRoot)
 
-	pattern := sessionPrefixPattern()
-	if !strings.Contains(pattern, "gt") {
-		t.Errorf("pattern %q missing 'gt'", pattern)
-	}
-	if !strings.Contains(pattern, "hq") {
-		t.Errorf("pattern %q missing 'hq'", pattern)
-	}
-	// With a real rigs.json via GT_TOWN_ROOT, we expect more than just gt+hq.
-	// At minimum there should be 3+ prefixes in a multi-rig town.
-	inner := strings.TrimPrefix(pattern, "^(")
-	inner = strings.TrimSuffix(inner, ")-")
-	prefixes := strings.Split(inner, "|")
-	if len(prefixes) < 3 {
-		t.Errorf("expected at least 3 prefixes via GT_TOWN_ROOT fallback, got %d: %v", len(prefixes), prefixes)
+	if got, want := sessionPrefixPattern(), "^(gt|hq|la|wl)-"; got != want {
+		t.Errorf("sessionPrefixPattern() via GT_TOWN_ROOT = %q, want %q", got, want)
 	}
 }
 

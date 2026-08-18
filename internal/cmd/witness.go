@@ -222,12 +222,8 @@ func runWitnessStop(cmd *cobra.Command, args []string) error {
 
 // WitnessStatusOutput is the JSON output format for witness status.
 type WitnessStatusOutput struct {
-	Running bool   `json:"running"`
-	RigName string `json:"rig_name"`
-	// Turn is the agent's turn state when Running: "active", "ended",
-	// "stranded", or "unknown". Running reports only that the tmux session is
-	// alive; a witness whose turn has ended is running and not patrolling.
-	Turn              string   `json:"turn,omitempty"`
+	Running           bool     `json:"running"`
+	RigName           string   `json:"rig_name"`
 	Session           string   `json:"session,omitempty"`
 	MonitoredPolecats []string `json:"monitored_polecats,omitempty"`
 }
@@ -247,12 +243,6 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 	running, _ := mgr.IsRunning()
 	sessionInfo, _ := mgr.Status() // may be nil if not running
 
-	// A live session says nothing about whether the patrol loop is in motion.
-	turn := ""
-	if running {
-		turn = agentTurn(tmux.NewTmux(), witnessSessionName(rigName))
-	}
-
 	// Polecats come from rig config, not state file
 	polecats := r.Polecats
 
@@ -261,7 +251,6 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 		output := WitnessStatusOutput{
 			Running:           running,
 			RigName:           rigName,
-			Turn:              turn,
 			MonitoredPolecats: polecats,
 		}
 		if sessionInfo != nil {
@@ -277,9 +266,6 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 
 	if running {
 		fmt.Printf("  State: %s\n", style.Bold.Render("● running"))
-		if rendered := renderAgentTurn(turn); rendered != "" {
-			fmt.Printf("  Turn:  %s\n", rendered)
-		}
 		if sessionInfo != nil {
 			fmt.Printf("  Session: %s\n", sessionInfo.Name)
 		}
