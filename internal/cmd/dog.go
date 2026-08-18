@@ -748,7 +748,11 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 	// Returning the dog to idle without archiving it leaves a dispatch
 	// assigned to a dog that is no longer executing it — an orphan by
 	// construction. Fail the dispatch with the work.
-	closePluginMails(name)
+	if err := closePluginMails(name); err != nil {
+		// Non-fatal: the dog still goes idle. But it MUST be visible — a silent
+		// failure here is what let dispatch mail accumulate unbounded (gt-u58w).
+		fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+	}
 	mgr.ClearDispatchAlarm(name)
 
 	fmt.Printf("✓ Cleared dog %s (now idle)\n", name)
@@ -797,7 +801,11 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	// Always close accumulated plugin mails, even if dog is already idle.
 	// Plugin dispatch mails accumulate across sessions and must be cleaned up
 	// regardless of current work state.
-	closePluginMails(name)
+	if err := closePluginMails(name); err != nil {
+		// Non-fatal: the dog still goes idle. But it MUST be visible — a silent
+		// failure here is what let dispatch mail accumulate unbounded (gt-u58w).
+		fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+	}
 
 	if d.State == dog.StateIdle && d.Work == "" {
 		fmt.Printf("Dog %s is already idle with no work\n", name)
@@ -854,21 +862,30 @@ func splitPathComponents(path string) []string {
 // Plugin dispatch mails sent by the daemon accumulate because gt dog done never
 // closed them. On every UserPromptSubmit hook, gt mail check --inject re-injects
 // ALL open mails, causing context to balloon. This function cleans up eagerly.
-// It is best-effort: failures are logged but do not prevent dog from going idle.
-func closePluginMails(dogName string) {
+//
+// It is NON-BLOCKING but NOT SILENT. A cleanup that cannot fail visibly cannot be
+// trusted to have run: before gt-u58w this returned nothing and exited quietly on
+// two of three paths, so `gt dog done` archived zero mail, printed nothing, and
+// reported success while 230+ dispatches accumulated across the pack. Callers must
+// surface the returned error; they must NOT abort on it, because a dog stuck
+// non-idle is worse than a dog with stale inbox mail.
+func closePluginMails(dogName string) error {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
-		return // not in a Gas Town workspace, skip cleanup
+		// Not in a Gas Town workspace. This is a legitimate skip, not a failure,
+		// but say so rather than returning an indistinguishable nil.
+		return fmt.Errorf("skipped dispatch-mail cleanup for %s: not in a Gas Town workspace: %w", dogName, err)
 	}
 
 	insp := newMailDispatchInspector(townRoot)
 	closed, err := insp.Reclaim(dogName)
-	if err != nil && closed == 0 {
-		return
-	}
 	if closed > 0 {
 		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
 	}
+	if err != nil {
+		return fmt.Errorf("dispatch-mail cleanup incomplete for %s (%d archived): %w", dogName, closed, err)
+	}
+	return nil
 }
 
 // mailDispatchInspector implements dog.DispatchInspector over the mail router.
