@@ -218,6 +218,11 @@ var mailArchiveCmd = &cobra.Command{
 
 Removes the messages from your inbox by closing them in beads.
 
+A cc copy is cleared rather than closed: the bead belongs to its assignee and
+only they can close it, so archiving your cc copy marks it cleared for you alone
+and leaves their obligation untouched. No --force is needed for that, and
+--force is not diverted — it still closes the record itself.
+
 Use --stale to archive messages sent before your current session started.
 
 Examples:
