@@ -74,6 +74,97 @@ func TestValidateMergeRequestSourceUsesPreResolvedSource(t *testing.T) {
 	}
 }
 
+func TestClosedSourceIssueRefusal(t *testing.T) {
+	tests := []struct {
+		name       string
+		issue      *beads.Issue
+		wantRefuse bool
+	}{
+		{"open", &beads.Issue{ID: "bd-6jp", Status: "open"}, false},
+		{"in_progress", &beads.Issue{ID: "bd-6jp", Status: "in_progress"}, false},
+		{"hooked", &beads.Issue{ID: "bd-6jp", Status: "hooked"}, false},
+		{"blocked", &beads.Issue{ID: "bd-6jp", Status: "blocked"}, false},
+		{"deferred", &beads.Issue{ID: "bd-6jp", Status: "deferred"}, false},
+		{"closed", &beads.Issue{ID: "bd-6jp", Status: "closed"}, true},
+		{"closed mixed case", &beads.Issue{ID: "bd-6jp", Status: " CLOSED "}, true},
+		{"tombstone", &beads.Issue{ID: "bd-6jp", Status: "tombstone"}, true},
+		{"nil issue defers to concreteness check", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refusal := closedSourceIssueRefusal("bd-6jp", tt.issue)
+			if (refusal != "") != tt.wantRefuse {
+				t.Fatalf("closedSourceIssueRefusal = %q, want refusal=%v", refusal, tt.wantRefuse)
+			}
+			if tt.wantRefuse && !strings.Contains(refusal, "bd-6jp") {
+				t.Fatalf("refusal %q does not name the source issue", refusal)
+			}
+		})
+	}
+}
+
+func TestValidateOpenSourceIssueForMRExplainsRecovery(t *testing.T) {
+	if err := validateOpenSourceIssueForMR("bd-6jp", &beads.Issue{ID: "bd-6jp", Status: "open"}); err != nil {
+		t.Fatalf("validateOpenSourceIssueForMR on open issue = %v, want nil", err)
+	}
+	err := validateOpenSourceIssueForMR("bd-6jp", &beads.Issue{ID: "bd-6jp", Status: "closed"})
+	if err == nil {
+		t.Fatal("validateOpenSourceIssueForMR on closed issue = nil, want refusal")
+	}
+	for _, want := range []string{"bd-6jp is closed", "bd update bd-6jp --status=open", "--allow-closed-issue"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRunMqSubmitRefusesClosedSourceIssue(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	logPath := installSubmitSourceBDRecorderWithStatus(t, currentBeadsDir, ownerBeadsDir, "closed")
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_RIG", "")
+	t.Chdir(workDir)
+
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitNoCleanup = true
+	err := runMqSubmit(nil, nil)
+	if err == nil {
+		t.Fatal("runMqSubmit against closed source issue succeeded, want refusal")
+	}
+	if !strings.Contains(err.Error(), "bd-source is closed") {
+		t.Fatalf("error %q does not explain the closed source issue", err.Error())
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
+}
+
+func TestRunMqSubmitAllowClosedIssueOverride(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	logPath := installSubmitSourceBDRecorderWithStatus(t, currentBeadsDir, ownerBeadsDir, "closed")
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_RIG", "")
+	t.Chdir(workDir)
+
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitNoCleanup = true
+	mqSubmitAllowClosedIssue = true
+	if err := runMqSubmit(nil, nil); err != nil {
+		t.Fatalf("runMqSubmit with --allow-closed-issue: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, currentBeadsDir, "create --json")
+}
+
 func TestMqSubmitPathUsesRoutedSourceAndCurrentRigQueueBeads(t *testing.T) {
 	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
 	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
@@ -180,6 +271,38 @@ func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	assertBDLogContains(t, log, ownerBeadsDir, "comments add bd-source")
 	assertBDLogContains(t, log, currentBeadsDir, "show gt-mr --json")
 	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
+}
+
+// gt-7qm: a polecat that respawns onto an already-closed bead must complete
+// without producing a merge request. Creating one restarts the submit/reject
+// loop that the closed bead is the terminal state of.
+func TestRunDoneCreatesNoMRForClosedSourceIssue(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupRoutedSubmitGitRepo(t, workDir, false)
+	logPath := installSubmitSourceBDRecorderWithStatus(t, currentBeadsDir, ownerBeadsDir, "closed")
+	resetDoneFlagsForTest(t)
+	townRoot := routedSourceTestTownRoot(workDir)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "refuge")
+	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+	t.Chdir(workDir)
+
+	doneIssue = "bd-source"
+	doneCleanupStatus = "unpushed"
+	doneSkipVerify = true
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error { return nil }
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
+	assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
 }
 
 func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBeadsDir string) {
@@ -300,6 +423,11 @@ exit 1
 
 func installSubmitSourceBDRecorder(t *testing.T, currentBeadsDir, ownerBeadsDir string) string {
 	t.Helper()
+	return installSubmitSourceBDRecorderWithStatus(t, currentBeadsDir, ownerBeadsDir, "open")
+}
+
+func installSubmitSourceBDRecorderWithStatus(t *testing.T, currentBeadsDir, ownerBeadsDir, sourceStatus string) string {
+	t.Helper()
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "bd.log")
 	script := fmt.Sprintf(`#!/bin/sh
@@ -313,11 +441,11 @@ fi
 printf '%%s\t%%s\n' "$BEADS_DIR" "$*" >> %q
 if [ "$1" = "show" ] && [ "$2" = "bd-source" ]; then
   if [ "$BEADS_DIR" = %q ]; then
-    echo '[{"id":"bd-source","title":"current mirror","status":"open","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\\nmerge_strategy: mr"}]'
+    echo '[{"id":"bd-source","title":"current mirror","status":"%s","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\\nmerge_strategy: mr"}]'
     exit 0
   fi
   if [ "$BEADS_DIR" = %q ]; then
-    echo '[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\\nmerge_strategy: mr"}]'
+    echo '[{"id":"bd-source","title":"owner source","status":"%s","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\\nmerge_strategy: mr"}]'
     exit 0
   fi
   echo "Issue not found in $BEADS_DIR" >&2
@@ -347,7 +475,7 @@ if [ "$1" = "close" ]; then
 fi
 echo "unexpected bd command: $*" >&2
 exit 1
-`, logPath, currentBeadsDir, ownerBeadsDir)
+`, logPath, currentBeadsDir, sourceStatus, ownerBeadsDir, sourceStatus)
 	path := filepath.Join(binDir, "bd")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write bd recorder: %v", err)
@@ -388,13 +516,16 @@ func resetMqSubmitFlagsForTest(t *testing.T) {
 	oldBranch, oldIssue, oldEpic := mqSubmitBranch, mqSubmitIssue, mqSubmitEpic
 	oldPriority := mqSubmitPriority
 	oldNoCleanup, oldSkipDeps, oldResubmit := mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit
+	oldAllowClosed := mqSubmitAllowClosedIssue
 	mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = "", "", ""
 	mqSubmitPriority = -1
 	mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = false, false, false
+	mqSubmitAllowClosedIssue = false
 	t.Cleanup(func() {
 		mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = oldBranch, oldIssue, oldEpic
 		mqSubmitPriority = oldPriority
 		mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = oldNoCleanup, oldSkipDeps, oldResubmit
+		mqSubmitAllowClosedIssue = oldAllowClosed
 	})
 }
 
