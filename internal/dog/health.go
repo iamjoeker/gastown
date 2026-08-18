@@ -15,71 +15,26 @@ type sessionChecker interface {
 	KillSession(name string) error
 }
 
-// DispatchInspector inspects and reclaims a dog's dispatch mail. It is
-// optional on HealthChecker: when absent, dispatch orphans and staleness are
-// simply not reported.
-type DispatchInspector interface {
-	// Scan reports the open dispatch mail for a dog.
-	Scan(dogName string) (DispatchScan, error)
-	// Reclaim archives every open dispatch for a dog, returning the count.
-	Reclaim(dogName string) (int, error)
-}
-
 // DogHealthResult describes the health of a single dog.
 type DogHealthResult struct {
 	Name           string        `json:"name"`
 	State          State         `json:"state"`
-	ExecState      ExecState     `json:"exec_state,omitempty"`    // observed state, not pool intent
-	SessionStatus  string        `json:"session_status"`          // from ZombieStatus.String()
-	WorkDuration   time.Duration `json:"work_duration,omitempty"` // how long current work has been running
+	SessionStatus  string        `json:"session_status"`           // from ZombieStatus.String()
+	WorkDuration   time.Duration `json:"work_duration,omitempty"`  // how long current work has been running
 	NeedsAttention bool          `json:"needs_attention"`
 	AutoCleared    bool          `json:"auto_cleared,omitempty"`
 	Recommendation string        `json:"recommendation,omitempty"`
-
-	// OpenDispatches is the number of dispatch mails still open for this dog.
-	OpenDispatches int `json:"open_dispatches,omitempty"`
-	// OldestDispatchAge is the age of the oldest open dispatch.
-	OldestDispatchAge time.Duration `json:"oldest_dispatch_age,omitempty"`
-	// DispatchesReclaimed counts dispatches archived by this check.
-	DispatchesReclaimed int `json:"dispatches_reclaimed,omitempty"`
-	// DispatchAlarm is set when this dog's dispatch backlog warrants an
-	// escalation and the per-dog cooldown has elapsed.
-	DispatchAlarm string `json:"dispatch_alarm,omitempty"`
 }
 
 // HealthChecker performs health checks on dogs in the kennel.
 type HealthChecker struct {
-	mgr        *Manager
-	checker    sessionChecker
-	dispatch   DispatchInspector
-	staleAfter time.Duration
-	cooldown   time.Duration
-	now        func() time.Time
+	mgr     *Manager
+	checker sessionChecker
 }
 
 // NewHealthChecker creates a HealthChecker.
 func NewHealthChecker(mgr *Manager, checker sessionChecker) *HealthChecker {
-	return &HealthChecker{
-		mgr:        mgr,
-		checker:    checker,
-		staleAfter: DefaultStaleDispatchAfter,
-		cooldown:   DefaultDispatchAlarmCooldown,
-		now:        time.Now,
-	}
-}
-
-// WithDispatch enables dispatch-mail inspection. staleAfter is how long a
-// dispatch may stay open before it alarms (zero uses the default); cooldown
-// throttles repeat alarms per dog (zero uses the default).
-func (hc *HealthChecker) WithDispatch(insp DispatchInspector, staleAfter, cooldown time.Duration) *HealthChecker {
-	hc.dispatch = insp
-	if staleAfter > 0 {
-		hc.staleAfter = staleAfter
-	}
-	if cooldown > 0 {
-		hc.cooldown = cooldown
-	}
-	return hc
+	return &HealthChecker{mgr: mgr, checker: checker}
 }
 
 // dogSessionName returns the tmux session name for a dog.
@@ -101,19 +56,10 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 
 	session := dogSessionName(d.Name)
 
-	// sessionAlive records whether an agent could actually be executing in
-	// this dog's session at the moment of the check — captured before
-	// auto-clear kills anything, so the diagnosis describes what was found
-	// rather than what this function then did about it.
-	sessionAlive := false
-
 	switch d.State {
 	case StateWorking:
 		status := hc.checker.CheckSessionHealth(session, maxInactivity)
 		result.SessionStatus = status.String()
-		// AgentDead counts as not alive: the pane exists but nothing in it
-		// can read mail or run a plugin.
-		sessionAlive = status != tmux.SessionDead && status != tmux.AgentDead
 
 		switch status {
 		case tmux.SessionDead:
@@ -162,7 +108,6 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 	case StateIdle:
 		// Check for orphan session.
 		has, _ := hc.checker.HasSession(session)
-		sessionAlive = has
 		if has {
 			result.SessionStatus = "orphan"
 			result.NeedsAttention = true
@@ -178,111 +123,7 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 		}
 	}
 
-	// Observed state, independent of dispatch mail. checkDispatch refines this
-	// when a dispatch inspector is configured.
-	result.ExecState = DeriveExecState(d.State, sessionAlive, 0)
-
-	hc.checkDispatch(d, sessionAlive, autoClear, &result)
 	return result
-}
-
-// clearAlarm forgets a dog's alarm history, tolerating a nil manager.
-func (hc *HealthChecker) clearAlarm(dogName string) {
-	if hc.mgr != nil {
-		hc.mgr.ClearDispatchAlarm(dogName)
-	}
-}
-
-// checkDispatch joins the session verdict with the dog's open dispatch mail.
-//
-// Two failures live here, and they are distinct:
-//
-//   - Orphaned: the assignee's session is gone but its dispatches are still
-//     open. Nothing will ever execute them, so with autoClear they are
-//     archived — session death fails the dispatch instead of stranding it.
-//   - Stale: dispatches are open past staleAfter while the session is alive.
-//     The dog is holding work it is not doing (the instruction was destroyed
-//     in delivery, say), which is the condition that previously went unnoticed
-//     for twelve days. This alarms rather than reclaims, because a live
-//     session may still be mid-execution.
-func (hc *HealthChecker) checkDispatch(d *Dog, sessionAlive, autoClear bool, result *DogHealthResult) {
-	if hc.dispatch == nil {
-		return
-	}
-
-	scan, err := hc.dispatch.Scan(d.Name)
-	if err != nil {
-		// A mailbox we cannot read is itself worth surfacing: it is the same
-		// blind spot that let orphans accumulate.
-		result.NeedsAttention = true
-		result.Recommendation = appendRecommendation(result.Recommendation,
-			"dispatch scan failed: "+err.Error())
-		return
-	}
-
-	result.OpenDispatches = scan.Open
-	result.OldestDispatchAge = scan.OldestAge
-	result.ExecState = DeriveExecState(d.State, sessionAlive, scan.Open)
-
-	if scan.Open == 0 {
-		// Nothing outstanding — forget any prior alarm so the next real
-		// problem is reported immediately instead of waiting out a cooldown.
-		hc.clearAlarm(d.Name)
-		return
-	}
-
-	if !sessionAlive {
-		result.NeedsAttention = true
-		reason := fmt.Sprintf("%d dispatch(es) orphaned by dead session (oldest %s)",
-			scan.Open, scan.OldestAge.Truncate(time.Second))
-		if autoClear {
-			n, reclaimErr := hc.dispatch.Reclaim(d.Name)
-			result.DispatchesReclaimed = n
-			if reclaimErr != nil {
-				reason = fmt.Sprintf("%s — reclaim incomplete (%d archived): %v", reason, n, reclaimErr)
-			} else {
-				reason = fmt.Sprintf("%d orphaned dispatch(es) reclaimed (dead session)", n)
-				hc.clearAlarm(d.Name)
-			}
-		}
-		result.Recommendation = appendRecommendation(result.Recommendation, reason)
-		if result.DispatchesReclaimed == 0 {
-			hc.raiseAlarm(d.Name, reason, result)
-		}
-		return
-	}
-
-	if hc.staleAfter > 0 && scan.OldestAge > hc.staleAfter {
-		result.NeedsAttention = true
-		reason := fmt.Sprintf("%d dispatch(es) open past %s (oldest %s) — session alive but not executing",
-			scan.Open, hc.staleAfter, scan.OldestAge.Truncate(time.Second))
-		result.Recommendation = appendRecommendation(result.Recommendation, reason)
-		hc.raiseAlarm(d.Name, reason, result)
-	}
-}
-
-// raiseAlarm records a dispatch alarm on the result if the dog's cooldown has
-// elapsed. The caller is responsible for actually escalating it.
-func (hc *HealthChecker) raiseAlarm(dogName, reason string, result *DogHealthResult) {
-	if hc.mgr == nil {
-		return
-	}
-	now := time.Now
-	if hc.now != nil {
-		now = hc.now
-	}
-	if hc.mgr.ShouldAlarmDispatch(dogName, hc.cooldown, now()) {
-		result.DispatchAlarm = fmt.Sprintf("dog %s: %s", dogName, reason)
-	}
-}
-
-// appendRecommendation joins recommendations so a dispatch finding never
-// overwrites the session finding that explains it.
-func appendRecommendation(existing, addition string) string {
-	if existing == "" {
-		return addition
-	}
-	return existing + "; " + addition
 }
 
 // CheckAll performs health checks on all dogs.

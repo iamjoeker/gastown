@@ -22,12 +22,11 @@ import (
 
 // Dog command flags
 var (
-	dogListJSON       bool
-	dogListNoDispatch bool
-	dogStatusJSON     bool
-	dogForce          bool
-	dogRemoveAll      bool
-	dogCallAll        bool
+	dogListJSON   bool
+	dogStatusJSON bool
+	dogForce      bool
+	dogRemoveAll  bool
+	dogCallAll    bool
 
 	// Dispatch flags
 	dogDispatchPlugin string
@@ -41,8 +40,6 @@ var (
 	dogHealthJSON          bool
 	dogHealthAutoClear     bool
 	dogHealthMaxInactivity time.Duration
-	dogHealthStaleDispatch time.Duration
-	dogHealthAlarmCooldown time.Duration
 )
 
 var dogCmd = &cobra.Command{
@@ -111,27 +108,14 @@ var dogListCmd = &cobra.Command{
 	Use:     "list",
 	Aliases: []string{"ls"},
 	Short:   "List all dogs in the kennel",
-	Long: `List all dogs in the kennel with their observed execution state.
+	Long: `List all dogs in the kennel with their status.
 
-Reports execution state, not pool intent. The state in .dog.json says what the
-dispatcher meant to happen; this command joins it with live tmux session state
-and the dog's open dispatch mail to report what is actually true:
-
-  idle      genuinely available
-  working   session alive and executing
-  stalled   state=working but the session is gone
-  pending   state=idle with dispatch mail no session will read
-  orphan    state=idle but a session is still alive
-
-Only idle and working are healthy. The others are counted separately so a dog
-holding undelivered dispatches can never be reported as spare capacity.
-
-Use --no-dispatches to skip the mailbox reads (session state only).
+Shows each dog's state (idle/working), current work assignment,
+and last active timestamp.
 
 Examples:
   gt dog list
-  gt dog list --json
-  gt dog list --no-dispatches`,
+  gt dog list --json`,
 	RunE: runDogList,
 }
 
@@ -226,22 +210,10 @@ The command:
 1. Finds the plugin definition (plugin.md)
 2. Assigns work to an idle dog (marks as working)
 3. Sends mail with plugin instructions to the dog
-4. Wakes the dog through exactly one delivery path
-5. Returns immediately (non-blocking)
-
-Step 4 matters: a dog's pane can be written by the mail notification or by a
-new session's startup prompt, and if both fire the second interrupts the first
-and destroys the instruction. So when the session is down its startup prompt
-is the delivery and the mail rides silently; when the session is already up
-the mail notification is the delivery and no session is started. The chosen
-path is reported as delivery_path in --json output.
+4. Returns immediately (non-blocking)
 
 The dog discovers the work via its mail inbox and executes the plugin
 instructions. On completion, the dog sends DOG_DONE mail to deacon/.
-
-If the session cannot be started the dispatch is rolled back completely: the
-work assignment is cleared AND the dispatch mail is archived, so the dog does
-not go back to idle still holding an open dispatch.
 
 Examples:
   gt dog dispatch --plugin rebuild-gt
@@ -262,20 +234,9 @@ Detects:
   - Zombies: state=working but tmux session or agent process is dead
   - Hung: agent alive but no tmux activity for too long
   - Orphans: dog idle but tmux session still exists
-  - Orphaned dispatches: dispatch mail still open for a dog whose session
-    is gone — nothing will ever execute it
-  - Stale dispatches: dispatch mail open past --stale-dispatch while the
-    session is alive, i.e. the dog is holding work it is not doing
 
-With --auto-clear, zombies are returned to idle state and orphaned dispatches
-are archived, so session death fails a dispatch instead of stranding it.
-Hung dogs are reported only (Deacon decides per ZFC principle). Stale
-dispatches on a live session are never auto-archived — the session may still
-be mid-execution — they escalate instead.
-
-Dispatch alarms escalate at MEDIUM severity, throttled per dog by
---alarm-cooldown so a persistent problem escalates once per window rather
-than once per patrol cycle.
+With --auto-clear, zombies are automatically returned to idle state.
+Hung dogs are reported only (Deacon decides per ZFC principle).
 
 Exit codes:
   0 = all healthy
@@ -287,8 +248,7 @@ Examples:
   gt dog health-check alpha
   gt dog health-check --json
   gt dog health-check --auto-clear
-  gt dog health-check --max-inactivity 1h
-  gt dog health-check --stale-dispatch 15m --alarm-cooldown 1h`,
+  gt dog health-check --max-inactivity 1h`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runDogHealthCheck,
 }
@@ -296,7 +256,6 @@ Examples:
 func init() {
 	// List flags
 	dogListCmd.Flags().BoolVar(&dogListJSON, "json", false, "Output as JSON")
-	dogListCmd.Flags().BoolVar(&dogListNoDispatch, "no-dispatches", false, "Skip the dispatch-mail probe (session state only, no mailbox reads)")
 
 	// Remove flags
 	dogRemoveCmd.Flags().BoolVarP(&dogForce, "force", "f", false, "Force removal even if working")
@@ -324,8 +283,6 @@ func init() {
 	dogHealthCheckCmd.Flags().BoolVar(&dogHealthJSON, "json", false, "Output as JSON")
 	dogHealthCheckCmd.Flags().BoolVar(&dogHealthAutoClear, "auto-clear", false, "Auto-clear zombie dogs")
 	dogHealthCheckCmd.Flags().DurationVar(&dogHealthMaxInactivity, "max-inactivity", 10*time.Minute, "Max inactivity before considering hung")
-	dogHealthCheckCmd.Flags().DurationVar(&dogHealthStaleDispatch, "stale-dispatch", dog.DefaultStaleDispatchAfter, "Alarm on dispatches open longer than this")
-	dogHealthCheckCmd.Flags().DurationVar(&dogHealthAlarmCooldown, "alarm-cooldown", dog.DefaultDispatchAlarmCooldown, "Minimum interval between dispatch alarms for the same dog")
 
 	// Add subcommands
 	dogCmd.AddCommand(dogAddCmd)
@@ -507,38 +464,24 @@ func runDogList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Observe reality rather than reporting pool intent. .dog.json says what
-	// the dispatcher meant to happen; the tmux session and the dog's open
-	// dispatch mail say what is actually happening. This list read "3 idle"
-	// for three dogs each holding 19 undelivered dispatches, which is why the
-	// probes below are not optional.
-	obs := dogObserveAll(dogs, !dogListNoDispatch)
-
 	if dogListJSON {
 		type DogListItem struct {
-			Name           string            `json:"name"`
-			State          dog.State         `json:"state"`
-			ExecState      dog.ExecState     `json:"exec_state"`
-			SessionRunning bool              `json:"session_running"`
-			OpenDispatches int               `json:"open_dispatches,omitempty"`
-			Work           string            `json:"work,omitempty"`
-			WorkStartedAt  *time.Time        `json:"work_started_at,omitempty"`
-			LastActive     time.Time         `json:"last_active"`
-			Worktrees      map[string]string `json:"worktrees,omitempty"`
+			Name          string            `json:"name"`
+			State         dog.State         `json:"state"`
+			Work          string            `json:"work,omitempty"`
+			WorkStartedAt *time.Time        `json:"work_started_at,omitempty"`
+			LastActive    time.Time         `json:"last_active"`
+			Worktrees     map[string]string `json:"worktrees,omitempty"`
 		}
 
 		var items []DogListItem
 		for _, d := range dogs {
-			o := obs[d.Name]
 			item := DogListItem{
-				Name:           d.Name,
-				State:          d.State,
-				ExecState:      o.exec,
-				SessionRunning: o.sessionRunning,
-				OpenDispatches: o.openDispatches,
-				Work:           d.Work,
-				LastActive:     d.LastActive,
-				Worktrees:      d.Worktrees,
+				Name:       d.Name,
+				State:      d.State,
+				Work:       d.Work,
+				LastActive: d.LastActive,
+				Worktrees:  d.Worktrees,
 			}
 			if !d.WorkStartedAt.IsZero() {
 				t := d.WorkStartedAt
@@ -556,86 +499,31 @@ func runDogList(cmd *cobra.Command, args []string) error {
 	fmt.Println(style.Bold.Render("The Pack"))
 	fmt.Println()
 
-	counts := map[dog.ExecState]int{}
+	idleCount := 0
+	workingCount := 0
 
 	for _, d := range dogs {
-		o := obs[d.Name]
-		counts[o.exec]++
-
 		stateIcon := "○"
 		stateStyle := style.Dim
-		switch o.exec {
-		case dog.ExecWorking:
-			stateIcon, stateStyle = "●", style.Bold
-		case dog.ExecStalled, dog.ExecOrphan:
-			stateIcon, stateStyle = "✗", style.Bold
-		case dog.ExecPending:
-			stateIcon, stateStyle = "◐", style.Bold
+		if d.State == dog.StateWorking {
+			stateIcon = "●"
+			stateStyle = style.Bold
+			workingCount++
+		} else {
+			idleCount++
 		}
 
-		line := fmt.Sprintf("  %s %s [%s]", stateIcon, stateStyle.Render(d.Name), o.exec)
+		line := fmt.Sprintf("  %s %s", stateIcon, stateStyle.Render(d.Name))
 		if d.Work != "" {
 			line += fmt.Sprintf(" → %s", style.Dim.Render(d.Work))
-		}
-		if o.openDispatches > 0 {
-			line += style.Dim.Render(fmt.Sprintf(" (%d open dispatch)", o.openDispatches))
 		}
 		fmt.Println(line)
 	}
 
 	fmt.Println()
-	fmt.Printf("  %d idle, %d working", counts[dog.ExecIdle], counts[dog.ExecWorking])
-	// Unhealthy states are named separately so they can never be folded into
-	// the idle count and read as capacity.
-	for _, s := range []dog.ExecState{dog.ExecStalled, dog.ExecPending, dog.ExecOrphan} {
-		if counts[s] > 0 {
-			fmt.Printf(", %d %s", counts[s], s)
-		}
-	}
-	fmt.Println()
+	fmt.Printf("  %d idle, %d working\n", idleCount, workingCount)
 
 	return nil
-}
-
-// dogObservation is a dog's observed execution state plus the evidence for it.
-type dogObservation struct {
-	exec           dog.ExecState
-	sessionRunning bool
-	openDispatches int
-}
-
-// dogObserveAll probes live session state (and, unless skipped, open dispatch
-// mail) for each dog and derives its execution state.
-//
-// Probe failures degrade rather than fail: a mailbox that cannot be read
-// contributes zero dispatches, which is the same view the old intent-only
-// output gave. Session liveness is always probed — it is a cheap tmux call and
-// it is what separates "working" from "stalled".
-func dogObserveAll(dogs []*dog.Dog, withDispatch bool) map[string]dogObservation {
-	obs := make(map[string]dogObservation, len(dogs))
-
-	tm := tmux.NewTmux()
-	var insp *mailDispatchInspector
-	if withDispatch {
-		if townRoot, err := workspace.FindFromCwd(); err == nil {
-			insp = newMailDispatchInspector(townRoot)
-		}
-	}
-
-	for _, d := range dogs {
-		o := dogObservation{}
-		if running, err := tm.HasSession(fmt.Sprintf("hq-dog-%s", d.Name)); err == nil {
-			o.sessionRunning = running
-		}
-		if insp != nil {
-			if scan, err := insp.Scan(d.Name); err == nil {
-				o.openDispatches = scan.Open
-			}
-		}
-		o.exec = dog.DeriveExecState(d.State, o.sessionRunning, o.openDispatches)
-		obs[d.Name] = o
-	}
-	return obs
 }
 
 func runDogCall(cmd *cobra.Command, args []string) error {
@@ -743,13 +631,6 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 	if err := mgr.ClearWork(name); err != nil {
 		return fmt.Errorf("clearing work for dog %s: %w", name, err)
 	}
-
-	// The dispatch that this work came from is still open in the dog's inbox.
-	// Returning the dog to idle without archiving it leaves a dispatch
-	// assigned to a dog that is no longer executing it — an orphan by
-	// construction. Fail the dispatch with the work.
-	closePluginMails(name)
-	mgr.ClearDispatchAlarm(name)
 
 	fmt.Printf("✓ Cleared dog %s (now idle)\n", name)
 	if d.Work != "" {
@@ -861,52 +742,42 @@ func closePluginMails(dogName string) {
 		return // not in a Gas Town workspace, skip cleanup
 	}
 
-	insp := newMailDispatchInspector(townRoot)
-	closed, err := insp.Reclaim(dogName)
-	if err != nil && closed == 0 {
+	dogAddress := fmt.Sprintf("deacon/dogs/%s", dogName)
+	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	mailbox, err := router.GetMailbox(dogAddress)
+	if err != nil {
 		return
 	}
+
+	messages, err := mailbox.List()
+	if err != nil {
+		return
+	}
+
+	closed := 0
+	for _, msg := range messages {
+		// Archive read AND unread direct plugin dispatch mail. The dog must read
+		// the dispatch mail to execute the plugin, so skipping read mail left
+		// every executed dispatch bead open forever. Keep this scoped to Deacon
+		// dispatches so CC or human messages with a similar subject are preserved.
+		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
+			continue
+		}
+		if mail.AddressToIdentity(msg.To) != mail.AddressToIdentity(dogAddress) {
+			continue
+		}
+		sender := mail.AddressToIdentity(msg.From)
+		if sender != "deacon/" && sender != "daemon" {
+			continue
+		}
+		if archErr := mailbox.Archive(msg.ID); archErr == nil {
+			closed++
+		}
+	}
+
 	if closed > 0 {
 		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
 	}
-}
-
-// mailDispatchInspector implements dog.DispatchInspector over the mail router.
-type mailDispatchInspector struct {
-	townRoot string
-}
-
-func newMailDispatchInspector(townRoot string) *mailDispatchInspector {
-	return &mailDispatchInspector{townRoot: townRoot}
-}
-
-// mailbox resolves a dog's inbox.
-func (i *mailDispatchInspector) mailbox(dogName string) (*mail.Mailbox, string, error) {
-	address := dog.DogAddress(dogName)
-	router := mail.NewRouterWithTownRoot(i.townRoot, i.townRoot)
-	mb, err := router.GetMailbox(address)
-	if err != nil {
-		return nil, address, fmt.Errorf("opening mailbox for %s: %w", address, err)
-	}
-	return mb, address, nil
-}
-
-// Scan reports the open dispatch mail for a dog.
-func (i *mailDispatchInspector) Scan(dogName string) (dog.DispatchScan, error) {
-	mb, address, err := i.mailbox(dogName)
-	if err != nil {
-		return dog.DispatchScan{}, err
-	}
-	return dog.ScanDispatchMail(mb, address, time.Now())
-}
-
-// Reclaim archives every open dispatch for a dog.
-func (i *mailDispatchInspector) Reclaim(dogName string) (int, error) {
-	mb, address, err := i.mailbox(dogName)
-	if err != nil {
-		return 0, err
-	}
-	return dog.ReclaimDispatchMail(mb, address)
 }
 
 func runDogStatus(cmd *cobra.Command, args []string) error {
@@ -1074,13 +945,6 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 	tm := tmux.NewTmux()
 	hc := dog.NewHealthChecker(mgr, tm)
 
-	// Dispatch inspection turns "the session is gone" into "and here are the
-	// N dispatches it was holding". Without a town root we can't reach the
-	// mailboxes, so the check degrades to session-only rather than failing.
-	if townRoot, trErr := workspace.FindFromCwd(); trErr == nil {
-		hc = hc.WithDispatch(newMailDispatchInspector(townRoot), dogHealthStaleDispatch, dogHealthAlarmCooldown)
-	}
-
 	var results []dog.DogHealthResult
 
 	if len(args) > 0 {
@@ -1101,21 +965,14 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 
 	attention := dog.NeedsAttentionCount(results)
 
-	// Raise the alarm that was missing: a dispatch stranded past threshold now
-	// escalates instead of waiting for someone to notice. The checker applies a
-	// per-dog cooldown, so a persistent problem escalates once per window
-	// rather than once per patrol cycle.
-	alarms := dogRaiseDispatchAlarms(results)
-
 	if dogHealthJSON {
 		type HealthReport struct {
 			Dogs           []dog.DogHealthResult `json:"dogs"`
 			NeedsAttention int                   `json:"needs_attention"`
-			Alarms         []string              `json:"alarms,omitempty"`
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(HealthReport{Dogs: results, NeedsAttention: attention, Alarms: alarms}); err != nil {
+		if err := enc.Encode(HealthReport{Dogs: results, NeedsAttention: attention}); err != nil {
 			return err
 		}
 	} else {
@@ -1133,17 +990,8 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 				icon = "✗"
 			}
 			line := fmt.Sprintf("  %s %s [%s] session=%s", icon, r.Name, r.State, r.SessionStatus)
-			if r.ExecState != "" && string(r.ExecState) != string(r.State) {
-				line += fmt.Sprintf(" exec=%s", r.ExecState)
-			}
 			if r.WorkDuration > 0 {
 				line += fmt.Sprintf(" duration=%s", r.WorkDuration.Truncate(time.Second))
-			}
-			if r.OpenDispatches > 0 {
-				line += fmt.Sprintf(" dispatches=%d", r.OpenDispatches)
-			}
-			if r.DispatchesReclaimed > 0 {
-				line += fmt.Sprintf(" reclaimed=%d", r.DispatchesReclaimed)
 			}
 			if r.AutoCleared {
 				line += " (auto-cleared)"
@@ -1155,9 +1003,6 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Println()
-		if len(alarms) > 0 {
-			fmt.Printf("  %d dispatch alarm(s) escalated\n", len(alarms))
-		}
 		if attention > 0 {
 			fmt.Printf("  %d dog(s) need attention\n", attention)
 		} else {
@@ -1171,77 +1016,6 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-// dispatchDelivery records which single path will deliver a dispatch to a dog.
-type dispatchDelivery struct {
-	// suppressMailNotify stops router.Send from firing its async tmux
-	// notification, leaving the session's startup prompt as the sole delivery.
-	suppressMailNotify bool
-	// reason explains the choice, for the dispatch result and for humans
-	// reading a failure after the fact.
-	reason string
-}
-
-// planDispatchDelivery picks exactly one delivery path for a dispatch.
-//
-// Two mechanisms can put text into a dog's pane: router.Send's background
-// notification goroutine, and the startup prompt handed to a newly launched
-// agent. They are independent and unsynchronised — the nudge lock serialises
-// nudge against nudge and cannot see a startup prompt at all. When both fire
-// at one pane the notification's idle probe reads a just-booted agent as idle
-// and types into a turn that is already in flight; the Enter interrupts it and
-// the instruction is destroyed. That is not a prompt-wording problem and no
-// wording can fix it.
-//
-// The fix is to let exactly one path deliver:
-//   - session down: we are about to start it, so its startup prompt is the
-//     delivery and the mail rides silently.
-//   - session up: the mail's notification is the delivery and we start nothing.
-//
-// A failed liveness probe is treated as "up", because the two errors are not
-// symmetric: a redundant nudge at a dead session is a no-op, while a
-// suppressed nudge at a live one strands the dispatch until it is reaped.
-func planDispatchDelivery(sessionRunning bool, probeErr error) dispatchDelivery {
-	if probeErr != nil {
-		return dispatchDelivery{
-			suppressMailNotify: false,
-			reason:             fmt.Sprintf("session liveness unknown (%v) — notifying via mail", probeErr),
-		}
-	}
-	if sessionRunning {
-		return dispatchDelivery{
-			suppressMailNotify: false,
-			reason:             "session already running — mail notification delivers",
-		}
-	}
-	return dispatchDelivery{
-		suppressMailNotify: true,
-		reason:             "session will be started — startup prompt delivers",
-	}
-}
-
-// dogRaiseDispatchAlarms escalates every dispatch alarm carried by the health
-// results and returns the messages escalated.
-//
-// The checker has already applied the per-dog cooldown, so anything reaching
-// here is due. Escalation is best-effort: a failed escalation is reported to
-// stderr rather than swallowed, because a silently-dropped alarm reproduces
-// the exact defect this alarm exists to fix.
-func dogRaiseDispatchAlarms(results []dog.DogHealthResult) []string {
-	var raised []string
-	for _, r := range results {
-		if r.DispatchAlarm == "" {
-			continue
-		}
-		msg := "dog dispatch stranded: " + r.DispatchAlarm
-		if err := dogEscalateBestEffort(msg); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: dispatch alarm escalation failed (%v) — escalate manually: gt escalate --severity medium %q\n", err, msg)
-			continue
-		}
-		raised = append(raised, msg)
-	}
-	return raised
 }
 
 // runDogDispatch dispatches plugin execution to a dog worker.
@@ -1378,28 +1152,9 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("assigning work to dog: %w", err)
 	}
 
-	// Decide the delivery path BEFORE sending, because sending is what starts
-	// the race.
-	//
-	// router.Send fires its tmux notification on a background goroutine, and
-	// session startup delivers the dog's instructions as the agent's initial
-	// prompt. When both happen for the same pane, the notification's
-	// WaitForIdle sees a freshly-booted agent as idle and types into a turn
-	// that is already in flight — the second delivery interrupts the first and
-	// the instruction is destroyed. The nudge lock serialises nudge against
-	// nudge; it cannot see a startup prompt.
-	//
-	// So exactly one path delivers: if we are about to start the session, its
-	// startup prompt is the delivery and the mail rides silently; if the
-	// session is already up, the mail's notification is the delivery and we
-	// start nothing.
-	t := tmux.NewTmux()
-	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
-	plan := planDispatchDelivery(sessMgr.IsRunning(targetDog.Name))
-
 	// Create and send mail message with plugin instructions
-	dogAddress := dog.DogAddress(targetDog.Name)
-	subject := dog.DispatchSubjectPrefix + p.Name
+	dogAddress := fmt.Sprintf("deacon/dogs/%s", targetDog.Name)
+	subject := fmt.Sprintf("Plugin: %s", p.Name)
 	body := p.FormatMailBody()
 
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
@@ -1410,12 +1165,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		Subject:   subject,
 		Body:      body,
 		Timestamp: time.Now(),
-		// Suppress the async nudge when the startup prompt will carry the
-		// wakeup. See planDispatchDelivery.
-		SuppressNotify: plan.suppressMailNotify,
 	}
-	result.NotifiedViaMail = !plan.suppressMailNotify
-	result.DeliveryPath = plan.reason
 
 	if err := router.Send(msg); err != nil {
 		// Rollback: clear work assignment since mail failed
@@ -1430,6 +1180,8 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 
 	// Ensure dog session is running so it can read the mail.
 	// Without this, dispatched work sits in mail with no session to read it.
+	t := tmux.NewTmux()
+	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
 	sessOpts := dog.SessionStartOptions{
 		WorkDesc: workDesc,
 	}
@@ -1445,17 +1197,6 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 			result.Warnings = append(result.Warnings, warn)
 			if !dogDispatchJSON {
 				style.PrintWarning("%s", warn)
-			}
-		}
-		// The mail is already durable but no session will ever read it.
-		// Archive it here rather than leaving an open dispatch assigned to a
-		// dog that is going back to idle — that orphan is mechanism B.
-		if mailbox, mbErr := router.GetMailbox(dogAddress); mbErr == nil {
-			if n, reclaimErr := dog.ReclaimDispatchMail(mailbox, dogAddress); reclaimErr != nil {
-				result.Warnings = append(result.Warnings, fmt.Sprintf(
-					"dispatch mail reclaim incomplete for %s (%d archived): %v", targetDog.Name, n, reclaimErr))
-			} else {
-				result.DispatchesReclaimed = n
 			}
 		}
 		warn := fmt.Sprintf("dog dispatch: session start failed for %s (work rolled back, re-dispatch with: gt dog dispatch --plugin %s): %v", targetDog.Name, p.Name, sessErr)
@@ -1510,7 +1251,6 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Plugin dispatched (non-blocking)\n", style.Bold.Render("✓"))
 	fmt.Printf("  Dog: %s\n", targetDog.Name)
 	fmt.Printf("  Work: %s\n", workDesc)
-	fmt.Printf("  Delivery: %s\n", plan.reason)
 
 	return nil
 }
@@ -1527,18 +1267,6 @@ type dogDispatchResult struct {
 	SessionStarted bool     `json:"session_started"`
 	WorkConfirmed  bool     `json:"work_confirmed"`
 	Warnings       []string `json:"warnings,omitempty"`
-
-	// NotifiedViaMail reports which path delivered the dispatch. True means
-	// the session was already up and the mail notification woke it; false
-	// means the session was started and its startup prompt was the delivery.
-	// Exactly one path delivers — see planDispatchDelivery.
-	NotifiedViaMail bool `json:"notified_via_mail"`
-
-	// DeliveryPath explains the delivery choice in words.
-	DeliveryPath string `json:"delivery_path,omitempty"`
-
-	// DispatchesReclaimed counts dispatch mails archived during rollback.
-	DispatchesReclaimed int `json:"dispatches_reclaimed,omitempty"`
 }
 
 // dogEscalateBestEffort fires a MEDIUM escalation via gt escalate.
