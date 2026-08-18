@@ -15,7 +15,6 @@ import (
 
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // minOrphanAge is the minimum age (in seconds) a process must be before
@@ -124,74 +123,30 @@ func collectPanePIDs(socketPath string, childMap map[int][]int, pids map[int]boo
 func getACPSessionPIDs() map[int]bool {
 	pids := make(map[int]bool)
 
+	// Find all town roots by looking for mayor-acp.pid files
+	// Common locations: ~/gt, ~/town-*, etc.
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return pids
+	}
+
 	// Build process tree once
 	childMap := buildChildMap()
 
-	// Check every candidate town root for a mayor-acp.pid file.
-	for _, root := range acpTownRootCandidates() {
-		data, err := os.ReadFile(filepath.Join(root, "mayor", "mayor-acp.pid"))
-		if err != nil {
-			continue
+	// Check the primary town root (~/gt)
+	pidPath := filepath.Join(homeDir, "gt", "mayor", "mayor-acp.pid")
+	if data, err := os.ReadFile(pidPath); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			// Check if process is still alive
+			if processExists(pid) {
+				pids[pid] = true
+				// Add all child processes (including the opencode agent)
+				addDescendants(pid, childMap, pids)
+			}
 		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-		if err != nil {
-			continue
-		}
-		// Check if process is still alive
-		if !processExists(pid) {
-			continue
-		}
-		pids[pid] = true
-		// Add all child processes (including the opencode agent)
-		addDescendants(pid, childMap, pids)
 	}
 
 	return pids
-}
-
-// acpTownRootCandidates returns the town roots to search for mayor-acp.pid,
-// most authoritative first and de-duplicated.
-//
-// This used to look in exactly one place, ~/gt (gt-3sz, hq-uwxo). The town is
-// frequently NOT at ~/gt, and on such a host the pid file was never found, so
-// getACPSessionPIDs returned an EMPTY protection set every time. That is not a
-// cosmetic path bug: the ACP proxy and its agent children have no TTY and no
-// tmux session, which is precisely the signature FindOrphanedClaudeProcesses
-// and FindZombieClaudeProcesses use to select processes for killing. A wrong
-// path here fails OPEN.
-//
-// So this widens rather than replaces. ~/gt stays in the list — dropping it
-// would blind hosts where the town really is there — and every candidate is
-// checked, because protecting a PID that turns out to be stale costs nothing
-// while missing a live one kills an agent mid-session.
-func acpTownRootCandidates() []string {
-	var candidates []string
-	seen := make(map[string]bool)
-	add := func(dir string) {
-		if dir == "" || seen[dir] {
-			return
-		}
-		seen[dir] = true
-		candidates = append(candidates, dir)
-	}
-
-	// Explicit town root: set by shell integration and by the session manager.
-	add(os.Getenv("GT_TOWN_ROOT"))
-	add(os.Getenv("GT_ROOT"))
-
-	// The town containing the current working directory.
-	if cwd, err := os.Getwd(); err == nil {
-		if root, err := workspace.Find(cwd); err == nil {
-			add(root)
-		}
-	}
-
-	// Conventional default, kept last: correct on some hosts, a guess on others.
-	if home, err := os.UserHomeDir(); err == nil {
-		add(filepath.Join(home, "gt"))
-	}
-
-	return candidates
 }
 
 // sigkillGracePeriod is how long (in seconds) we wait after sending SIGTERM

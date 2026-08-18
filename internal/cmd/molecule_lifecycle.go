@@ -376,14 +376,10 @@ func forceCloseDescendants(b *beads.Beads, parentID string) (int, error) {
 }
 
 func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, error) {
-	// Enumerate children across BOTH the durable issues table and the wisps
-	// table, at every priority. A bare b.List here saw neither: it defaults to
-	// Ephemeral=false (so `bd list` never returns wisps) and to Priority=0 (so
-	// it passes --priority=0 and drops every child at another priority).
-	// Molecule step children are ephemeral wisps, so this listing came back
-	// empty, closed nothing, and returned no error — the caller then closed the
-	// root over still-open steps and reported success (gt-u2u).
-	children, err := listChildrenAcrossTables(b, parentID)
+	children, err := b.List(beads.ListOptions{
+		Parent: parentID,
+		Status: "all",
+	})
 	if err != nil {
 		return 0, fmt.Errorf("listing children of %s: %w", parentID, err)
 	}

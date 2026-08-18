@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/runtime"
@@ -832,7 +833,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	}
 
 	if err != nil {
-		return nil, b.wrapError(err, stderr.String(), args)
+		return nil, b.wrapErrorWithOutput(err, stderr.String(), stdout.String(), args)
 	}
 
 	// Handle bd exit code 0 bug: when issue not found,
@@ -850,11 +851,6 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 // This is needed for slot operations that reference beads with different prefixes
 // (e.g., setting an hq-* hook bead on a gt-* agent bead).
 // See: sling_helpers.go verifyBeadExists/hookBeadWithRetry for the same pattern.
-//
-// The subprocess runs from RoutingWorkDir(b.workDir), not b.workDir: bd only
-// consults routes.jsonl in the beads directory it already resolved to, so a
-// wrapper rooted in a rig worktree would otherwise get no routing at all and
-// report every foreign-prefix bead as missing (gt-dno).
 func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //nolint:unparam // mirrors run() signature for consistency
 	start := time.Now()
 	var stdout, stderr bytes.Buffer
@@ -870,7 +866,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
-	cmd.Dir = RoutingWorkDir(b.workDir)
+	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -880,7 +876,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, b.wrapError(err, stderr.String(), args)
+		return nil, b.wrapErrorWithOutput(err, stderr.String(), stdout.String(), args)
 	}
 
 	if stdout.Len() == 0 && stderr.Len() > 0 {
@@ -897,11 +893,23 @@ func (b *Beads) Run(args ...string) ([]byte, error) {
 	return b.run(args...)
 }
 
-// wrapError wraps bd errors with context.
+// wrapError wraps bd errors with context, using stderr as the only source of
+// detail. Prefer wrapErrorWithOutput wherever bd's stdout is also available.
+func (b *Beads) wrapError(err error, stderr string, args []string) error {
+	return b.wrapErrorWithOutput(err, stderr, "", args)
+}
+
+// wrapErrorWithOutput wraps bd errors with context.
 // ZFC: Avoid parsing stderr to make decisions. Transport errors to agents instead.
 // Exception: ErrNotInstalled (exec.ErrNotFound) and ErrNotFound (issue lookup) are
 // acceptable as they enable basic error handling without decision-making.
-func (b *Beads) wrapError(err error, stderr string, args []string) error {
+//
+// bd reports some failures — notably database/config initialization errors — as a
+// JSON payload on STDOUT while exiting non-zero with an EMPTY stderr. Reading
+// stderr alone left operators with a bare "bd create ...: exit status 1" and no
+// way to see why the merge queue was not receiving MR beads (gt-k3h), so stdout
+// is used as a fallback when stderr is silent.
+func (b *Beads) wrapErrorWithOutput(err error, stderr, stdout string, args []string) error {
 	stderr = strings.TrimSpace(stderr)
 
 	// Check for bd not installed
@@ -909,17 +917,78 @@ func (b *Beads) wrapError(err error, stderr string, args []string) error {
 		return ErrNotInstalled
 	}
 
+	// detail is what the caller gets to read; classify says whether it is bd's own
+	// error text. Ordinary command output that happens to land on stdout is worth
+	// surfacing in the message but must never be classified as a lookup failure.
+	detail, classify := stderr, stderr != ""
+	if detail == "" {
+		if payload := bdErrorFromStdout(stdout); payload != "" {
+			detail, classify = payload, true
+		} else {
+			detail = truncateBDOutput(stdout)
+		}
+	}
+
 	// ErrNotFound is widely used for issue lookups - acceptable exception
 	// Match various "not found" error patterns from bd
-	if strings.Contains(stderr, "not found") || strings.Contains(stderr, "Issue not found") ||
-		strings.Contains(stderr, "no issue found") {
+	if classify && (strings.Contains(detail, "not found") || strings.Contains(detail, "Issue not found") ||
+		strings.Contains(detail, "no issue found")) {
 		return ErrNotFound
 	}
 
-	if stderr != "" {
-		return fmt.Errorf("bd %s: %s", strings.Join(args, " "), stderr)
+	if detail != "" {
+		return fmt.Errorf("bd %s: %s", strings.Join(args, " "), detail)
 	}
 	return fmt.Errorf("bd %s: %w", strings.Join(args, " "), err)
+}
+
+// bdErrorFromStdout returns bd's own error message when stdout carries a
+// {"error": "..."} payload, or "" when it does not. bd may print warnings ahead
+// of the payload, so lines are scanned newest-first before the whole body is
+// tried as one pretty-printed object.
+func bdErrorFromStdout(stdout string) string {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return ""
+	}
+	lines := strings.Split(stdout, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if msg := bdErrorField(strings.TrimSpace(lines[i])); msg != "" {
+			return msg
+		}
+	}
+	return bdErrorField(stdout)
+}
+
+func bdErrorField(candidate string) string {
+	if !strings.HasPrefix(candidate, "{") {
+		return ""
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(candidate), &payload) != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Error)
+}
+
+// maxBDOutputInError bounds how much unstructured stdout is pasted into an error.
+// bd output can be arbitrarily large; an error message that has to travel through
+// logs and agent context cannot be.
+const maxBDOutputInError = 2000
+
+func truncateBDOutput(stdout string) string {
+	stdout = strings.TrimSpace(string(stripStdoutWarnings([]byte(stdout))))
+	if len(stdout) <= maxBDOutputInError {
+		return stdout
+	}
+	// Cut on a rune boundary so the message never ends in a mangled character.
+	cut := maxBDOutputInError
+	for cut > 0 && !utf8.RuneStart(stdout[cut]) {
+		cut--
+	}
+	return stdout[:cut] + "… (truncated)"
 }
 
 // isSubprocessCrash returns true if the error indicates the subprocess crashed

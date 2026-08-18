@@ -2893,7 +2893,20 @@ func (m *Manager) setupSharedBeads(clonePath string) error {
 		util.SetDetachedProcessGroup(cmd)
 		_ = cmd.Run()
 	}
-	cmd := exec.Command("git", "-C", clonePath, "config", "beads.role", "contributor")
+	// maintainer, not contributor. A rig's beads ARE the project's beads, and bd
+	// routes by role: under beads.role=contributor it silently redirects create
+	// and list into the caller's personal planning store, still exiting 0 with a
+	// real bead ID. Work a polecat filed with a bare `bd create` — which every
+	// polecat is instructed to do for discovered work — then became invisible to
+	// the Witness, Mayor and Refinery and could never be updated or closed
+	// ("embeddeddolt: store is read-only"). gt's own bd subprocesses are already
+	// immune because BuildPinnedBDEnv pins the role per-command (gt-2ta); this
+	// covers the bare `bd` an agent runs in its sandbox (gt-k3h).
+	//
+	// Polecat sandboxes are worktrees sharing one config file, so this write is
+	// repo-wide — which is exactly why writing "contributor" here stranded beads
+	// for the rig root and every other sandbox too, not just the new one.
+	cmd := exec.Command("git", "-C", clonePath, "config", "beads.role", "maintainer")
 	util.SetDetachedProcessGroup(cmd)
 	_ = cmd.Run()
 
