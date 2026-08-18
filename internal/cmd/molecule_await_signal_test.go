@@ -2,12 +2,15 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/events"
 )
 
 func TestCalculateEffectiveTimeout(t *testing.T) {
@@ -446,5 +449,279 @@ esac
 				t.Fatalf("bd mutation was not auto-commit pinned: %s\nfull log:\n%s", line, log)
 			}
 		}
+	}
+}
+
+// awaitSignalIdleRun is the observable result of one runMoleculeAwaitSignal
+// invocation against the fake bd: every bd argv line it saw, and the label set
+// left on the agent bead afterwards.
+type awaitSignalIdleRun struct {
+	log         string
+	finalLabels []string
+}
+
+// updateCalls returns the bd update invocations from the run's log.
+func (r awaitSignalIdleRun) updateCalls() []string {
+	var updates []string
+	for _, line := range strings.Split(r.log, "\n") {
+		if strings.HasPrefix(line, "update ") {
+			updates = append(updates, line)
+		}
+	}
+	return updates
+}
+
+// idleLabel returns the idle:N value left on the agent bead, or "" if absent.
+func (r awaitSignalIdleRun) idleLabel() string {
+	for _, l := range r.finalLabels {
+		if strings.HasPrefix(l, "idle:") {
+			return strings.TrimPrefix(l, "idle:")
+		}
+	}
+	return ""
+}
+
+// runAwaitSignalIdle drives runMoleculeAwaitSignal against a stateful fake bd
+// and a throwaway town root.
+//
+// The harness is deliberately self-contained: the only reachable bd is the
+// stub, so nothing touches the production Dolt server, and no delivery path
+// (tmux or otherwise) is exercised.
+//
+// The stub is stateful — update --set-labels replaces the label set that the
+// next show returns — because await-signal issues several read-modify-write
+// label updates per invocation and a fixed-response stub would make their
+// ordering unobservable.
+//
+// With sendSignal, a line is appended to .events.jsonl shortly after the wait
+// begins so waitForActivitySignal returns reason "signal"; otherwise the wait
+// runs to timeout.
+func runAwaitSignalIdle(t *testing.T, labels []string, sendSignal bool) awaitSignalIdleRun {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fake bd")
+	}
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0o755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Chdir(root)
+
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	logPath := filepath.Join(root, "bd.log")
+	statePath := filepath.Join(root, "labels.txt")
+	if err := os.WriteFile(statePath, []byte(strings.Join(labels, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write initial labels: %v", err)
+	}
+
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+STATE=%q
+case "$1" in
+show)
+  out=
+  while IFS= read -r l; do
+    [ -z "$l" ] && continue
+    if [ -z "$out" ]; then out="\"$l\""; else out="$out,\"$l\""; fi
+  done < "$STATE"
+  printf '[{"labels":[%%s]}]\n' "$out"
+  ;;
+update)
+  : > "$STATE.tmp"
+  for a in "$@"; do
+    case "$a" in
+      --set-labels=?*) printf '%%s\n' "${a#--set-labels=}" >> "$STATE.tmp" ;;
+    esac
+  done
+  mv "$STATE.tmp" "$STATE"
+  ;;
+esac
+exit 0
+`, logPath, statePath)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	eventsPath := filepath.Join(root, events.EventsFile)
+	if err := os.WriteFile(eventsPath, nil, 0o644); err != nil {
+		t.Fatalf("create events file: %v", err)
+	}
+
+	oldTimeout := awaitSignalTimeout
+	oldBackoffBase := awaitSignalBackoffBase
+	oldBackoffMult := awaitSignalBackoffMult
+	oldBackoffMax := awaitSignalBackoffMax
+	oldQuiet := awaitSignalQuiet
+	oldAgentBead := awaitSignalAgentBead
+	oldJSON := moleculeJSON
+	t.Cleanup(func() {
+		awaitSignalTimeout = oldTimeout
+		awaitSignalBackoffBase = oldBackoffBase
+		awaitSignalBackoffMult = oldBackoffMult
+		awaitSignalBackoffMax = oldBackoffMax
+		awaitSignalQuiet = oldQuiet
+		awaitSignalAgentBead = oldAgentBead
+		moleculeJSON = oldJSON
+	})
+
+	awaitSignalBackoffBase = ""
+	awaitSignalBackoffMult = 2
+	awaitSignalBackoffMax = ""
+	awaitSignalQuiet = true
+	awaitSignalAgentBead = "gt-test-witness"
+	moleculeJSON = false
+
+	if sendSignal {
+		// Generous timeout: the appended event, not the clock, must end the wait.
+		awaitSignalTimeout = "10s"
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			time.Sleep(300 * time.Millisecond)
+			f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				return
+			}
+			defer f.Close()
+			_, _ = f.WriteString(`{"type":"test_activity"}` + "\n")
+		}()
+		t.Cleanup(func() { <-done })
+	} else {
+		awaitSignalTimeout = "80ms"
+	}
+
+	if err := runMoleculeAwaitSignal(nil, nil); err != nil {
+		t.Fatalf("runMoleculeAwaitSignal: %v", err)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	stateData, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read final labels: %v", err)
+	}
+
+	var final []string
+	for _, l := range strings.Split(string(stateData), "\n") {
+		if l != "" {
+			final = append(final, l)
+		}
+	}
+	return awaitSignalIdleRun{log: string(logData), finalLabels: final}
+}
+
+// TestAwaitSignalResetsIdleOnSignalReceived is the regression test for gt-609:
+// a received signal must walk the idle counter back to 0 in the binary rather
+// than delegating that to the caller's patrol formula. Before the fix, idle
+// survived a signal and ratcheted upward until the agent parked at the backoff
+// cap and slept through real work.
+func TestAwaitSignalResetsIdleOnSignalReceived(t *testing.T) {
+	run := runAwaitSignalIdle(t, []string{"gt:agent", "idle:3"}, true)
+
+	if len(run.updateCalls()) == 0 {
+		t.Fatalf("expected bd update calls, log:\n%s", run.log)
+	}
+	if got := run.idleLabel(); got != "0" {
+		t.Fatalf("idle after signal = %q, want %q (a signal must reset the counter)\nlabels: %v\nlog:\n%s",
+			got, "0", run.finalLabels, run.log)
+	}
+}
+
+// TestAwaitSignalTimeoutStillIncrementsIdle guards the other half of the
+// backoff: the reset must not disturb the timeout-side increment.
+func TestAwaitSignalTimeoutStillIncrementsIdle(t *testing.T) {
+	run := runAwaitSignalIdle(t, []string{"gt:agent", "idle:3"}, false)
+
+	if len(run.updateCalls()) == 0 {
+		t.Fatalf("expected bd update calls, log:\n%s", run.log)
+	}
+	if got := run.idleLabel(); got != "4" {
+		t.Fatalf("idle after timeout = %q, want %q\nlabels: %v\nlog:\n%s",
+			got, "4", run.finalLabels, run.log)
+	}
+}
+
+// TestAwaitSignalResetPreservesOtherLabels checks the reset uses the same
+// read-modify-write path as the increment and does not drop unrelated labels.
+func TestAwaitSignalResetPreservesOtherLabels(t *testing.T) {
+	run := runAwaitSignalIdle(t, []string{"gt:agent", "role:witness", "idle:2"}, true)
+
+	for _, want := range []string{"gt:agent", "role:witness"} {
+		found := false
+		for _, l := range run.finalLabels {
+			if l == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("label %q was dropped by the reset; final labels: %v\nlog:\n%s",
+				want, run.finalLabels, run.log)
+		}
+	}
+}
+
+// TestAwaitSignalSkipsIdleWriteWhenAlreadyZero checks the idleCycles > 0 guard.
+// Every bd mutation is a permanent Dolt commit, so an agent woken repeatedly
+// while already at idle:0 must not write the label it would not change. The
+// assertion is relative — one fewer update than the same run from idle:3 —
+// so it does not hard-code the total number of label writes per invocation.
+func TestAwaitSignalSkipsIdleWriteWhenAlreadyZero(t *testing.T) {
+	fromZero := len(runAwaitSignalIdle(t, []string{"gt:agent", "idle:0"}, true).updateCalls())
+	fromThree := len(runAwaitSignalIdle(t, []string{"gt:agent", "idle:3"}, true).updateCalls())
+
+	if fromZero != fromThree-1 {
+		t.Errorf("update calls from idle:0 = %d, from idle:3 = %d; want exactly one fewer "+
+			"(the reset write should be skipped when the counter is already 0)", fromZero, fromThree)
+	}
+}
+
+// TestBackoffAtCap covers the health signal for an agent parked at the backoff
+// cap, which is otherwise indistinguishable from a healthy briefly-idle one.
+func TestBackoffAtCap(t *testing.T) {
+	oldBase := awaitSignalBackoffBase
+	oldMax := awaitSignalBackoffMax
+	t.Cleanup(func() {
+		awaitSignalBackoffBase = oldBase
+		awaitSignalBackoffMax = oldMax
+	})
+
+	tests := []struct {
+		name        string
+		base        string
+		max         string
+		fullTimeout time.Duration
+		want        bool
+	}{
+		{"simple timeout mode is never at cap", "", "", time.Hour, false},
+		{"backoff without a max is never at cap", "30s", "", time.Hour, false},
+		{"below cap", "30s", "15m", 4 * time.Minute, false},
+		{"exactly at cap", "30s", "15m", 15 * time.Minute, true},
+		{"clamped to cap", "30s", "15m", 30 * time.Minute, true},
+		{"unparseable max is not at cap", "30s", "not-a-duration", time.Hour, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			awaitSignalBackoffBase = tt.base
+			awaitSignalBackoffMax = tt.max
+			if got := backoffAtCap(tt.fullTimeout); got != tt.want {
+				t.Errorf("backoffAtCap(%v) = %v, want %v", tt.fullTimeout, got, tt.want)
+			}
+		})
 	}
 }
