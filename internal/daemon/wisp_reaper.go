@@ -26,8 +26,30 @@ const (
 	wispAlertThreshold = reaper.DefaultAlertThreshold
 	// Closed mail older than this is permanently deleted. Formula var: mail_delete_age.
 	defaultMailDeleteAge = 7 * 24 * time.Hour
-	// Issues stale longer than this are auto-closed. Formula var: stale_issue_age.
-	defaultStaleIssueAge = 7 * 24 * time.Hour
+	// Issues stale longer than this are auto-closed.
+	//
+	// 30 DAYS, NOT 7 (gt-zjb). This was 7*24 — the 7-day pattern from the two
+	// constants above applied one line too far, where both neighbours are
+	// legitimately 7 days. That made the daemon auto-close issues 4.3x more
+	// aggressively than every documented surface says:
+	//
+	//	formula [vars.stale_issue_age]   720h
+	//	gt reaper auto-close --help      720h   (reaper.go CLI default)
+	//	ACTING value                     168h   <- what actually ran
+	//
+	// It is a typed constant, so Duration.String() renders "168h0m0s" into the
+	// patrol digest and no search for "720h" or for a config key ever finds it.
+	//
+	// ⚠️ THERE IS NO OVERRIDE PATH, and the old comment claimed one. max_age and
+	// purge_age are resolved through wispReaperMaxAge()/wispDeleteAge(), which
+	// consult DaemonPatrolConfig. stale_issue_age and mail_delete_age are used
+	// BARE — see the AutoClose call below. So the formula var of that name is
+	// dead code: editing the formula or any config changes nothing, and only a
+	// code change plus a rebuild moves this value. Do not re-add a "Formula var:"
+	// comment here unless you also add the reader.
+	//
+	// This is the constant that auto-closed 7 of 8 agent beads town-wide, twice.
+	defaultStaleIssueAge = 30 * 24 * time.Hour
 )
 
 // WispReaperConfig holds configuration for the wisp_reaper patrol.

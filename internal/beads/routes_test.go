@@ -728,3 +728,109 @@ func TestValidateRigPrefix(t *testing.T) {
 		})
 	}
 }
+
+// newRoutedTown builds a town tree with routes.jsonl at the town .beads and a
+// rig whose worktrees redirect to the rig's canonical database, mirroring the
+// production layout gt-dno was reported against.
+func newRoutedTown(t *testing.T) string {
+	t.Helper()
+	townRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	townBeads := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routes := `{"prefix":"hq-","path":"."}
+{"prefix":"gt-","path":"gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(townBeads, RoutesFileName), []byte(routes), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rig canonical database — deliberately has no routes.jsonl, which is what
+	// strands bd's prefix routing when a command runs from a rig context.
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Rig root redirects to the canonical rig database.
+	rigRootBeads := filepath.Join(townRoot, "gastown", ".beads")
+	if err := os.MkdirAll(rigRootBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigRootBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	return townRoot
+}
+
+func TestRoutingWorkDir(t *testing.T) {
+	townRoot := newRoutedTown(t)
+
+	rigContexts := []struct {
+		name string
+		dir  string
+	}{
+		{"rig root", filepath.Join(townRoot, "gastown")},
+		{"canonical rig database", filepath.Join(townRoot, "gastown", "mayor", "rig")},
+		{"refinery worktree", filepath.Join(townRoot, "gastown", "refinery", "rig")},
+		{"polecat worktree", filepath.Join(townRoot, "gastown", "polecats", "fury", "gastown")},
+	}
+
+	// Every rig context relocates to the town root, because that is the only
+	// directory publishing routes.jsonl. Without this, bd resolves to the rig
+	// database, finds no routes, and reports foreign-prefix beads as absent.
+	for _, tc := range rigContexts {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RoutingWorkDir(tc.dir); got != townRoot {
+				t.Errorf("RoutingWorkDir(%q) = %q, want town root %q", tc.dir, got, townRoot)
+			}
+		})
+	}
+
+	t.Run("town root is already routes-bearing", func(t *testing.T) {
+		if got := RoutingWorkDir(townRoot); got != townRoot {
+			t.Errorf("RoutingWorkDir(%q) = %q, want %q", townRoot, got, townRoot)
+		}
+	})
+
+	t.Run("empty dir is returned unchanged", func(t *testing.T) {
+		if got := RoutingWorkDir(""); got != "" {
+			t.Errorf("RoutingWorkDir(\"\") = %q, want \"\"", got)
+		}
+	})
+}
+
+func TestRoutingWorkDirLeavesDirAloneWithoutRoutes(t *testing.T) {
+	// A town with no routes.jsonl offers nothing to relocate for: moving cwd
+	// would only change which database bd tries first.
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := RoutingWorkDir(rigDir); got != rigDir {
+		t.Errorf("RoutingWorkDir(%q) = %q, want unchanged %q", rigDir, got, rigDir)
+	}
+}
+
+func TestRoutingWorkDirOutsideTownIsUnchanged(t *testing.T) {
+	outside := t.TempDir()
+	if got := RoutingWorkDir(outside); got != outside {
+		t.Errorf("RoutingWorkDir(%q) = %q, want unchanged %q", outside, got, outside)
+	}
+}

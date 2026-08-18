@@ -851,6 +851,11 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 // This is needed for slot operations that reference beads with different prefixes
 // (e.g., setting an hq-* hook bead on a gt-* agent bead).
 // See: sling_helpers.go verifyBeadExists/hookBeadWithRetry for the same pattern.
+//
+// The subprocess runs from RoutingWorkDir(b.workDir), not b.workDir: bd only
+// consults routes.jsonl in the beads directory it already resolved to, so a
+// wrapper rooted in a rig worktree would otherwise get no routing at all and
+// report every foreign-prefix bead as missing (gt-dno).
 func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //nolint:unparam // mirrors run() signature for consistency
 	start := time.Now()
 	var stdout, stderr bytes.Buffer
@@ -866,7 +871,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
-	cmd.Dir = b.workDir
+	cmd.Dir = RoutingWorkDir(b.workDir)
 
 	cmd.Env = runEnv
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
