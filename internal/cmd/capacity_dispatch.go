@@ -854,19 +854,19 @@ func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 // a partial scan looked authoritative and the scheduler would re-dispatch work
 // it could not prove was unscheduled. Isolating a failure must not convert it
 // into "nothing is scheduled".
-var ErrPartialSlingContextScan = errors.New("planning scan could not read every store; result is incomplete")
+//
+// The message names the OPERATION, not just the planning pass (gt-qm04). This
+// error reaches `gt scheduler clear` and areScheduled too, and "planning scan
+// could not read every store" tells an operator staring at a failed clear
+// nothing about what the command was unable to enumerate.
+var ErrPartialSlingContextScan = errors.New("listing sling contexts: scan could not read every store; result is incomplete")
 
-// listAllSlingContextRecords names itself in every error it returns ("listing
-// sling contexts: ..."), so callers can surface the failure verbatim instead of
-// re-wrapping it. A partial-scan error also carries which stores were skipped,
-// because "one rig was unreadable" and "the whole scan is broken" call for very
-// different operator responses.
 func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	var records []slingContextRecord
 	seen := make(map[string]bool)
 	dirs, err := beadsSearchDirs(townRoot)
 	if err != nil {
-		return nil, fmt.Errorf("listing sling contexts: %w", err)
+		return nil, err
 	}
 	// PER-ENTRY ERROR ISOLATION (hq-v05uw). This loop previously returned on the
 	// first store that errored, so ONE bad .beads directory aborted the ENTIRE
@@ -904,13 +904,13 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	// Total failure is still an error — degrading to "no work found" would hide
 	// a broken scan behind an empty result.
 	if len(dirs) > 0 && len(skipped) == len(dirs) {
-		return nil, fmt.Errorf("listing sling contexts: planning scan failed on ALL %d stores; last: %s", len(dirs), skipped[len(skipped)-1])
+		return nil, fmt.Errorf("planning scan failed on ALL %d stores; last: %s", len(dirs), skipped[len(skipped)-1])
 	}
 	if len(skipped) > 0 {
 		// Records ARE returned so best-effort planning still works, but the
 		// sentinel travels with them so a completeness-sensitive caller can
 		// fail closed instead of trusting an incomplete view (gt-mji1).
-		return records, fmt.Errorf("listing sling contexts: %w (skipped %d of %d: %s)",
+		return records, fmt.Errorf("%w (skipped %d of %d: %s)",
 			ErrPartialSlingContextScan, len(skipped), len(dirs), strings.Join(skipped, ", "))
 	}
 	return records, nil
