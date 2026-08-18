@@ -3159,12 +3159,16 @@ func (d *Daemon) dispatchQueuedWork() {
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
-	out, err := cmd.CombinedOutput()
+	// Streams are captured separately: `gt scheduler run` reports the failure on
+	// stdout while bd writes advisory warnings (e.g. .beads directory
+	// permissions) to stderr. Merged capture made the warning read like the
+	// cause and hid a missing-table error for a day (gt-q134).
+	stdout, stderr, err := runSplitOutput(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
-		d.logger.Printf("Scheduler dispatch timed out after 5m")
+		d.logger.Printf("Scheduler dispatch timed out after 5m%s", formatSplitOutput(stdout, stderr))
 	} else if err != nil {
-		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, string(out))
-	} else if len(out) > 0 {
-		d.logger.Printf("Scheduler dispatch: %s", string(out))
+		d.logger.Printf("Scheduler dispatch failed: %v%s", err, formatSplitOutput(stdout, stderr))
+	} else if stdout != "" || stderr != "" {
+		d.logger.Printf("Scheduler dispatch:%s", formatSplitOutput(stdout, stderr))
 	}
 }
