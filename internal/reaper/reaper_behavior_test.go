@@ -235,6 +235,137 @@ func TestPurgeClosedWispsBehaviour(t *testing.T) {
 	}
 }
 
+// TestPurgeProtectsMergeRequestWispsBehaviour is the acceptance test for gt-nmg.
+//
+// A gt:merge-request wisp CLOSED WITHOUT MERGING is the only record that the
+// work did not land, and it carries the rejection rationale. Wisps are
+// unversioned and unbacked, so deleting one is unrecoverable by any means the
+// town has. On 2026-08-17 seven closed MR beads were deleted on the beads rig,
+// including a rejection eleven minutes old (gt-6dp).
+//
+// This path is a NATIVE SQL DELETE — it is not the `bd purge` shell-out that
+// gt-fdj bounded with --older-than, and it is not covered by whatever bd purge
+// grows. Age alone was never the guard: a merge queue that stalls for a week
+// produces a closed unmerged MR older than any purge_age we would set. That is
+// what the w-mr-ancient row below stands for.
+//
+// The NEGATIVE CONTROL (w-ordinary) is closed by the SAME margin and differs
+// only in its label. A purge that stopped deleting anything — the way a guard
+// applied too broadly fails — leaves it behind and fails here.
+func TestPurgeProtectsMergeRequestWispsBehaviour(t *testing.T) {
+	f := newFixture(t, "purge_protect_mr")
+	now := time.Now().UTC()
+	oldClose := now.Add(-30 * 24 * time.Hour)
+	ancientClose := now.Add(-365 * 24 * time.Hour)
+
+	f.insertWisps(t,
+		// Protected by type. Same age and status as the control.
+		wispRow{id: "w-mr", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			labels: []string{"gt:merge-request"}},
+		// A year past the cutoff: no age bound rescues this one, only the type does.
+		wispRow{id: "w-mr-ancient", status: "closed", createdAt: ancientClose, closedAt: &ancientClose,
+			labels: []string{"gt:merge-request"}},
+		// Protected by the pinned column an incident responder sets by hand.
+		wispRow{id: "w-pinned", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			pinned: boolPtr(true)},
+		// Explicitly unpinned, and NULL-pinned: both must still be purged. The
+		// NULL row is why the guard COALESCEs — `pinned = 0` alone would skip it
+		// and quietly stop purging most of the table.
+		wispRow{id: "w-unpinned", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			pinned: boolPtr(false)},
+		wispRow{id: "w-null-pinned", status: "closed", createdAt: oldClose, closedAt: &oldClose},
+		// NEGATIVE CONTROL: same age, same status, ordinary label.
+		wispRow{id: "w-ordinary", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			labels: []string{"gt:wisp"}},
+	)
+	// Auxiliary rows for a protected wisp: protecting the wisp row while its
+	// labels and comments are deleted would leave a husk, not a record.
+	f.insertWispAux(t, "w-mr")
+
+	scan, err := Scan(f.db, f.dbName, purgeAge, purgeAge, purgeAge, staleAge)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.PurgeCandidates != 3 {
+		t.Errorf("Scan.PurgeCandidates = %d, want 3 (w-unpinned, w-null-pinned, w-ordinary) — "+
+			"scan must count what purge will actually delete, or it advertises rows purge declines", scan.PurgeCandidates)
+	}
+	if scan.ProtectedFromPurge != 3 {
+		t.Errorf("Scan.ProtectedFromPurge = %d, want 3 (w-mr, w-mr-ancient, w-pinned)", scan.ProtectedFromPurge)
+	}
+
+	dry, err := Purge(f.db, f.dbName, purgeAge, purgeAge, true)
+	if err != nil {
+		t.Fatalf("dry-run Purge: %v", err)
+	}
+	if dry.WispsPurged != 3 || dry.WispsProtected != 3 {
+		t.Errorf("dry-run WispsPurged/WispsProtected = %d/%d, want 3/3", dry.WispsPurged, dry.WispsProtected)
+	}
+
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if result.WispsPurged != 3 {
+		t.Errorf("WispsPurged = %d, want 3 — the control must still be deleted; a purge that "+
+			"deletes nothing would satisfy every protection assertion below", result.WispsPurged)
+	}
+	if result.WispsProtected != 3 {
+		t.Errorf("WispsProtected = %d, want 3 — the skip has to be reported, or a protected "+
+			"purge is indistinguishable from a quiet one", result.WispsProtected)
+	}
+
+	wantWisps := []string{"w-mr", "w-mr-ancient", "w-pinned"}
+	if got := f.ids(t, "wisps"); !reflect.DeepEqual(got, wantWisps) {
+		t.Errorf("surviving wisps = %v, want %v", got, wantWisps)
+	}
+
+	// The protected wisp keeps its record, not just its row.
+	for _, table := range []string{"wisp_labels", "wisp_comments", "wisp_events"} {
+		found := false
+		for _, id := range f.issueIDs(t, table) {
+			if id == "w-mr" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s lost w-mr's rows — the wisp survived but its record did not", table)
+		}
+	}
+}
+
+// TestPurgeProtectionIsNotHardcodedToOneLabel guards the mechanism rather than
+// the current list: protection is driven by protectedWispLabels, so a future
+// entry takes effect everywhere without a second edit. A guard that inlined
+// 'gt:merge-request' into the SQL passes the test above and fails this one.
+func TestPurgeProtectionIsNotHardcodedToOneLabel(t *testing.T) {
+	original := protectedWispLabels
+	protectedWispLabels = append(append([]string{}, original...), "gt:test-protected")
+	t.Cleanup(func() { protectedWispLabels = original })
+
+	f := newFixture(t, "purge_protect_list")
+	oldClose := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	f.insertWisps(t,
+		wispRow{id: "w-added", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			labels: []string{"gt:test-protected"}},
+		wispRow{id: "w-control", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			labels: []string{"gt:wisp"}},
+	)
+
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if result.WispsPurged != 1 {
+		t.Errorf("WispsPurged = %d, want 1 (the control) — a purge that deleted nothing "+
+			"would pass the survival check below for the wrong reason", result.WispsPurged)
+	}
+	if got := f.ids(t, "wisps"); !reflect.DeepEqual(got, []string{"w-added"}) {
+		t.Errorf("surviving wisps = %v, want [w-added] — adding a label to protectedWispLabels "+
+			"must protect it, without editing any query", got)
+	}
+}
+
 // TestPurgeClosedWispsBatchesBeyondLimit drives the purge loop past
 // DefaultBatchSize. The batch SELECT carries a LIMIT, so a loop that stopped
 // after one pass would leave rows behind and a loop that failed to shrink its
