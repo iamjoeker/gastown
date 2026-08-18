@@ -697,62 +697,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 	g := git.NewGit(cwd)
 
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
-	}
-
-	// Name the working branch by a method that cannot yield the literal "HEAD"
-	// (gt-e45). Polecat worktrees are routinely detached, and rev-parse
-	// --abbrev-ref HEAD reports "HEAD" for a detached worktree. That name would
-	// then flow into the push refspec and the remote verification below, where
-	// it can never succeed — no remote carries refs/heads/HEAD — so the
-	// PUSH_FAILED alarm would name a branch nobody can push and would fire
-	// whether or not the push actually failed.
-	branchRes, err := polecat.ResolveWorkingBranch(g, polecatName, defaultBranch)
+	branch, err := g.CurrentBranch()
 	if err != nil {
 		return fmt.Errorf("getting current branch: %w", err)
-	}
-	if branchRes.Unresolvable() && exitType == ExitCompleted {
-		// COMPLETED is the only exit that pushes. Refuse to report a push result
-		// we never measured: nothing is pushed, no completion metadata is
-		// written, and the session and worktree survive so the commits can be
-		// recovered by name.
-		return reportDetachedBranchUnresolvable(cwd, townRoot, rigName, polecatName, sender, branchRes.Reason)
-	}
-	// ESCALATED and DEFERRED push nothing, so an unnameable branch costs them
-	// nothing — but they must still not record "HEAD" as their branch.
-	branch := branchRes.Branch
-	switch {
-	case branchRes.Recovered:
-		style.PrintWarning("HEAD is detached — recovered working branch %q from the branch pointing at HEAD", branch)
-		// Re-attach to it. HEAD already equals that branch's tip, so this moves
-		// no content — but it keeps every later step honest: the auto-commit
-		// safety net below would otherwise commit onto a detached HEAD, leaving
-		// the recovered branch stale and the push verifying a commit that was
-		// never on it.
-		if err := g.Checkout(branch); err != nil {
-			// Re-attaching can fail legitimately — most often the branch is
-			// checked out by another worktree. With a clean tree that costs
-			// nothing: HEAD is the branch tip and nothing below will move it.
-			// With uncommitted work it costs everything, because the auto-commit
-			// would land somewhere the push can never reach.
-			workStatus, wsErr := g.CheckUncommittedWork()
-			dirty := wsErr != nil || (workStatus.HasUncommittedChanges && !workStatus.CleanExcludingRuntime())
-			if dirty {
-				return fmt.Errorf("cannot submit work: HEAD is detached at the tip of %s, re-attaching failed (%w), and there is uncommitted work\n"+
-					"Committing it here would strand it off the branch this push verifies.\n"+
-					"Your commits are safe at HEAD and this session was left intact.\n"+
-					"Re-attach manually and re-run gt done:\n"+
-					"  git switch %s\n", branch, err, branch)
-			}
-			style.PrintWarning("could not re-attach to %s (%v) — continuing with a clean tree at that branch's tip", branch, err)
-		} else {
-			fmt.Printf("%s Re-attached worktree to %s\n", style.Bold.Render("✓"), branch)
-		}
-	case branchRes.Unresolvable():
-		style.PrintWarning("HEAD is detached and unnameable (%s) — exiting %s with no branch recorded", branchRes.Reason, exitType)
 	}
 
 	// Auto-detect cleanup status if not explicitly provided
@@ -765,15 +712,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// CheckUncommittedWork.UnpushedCommits doesn't work for branches
 			// without upstream tracking (common for polecats). Use the more
 			// robust BranchPushedToRemote which compares against origin/main.
-			// An unnameable branch is unpushed by definition — asking the remote
-			// about it would only produce a misleading error.
-			pushed, unpushedCount := false, 0
-			var pushErr error
-			if branch != "" {
-				pushed, unpushedCount, pushErr = g.BranchPushedToRemote(branch, "origin")
-				if pushErr != nil {
-					style.PrintWarning("could not check if branch is pushed: %v", pushErr)
-				}
+			pushed, unpushedCount, pushErr := g.BranchPushedToRemote(branch, "origin")
+			if pushErr != nil {
+				style.PrintWarning("could not check if branch is pushed: %v", pushErr)
 			}
 			doneCleanupStatus = cleanupStatusFromWorkState(workStatus, pushed, unpushedCount, pushErr)
 		}
@@ -998,8 +939,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
 	}
 
-	// defaultBranch was resolved before the branch lookup above — the branch
-	// resolver needs it to rule out the default branch as a work branch.
+	// Get configured default branch for this rig
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
 	baseRef := g.CleanBaseRef("origin", defaultBranch, doneTarget)
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
@@ -2129,71 +2073,6 @@ func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
 	} else {
 		fmt.Printf("%s Witness notified: DONE_CLOSE_SKIPPED\n", style.Bold.Render("✓"))
 	}
-}
-
-// reportDetachedBranchUnresolvable escalates the one condition gt done must never
-// report as a push failure: HEAD is detached and no branch names the commits, so
-// no push was attempted and there is no push result to report (gt-e45).
-//
-// PUSH_FAILED means "your branch never reached origin — push it". That advice is
-// unusable when the branch cannot be named, and an alarm that fires for both
-// conditions gets learned as noise. So this is its own alarm, and gt done fails
-// instead of completing: the session, the worktree, and the hook all survive, and
-// the commits stay reachable from the worktree's HEAD for recovery by name.
-func reportDetachedBranchUnresolvable(cwd, townRoot, rigName, polecatName, sender, reason string) error {
-	issueID := doneIssue
-	if issueID == "" && sender != "" {
-		if hookIssue, _ := selectAssignedIssue("", findAssignedBeadsForAgent(cwd, sender)); hookIssue != "" {
-			issueID = hookIssue
-		}
-	}
-	head, _ := git.NewGit(cwd).Rev("HEAD")
-
-	// The branch to recover onto. With no issue the operator has to supply the
-	// bead id, so the suggestion says so rather than emitting a trailing slash.
-	issueSlug := issueID
-	if issueSlug == "" {
-		issueSlug = "<bead-id>"
-	}
-	recoveryBranch := fmt.Sprintf("polecat/%s/%s", polecatName, issueSlug)
-
-	alarm := fmt.Sprintf("POLECAT_DETACHED: polecat=%s branch=unresolvable issue=%s head=%s — %s; no push attempted, work is local only",
-		polecatName, issueID, head, reason)
-
-	if townRoot != "" && rigName != "" {
-		from := sender
-		if from == "" {
-			from = fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
-		}
-		router := mail.NewRouter(townRoot)
-		defer router.WaitPendingNotifications()
-		msg := &mail.Message{
-			To:      fmt.Sprintf("%s/witness", rigName),
-			From:    from,
-			Subject: fmt.Sprintf("POLECAT_DETACHED: %s", polecatName),
-			Body: fmt.Sprintf("%s\n\ngt done refused to run: %s\n\n"+
-				"This is NOT a push failure — the push was never attempted, so no push result was measured.\n"+
-				"The commits are reachable only from the worktree's HEAD (%s).\n\n"+
-				"Recovery: name the work, then push it.\n"+
-				"  git -C <worktree> branch %s %s\n"+
-				"  git -C <worktree> push origin %s\n"+
-				"Verify with ls-remote against the push URL, not refs/remotes/origin.\n",
-				alarm, reason, head, recoveryBranch, head, recoveryBranch),
-		}
-		if err := router.Send(msg); err != nil {
-			style.PrintWarning("could not notify witness about detached worktree: %v", err)
-		} else {
-			fmt.Printf("%s Witness notified: POLECAT_DETACHED\n", style.Bold.Render("✓"))
-		}
-		nudgeWitness(rigName, alarm)
-	}
-
-	return fmt.Errorf("cannot submit work: %s\n"+
-		"No push was attempted — a detached worktree has no branch name to push or verify.\n"+
-		"Your commits are safe at HEAD (%s) and this session was left intact.\n"+
-		"Name the work and re-run gt done:\n"+
-		"  git switch -c %s\n",
-		reason, head, recoveryBranch)
 }
 
 // notifyDoneSkipVerifyUsed tells the witness that a completion bypassed

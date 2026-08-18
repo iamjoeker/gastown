@@ -247,15 +247,17 @@ func HandlePolecatDoneFromBead(bd *BdCli, workDir, rigName, polecatName string, 
 
 	// Push failed: branch never reached origin (gas-556). Report recovery needed.
 	if payload.PushFailed {
-		alarm := pushFailureAlarm(polecatName, payload.Branch, payload.IssueID)
 		result.Handled = true
-		result.Action = alarm.Action
+		result.Action = fmt.Sprintf("push-failed-recovery-needed for %s (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
+			polecatName, payload.Branch, payload.IssueID)
 		townRoot, _ := workspace.Find(workDir)
 		if townRoot != "" {
+			mayorMsg := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss",
+				polecatName, payload.Branch, payload.IssueID)
 			mayorSession := session.MayorSessionName()
 			t := tmux.NewTmux()
 			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, alarm.MayorMessage)
+				_ = t.NudgeSession(mayorSession, mayorMsg)
 			}
 		}
 		return result
@@ -2478,15 +2480,17 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	// The polecat's worktree may be in /tmp and lost on reboot. Escalate so the
 	// witness agent can investigate and trigger recovery (gas-556).
 	if payload.PushFailed {
-		alarm := pushFailureAlarm(payload.PolecatName, payload.Branch, payload.IssueID)
-		discovery.Action = alarm.DiscoveryAction
+		discovery.Action = fmt.Sprintf("push-failed-recovery-needed (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
+			payload.Branch, payload.IssueID)
 		// Notify mayor so a new polecat can be dispatched if work is lost.
 		townRoot, _ := workspace.Find(workDir)
 		if townRoot != "" {
+			mayorMsg := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss",
+				payload.PolecatName, payload.Branch, payload.IssueID)
 			mayorSession := session.MayorSessionName()
 			t := tmux.NewTmux()
 			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, alarm.MayorMessage)
+				_ = t.NudgeSession(mayorSession, mayorMsg)
 			}
 		}
 		return
