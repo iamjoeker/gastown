@@ -106,12 +106,6 @@ func witnessActionFor(verdict string) string {
 		return "escalate"
 	case "PENDING_MR":
 		return "leave-alone"
-	case "WORKING":
-		// Restart is non-destructive to the worktree but destroys the agent's
-		// context, and WORKING means the agent is generating right now — often
-		// while running `gt done` (gt-5tg). Leave it alone; it is not a slot to
-		// reclaim yet.
-		return "leave-alone"
 	default:
 		return witnessActionRestart
 	}

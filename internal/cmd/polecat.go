@@ -234,23 +234,15 @@ var polecatCheckRecoveryCmd = &cobra.Command{
 
 Reports whether any work is at risk. It does NOT authorize destroying the polecat:
   - SAFE_TO_NUKE: no work at risk — cleanup_status is 'clean', active_mr is terminal, AND work submitted to merge queue
-  - WORKING: the agent's pane shows it mid-turn; bead state is not yet meaningful
   - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
   - NEEDS_RECOVERY: cleanup_status, active_mr, or fallback git predicates require recovery
   - PENDING_MR: work is waiting on an active merge request
 
-Every predicate except WORKING is read from the agent bead and from git, both of
-which 'gt done' writes BEFORE it pushes, submits the MR, and exits. WORKING is
-checked first and from the live session, so a polecat that is still finishing is
-not reported as finished (gt-5tg). It is positive evidence only: a session that
-cannot be read is not reported as working.
-
 The verdict names a work-at-risk state, not an action for the caller. The
 witness_action field names what a witness may do about it: 'restart' to reclaim
 the slot (worktree and branch preserved), 'escalate' when work is at risk, or
-'leave-alone' while an MR is in flight or the agent is mid-turn. Nuking is never
-among them — under the restart-first policy (gt-dsgp) that requires a human or
-Mayor identity.
+'leave-alone' while an MR is in flight. Nuking is never among them — under the
+restart-first policy (gt-dsgp) that requires a human or Mayor identity.
 
 Examples:
   gt polecat check-recovery greenplace/Toast
@@ -1091,16 +1083,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	beadTerminal := isAssignedBeadTerminal(bd, status.Issue)
 	workTerminal := beadTerminal
 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
-	// Read session liveness up front. The bead facts gathered below are written
-	// early in the completion sequence and lead the session by a minute or two,
-	// which is what let this command answer SAFE_TO_NUKE for a polecat still
-	// pushing its branch (gt-5tg). DecideWorkstate lets this outrank them.
-	input := polecat.WorkstateInput{
-		State:         p.State,
-		SessionBusy:   mgr.SessionBusy(polecatName),
-		CleanupStatus: polecat.CleanupUnknown,
-		Branch:        p.Branch,
-	}
+	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch}
 	var gitState *GitState
 	var gitErr error
 	gitStateLoaded := false
@@ -1234,16 +1217,6 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	switch status.Verdict {
-	case "WORKING":
-		// Must be its own case, not the default arm: the default prints
-		// SAFE_TO_NUKE, so an unlisted verdict renders as permission to destroy
-		// a polecat that is still generating — the exact confusion gt-5tg is about.
-		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("WORKING"))
-		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
-		fmt.Println()
-		fmt.Println("  The agent's pane shows it mid-turn. Bead state can say 'done' a minute or")
-		fmt.Println("  two before the session actually exits — this verdict reflects the session.")
-		fmt.Println("  Leave it alone and re-check once the pane is quiet.")
 	case "NEEDS_MQ_SUBMIT":
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
 		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
