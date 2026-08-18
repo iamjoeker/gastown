@@ -119,6 +119,39 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "not-idle", NeedsRecovery: false, CountsTowardCapacity: true},
 		},
 		{
+			// gt-5tg: the reported case. `gt done` has written agent_state=done
+			// and cleared the work bead, so every bead predicate reads finished,
+			// but the pane still shows the agent generating. Bead state must not
+			// win — this was answering SAFE_TO_NUKE while the polecat was
+			// mid-push.
+			name: "busy session outranks a bead that already says done",
+			in:   WorkstateInput{State: StateDone, SessionBusy: true, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, HasSubmittableWork: true, MRSubmitted: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-busy", CountsTowardCapacity: true, Blockers: []string{"session_state=busy (agent mid-turn)"}},
+		},
+		{
+			name: "busy session outranks an idle bead with clean cleanup",
+			in:   WorkstateInput{State: StateIdle, SessionBusy: true, CleanupStatus: CleanupClean, Branch: "main"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-busy", CountsTowardCapacity: true, Blockers: []string{"session_state=busy (agent mid-turn)"}},
+		},
+		{
+			name: "busy session outranks an open active mr",
+			in:   WorkstateInput{State: StateDone, SessionBusy: true, CleanupStatus: CleanupClean, ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-busy", CountsTowardCapacity: true, Blockers: []string{"session_state=busy (agent mid-turn)"}},
+		},
+		{
+			// The absent-evidence direction: an unreadable or missing session
+			// leaves SessionBusy false, and every existing verdict must survive
+			// untouched. Anything else would stall reuse on rigs without tmux.
+			name: "unknown session liveness leaves the safe verdict alone",
+			in:   WorkstateInput{State: StateIdle, SessionBusy: false, CleanupStatus: CleanupClean, Branch: "main"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-clean"},
+		},
+		{
+			name: "busy session is never reusable or safe to nuke",
+			in:   WorkstateInput{State: StateIdle, SessionBusy: true, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, MRSubmitted: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-busy", Reusable: false, SafeToNuke: false, CountsTowardCapacity: true},
+		},
+		{
 			name: "stalled active work preserves blocker",
 			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean, ActiveWorkBlocker: "assigned_work=gt-open status=open", ActiveWorkCountsTowardCapacity: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"assigned_work=gt-open status=open"}},
