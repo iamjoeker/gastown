@@ -979,45 +979,13 @@ Dogs dispatched via `gt dog dispatch --plugin` are marked as "working" with
 a work description like "plugin:rebuild-gt". If a dog hangs, crashes, or
 takes too long, it needs intervention.
 
-**Step 1: Run the health check — this is the alarm, so it must actually run**
-```bash
-gt dog health-check --auto-clear --json
-```
-
-This single command covers three failures that pool state cannot show:
-
-- **Zombies/hung** — state=working but the session or agent is dead.
-  Auto-cleared back to idle.
-- **Orphaned dispatches** — the assignee's session is gone but its dispatch
-  mail is still open. With `--auto-clear` these are archived: session death
-  fails the dispatch instead of stranding it. Left alone, they accumulate
-  silently (59 open dispatches were measured across four dogs).
-- **Stale dispatches** — open past `--stale-dispatch` (default 30m) while the
-  session is alive, i.e. the dog is holding work it is not doing. These are
-  NOT auto-archived (the session may still be mid-execution); they escalate.
-
-Read `exec_state` per dog, not `state`. `state` is pool intent; `exec_state`
-joins it with session liveness and open dispatch mail:
-
-| exec_state | meaning | action |
-|------------|---------|--------|
-| `idle` | genuinely available | none |
-| `working` | session alive and executing | none |
-| `stalled` | state=working, session gone | auto-cleared |
-| `pending` | state=idle, dispatch mail unread, no session | auto-reclaimed |
-| `orphan` | state=idle, session still alive | auto-cleared |
-
-`alarms` in the JSON lists escalations raised this cycle. The command applies a
-per-dog cooldown (`--alarm-cooldown`, default 6h), so a persistent problem
-escalates once per window rather than once per patrol cycle. Exit code 2 means
-at least one dog needs attention.
-
-**Step 2: Check work duration**
+**Step 1: List working dogs**
 ```bash
 gt dog list --json
 # Filter for state: "working"
 ```
 
+**Step 2: Check work duration**
 For each working dog:
 ```bash
 gt dog status <name> --json
@@ -1062,8 +1030,7 @@ gt mail send mayor/ -s "Dog <name> chronic failures" \
   -m "Dog has timed out N times in last 24h. Consider removing from pool."
 ```
 
-**Exit criteria:** `gt dog health-check --auto-clear` has run, and all stuck
-dogs are handled (warrant filed or cleared)."""
+**Exit criteria:** All stuck dogs handled (warrant filed or cleared)."""
 
 [[steps]]
 id = "orphan-check"
