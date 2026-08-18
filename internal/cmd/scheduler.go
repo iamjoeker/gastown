@@ -318,7 +318,7 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 		// Scan all rig dirs since contexts live in target rig beads. (GH#3468)
 		contexts, err := listAllSlingContextRecords(townRoot)
 		if err != nil {
-			return fmt.Errorf("listing sling contexts: %w", err)
+			return fmt.Errorf("scheduler clear: %w", err)
 		}
 
 		closed := 0
@@ -345,7 +345,7 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 	// Close all open sling contexts across all dirs
 	allContexts, err := listAllSlingContextRecords(townRoot)
 	if err != nil {
-		return fmt.Errorf("listing sling contexts: %w", err)
+		return fmt.Errorf("scheduler clear: %w", err)
 	}
 
 	if len(allContexts) == 0 {

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,5 +62,40 @@ func TestPlanningScanStillFailsWhenEveryStoreFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ALL") {
 		t.Logf("total-failure path returned a non-aggregate error (environment-dependent): %v", err)
+	}
+}
+
+// TestPartialScanErrorCarriesSentinelAndOperation pins the two properties the
+// partial-scan error must have at once (gt-mji1, gt-qm04), because the callers
+// split on different ones and each half has already been lost once.
+//
+// The IDENTITY is what best-effort planning callers switch on: cleanupStaleContexts
+// and assessScheduledContexts do errors.Is(err, ErrPartialSlingContextScan) to
+// decide "keep planning on the readable stores". Wrap the error without %w and
+// they turn a survivable partial scan back into an aborted town-wide pass —
+// the hq-v05uw outage.
+//
+// The MESSAGE is what a completeness-sensitive caller shows a human. This error
+// surfaces from `gt scheduler clear` and areScheduled, not only from planning,
+// so it has to name the operation that came up short rather than describing
+// itself as a planning scan.
+func TestPartialScanErrorCarriesSentinelAndOperation(t *testing.T) {
+	townRoot := setupSchedulerScanFailureTown(t)
+
+	_, err := listAllSlingContextRecords(townRoot)
+	if err == nil {
+		t.Fatal("partial scan returned no error; completeness-sensitive callers would trust it")
+	}
+	if !errors.Is(err, ErrPartialSlingContextScan) {
+		t.Errorf("errors.Is(err, ErrPartialSlingContextScan) = false for %q\n"+
+			"best-effort planning callers switch on this identity; losing it aborts the town-wide pass (hq-v05uw).", err)
+	}
+	if !strings.Contains(err.Error(), "listing sling contexts") {
+		t.Errorf("error = %q, want it to name the operation (\"listing sling contexts\")\n"+
+			"this error also reaches `gt scheduler clear` and areScheduled (gt-qm04).", err)
+	}
+	// The unreadable store must be named — an operator cannot act on a count.
+	if !strings.Contains(err.Error(), filepath.Join("rig", ".beads")) {
+		t.Errorf("error = %q, want the skipped store path", err)
 	}
 }

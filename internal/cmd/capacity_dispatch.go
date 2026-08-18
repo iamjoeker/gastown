@@ -3,12 +3,12 @@ package cmd
 import (
 	"encoding/json"
 	"errors"
-	"strings"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -832,18 +832,6 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 // Deduplicates by context ID: different search dirs can resolve to the same
 // underlying beads DB (e.g., when a rig's top-level .beads is a redirect to
 // mayor/rig/.beads), and both paths would otherwise return the same contexts.
-// ErrPartialSlingContextScan reports that at least one store could not be
-// scanned. Callers that need a COMPLETE view (idempotency checks such as
-// areScheduled) MUST treat this as failure and fail closed; callers that only
-// need best-effort planning may ignore it and use the records returned.
-//
-// gt-mji1: the per-store isolation added for hq-v05uw made partial failures
-// return a nil error, which silently removed areScheduled's fail-closed path —
-// a partial scan looked authoritative and the scheduler would re-dispatch work
-// it could not prove was unscheduled. Isolating a failure must not convert it
-// into "nothing is scheduled".
-var ErrPartialSlingContextScan = errors.New("planning scan could not read every store; result is incomplete")
-
 func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 	records, err := listAllSlingContextRecords(townRoot)
 	if err != nil {
@@ -855,6 +843,23 @@ func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 	}
 	return all, nil
 }
+
+// ErrPartialSlingContextScan reports that at least one store could not be
+// scanned. Callers that need a COMPLETE view (idempotency checks such as
+// areScheduled) MUST treat this as failure and fail closed; callers that only
+// need best-effort planning may ignore it and use the records returned.
+//
+// gt-mji1: the per-store isolation added for hq-v05uw made partial failures
+// return a nil error, which silently removed areScheduled's fail-closed path —
+// a partial scan looked authoritative and the scheduler would re-dispatch work
+// it could not prove was unscheduled. Isolating a failure must not convert it
+// into "nothing is scheduled".
+//
+// The message names the OPERATION, not just the planning pass (gt-qm04). This
+// error reaches `gt scheduler clear` and areScheduled too, and "planning scan
+// could not read every store" tells an operator staring at a failed clear
+// nothing about what the command was unable to enumerate.
+var ErrPartialSlingContextScan = errors.New("listing sling contexts: scan could not read every store; result is incomplete")
 
 func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	var records []slingContextRecord
