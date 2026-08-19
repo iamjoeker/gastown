@@ -72,16 +72,30 @@ type HealthReport struct {
 // embedded corpus does not reach a town that has a disk copy. See
 // docs/design/directives-and-overlays.md ("Editing a Formula File Directly")
 // for which edits survive UpdateFormulas and which get silently overwritten.
-// Callers that need to know WHICH tier won, or whether the winning copy is
-// shadowing a newer shipped default, should use ResolveFormula instead — this
-// function is a thin wrapper over it and the two can never disagree about which
-// copy executes.
 func ResolveFormulaContent(name, townRoot, rigName string) ([]byte, error) {
-	resolved, err := ResolveFormula(name, townRoot, rigName)
-	if err != nil {
-		return nil, err
+	filename := name
+	if !hasFormulaSuffix(filename) {
+		filename = filename + ".formula.toml"
 	}
-	return resolved.Content, nil
+
+	// Tier 1: rig-level (most specific)
+	if townRoot != "" && rigName != "" {
+		path := filepath.Join(townRoot, rigName, ".beads", "formulas", filename)
+		if content, err := os.ReadFile(path); err == nil {
+			return content, nil
+		}
+	}
+
+	// Tier 2: town-level
+	if townRoot != "" {
+		path := filepath.Join(townRoot, ".beads", "formulas", filename)
+		if content, err := os.ReadFile(path); err == nil {
+			return content, nil
+		}
+	}
+
+	// Tier 3: embedded (system fallback)
+	return GetEmbeddedFormulaContent(name)
 }
 
 // GetEmbeddedFormulaContent returns the raw content of an embedded formula by name.

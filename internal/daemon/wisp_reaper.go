@@ -24,9 +24,13 @@ const (
 	// Alert threshold: if open wisp count exceeds this, the Dog should escalate.
 	// Shared with `gt reaper run` warning. See reaper.DefaultAlertThreshold.
 	wispAlertThreshold = reaper.DefaultAlertThreshold
-	// Closed mail older than this is permanently deleted. Formula var: mail_delete_age.
+	// Closed mail older than this is permanently deleted.
+	// Config: lifecycle.reaper.mail_delete_age. Formula var: mail_delete_age.
+	// Read via mailDeleteAge(); do not use this constant directly.
 	defaultMailDeleteAge = 7 * 24 * time.Hour
 	// Issues stale longer than this are auto-closed.
+	// Config: lifecycle.reaper.stale_issue_age. Formula var: stale_issue_age.
+	// Read via staleIssueAge(); do not use this constant directly.
 	//
 	// 30 DAYS, NOT 7 (gt-zjb). This was 7*24 — the 7-day pattern from the two
 	// constants above applied one line too far, where both neighbors are
@@ -40,13 +44,14 @@ const (
 	// It is a typed constant, so Duration.String() renders "168h0m0s" into the
 	// patrol digest and no search for "720h" or for a config key ever finds it.
 	//
-	// ⚠️ THERE IS NO OVERRIDE PATH, and the old comment claimed one. max_age and
-	// purge_age are resolved through wispReaperMaxAge()/wispDeleteAge(), which
-	// consult DaemonPatrolConfig. stale_issue_age and mail_delete_age are used
-	// BARE — see the AutoClose call below. So the formula var of that name is
-	// dead code: editing the formula or any config changes nothing, and only a
-	// code change plus a rebuild moves this value. Do not re-add a "Formula var:"
-	// comment here unless you also add the reader.
+	// The override path is NEW (gt-7hs) — for the whole life of the bug there was
+	// none, and the "Formula var:" comment that used to sit here named a binding
+	// that did not exist. stale_issue_age and mail_delete_age were used bare at
+	// the Purge/AutoClose call sites while max_age and purge_age went through
+	// wispReaperMaxAge()/wispDeleteAge(), so editing the formula var or any config
+	// key changed nothing and only a rebuild moved the value. They now have the
+	// same readers as their neighbours. Keep it that way: a constant referenced
+	// straight from a call site here is unreachable by every operator surface.
 	//
 	// This is the constant that auto-closed 7 of 8 agent beads town-wide, twice.
 	defaultStaleIssueAge = 30 * 24 * time.Hour
@@ -54,12 +59,14 @@ const (
 
 // WispReaperConfig holds configuration for the wisp_reaper patrol.
 type WispReaperConfig struct {
-	Enabled      bool     `json:"enabled"`
-	DryRun       bool     `json:"dry_run,omitempty"`
-	IntervalStr  string   `json:"interval,omitempty"`
-	MaxAgeStr    string   `json:"max_age,omitempty"`
-	DeleteAgeStr string   `json:"delete_age,omitempty"`
-	Databases    []string `json:"databases,omitempty"`
+	Enabled          bool     `json:"enabled"`
+	DryRun           bool     `json:"dry_run,omitempty"`
+	IntervalStr      string   `json:"interval,omitempty"`
+	MaxAgeStr        string   `json:"max_age,omitempty"`
+	DeleteAgeStr     string   `json:"delete_age,omitempty"`
+	StaleIssueAgeStr string   `json:"stale_issue_age,omitempty"`
+	MailDeleteAgeStr string   `json:"mail_delete_age,omitempty"`
+	Databases        []string `json:"databases,omitempty"`
 }
 
 // wispReaperInterval returns the configured interval, or the default (1h).
@@ -98,6 +105,65 @@ func wispDeleteAge(config *DaemonPatrolConfig) time.Duration {
 	return defaultWispDeleteAge
 }
 
+// staleIssueAge returns the configured auto-close staleness, or the default (30 days).
+//
+// This is the highest-consequence knob on the patrol: it closes live issues in the
+// issues table, not wisps. Read it here rather than touching defaultStaleIssueAge —
+// a bare reference at a call site is invisible to `gt config` and to the digest.
+func staleIssueAge(config *DaemonPatrolConfig) time.Duration {
+	if config != nil && config.Patrols != nil && config.Patrols.WispReaper != nil {
+		if config.Patrols.WispReaper.StaleIssueAgeStr != "" {
+			if d, err := time.ParseDuration(config.Patrols.WispReaper.StaleIssueAgeStr); err == nil && d > 0 {
+				return d
+			}
+		}
+	}
+	return defaultStaleIssueAge
+}
+
+// mailDeleteAge returns the configured closed-mail purge age, or the default (7 days).
+func mailDeleteAge(config *DaemonPatrolConfig) time.Duration {
+	if config != nil && config.Patrols != nil && config.Patrols.WispReaper != nil {
+		if config.Patrols.WispReaper.MailDeleteAgeStr != "" {
+			if d, err := time.ParseDuration(config.Patrols.WispReaper.MailDeleteAgeStr); err == nil && d > 0 {
+				return d
+			}
+		}
+	}
+	return defaultMailDeleteAge
+}
+
+// reaperFormulaVars builds the var set handed to mol-dog-reaper, and — because
+// the Dog interpolates these straight into `gt reaper` flags — the values that
+// actually act on the data.
+//
+// Every age here must come from an accessor. The vars map is also the only
+// surface that reports the acting values (they land in the patrol digest as
+// Duration.String()), so a value that does not pass through this map is a value
+// nobody can see or change. That is exactly how stale_issue_age ran at 168h
+// against a documented 720h for as long as it did (gt-zjb, gt-7hs).
+func reaperFormulaVars(config *DaemonPatrolConfig) map[string]string {
+	vars := map[string]string{
+		"max_age":         wispReaperMaxAge(config).String(),
+		"purge_age":       wispDeleteAge(config).String(),
+		"stale_issue_age": staleIssueAge(config).String(),
+		"mail_delete_age": mailDeleteAge(config).String(),
+		"alert_threshold": fmt.Sprintf("%d", wispAlertThreshold),
+	}
+
+	if config == nil || config.Patrols == nil || config.Patrols.WispReaper == nil {
+		return vars
+	}
+	wr := config.Patrols.WispReaper
+	if wr.DryRun {
+		vars["dry_run"] = "true"
+	}
+	if len(wr.Databases) > 0 {
+		vars["databases"] = strings.Join(wr.Databases, ",")
+	}
+	return vars
+}
+
 // reapWisps is the thin orchestrator for the wisp_reaper patrol.
 // It pours a mol-dog-reaper molecule, then dispatches a Dog to execute it.
 // The Dog reads the formula steps and calls `gt reaper` CLI helpers.
@@ -110,21 +176,10 @@ func (d *Daemon) reapWisps() {
 	config := d.patrolConfig.Patrols.WispReaper
 	maxAge := wispReaperMaxAge(d.patrolConfig)
 	deleteAge := wispDeleteAge(d.patrolConfig)
+	staleAge := staleIssueAge(d.patrolConfig)
+	mailAge := mailDeleteAge(d.patrolConfig)
 
-	vars := map[string]string{
-		"max_age":         maxAge.String(),
-		"purge_age":       deleteAge.String(),
-		"stale_issue_age": defaultStaleIssueAge.String(),
-		"mail_delete_age": defaultMailDeleteAge.String(),
-		"alert_threshold": fmt.Sprintf("%d", wispAlertThreshold),
-	}
-
-	if config.DryRun {
-		vars["dry_run"] = "true"
-	}
-	if len(config.Databases) > 0 {
-		vars["databases"] = strings.Join(config.Databases, ",")
-	}
+	vars := reaperFormulaVars(d.patrolConfig)
 
 	// Pour the molecule for observability tracking.
 	mol := d.pourDogMolecule(constants.MolDogReaper, vars)
@@ -137,7 +192,7 @@ func (d *Daemon) reapWisps() {
 	// Try dispatching to a Dog for formula-driven execution.
 	if err := d.dispatchReaperDog(vars); err != nil {
 		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
-		d.reapWispsInline(config, maxAge, deleteAge, mol)
+		d.reapWispsInline(config, maxAge, deleteAge, staleAge, mailAge, mol)
 		return
 	}
 
@@ -165,7 +220,10 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 
 // reapWispsInline is the fallback that runs the reaper cycle inline when
 // Dog dispatch is unavailable. Delegates to the reaper package for SQL execution.
-func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge time.Duration, mol *dogMol) {
+//
+// The ages are passed in rather than re-derived so this path cannot drift from
+// the vars the Dog path slings — the two must agree on what acted.
+func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, staleAge, mailAge time.Duration, mol *dogMol) {
 	databases := config.Databases
 	host := d.doltServerHost()
 	if len(databases) == 0 {
@@ -239,7 +297,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 			db.Close()
 			continue
 		}
-		result, err := reaper.Purge(db, dbName, deleteAge, defaultMailDeleteAge, dryRun)
+		result, err := reaper.Purge(db, dbName, deleteAge, mailAge, dryRun)
 		db.Close()
 		if err != nil {
 			d.logger.Printf("wisp_reaper: %s: purge error: %v", dbName, err)
@@ -330,7 +388,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 			db.Close()
 			continue
 		}
-		result, err := reaper.AutoClose(db, dbName, defaultStaleIssueAge, dryRun)
+		result, err := reaper.AutoClose(db, dbName, staleAge, dryRun)
 		db.Close()
 		if err != nil {
 			d.logger.Printf("wisp_reaper: %s: auto-close error: %v", dbName, err)
@@ -356,6 +414,11 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	}
 	summary += fmt.Sprintf(" purged=%d protected=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
 		totalPurged, totalProtected, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	// Report the acting ages. This path never slings the formula, so the digest
+	// vars — the only other place these surface — are not written for it. Without
+	// this line an inline cycle reports what it closed but not the policy it used.
+	summary += fmt.Sprintf(" max_age=%s purge_age=%s stale_issue_age=%s mail_delete_age=%s",
+		maxAge, deleteAge, staleAge, mailAge)
 	d.logger.Printf("%s", summary)
 	mol.closeStep("report")
 }

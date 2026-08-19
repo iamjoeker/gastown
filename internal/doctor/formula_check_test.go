@@ -112,13 +112,9 @@ func TestFormulaCheck_Run_ModifiedShadowingNewerEmbedded(t *testing.T) {
 		t.Errorf("Status = %v, want %v", result.Status, StatusWarning)
 	}
 	// --fix cannot repair this: UpdateFormulas skips modified files, so a hint
-	// pointing at it would send the operator in a circle. Point at the command
-	// that can actually reconcile instead.
-	if !strings.Contains(result.FixHint, "gt formula drift") {
-		t.Errorf("FixHint = %q, want it to name the reconcile command", result.FixHint)
-	}
-	if strings.Contains(result.FixHint, "doctor --fix") {
-		t.Errorf("FixHint = %q, must not send the operator back to --fix", result.FixHint)
+	// pointing at it would send the operator in a circle.
+	if !strings.Contains(result.FixHint, "by hand") {
+		t.Errorf("FixHint = %q, want a manual-reconciliation hint", result.FixHint)
 	}
 }
 

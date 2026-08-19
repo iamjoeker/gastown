@@ -134,49 +134,6 @@ exists. Unifying these onto one resolver is unfinished work.
 - Factory reset target
 - The "blessed" versions
 
-## Drift: When the Executing Copy Is Not the Shipped Default
-
-The precedence above has a consequence that has bitten repeatedly: because a
-disk copy shadows the embedded one, **a fix merged into the embedded corpus
-never reaches a town that has a disk copy**. Rebuilding gt only changes tier 3.
-
-Worse, it cannot self-heal. `UpdateFormulas` compares each disk file against the
-hash recorded in `.beads/formulas/.installed.json`; if they differ it classifies
-the file as user-modified and skips it rather than clobbering local edits. A town
-whose copy was ever hand-edited is pinned to that edit permanently. gt-kr6's P1
-witness fix sat inert for two days looking done, because `git log` and the
-embedded corpus both showed it landed (gt-0wm7).
-
-`formula.ResolveFormula()` answers "is what will run the thing we just shipped?"
-alongside "what will run". It classifies the executing copy:
-
-| Kind | Meaning | Repair |
-|------|---------|--------|
-| `outdated` | Unmodified older install; a newer default has shipped | `gt doctor --fix` |
-| `untracked` | No install hash recorded; gt cannot tell stale from deliberate | `gt doctor --fix` (town tier only) |
-| `pinned` | Locally edited **and** the default moved afterwards | human merge |
-| `customized` | Locally edited, default has not moved — **not drift** | none needed |
-
-`customized` is deliberately excluded from the warning: nothing is being missed
-there, and a warning that fires on every deliberate customization gets ignored.
-
-Where it surfaces:
-
-- **`gt prime`** prints a drift notice inline with the formula steps whenever the
-  copy about to be executed shadows a newer default. Agents read the checklist,
-  so the warning has to travel with it.
-- **`gt doctor`** reports the count and names the files.
-- **`gt upgrade`** calls out pinned formulas after updating, which is the moment
-  a shipped fix is most likely to be assumed live.
-- **`gt formula drift`** lists them, prints the shipped default for diffing
-  (`--embedded`), and offers the two reconcile outcomes: `--accept-embedded`
-  discards the local edits, `--mark-reconciled` keeps them and records the
-  current embedded hash as the new baseline.
-
-`--mark-reconciled` is the piece that makes hand-merging terminate. Without it a
-file a human has already merged keeps reporting as pinned forever, because the
-recorded hash still names the pre-fix default.
-
 ## Formula Identity
 
 ### Current Format

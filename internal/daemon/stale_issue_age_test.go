@@ -13,12 +13,16 @@ import (
 // than documented. It is the constant that auto-closed 7 of 8 agent beads
 // town-wide, twice.
 //
-// Why this is asserted against a LITERAL rather than against the formula: there
-// is no code path from the formula var to this constant. stale_issue_age is used
-// bare (see the reaper.AutoClose call), unlike max_age and purge_age which go
-// through wispReaperMaxAge()/wispDeleteAge(). A test that read the formula would
-// be asserting that two unconnected things agree, and would keep passing if
-// someone edited the formula alone — which changes nothing at runtime.
+// Why this is asserted against a LITERAL rather than against the formula: the
+// formula var is the OVERRIDE, and this constant is what acts when nobody sets
+// one. Reading the formula here would assert that a default agrees with itself.
+//
+// (When this test was written there was no code path at all from the formula var
+// to this constant — stale_issue_age was used bare at the reaper.AutoClose call
+// while max_age and purge_age went through wispReaperMaxAge()/wispDeleteAge().
+// gt-7hs added the missing staleIssueAge() reader. The wiring is now guarded
+// separately by TestReaperFormulaVarsAreConfigurable; this test still owns the
+// default, because an override nobody sets leaves this constant acting alone.)
 func TestStaleIssueAgeMatchesDocumentedDefault(t *testing.T) {
 	const documented = 720 * time.Hour // 30d, per formula var + CLI --help default
 
