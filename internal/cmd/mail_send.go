@@ -108,8 +108,10 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Set pinned flag
 	msg.Pinned = mailPinned
 
-	// Set storage class from --wisp/--permanent (gt-jbn, gt-rhxb).
-	applyRoutingFlags(msg, mailWisp, mailPermanent)
+	// Set wisp flag (ephemeral message) — default false, so mail is durable
+	// unless the sender explicitly opts into --wisp. --permanent still wins
+	// over --wisp for callers that pass both (gt-jbn).
+	msg.Wisp = mailWisp && !mailPermanent
 
 	// Set CC recipients
 	msg.CC = mailCC
@@ -172,7 +174,6 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		_ = events.LogFeed(events.TypeMail, from, events.MailPayload(to, mailSubject))
 		fmt.Printf("%s Message sent to %s\n", style.Bold.Render("✓"), to)
 		fmt.Printf("  Subject: %s\n", mailSubject)
-		printStorageClass(msg)
 		return nil
 	}
 
@@ -232,7 +233,6 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Message sent to %s\n", style.Bold.Render("✓"), to)
 	fmt.Printf("  Subject: %s\n", mailSubject)
-	printStorageClass(msg)
 
 	// Show resolved recipients if fan-out occurred
 	if len(recipientAddrs) > 1 || (len(recipientAddrs) == 1 && recipientAddrs[0] != to) {
@@ -247,33 +247,6 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-// applyRoutingFlags sets the storage class from --wisp/--permanent.
-//
-// Mail is durable unless the sender opts into --wisp (gt-jbn), and --permanent
-// wins when both are passed. Permanent is recorded explicitly rather than just
-// cancelling Wisp, because subject auto-detection also routes to wisps: a
-// message whose only signal was "not --wisp" could not be told apart from one
-// the sender explicitly demanded be durable (gt-rhxb).
-func applyRoutingFlags(msg *mail.Message, wisp, permanent bool) {
-	msg.Wisp = wisp && !permanent
-	msg.Permanent = permanent
-}
-
-// printStorageClass reports which table the message landed in. "Message sent"
-// reads the same for a durable bead and for an age-GC reclaimable wisp, so it
-// could not be used to tell a surviving merge receipt from a doomed one
-// (gt-rhxb).
-func printStorageClass(msg *mail.Message) {
-	if !mail.WillBeEphemeral(msg) {
-		fmt.Printf("  Storage: durable\n")
-		return
-	}
-	fmt.Printf("  Storage: %s\n", style.Warning.Render("ephemeral (wisp — age-GC reclaimable, not synced to git)"))
-	if !msg.Wisp {
-		fmt.Printf("  Subject matched a protocol prefix; pass --permanent to store durably.\n")
-	}
 }
 
 // generateThreadID creates a random thread ID for new message threads.

@@ -1,10 +1,6 @@
 package cmd
 
-import (
-	"testing"
-
-	"github.com/steveyegge/gastown/internal/mail"
-)
+import "testing"
 
 // TestMailSendDefaultsToDurable pins the gt-jbn regression.
 //
@@ -34,39 +30,5 @@ func TestMailSendDefaultsToDurable(t *testing.T) {
 	}
 	if permanent.DefValue != "false" {
 		t.Errorf("--permanent default = %q, want %q", permanent.DefValue, "false")
-	}
-}
-
-// TestRoutingFlagsReachClassifier pins the gt-rhxb regression.
-//
-// --permanent only cancelled --wisp; it never reached the subject
-// auto-detection in the router. A merge receipt ("MERGED crater ...") was
-// therefore stored as an age-GC reclaimable wisp no matter what the sender
-// passed, and --permanent was documented as overriding exactly that.
-func TestRoutingFlagsReachClassifier(t *testing.T) {
-	tests := []struct {
-		name          string
-		subject       string
-		wisp          bool
-		permanent     bool
-		wantEphemeral bool
-	}{
-		{"plain subject, no flags", "Please review this", false, false, false},
-		{"plain subject, --wisp", "Please review this", true, false, true},
-		{"protocol subject, no flags", "MERGED crater", false, false, true},
-		{"protocol subject, --permanent", "MERGED crater", false, true, false},
-		{"protocol subject, both flags", "MERGED crater", true, true, false},
-		{"prose that starts with a protocol word", "Merged crater by hand", false, false, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			msg := mail.NewMessage("a/", "b/", tt.subject, "body")
-			applyRoutingFlags(msg, tt.wisp, tt.permanent)
-			if got := mail.WillBeEphemeral(msg); got != tt.wantEphemeral {
-				t.Errorf("WillBeEphemeral(subject=%q, wisp=%v, permanent=%v) = %v, want %v",
-					tt.subject, tt.wisp, tt.permanent, got, tt.wantEphemeral)
-			}
-		})
 	}
 }

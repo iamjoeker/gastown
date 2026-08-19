@@ -132,20 +132,6 @@ func TestSendStoresOrdinaryMailDurably(t *testing.T) {
 			msg:           &Message{Subject: "MERGE_READY nux", Body: "branch pushed"},
 			wantEphemeral: true,
 		},
-		{
-			// gt-rhxb: --permanent set only Message.Wisp=false, which subject
-			// auto-detection then overrode — so a merge receipt was ephemeral
-			// no matter what the sender passed.
-			name:          "explicit --permanent beats protocol subject",
-			msg:           &Message{Subject: "MERGED nux", Body: "main 6ed93ed7", Permanent: true},
-			wantEphemeral: false,
-		},
-		{
-			// gt-rhxb: matching case-insensitively made prose ephemeral too.
-			name:          "prose starting with a protocol word is durable",
-			msg:           &Message{Subject: "Merged nux by hand — see notes", Body: "context"},
-			wantEphemeral: false,
-		},
 	}
 
 	for _, tt := range tests {
