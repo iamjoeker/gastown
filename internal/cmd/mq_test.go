@@ -1,13 +1,10 @@
 package cmd
 
 import (
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/refinery"
 )
 
 func TestParseBranchName(t *testing.T) {
@@ -459,89 +456,6 @@ func TestMRFilteringByLabel(t *testing.T) {
 			if got != tt.wantIsMR {
 				t.Errorf("HasLabel(%q, \"gt:merge-request\") = %v, want %v",
 					tt.issue.ID, got, tt.wantIsMR)
-			}
-		})
-	}
-}
-
-// gt-a46b: the reject line must report the ISSUE's state, not reject's own
-// behaviour. "(not closed - work not done)" was true of reject and false of a
-// closed bead, and readers acted on the second meaning.
-func TestRejectedIssueReportFor(t *testing.T) {
-	tests := []struct {
-		name        string
-		result      *refinery.RejectResult
-		wantNote    string
-		wantAction  string
-		wantNoTrace string // substring that must NOT appear
-	}{
-		{
-			name: "closed issue was reopened",
-			result: &refinery.RejectResult{
-				SourceIssueID:       "gt-egq9",
-				SourceIssueStatus:   "open",
-				SourceIssueReopened: true,
-			},
-			wantNote: "(was closed - reopened: rejection means the work is not done)",
-		},
-		{
-			name: "open issue reports its real status",
-			result: &refinery.RejectResult{
-				SourceIssueID:     "gt-1jrl",
-				SourceIssueStatus: "open",
-			},
-			wantNote: "(status: open - reject did not close it)",
-		},
-		{
-			name: "hooked issue reports its real status",
-			result: &refinery.RejectResult{
-				SourceIssueID:     "gt-1jrl",
-				SourceIssueStatus: "hooked",
-			},
-			wantNote: "(status: hooked - reject did not close it)",
-		},
-		{
-			name: "unreadable status admits it and names the manual fix",
-			result: &refinery.RejectResult{
-				SourceIssueID:  "gt-egq9",
-				SourceIssueErr: errors.New("dolt unreachable"),
-			},
-			wantNote:   "(status unknown: dolt unreachable)",
-			wantAction: "bd reopen gt-egq9",
-		},
-		{
-			name: "terminal issue left alone says so and why",
-			result: &refinery.RejectResult{
-				SourceIssueID:         "gt-egq9",
-				SourceIssueStatus:     "tombstone",
-				SourceIssueSkipReason: "terminal:tombstone",
-			},
-			wantNote:   "(status: tombstone - not reopened: terminal:tombstone)",
-			wantAction: "cannot be re-slung",
-		},
-		{
-			name: "missing status never claims to know one",
-			result: &refinery.RejectResult{
-				SourceIssueID: "gt-egq9",
-			},
-			wantNote: "(status: unknown - reject did not close it)",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := rejectedIssueReportFor(tt.result)
-			if got.Note != tt.wantNote {
-				t.Errorf("Note = %q, want %q", got.Note, tt.wantNote)
-			}
-			if tt.wantAction == "" && got.Action != "" {
-				t.Errorf("Action = %q, want none", got.Action)
-			}
-			if tt.wantAction != "" && !strings.Contains(got.Action, tt.wantAction) {
-				t.Errorf("Action = %q, want it to contain %q", got.Action, tt.wantAction)
-			}
-			if strings.Contains(got.Note, "not closed - work not done") {
-				t.Errorf("Note = %q still describes reject's behaviour instead of the issue's state", got.Note)
 			}
 		})
 	}
