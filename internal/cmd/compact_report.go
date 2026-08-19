@@ -172,9 +172,7 @@ func runDailyDigest() error {
 	if err != nil {
 		return fmt.Errorf("getting working dir: %w", err)
 	}
-	// Role directories (<town>/deacon, <town>/mayor) have no .beads of their
-	// own, so cwd alone resolves to a database that does not exist.
-	bd := beads.New(beads.BeadsWorkDirWithTownFallback(workDir, beads.FindTownRoot(workDir)))
+	bd := beads.New(workDir)
 	activeWisps, err := listReportWisps(bd)
 	if err != nil {
 		return fmt.Errorf("listing active wisps: %w", err)

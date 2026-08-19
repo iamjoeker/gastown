@@ -200,11 +200,8 @@ func runCompact(cmd *cobra.Command, args []string) error {
 	// Load TTL config
 	ttls := loadTTLConfig(townRoot, rigName)
 
-	// Query all ephemeral (wisp) issues via bd list.
-	// Role directories (<town>/deacon, <town>/mayor) have no .beads of their
-	// own, so cwd alone resolves to a database that does not exist — which is
-	// why gt compact used to work only from the town root.
-	bd := beads.New(beads.BeadsWorkDirWithTownFallback(workDir, townRoot))
+	// Query all ephemeral (wisp) issues via bd list
+	bd := beads.New(workDir)
 	allWisps, err := listWisps(bd)
 	if err != nil {
 		return fmt.Errorf("listing wisps: %w", err)

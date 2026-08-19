@@ -294,10 +294,8 @@ func runHook(_ *cobra.Command, args []string) error {
 
 	b := beads.New(workDir)
 
-	// Check for existing hooked bead for this agent. Match every address form:
-	// missing a bead hooked under the other form would let this hook silently
-	// double-book the agent.
-	existingPinned, err := listAcrossAssigneeForms(b.List, beads.ListOptions{
+	// Check for existing hooked bead for this agent
+	existingPinned, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
 		Priority: -1,

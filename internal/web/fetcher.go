@@ -972,12 +972,18 @@ func determineColorClass(ciStatus, mergeable string) string {
 }
 
 // FetchWorkers fetches all running worker sessions (polecats and refinery) with activity data.
-func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
+//
+// The rows come from tmux, but the issue each worker is carrying comes from the
+// beads stores, and a worker whose issue cannot be found renders as idle. That
+// makes the assignment lookup's failures part of this panel's honesty: a rig
+// store that could not answer is carried out in the result rather than turning
+// its workers idle without saying so. See getAssignedIssuesMap.
+func (f *LiveConvoyFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
 	// Load registered rigs to filter sessions
 	rigsConfigPath := filepath.Join(f.townRoot, "mayor", "rigs.json")
 	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("loading rigs config: %w", err)
+		return StoreResult[WorkerRow]{}, fmt.Errorf("loading rigs config: %w", err)
 	}
 
 	// Build set of registered rig names
@@ -987,13 +993,15 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	}
 
 	// Pre-fetch assigned issues map: assignee -> (issueID, title)
-	assignedIssues := f.getAssignedIssuesMap()
+	assigned := f.getAssignedIssuesMap()
+	assignedIssues := assignedIssuesByAssignee(assigned.Rows)
 
 	// Query all tmux sessions with window_activity for more accurate timing
 	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
-		// tmux not running or no sessions
-		return nil, nil
+		// tmux not running or no sessions. There are no worker rows to caveat,
+		// so the assignment lookup's caveats are dropped with them.
+		return StoreResult[WorkerRow]{}, nil
 	}
 
 	// Pre-fetch merge queue count to determine refinery idle status
@@ -1084,7 +1092,12 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 		})
 	}
 
-	return workers, nil
+	return StoreResult[WorkerRow]{
+		Rows:            workers,
+		FailedStores:    assigned.FailedStores,
+		TruncatedStores: assigned.TruncatedStores,
+		UnreadStores:    assigned.UnreadStores,
+	}, nil
 }
 
 // assignedIssue holds issue info for the assigned issues map.
@@ -1093,37 +1106,79 @@ type assignedIssue struct {
 	Title string
 }
 
-// getAssignedIssuesMap returns a map of assignee -> assigned issue.
-// Queries beads for all in_progress issues with assignees.
-func (f *LiveConvoyFetcher) getAssignedIssuesMap() map[string]assignedIssue {
-	result := make(map[string]assignedIssue)
+// assignedBead is one bead somebody is currently working, as the Workers panel
+// reads it from bd.
+type assignedBead struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Assignee string `json:"assignee"`
+}
 
-	// Query all in_progress issues (these are the ones being worked on)
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--status=in_progress", "--json")
+// assignedStatuses are the statuses that mean "an agent is working this bead",
+// matching beads.IssueStatus.IsAssigned.
+//
+// Both are asked for because Gas Town writes both: gt sling sets "hooked"
+// (internal/beads/handoff.go), while the older assignment path sets
+// "in_progress". internal/beads/beads.go:1573 already queries them together for
+// the same reason. Measured against this town, not one assigned bead in any
+// store was at "in_progress" while eleven sat at "hooked" — so asking for
+// in_progress alone, as this lookup used to, found nothing at all.
+var assignedStatuses = []string{string(beads.IssueStatusHooked), string(beads.StatusInProgress)}
+
+// getAssignedIssuesMap returns the beads currently being worked, from every store.
+//
+// Assignments are per-rig data. A polecat's work bead lives in its own rig's
+// store — measured against this town, the rigs held all 11 assigned beads and
+// the town root held none — so the town-root-only query this replaced returned
+// an empty map. That is not a cosmetic loss: FetchWorkers gives a worker with no
+// issue an empty IssueID, and calculateWorkerWorkStatus reports empty as "idle".
+// Every polecat in town rendered idle while working.
+//
+// The row budget is unlimited: this is a lookup table, not a display list, and a
+// truncated one silently downgrades the workers it could not find to idle.
+func (f *LiveConvoyFetcher) getAssignedIssuesMap() StoreResult[assignedBead] {
+	var result StoreResult[assignedBead]
+	for _, status := range assignedStatuses {
+		result = result.merge(forEachStore(f, storeBudgetUnlimited, func(src storeSource, _ int) ([]assignedBead, error) {
+			return f.listAssignedBeads(src.Dir, status)
+		}))
+	}
+	return result
+}
+
+// listAssignedBeads reads one status from one store.
+//
+// Unlike the query it replaced, a bd failure is an error rather than an empty
+// map: the resolver names the store that could not answer, so a rig whose store
+// is unreachable stops looking like a rig whose workers are all idle.
+func (f *LiveConvoyFetcher) listAssignedBeads(storeDir, status string) ([]assignedBead, error) {
+	stdout, err := f.runBdCmd(storeDir, "list", "--status="+status, "--json", "--limit=0")
 	if err != nil {
-		log.Printf("warning: bd list in_progress failed: %v", err)
-		return result
+		return nil, fmt.Errorf("listing %s beads: %w", status, err)
 	}
 
-	var issues []struct {
-		ID       string `json:"id"`
-		Title    string `json:"title"`
-		Assignee string `json:"assignee"`
+	var found []assignedBead
+	if err := json.Unmarshal(stdout.Bytes(), &found); err != nil {
+		return nil, fmt.Errorf("parsing %s beads: %w", status, err)
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		log.Printf("warning: parsing bd list output: %v", err)
-		return result
-	}
+	return found, nil
+}
 
-	for _, issue := range issues {
-		if issue.Assignee != "" {
-			result[issue.Assignee] = assignedIssue{
-				ID:    issue.ID,
-				Title: issue.Title,
-			}
+// assignedIssuesByAssignee indexes the union by assignee address.
+//
+// An agent holding more than one assigned bead keeps the first the union
+// returned, which is store order: the town root, then rigs by name.
+func assignedIssuesByAssignee(found []assignedBead) map[string]assignedIssue {
+	result := make(map[string]assignedIssue, len(found))
+	for _, bead := range found {
+		if bead.Assignee == "" {
+			continue
 		}
+		if _, seen := result[bead.Assignee]; seen {
+			continue
+		}
+		result[bead.Assignee] = assignedIssue{ID: bead.ID, Title: bead.Title}
 	}
-
 	return result
 }
 

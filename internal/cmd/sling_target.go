@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -62,7 +61,14 @@ func sessionToAgentID(sessionName string) string {
 // session.AgentIdentity.Address() returns the bare name for those roles, which
 // causes the read/write mismatch in GH#3699.
 func canonicalAssigneeAddress(identity *session.AgentIdentity) string {
-	return beads.CanonicalAgentAddress(identity.Address())
+	addr := identity.Address()
+	switch identity.Role {
+	case session.RoleMayor, session.RoleDeacon:
+		if !strings.HasSuffix(addr, "/") {
+			return addr + "/"
+		}
+	}
+	return addr
 }
 
 // resolveSelfTarget determines agent identity, pane, and hook root for slinging to self.
