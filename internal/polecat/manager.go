@@ -362,6 +362,26 @@ func (m *Manager) resetAgentBeadForReuse(agentID, reason string) error {
 	return m.agentBeads().ResetAgentBeadForReuse(agentID, reason)
 }
 
+// agentBeadRetirer is the agent-bead close used by the removal path. Narrow so
+// retirement can be exercised without a live beads store.
+type agentBeadRetirer interface {
+	CloseAgentBead(id, reason string) error
+}
+
+// retireAgentBead closes the agent bead of a polecat that has just been removed.
+//
+// Best-effort by design: a close failure must never turn into a failed removal,
+// or a Dolt hiccup would strand the worktree — which is worse than a stale bead.
+// A missing bead is not worth a warning; there is nothing left to retire.
+func retireAgentBead(r agentBeadRetirer, agentID, reason string) {
+	if err := r.CloseAgentBead(agentID, reason); err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return
+		}
+		style.PrintWarning("could not close agent bead %s: %v", agentID, err)
+	}
+}
+
 // SetAgentStateWithRetry wraps SetAgentState with retry logic.
 // Returns an error after exhausting retries, but callers may choose to warn
 // rather than fail — e.g., in StartSession where the tmux session is already
@@ -1135,7 +1155,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	return m.removeWithOptionsLocked(name, force, nuclear, selfNuke)
 }
 
-func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
+func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) (retErr error) {
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
@@ -1197,6 +1217,22 @@ func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke 
 			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
 		}
 	}
+
+	// Retire the agent bead once the removal has actually happened. Resetting
+	// alone leaves it open, and gt feed's problems pane reports every open agent
+	// bead with no live session as a zombie — so without this, each removal adds
+	// a permanent "dead" entry to the pane (gt-qvx7).
+	//
+	// Deferred so it covers every success path, including the repo-base fallback
+	// that returns early after a direct os.RemoveAll. Still runs inside the
+	// per-polecat lock held by RemoveWithOptions and before the name returns to
+	// the pool, so a concurrent spawn cannot have reopened the bead underneath us.
+	defer func() {
+		if retErr != nil {
+			return
+		}
+		retireAgentBead(m.agentBeads(), agentID, "polecat removed")
+	}()
 
 	// Unassign any work beads still pointing at this polecat (gt-e4u1).
 	// Without this, beads remain assigned to a ghost polecat (status in_progress,
