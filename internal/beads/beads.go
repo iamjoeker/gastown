@@ -744,6 +744,12 @@ func (b *Beads) Init(prefix string) error {
 // Investigation: dc-1pq8 (forensic report 2026-05-02).
 const bdSubprocessTimeout = 60 * time.Second
 
+// bdWaitDelay bounds how long Wait keeps reading bd's output pipes after the
+// timeout has already killed bd. Without it the deadline is advisory: the kill
+// signals only bd itself, so anything bd left holding the pipe keeps Run
+// blocked and the subprocess timeout never surfaces at all.
+const bdWaitDelay = 5 * time.Second
+
 // resolveBdSubprocessTimeout returns the configured timeout, honoring the
 // GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
 func resolveBdSubprocessTimeout() time.Duration {
@@ -786,7 +792,8 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
 	// The context covers both the initial attempt and the --flat retry.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	timeout := resolveBdSubprocessTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
@@ -794,6 +801,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// resolve from working directory.
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
+	cmd.WaitDelay = bdWaitDelay
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -821,6 +829,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 		stderr.Reset()
 		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 		util.SetDetachedProcessGroup(cmd)
+		cmd.WaitDelay = bdWaitDelay
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -833,7 +842,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	}
 
 	if err != nil {
-		return nil, b.wrapErrorWithOutput(err, stderr.String(), stdout.String(), args)
+		return nil, b.wrapErrorWithOutput(annotateTimeout(ctx, err, timeout), stderr.String(), stdout.String(), args)
 	}
 
 	// Handle bd exit code 0 bug: when issue not found,
@@ -866,11 +875,13 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
 	// Bound subprocess runtime — see bdSubprocessTimeout doc comment.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	timeout := resolveBdSubprocessTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
+	cmd.WaitDelay = bdWaitDelay
 	cmd.Dir = RoutingWorkDir(b.workDir)
 
 	cmd.Env = runEnv
@@ -881,7 +892,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, b.wrapErrorWithOutput(err, stderr.String(), stdout.String(), args)
+		return nil, b.wrapErrorWithOutput(annotateTimeout(ctx, err, timeout), stderr.String(), stdout.String(), args)
 	}
 
 	if stdout.Len() == 0 && stderr.Len() > 0 {
@@ -944,7 +955,25 @@ func (b *Beads) wrapErrorWithOutput(err error, stderr, stdout string, args []str
 	if detail != "" {
 		return fmt.Errorf("bd %s: %s", strings.Join(args, " "), detail)
 	}
-	return fmt.Errorf("bd %s: %w", strings.Join(args, " "), err)
+
+	// bd exited non-zero without writing a single byte to either stream. Saying
+	// so is the point: a bare "bd create ...: exit status 1" is indistinguishable
+	// from gt discarding bd's stderr, and gt-h7p was filed on exactly that
+	// ambiguity — a polecat whose MR bead creation failed could not tell whether
+	// the diagnosis was missing or merely hidden. With no message from bd, the
+	// database the write was aimed at is the only lead left, so name it.
+	return fmt.Errorf("bd %s: %w (bd wrote nothing to stdout or stderr; beads_dir=%s cwd=%s)",
+		strings.Join(args, " "), err, b.getResolvedBeadsDir(), b.workDir)
+}
+
+// annotateTimeout marks subprocess failures caused by the bd timeout expiring.
+// A killed bd exits with an empty stdout and stderr, so without this the caller
+// sees only "signal: killed" and cannot tell a hung Dolt server from a crash.
+func annotateTimeout(ctx context.Context, err error, timeout time.Duration) error {
+	if err == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("timed out after %s (raise GT_BD_TIMEOUT_SEC to extend): %w", timeout, err)
 }
 
 // bdErrorFromStdout returns bd's own error message when stdout carries a
