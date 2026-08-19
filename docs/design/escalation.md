@@ -141,10 +141,22 @@ ones nobody acted on. Closing is protected as well as deleting, because
 `gt escalate list` hides copies whose record is closed: reaping the record alone
 removes a live escalation from the only surface an operator reads.
 
-**The cost is real and deliberate**: escalation rows now accumulate without
-bound, on the grounds that the growth is merely expensive while the deletion is
-final. Wisps are unversioned, unbacked and `dolt_ignore`'d, so there is no Dolt
-history to restore one from.
+**The cost was real and deliberate**: escalation rows accumulated without bound,
+on the grounds that the growth is merely expensive while the deletion is final.
+Wisps are unversioned, unbacked and `dolt_ignore`'d, so there is no Dolt history
+to restore one from.
+
+**Retention now pays that bill without reopening the hole** (gt-6xwt). `Purge`
+exports a closed escalation record — description, close reason, labels,
+comments, dependencies — to the durable archive under `~/.gt/wisp-archive/`, and
+only then deletes the row; `gt reaper archive --grep <id>` reads it back. The
+export is fsynced before the DELETE, so a failure leaves the row in Dolt rather
+than the record nowhere, and `--no-archive` restores the keep-forever behaviour.
+Note what this does NOT change: `Reap` still never closes an open escalation
+record, because the hazard there is disappearing from `gt escalate list` while
+still needing attention, and no archive fixes that. A PINNED record is never
+exported or released either — the pin is a responder's instruction about that
+one row.
 
 **Residual gap — bd's own GC is NOT covered.** `bd purge` and
 `bd mol wisp gc --age` protect by label too, but from bd's `gc.protected_labels`

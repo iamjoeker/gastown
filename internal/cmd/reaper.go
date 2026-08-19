@@ -14,17 +14,56 @@ import (
 )
 
 var (
-	reaperDB       string
-	reaperHost     string
-	reaperPort     int
-	reaperMaxAge   string
-	reaperPurgeAge string
-	reaperMailAge  string
-	reaperStaleAge string
-	reaperDBDelay  string
-	reaperDryRun   bool
-	reaperJSON     bool
+	reaperDB          string
+	reaperHost        string
+	reaperPort        int
+	reaperMaxAge      string
+	reaperPurgeAge    string
+	reaperMailAge     string
+	reaperStaleAge    string
+	reaperDBDelay     string
+	reaperDryRun      bool
+	reaperJSON        bool
+	reaperArchiveDir  string
+	reaperNoArchive   bool
+	reaperArchiveID   string
+	reaperArchiveGrep string
+	reaperArchiveLmt  int
 )
+
+// reaperArchiver resolves the archive purge exports protected wisps to before
+// deleting them (gt-6xwt).
+//
+// FAILING TO OPEN THE ARCHIVE IS NOT A FAILURE OF THE PURGE, it is a return to
+// the old contract: a nil Archiver means ProtectedWispLabels protects
+// absolutely, exactly as it did before retention existed. So an unwritable
+// archive directory costs rows that stay in Dolt and a warning on stderr, never
+// a record. The warning is on stderr rather than swallowed because "protected: N"
+// climbing forever with no explanation is how this became a bead in the first
+// place.
+func reaperArchiver() reaper.Archiver {
+	if reaperNoArchive {
+		return nil
+	}
+	dir := reaperArchiveDir
+	if dir == "" {
+		dir = reaper.DefaultArchiveDir()
+	}
+	archive, err := reaper.NewFileArchive(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: wisp archive unavailable (%v); protected wisps will be kept, not released\n", err)
+		return nil
+	}
+	return archive
+}
+
+// reaperArchiveLocation returns the directory `gt reaper archive` reads.
+func reaperArchiveLocation() string {
+	if reaperArchiveDir != "" {
+		return reaperArchiveDir
+	}
+	return reaper.DefaultArchiveDir()
+}
 
 func reaperDatabaseNames() []string {
 	if reaperDB == "" {
@@ -94,7 +133,8 @@ When run by a Dog:
   gt reaper scan --db=gastown          # Discover candidates
   gt reaper reap --db=gastown          # Close stale wisps
   gt reaper purge --db=gastown         # Delete old closed wisps + mail
-  gt reaper auto-close --db=gastown    # Close stale issues`,
+  gt reaper auto-close --db=gastown    # Close stale issues
+  gt reaper archive --grep=gt-abc      # Read records purge archived before deleting`,
 	RunE: requireSubcommand,
 }
 
@@ -191,6 +231,12 @@ The Dog uses this to understand the state before deciding what to reap.`,
 				fmt.Printf("  Purge candidates: %d\n", r.PurgeCandidates)
 				if r.ProtectedFromPurge > 0 {
 					fmt.Printf("  Purge-protected:  %d\n", r.ProtectedFromPurge)
+				}
+				// How much of that protection a purge with an archive would
+				// release. Without this line the protected count only ever
+				// grows and never says what would clear it (gt-6xwt).
+				if r.ArchivableFromPurge > 0 {
+					fmt.Printf("  Archivable:       %d\n", r.ArchivableFromPurge)
 				}
 				fmt.Printf("  Mail candidates:  %d\n", r.MailCandidates)
 				fmt.Printf("  Stale candidates: %d\n", r.StaleCandidates)
@@ -322,6 +368,11 @@ past the mail-age threshold. Irreversible operation.
 When --db is provided, purges a single database. When omitted, auto-discovers
 all databases on the Dolt server and purges each one.
 
+Wisps whose type must never be lost (merge requests, escalations) are exported
+to the durable archive and only then deleted, so protection releases the row
+without losing the record. Pinned wisps are never exported or deleted. Use
+--no-archive to keep protected wisps in the database instead.
+
 Returns counts of purged rows. Use --dry-run to preview.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		purgeAge, err := time.ParseDuration(reaperPurgeAge)
@@ -333,6 +384,7 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 			return fmt.Errorf("invalid --mail-age: %w", err)
 		}
 
+		archive := reaperArchiver()
 		databases := reaperDatabaseNames()
 
 		var results []*reaper.PurgeResult
@@ -360,7 +412,7 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				continue
 			}
 
-			result, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun)
+			result, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun, reaper.WithArchive(archive))
 			db.Close()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: purge error: %v\n", dbName, err)
@@ -372,7 +424,7 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalWisps, totalMail, totalProtected int
+			var totalWisps, totalMail, totalArchived, totalProtected int
 			for _, r := range results {
 				prefix := ""
 				if r.DryRun {
@@ -380,6 +432,11 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				}
 				fmt.Printf("%s: %spurged %d wisps, %d mail\n",
 					r.Database, prefix, r.WispsPurged, r.MailPurged)
+				// Name the archive alongside the count: a deletion that reports
+				// only a number is the shape of the loss this replaced.
+				if r.WispsArchived > 0 && archive != nil {
+					fmt.Printf("  Archived (released): %d → %s\n", r.WispsArchived, archive.Location())
+				}
 				// Report the skip rather than just deleting fewer rows: without
 				// this a protected purge is indistinguishable from a quiet one.
 				if r.WispsProtected > 0 {
@@ -390,6 +447,7 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				}
 				totalWisps += r.WispsPurged
 				totalMail += r.MailPurged
+				totalArchived += r.WispsArchived
 				totalProtected += r.WispsProtected
 			}
 			if len(results) > 1 {
@@ -397,8 +455,8 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				if reaperDryRun {
 					prefix = "[DRY RUN] "
 				}
-				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail, protected %d wisps\n",
-					prefix, len(results), totalWisps, totalMail, totalProtected)
+				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail, archived %d wisps, protected %d wisps\n",
+					prefix, len(results), totalWisps, totalMail, totalArchived, totalProtected)
 			}
 		}
 		return nil
@@ -514,7 +572,8 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalProtected, totalClosed, totalOpen int
+		archive := reaperArchiver()
+		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalArchived, totalProtected, totalClosed, totalOpen int
 
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
@@ -563,12 +622,13 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			}
 
 			// Purge
-			purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun)
+			purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun, reaper.WithArchive(archive))
 			if err != nil {
 				fmt.Printf("%s: purge error: %v\n", dbName, err)
 			} else {
 				totalPurged += purgeResult.WispsPurged
 				totalMailPurged += purgeResult.MailPurged
+				totalArchived += purgeResult.WispsArchived
 				totalProtected += purgeResult.WispsProtected
 			}
 
@@ -600,14 +660,111 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		}
 		fmt.Println()
 		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
+		if totalArchived > 0 && archive != nil {
+			fmt.Printf("  Archived:  %d wisps → %s\n", totalArchived, archive.Location())
+		}
 		if totalProtected > 0 {
-			fmt.Printf("  Protected: %d wisps (pinned or protected label)\n", totalProtected)
+			fmt.Printf("  Protected: %d wisps (pinned, or protected label with no archive)\n", totalProtected)
 		}
 		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
 		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)
 
 		return nil
 	},
+}
+
+// reaperArchiveCmd is the read half of retention. An archive nobody can query
+// is a hole with a nicer name: the record was kept so that somebody looking for
+// a merge that did not land, months later, can find the rejection rationale.
+var reaperArchiveCmd = &cobra.Command{
+	Use:   "archive",
+	Short: "Search wisps the purge archived before deleting",
+	Long: `Read the durable archive of wisps that purge exported before deleting.
+
+Protected wisp types (merge requests, escalations) are written here as JSON
+Lines before their rows are removed from Dolt, so the record outlives the row.
+
+  gt reaper archive                        # most recent records
+  gt reaper archive --db gastown           # one database
+  gt reaper archive --grep gt-6xwt         # id, title, description, close reason
+  gt reaper archive --id gt-wisp-abc123    # one record in full
+  gt reaper archive --json                 # machine-readable`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dir := reaperArchiveLocation()
+		scan, err := reaper.ReadArchive(dir, reaper.ArchiveFilter{
+			Database: reaperDB,
+			ID:       reaperArchiveID,
+			Contains: reaperArchiveGrep,
+			Limit:    reaperArchiveLmt,
+		})
+		if err != nil {
+			return err
+		}
+
+		if reaperJSON {
+			fmt.Println(reaper.FormatJSON(scan))
+			return nil
+		}
+
+		// A corrupt archive must not read as an empty one.
+		if scan.Malformed > 0 {
+			fmt.Fprintf(os.Stderr, "WARNING: %d unreadable line(s) in %s\n", scan.Malformed, dir)
+		}
+		if len(scan.Records) == 0 {
+			fmt.Printf("No archived wisps in %s (%d file(s) read)\n", dir, scan.Files)
+			return nil
+		}
+
+		// A single record is a lookup, and the description is the point of it:
+		// an MR's branch, target and source_issue live in there as key: value
+		// lines, not in columns.
+		if reaperArchiveID != "" {
+			for _, rec := range scan.Records {
+				printArchivedWisp(rec)
+			}
+			return nil
+		}
+
+		for _, rec := range scan.Records {
+			closed := "-"
+			if rec.ClosedAt != nil {
+				closed = rec.ClosedAt.Format("2006-01-02")
+			}
+			fmt.Printf("%s  %-24s  %-10s  %s\n", closed, rec.ID, rec.Database, rec.Title)
+		}
+		fmt.Printf("\n%s %d record(s) from %d file(s) in %s\n",
+			style.Dim.Render("Archive:"), len(scan.Records), scan.Files, dir)
+		return nil
+	},
+}
+
+func printArchivedWisp(rec reaper.ArchivedWisp) {
+	fmt.Printf("%s  (%s)\n", rec.ID, rec.Database)
+	fmt.Printf("  Title:        %s\n", rec.Title)
+	fmt.Printf("  Status:       %s\n", rec.Status)
+	if rec.WispType != "" {
+		fmt.Printf("  Wisp type:    %s\n", rec.WispType)
+	}
+	if len(rec.Labels) > 0 {
+		fmt.Printf("  Labels:       %s\n", strings.Join(rec.Labels, ", "))
+	}
+	if rec.Assignee != "" {
+		fmt.Printf("  Assignee:     %s\n", rec.Assignee)
+	}
+	if rec.ClosedAt != nil {
+		fmt.Printf("  Closed:       %s\n", rec.ClosedAt.Format(time.RFC3339))
+	}
+	fmt.Printf("  Archived:     %s\n", rec.ArchivedAt.Format(time.RFC3339))
+	if rec.CloseReason != "" {
+		fmt.Printf("  Close reason: %s\n", rec.CloseReason)
+	}
+	if rec.Description != "" {
+		fmt.Printf("\n%s\n", rec.Description)
+	}
+	for _, c := range rec.Comments {
+		fmt.Printf("\n  --- comment ---\n  %s\n", strings.ReplaceAll(c, "\n", "\n  "))
+	}
+	fmt.Println()
 }
 
 func init() {
@@ -644,12 +801,30 @@ func init() {
 		cmd.Flags().StringVar(&reaperStaleAge, "stale-age", "720h", "Max issue staleness before auto-close (30d)")
 	}
 
+	// Retention flags (gt-6xwt). --archive-dir is shared with the read command
+	// so a non-default archive is read back from where it was written.
+	for _, cmd := range []*cobra.Command{reaperPurgeCmd, reaperRunCmd, reaperArchiveCmd} {
+		cmd.Flags().StringVar(&reaperArchiveDir, "archive-dir", "",
+			fmt.Sprintf("Directory for archived wisp records (default %s, env: %s)",
+				reaper.DefaultArchiveDir(), reaper.ArchiveDirEnv))
+	}
+	for _, cmd := range []*cobra.Command{reaperPurgeCmd, reaperRunCmd} {
+		cmd.Flags().BoolVar(&reaperNoArchive, "no-archive", false,
+			"Keep protected wisps in the database instead of archiving and releasing them")
+	}
+	reaperArchiveCmd.Flags().StringVar(&reaperDB, "db", "", "Only records from this database")
+	reaperArchiveCmd.Flags().StringVar(&reaperArchiveID, "id", "", "Show one archived wisp in full")
+	reaperArchiveCmd.Flags().StringVar(&reaperArchiveGrep, "grep", "", "Substring match on id, title, description, close reason")
+	reaperArchiveCmd.Flags().IntVar(&reaperArchiveLmt, "limit", 50, "Maximum records to show (0 = no limit)")
+	reaperArchiveCmd.Flags().BoolVar(&reaperJSON, "json", false, "Output as JSON")
+
 	reaperCmd.AddCommand(reaperDatabasesCmd)
 	reaperCmd.AddCommand(reaperScanCmd)
 	reaperCmd.AddCommand(reaperReapCmd)
 	reaperCmd.AddCommand(reaperPurgeCmd)
 	reaperCmd.AddCommand(reaperAutoCloseCmd)
 	reaperCmd.AddCommand(reaperRunCmd)
+	reaperCmd.AddCommand(reaperArchiveCmd)
 
 	rootCmd.AddCommand(reaperCmd)
 }
