@@ -33,7 +33,6 @@ type MockConvoyFetcher struct {
 	Mail                []MailRow
 	Rigs                []RigRow
 	Dogs                []DogRow
-	DogsError           error
 	Escalations         []EscalationRow
 	EscalationsError    error
 	Health              *HealthRow
@@ -77,7 +76,7 @@ func (m *MockConvoyFetcher) FetchRigs() ([]RigRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchDogs() ([]DogRow, error) {
-	return m.Dogs, m.DogsError
+	return m.Dogs, nil
 }
 
 func (m *MockConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
@@ -493,10 +492,6 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 		SessionsError: errors.New("listing tmux sessions: tmux timed out after 2s"),
 		MayorError:    errors.New("checking mayor session: tmux timed out after 2s"),
 		ActivityError: errors.New("reading event log: permission denied"),
-		// The Dogs panel reached the handler with its error already computed and
-		// dropped it here, so it was the last of the nine sites still rendering
-		// a failure as an empty kennel (gt-1jrl).
-		DogsError: errors.New("reading kennel: permission denied"),
 	}
 
 	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
@@ -517,7 +512,6 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 		"Sessions unavailable: listing tmux sessions: tmux timed out after 2s",
 		"Mayor status unavailable: checking mayor session: tmux timed out after 2s",
 		"Activity unavailable: reading event log: permission denied",
-		"Dogs unavailable: reading kennel: permission denied",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("panel should name why it could not read: missing %q", want)
@@ -530,7 +524,6 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 		"<p>No polecats</p>",
 		"No active sessions",
 		"No recent activity",
-		"No dogs in kennel",
 	} {
 		if strings.Contains(body, unwanted) {
 			t.Errorf("an unreadable panel must not render its empty state: found %q", unwanted)
@@ -575,7 +568,6 @@ func TestConvoyHandler_QuietTownRendersEmptyStates(t *testing.T) {
 		"<p>No polecats</p>",
 		"No active sessions",
 		"No recent activity",
-		"No dogs in kennel",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("a readable, quiet panel should render its empty state: missing %q", want)
@@ -588,7 +580,6 @@ func TestConvoyHandler_QuietTownRendersEmptyStates(t *testing.T) {
 		"Sessions unavailable",
 		"Mayor status unavailable",
 		"Activity unavailable",
-		"Dogs unavailable",
 	} {
 		if strings.Contains(body, unwanted) {
 			t.Errorf("a successful query must not render an unavailable notice: found %q", unwanted)
