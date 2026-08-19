@@ -135,23 +135,7 @@ var mqListCmd = &cobra.Command{
 	Short: "Show the merge queue",
 	Long: `Show the merge queue for a rig.
 
-Lists pending merge requests waiting to be processed. The default scope is
-status=open, so merged and rejected MRs — which are closed — are NOT shown.
-
-This is the ONLY correct surface for auditing merge requests, and the header
-names the store and status scope it queried so an empty result is falsifiable.
-MR records are wisps in the RIG's store, which is why the other obvious probes
-answer zero for MRs that exist (gt-kb63):
-
-  bd list --label gt:merge-request   MRs are wisps; bd list reads issues.
-                                     No filter on bd list can ever reach them.
-  bd mol wisp list                   Reads the store of the CWD, and is
-                                     open-only without --all. From the town
-                                     root it cannot see rig wisps at all.
-
-To audit merged MRs, ask for the closed ones explicitly:
-
-  gt mq list <rig> --status closed
+Lists all pending merge requests waiting to be processed.
 
 Output format:
   ID          STATUS       PRIORITY  BRANCH                    WORKER  AGE
@@ -164,8 +148,6 @@ Examples:
   gt mq list greenplace
   gt mq list greenplace --ready
   gt mq list greenplace --status=open
-  gt mq list greenplace --status=closed    # merged/rejected MRs (audit)
-  gt mq list greenplace --status=all       # every MR regardless of status
   gt mq list greenplace --worker=Nux`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMQList,
