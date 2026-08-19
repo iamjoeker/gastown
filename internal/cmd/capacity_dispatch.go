@@ -83,6 +83,10 @@ type schedulerDispatchPlan struct {
 	Scheduled   []scheduledBeadInfo
 	Ready       []capacity.PendingBead
 	Plan        capacity.DispatchPlan
+	// Scan reports whether the planning scan behind Scheduled/Ready saw every
+	// store. A plan built from a half-read town is still a plan, but "nothing
+	// to dispatch" from it means something different (gt-vpds).
+	Scan slingContextScanHealth
 }
 
 func buildSchedulerDispatchPlan(townRoot string, batchOverride int, cleanup bool) (*schedulerDispatchPlan, error) {
@@ -114,7 +118,7 @@ func buildSchedulerDispatchPlan(townRoot string, batchOverride int, cleanup bool
 		}
 	}
 
-	assessments, blockedErr := assessScheduledContexts(townRoot)
+	assessments, scan, blockedErr := assessScheduledContexts(townRoot)
 	if blockedErr != nil {
 		return nil, blockedErr
 	}
@@ -147,6 +151,7 @@ func buildSchedulerDispatchPlan(townRoot string, batchOverride int, cleanup bool
 		Scheduled:   scheduledBeadInfosFromAssessments(assessments),
 		Ready:       ready,
 		Plan:        dispatchPlan,
+		Scan:        scan,
 	}, nil
 }
 
@@ -183,6 +188,13 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 	dispatchPlan, err := buildSchedulerDispatchPlan(townRoot, batchOverride, true)
 	if err != nil {
 		return 0, fmt.Errorf("planning dispatch: %w", err)
+	}
+	if !isDaemonDispatch() {
+		// The daemon already has this on stderr from the scan itself; an
+		// interactive operator needs it beside the dispatch counts, because
+		// "No ready beads scheduled for dispatch" from a half-read town looks
+		// exactly like an empty scheduler (gt-vpds).
+		printScanIncompleteWarning(dispatchPlan.Scan)
 	}
 
 	if dispatchPlan.State.Paused {
@@ -310,7 +322,16 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 	return report.Dispatched, nil
 }
 
+// printScanIncompleteWarning surfaces a degraded planning scan beside the
+// numbers it qualifies. No-op when the scan read every store.
+func printScanIncompleteWarning(scan slingContextScanHealth) {
+	if warn := scan.Warning(); warn != "" {
+		fmt.Printf("%s %s\n", style.Warning.Render("⚠"), warn)
+	}
+}
+
 func printSchedulerDryRunPlan(dispatchPlan *schedulerDispatchPlan) {
+	printScanIncompleteWarning(dispatchPlan.Scan)
 	if dispatchPlan.State.Paused {
 		fmt.Printf("Scheduler is paused (by %s); %d ready bead(s) not dispatched\n",
 			dispatchPlan.State.PausedBy, len(dispatchPlan.Ready))
@@ -583,16 +604,21 @@ func groupBeadIDsByResolvedBeadsDir(townRoot string, ids []string) map[string][]
 	return idsByBeadsDir
 }
 
-func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, error) {
+// assessScheduledContexts returns what the scan found AND how complete the scan
+// was. The health value is not advisory decoration: an incomplete scan that
+// finds zero contexts is indistinguishable from an empty scheduler unless it
+// travels with the result (gt-vpds), and the zero case returns early below.
+func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, slingContextScanHealth, error) {
 	contexts, err := listAllSlingContextRecords(townRoot)
 	if err != nil && !errors.Is(err, ErrPartialSlingContextScan) {
-		return nil, err
+		return nil, slingContextScanHealth{}, err
 	}
-	if errors.Is(err, ErrPartialSlingContextScan) {
+	scan := scanHealthFromErr(err)
+	if scan.Incomplete {
 		fmt.Fprintf(os.Stderr, "⚠ %v — planning continues on the readable stores\n", err)
 	}
 	if len(contexts) == 0 {
-		return nil, nil
+		return nil, scan, nil
 	}
 
 	candidates := make([]scheduledContextAssessment, 0, len(contexts))
@@ -609,7 +635,7 @@ func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, err
 		workBeadIDs = append(workBeadIDs, fields.WorkBeadID)
 	}
 	if len(candidates) == 0 {
-		return nil, nil
+		return nil, scan, nil
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
@@ -642,7 +668,7 @@ func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, err
 		assessments = append(assessments, candidate)
 	}
 
-	return assessments, blockedErr
+	return assessments, scan, blockedErr
 }
 
 // getReadySlingContexts queries for sling context beads whose work beads are ready.
@@ -652,7 +678,7 @@ func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, err
 // Sling contexts are scanned from HQ and rig DBs. Work bead readiness is checked
 // by source ID so context location and source readiness cannot diverge.
 func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
-	assessments, blockedErr := assessScheduledContexts(townRoot)
+	assessments, _, blockedErr := assessScheduledContexts(townRoot)
 	if blockedErr != nil {
 		return nil, blockedErr
 	}
@@ -856,6 +882,68 @@ func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 // into "nothing is scheduled".
 var ErrPartialSlingContextScan = errors.New("planning scan could not read every store; result is incomplete")
 
+// partialSlingContextScanError carries WHICH stores were missed, not just that
+// some were. Callers that continue on a degraded scan have to tell operators
+// what the view is missing (gt-vpds), and a message they would have to re-parse
+// to recover the store list is a message they render as prose and drop from
+// JSON. Its text is unchanged from the fmt.Errorf it replaces.
+type partialSlingContextScanError struct {
+	skipped []string
+	total   int
+}
+
+func (e *partialSlingContextScanError) Error() string {
+	return fmt.Sprintf("listing sling contexts: %s (skipped %d of %d: %s)",
+		ErrPartialSlingContextScan, len(e.skipped), e.total, strings.Join(e.skipped, ", "))
+}
+
+func (e *partialSlingContextScanError) Unwrap() error { return ErrPartialSlingContextScan }
+
+// slingContextScanHealth travels with the records a planning scan produced, so
+// the surfaces that report on those records can say the view is incomplete.
+//
+// gt-vpds: on 2026-08-19 six of twelve stores were unreadable and the planner
+// proceeded on the other six. It was RIGHT to proceed — that isolation is
+// hq-v05uw — but the only trace was a stderr warning. `gt scheduler status`
+// still printed "Scheduled: 3 total, 3 ready" with no qualifier, `--json`
+// carried no field at all, and the town read as idle-by-choice rather than
+// half-blind. Incompleteness has to travel in-band with the numbers it
+// qualifies, or the operator has nothing to suspect.
+type slingContextScanHealth struct {
+	Incomplete bool     `json:"incomplete"`
+	Skipped    []string `json:"skipped_stores,omitempty"`
+	Total      int      `json:"stores_total,omitempty"`
+}
+
+// scanHealthFromErr classifies a listAllSlingContextRecords error for callers
+// that continue on partial results. Non-partial errors are fatal to every
+// caller and never reach here; they report a healthy scan so a mistaken call
+// cannot manufacture a false degradation warning.
+func scanHealthFromErr(err error) slingContextScanHealth {
+	var partial *partialSlingContextScanError
+	if errors.As(err, &partial) {
+		return slingContextScanHealth{Incomplete: true, Skipped: partial.skipped, Total: partial.total}
+	}
+	if errors.Is(err, ErrPartialSlingContextScan) {
+		// Sentinel without the typed carrier: still degraded, just unnamed.
+		return slingContextScanHealth{Incomplete: true}
+	}
+	return slingContextScanHealth{}
+}
+
+// Warning renders the operator-facing line for a degraded scan, or "" when the
+// scan was complete. Callers print it beside the counts it qualifies.
+func (h slingContextScanHealth) Warning() string {
+	if !h.Incomplete {
+		return ""
+	}
+	if len(h.Skipped) == 0 || h.Total == 0 {
+		return "planning scan could not read every store — the counts below are incomplete"
+	}
+	return fmt.Sprintf("planning scan read only %d of %d stores — the counts below are incomplete (skipped: %s)",
+		h.Total-len(h.Skipped), h.Total, strings.Join(h.Skipped, ", "))
+}
+
 // listAllSlingContextRecords names itself in every error it returns ("listing
 // sling contexts: ..."), so callers can surface the failure verbatim instead of
 // re-wrapping it. A partial-scan error also carries which stores were skipped,
@@ -909,9 +997,10 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	if len(skipped) > 0 {
 		// Records ARE returned so best-effort planning still works, but the
 		// sentinel travels with them so a completeness-sensitive caller can
-		// fail closed instead of trusting an incomplete view (gt-mji1).
-		return records, fmt.Errorf("listing sling contexts: %w (skipped %d of %d: %s)",
-			ErrPartialSlingContextScan, len(skipped), len(dirs), strings.Join(skipped, ", "))
+		// fail closed instead of trusting an incomplete view (gt-mji1), and the
+		// skipped stores travel with it so best-effort callers can name what
+		// their view is missing (gt-vpds).
+		return records, &partialSlingContextScanError{skipped: skipped, total: len(dirs)}
 	}
 	return records, nil
 }
