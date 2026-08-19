@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 18
+version = 17
 
 [vars]
 [vars.wisp_type]
@@ -322,7 +322,7 @@ needs = ["inbox-check"]
 description = """
 Detect and clean runtime pollution left by tests and dead processes.
 
-This step cleans up five categories of pollution, plus one report-only survey. **Only clean items where the
+This step cleans up four categories of pollution. **Only clean items where the
 owning process is confirmed dead** — never kill or remove resources owned by
 live processes.
 
@@ -448,34 +448,7 @@ to strand dozens of work directories in three days. If `removed` is routinely
 high, that is worth an investigation of its own (OOM killer, test timeouts,
 mid-build recycles), not a bigger sweep.
 
-**4. Agent scratchpad directories**
-
-The other half of the same tmpfs. Every Claude Code session gets a private
-working directory under `$TMPDIR/claude-<uid>/`, and nothing removes it when the
-session ends: 2654 of them held 13.7GB of the same 31GB tmpfs on 2026-08-19,
-against 5.35GB of stranded Go work directories (gt-h0jb).
-
-**Report only. Do not pass `--apply` from patrol.**
-
-```bash
-gt deacon sweep-scratchpads --json
-```
-
-Read `sweepable`, `sweepable_bytes`, `used_percent` and `triggered` for the
-digest. `triggered` true means the filesystem is above the high-water mark and a
-sweep would act — escalate that with the numbers rather than applying it here.
-Deleting another agent's working files is irreversible and belongs to an
-operator who has read a real report, not to a patrol step.
-
-Age is NOT the rule here and a shell one-liner cannot substitute for the
-command. A live agent's scratchpad can sit untouched for hours while it thinks —
-2 of 15 live sessions had been quiet for over 2h when this was measured, one of
-them for 4.7h — so an age-only `find -delete` destroys live work. The command
-proves death by conjunction (birth time versus live process start times, working
-directories, transcript activity, a forensic floor) and keeps anything it cannot
-prove dead. See `docs/scratchpad-retention.md`.
-
-**5. Stale PID/lock files**
+**4. Stale PID/lock files**
 
 Remove test-server PID files whose process is PROVEN dead. Same discipline as
 sub-section 2, one blast radius smaller: alive beats every probe, and a probe
@@ -558,7 +531,7 @@ kill -0 999999 (unallocated)   -> rc=1, "No such process"           dead
 **Never restore an exit-status-only `kill -0` test here, and never re-add a bare
 glob `for` loop over these patterns.**
 
-**6. Dead dog worktrees**
+**5. Dead dog worktrees**
 
 If a dog's tmux session is dead but worktree dirs remain, prune them.
 
@@ -603,13 +576,13 @@ only counts. **If you restore deletion here, you re-arm exactly that hazard** �
 a worktree is frequently the only thing holding a commit reachable. Prefer a tag
 (`preserve/*`) plus an explicit human decision over any automated prune.
 
-**7. Report**
+**6. Report**
 
 Log counts of cleaned items. If any items were cleaned, include counts in a
 brief summary for the patrol digest:
 
 ```
-Test pollution cleanup: rogue_dolt=N stale_dirs=N go_build_dirs=N scratchpads=N stale_pids=N dead_worktrees=N
+Test pollution cleanup: rogue_dolt=N stale_dirs=N go_build_dirs=N stale_pids=N dead_worktrees=N
 ```
 
 If all counts are 0, log "Test pollution cleanup: clean" and move on.
