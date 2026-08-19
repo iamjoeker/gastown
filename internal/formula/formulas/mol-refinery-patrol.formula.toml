@@ -1253,26 +1253,14 @@ For each open MR bead:
 
 **NEVER close an MR bead without verifying the work landed or is unrecoverable.**
 
-**Step 4: Reconcile the ledger — merged work whose bead or MR never closed**
+**Step 4: Reconcile the ledger — merged work whose bead never closed**
 
-Step 3 sweeps MR beads whose branch is gone. This sweeps what is left: work
-beads whose merge landed while their close did not, and open MRs whose merge
-landed while their completion never ran. Closing the bead is a separate step
+Step 3 sweeps MR beads. This sweeps the other direction: work beads whose
+merge landed while their close did not. Closing the bead is a separate step
 from landing the merge, so anything that bypasses it — a hand-landed merge, an
 unresolvable work bead, a failed `bd` write — leaves a bead that looks like
 ordinary pending work and gets re-dispatched to a polecat who finds the fix
 already in main (gt-602).
-
-The MR half is the same failure with the opposite symptom (gt-3jx0). The entire
-completion path — close the MR, close the source issue, clear the polecat's
-`active_mr`, delete the remote branch — is one call, `gt mq post-merge`. When it
-does not run, and it does not run whenever you land a merge by hand and the
-cleanup is interrupted, the work is on main with the MR still open and the
-branch still on origin. Step 3 cannot see it: that branch is not MISSING. Nor
-can `--verify`, which reports a merged branch as EMPTY, because a merged branch
-is no longer ahead of its target. The 24h wisp sweep eventually closes such an
-MR by age alone, which clears the record without doing any of the rest — and
-after that it is indistinguishable from a properly completed one.
 
 ```bash
 gt mq reconcile <rig>
@@ -1294,17 +1282,6 @@ For each bead under **still open with work on origin/<target>**:
 For each bead under **hooked beads already have work**: a polecat is on it now.
 If the landed commit is the whole fix, nudge the witness — the polecat is
 redoing merged work. If it is a second round, leave it alone.
-
-For each MR under **open MR(s) whose work is already on origin/<target>**:
-1. Marked `MERGED, completion never ran` — the report prints the exact line:
-   `gt mq post-merge <rig> <mr-id>`. Run it. Add `--skip-branch-delete` only if
-   the branch must survive; the branch delete is part of the cleanup.
-2. Marked `UNCONFIRMED` — one of the two checks fired, not both. Containment
-   alone is also what an MR whose branch never carried a commit looks like, and
-   post-merging that one closes a bead for work never done. Read the branch
-   first: `git log --oneline origin/<target>..origin/<branch>`.
-3. **Never reject one.** Reject reopens the source issue and nudges the polecat
-   to resubmit work that is already in main.
 
 **Do NOT bulk-close the report.** Closing a bead whose work did not land is the
 false completion the ledger exists to prevent, and it is invisible afterwards.
