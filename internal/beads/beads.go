@@ -2328,41 +2328,6 @@ func (b *Beads) ReleaseWithReason(id, reason string) error {
 	return err
 }
 
-// Reopen moves a closed issue back to open status with a reason.
-//
-// It routes by issue ID like Close/Update do, and falls back to a direct status
-// update when `bd reopen` fails: some Dolt backends reject the reopen path (see
-// CreateOrReopenAgentBead, which carries the same fallback).
-func (b *Beads) Reopen(id, reason string) error {
-	if !b.noRoute {
-		if target := b.forIssueID(id); target != b {
-			return target.Reopen(id, reason)
-		}
-	}
-
-	if b.store != nil {
-		updates := map[string]interface{}{"status": string(StatusOpen)}
-		if reason != "" {
-			updates["notes"] = "Reopened: " + reason
-		}
-		ctx, cancel := storeCtx()
-		defer cancel()
-		return b.store.UpdateIssue(ctx, id, updates, b.getActor())
-	}
-
-	args := []string{"reopen", id}
-	if reason != "" {
-		args = append(args, "--reason="+reason)
-	}
-	if _, err := b.run(args...); err != nil {
-		open := string(StatusOpen)
-		if updateErr := b.Update(id, UpdateOptions{Status: &open}); updateErr != nil {
-			return fmt.Errorf("could not reopen %s (reopen: %v, update: %w)", id, err, updateErr)
-		}
-	}
-	return nil
-}
-
 // AddDependency adds a dependency: issue depends on dependsOn.
 func (b *Beads) AddDependency(issue, dependsOn string) error {
 	if b.store != nil {

@@ -686,28 +686,10 @@ func (m *Manager) RegisterMR(_ *MergeRequest) error {
 	return fmt.Errorf("RegisterMR is deprecated: use beads to create merge-request issues")
 }
 
-// RejectResult holds the outcome of rejecting a merge request, including what
-// happened to the source issue.
-type RejectResult struct {
-	MR *MergeRequest
-	// SourceIssueID is the resolved work bead, "" when the MR has none.
-	SourceIssueID string
-	// SourceIssueStatus is the issue's status AFTER the rejection.
-	SourceIssueStatus string
-	// SourceIssueReopened is true when the issue was closed and reject reopened it.
-	SourceIssueReopened bool
-	// SourceIssueSkipReason names why a terminal issue was left alone.
-	SourceIssueSkipReason string
-	// SourceIssueErr is non-fatal: the MR was rejected, but the source issue's
-	// state could not be read or corrected.
-	SourceIssueErr error
-}
-
 // RejectMR manually rejects a merge request.
-// It closes the MR with rejected status, reopens the source issue if it was
-// closed (a rejection means the work is not done), and optionally notifies the
-// worker.
-func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*RejectResult, error) {
+// It closes the MR with rejected status and optionally notifies the worker.
+// Returns the rejected MR for display purposes.
+func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*MergeRequest, error) {
 	b := beads.New(m.rig.BeadsPath())
 	mr, err := m.findMRForTerminalCleanup(idOrBranch, b)
 	if err != nil {
@@ -741,34 +723,12 @@ func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*Reje
 	}
 	mr.Error = reason
 
-	// A rejection means the work is not done. If the source issue was closed
-	// (a polecat closing its own bead before submitting, or any other route),
-	// leaving it closed strands the branch: nothing re-slings a closed bead.
-	workBeadID := resolveMergedWorkBead(b.ForAgentBead(), mergedWorkBeadCloseRequest{
-		MRID:        mr.ID,
-		Branch:      mr.Branch,
-		SourceIssue: mr.IssueID,
-		AgentBead:   mr.AgentBead,
-	})
-	reopen := reopenRejectedWorkBead(b, workBeadID, mr.ID, reason)
-	result := &RejectResult{
-		MR:                    mr,
-		SourceIssueID:         reopen.WorkBeadID,
-		SourceIssueStatus:     reopen.Status,
-		SourceIssueReopened:   reopen.Reopened,
-		SourceIssueSkipReason: reopen.SkipReason,
-		SourceIssueErr:        reopen.Err,
-	}
-	if reopen.Err != nil {
-		_, _ = fmt.Fprintf(m.output, "Warning: source issue %s: %v\n", reopen.WorkBeadID, reopen.Err)
-	}
-
 	// Optionally notify worker
 	if notify && !closeResult.AlreadyTerminal {
 		m.notifyWorkerRejected(mr, reason)
 	}
 
-	return result, nil
+	return mr, nil
 }
 
 // PostMergeResult holds the result of a post-merge cleanup operation.
