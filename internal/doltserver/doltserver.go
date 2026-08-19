@@ -538,6 +538,12 @@ type State struct {
 
 	// Databases is the list of available databases (rig names).
 	Databases []string `json:"databases,omitempty"`
+
+	// Supervisor is the process supervisor that owned the server the last time
+	// gt saw one running, remembered so the unit is still identifiable once the
+	// server is stopped and its /proc/<pid>/cgroup is gone. See
+	// SupervisorRecord. (gt-cru5)
+	Supervisor *SupervisorRecord `json:"supervisor,omitempty"`
 }
 
 // SQLServerInfo is Dolt's own runtime metadata from .dolt/sql-server.info.
@@ -1835,6 +1841,11 @@ func Start(townRoot string) error {
 				} else if changed {
 					fmt.Printf("Refreshed stale Dolt PID state (actual %d)\n", pid)
 				}
+				// A running server is the only time the owning unit is
+				// discoverable. Record it now so the next start — when there is
+				// no PID and no cgroup to read it from — can hand the start to
+				// the supervisor instead of spawning behind its back. (gt-cru5)
+				ObserveSupervisor(townRoot, pid)
 				return nil // already running and legitimate — idempotent success
 			}
 		}
@@ -1900,43 +1911,96 @@ func Start(townRoot string) error {
 		logFile.Close()
 		return fmt.Errorf("writing Dolt config: %w", err)
 	}
-	cmd := NewSQLServerCommand("dolt", config.DataDir, configPath)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
 
-	// Detach from terminal and put dolt in its own process group so that
-	// signals sent to the parent process group (e.g. SIGHUP when the caller
-	// calls syscall.Exec to become tmux) don't reach the dolt server.
-	cmd.Stdin = nil
-	setProcessGroup(cmd)
+	// Bring the server up, through the supervisor when one owns this town's
+	// server. Spawning dolt directly while its unit is stopped leaves systemd
+	// reporting the unit inactive while a server serves on the port: nothing
+	// restarts that process if it dies, a later `systemctl start` finds the
+	// port occupied, and it dies with whatever shell started it. (gt-cru5)
+	//
+	// killProcess undoes a failed start on whichever path started the server;
+	// it is nil when nothing needs undoing.
+	var serverPID int
+	var killProcess func()
 
-	if err := cmd.Start(); err != nil {
+	if sup := supervisorForStart(townRoot); sup != nil {
+		// The unit's output goes to the journal, not to gt's log file.
 		if closeErr := logFile.Close(); closeErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
 		}
-		return fmt.Errorf("starting Dolt server: %w", err)
+		fmt.Fprintf(os.Stderr, "Dolt is supervised by %s — starting through the supervisor\n", sup.Describe())
+		supPID, startErr := sup.StartUnit()
+		if startErr != nil {
+			return fmt.Errorf(`starting Dolt through its supervisor failed: %w
+
+gt did not start a server directly instead: a process started outside %s is
+one systemd believes does not exist, so nothing would restart it and the next
+%s would find port %d occupied.
+
+What the unit did: %s
+To start a server outside the unit anyway: GT_DOLT_DIRECT_START=1 gt dolt start`,
+				startErr, sup.Unit, sup.StartCommand(), config.Port, sup.JournalCommand())
+		}
+		serverPID = supPID
+	} else {
+		cmd := NewSQLServerCommand("dolt", config.DataDir, configPath)
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+
+		// Detach from terminal and put dolt in its own process group so that
+		// signals sent to the parent process group (e.g. SIGHUP when the caller
+		// calls syscall.Exec to become tmux) don't reach the dolt server.
+		cmd.Stdin = nil
+		setProcessGroup(cmd)
+
+		if err := cmd.Start(); err != nil {
+			if closeErr := logFile.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
+			}
+			return fmt.Errorf("starting Dolt server: %w", err)
+		}
+
+		// Close log file in parent (child has its own handle)
+		if closeErr := logFile.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
+		}
+
+		serverPID = cmd.Process.Pid
+		killProcess = func() { _ = cmd.Process.Kill() }
 	}
 
-	// Close log file in parent (child has its own handle)
-	if closeErr := logFile.Close(); closeErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
+	// Write PID file. A supervised start may report no MainPID (older systemd,
+	// no bus); an unknown PID is left out rather than written as 0, which
+	// IsRunning would read as a real process.
+	if serverPID > 0 {
+		if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(serverPID)), 0644); err != nil {
+			// Try to kill the process we just started. Not on the supervised
+			// path: killing the unit's main process is the supervisor's call,
+			// and a PID file gt failed to write is not worth an outage for.
+			if killProcess != nil {
+				killProcess()
+			}
+			return fmt.Errorf("writing PID file: %w", err)
+		}
+	} else {
+		// No PID to record. A leftover file from the previous server would be
+		// read as this one's, and PIDs are reused.
+		_ = os.Remove(config.PidFile)
 	}
 
-	// Write PID file
-	if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
-		// Try to kill the process we just started
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("writing PID file: %w", err)
-	}
-
-	// Save state
+	// Save state, preserving the remembered supervisor: this is a fresh state
+	// value, and overwriting the record would forget the unit on the very path
+	// that most needs it next time.
 	state := &State{
 		Running:   true,
-		PID:       cmd.Process.Pid,
+		PID:       serverPID,
 		Port:      config.Port,
 		StartedAt: time.Now(),
 		DataDir:   config.DataDir,
 		Databases: databases,
+	}
+	if prior, loadErr := LoadState(townRoot); loadErr == nil && prior != nil {
+		state.Supervisor = prior.Supervisor
 	}
 	if err := SaveState(townRoot, state); err != nil {
 		// Non-fatal - server is still running
@@ -1965,8 +2029,10 @@ func Start(townRoot string) error {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		time.Sleep(500 * time.Millisecond)
 
-		// Check if the process we started is still alive.
-		if !processIsAlive(cmd.Process.Pid) {
+		// Check if the process we started is still alive. A PID of 0 means the
+		// supervisor gave none, so there is nothing to check liveness against
+		// and reachability below is the only evidence.
+		if serverPID > 0 && !processIsAlive(serverPID) {
 			return fmt.Errorf("Dolt server process died during startup (check logs with 'gt dolt logs')")
 		}
 
@@ -2007,9 +2073,9 @@ func Start(townRoot string) error {
 
 	totalTimeout := time.Duration(dbCount) * 5 * time.Second
 	if !tcpReachable {
-		return fmt.Errorf("Dolt server process started (PID %d) but not accepting connections after %v (%d databases × 5s): %w\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
+		return fmt.Errorf("Dolt server process started (PID %d) but not accepting connections after %v (%d databases × 5s): %w\nCheck logs with: gt dolt logs", serverPID, totalTimeout, dbCount, lastErr)
 	}
-	return fmt.Errorf("Dolt server process started (PID %d) and is reachable, but databases failed to load after %v (%d databases × 5s): %w\nRecovery: gt dolt stop && gt dolt start\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
+	return fmt.Errorf("Dolt server process started (PID %d) and is reachable, but databases failed to load after %v (%d databases × 5s): %w\nRecovery: gt dolt stop && gt dolt start\nCheck logs with: gt dolt logs", serverPID, totalTimeout, dbCount, lastErr)
 }
 
 // WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
