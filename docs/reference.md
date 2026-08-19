@@ -702,6 +702,7 @@ gt mq list [rig]             # Show the merge queue (open MRs only)
 gt mq list <rig> --status closed   # Merged/rejected MRs — THE audit surface
 gt mq list <rig> --status all      # Every MR regardless of status
 gt mq next [rig]             # Show highest-priority merge request
+gt mq next <rig> --verify=false    # Select without the git content check
 gt mq submit                 # Submit current branch to merge queue
 gt mq status <id>            # Show detailed merge request status
 gt mq retry <id>             # Retry a failed merge request
@@ -715,6 +716,13 @@ gt mq reject <id>            # Reject a merge request
 `--all`. Merged MRs are closed, so the default `gt mq list` scope excludes them
 — ask for `--status closed`. See
 [False-Zero Queries](guides/false-zero-queries.md).
+
+Both the display path (`gt mq list --verify`) and the selection path
+(`gt mq next`) check each MR's branch in git, because bead state cannot tell a
+branch with work from one that points at its own target. `gt mq next` will not
+hand back an MR whose branch carries no commits over its target — merging one is
+a no-op that still closes the source issue — and names every MR it skipped, with
+the `gt mq reject` command to dispose of them.
 
 #### Integration Branch Commands
 
