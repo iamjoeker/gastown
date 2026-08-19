@@ -592,3 +592,50 @@ func TestCleanupStuckDogs_SkipsIdleDogs(t *testing.T) {
 		t.Errorf("idle dog state = %q, want idle", dg.State)
 	}
 }
+
+// TestPrunePluginReceipts_RefusesWithoutAGateSet asserts the daemon does not
+// prune plugin receipts when discovery yields no plugins (gt-0cja).
+//
+// The retention window is derived from the discovered cooldown gates. An empty
+// set is indistinguishable from a plugins directory that could not be read, and
+// the plugin with the longest gate — tool-updater, at 168h — is exactly the one
+// a defaulted short window would destroy mid-cooldown. The stamp staying zero
+// is what proves the run was declined rather than merely finding nothing to do:
+// a prune that ran would have set it.
+func TestPrunePluginReceipts_RefusesWithoutAGateSet(t *testing.T) {
+	townRoot := t.TempDir() // No plugins directory at all.
+	d := testHandlerDaemon(t, townRoot)
+
+	d.prunePluginReceipts(&config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+
+	if !d.lastReceiptPrune.IsZero() {
+		t.Error("daemon pruned receipts with no plugins discovered — retention would fall to the floor")
+	}
+}
+
+// TestPrunePluginReceipts_HonoursTheInterval asserts the prune is rate-limited.
+// It reads every receipt in the town database, which is not heartbeat work.
+func TestPrunePluginReceipts_HonoursTheInterval(t *testing.T) {
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+
+	// A plugin exists, so only the interval can stop the run — and it must,
+	// without reaching bd.
+	pluginDir := filepath.Join(townRoot, "plugins", "test-cooldown")
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pluginMD := "+++\nname = \"test-cooldown\"\ndescription = \"cooldown plugin\"\n\n[gate]\ntype = \"cooldown\"\nduration = \"1h\"\n+++\n\n# Instructions\n"
+	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), []byte(pluginMD), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	last := time.Now().Add(-receiptPruneInterval / 2)
+	d.lastReceiptPrune = last
+
+	d.prunePluginReceipts(&config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+
+	if !d.lastReceiptPrune.Equal(last) {
+		t.Errorf("prune ran inside the %s interval (stamp moved to %s)", receiptPruneInterval, d.lastReceiptPrune)
+	}
+}
