@@ -45,12 +45,17 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 		wantCapacity bool
 	}{
 		{
-			name:         "clean idle reusable",
+			// Nothing blocks and nothing was checked. This constructor reads
+			// beads only, so it reports UNVERIFIED instead of the reuse gate's
+			// SAFE_TO_NUKE/reusable — the two used to be indistinguishable in
+			// the output while the gate refused polecats this surface listed as
+			// reusable (gt-49dp).
+			name:         "clean idle is unverified without git facts",
 			polecatName:  "idle",
 			fields:       &beads.AgentFields{AgentState: string(beads.AgentStateIdle), CleanupStatus: string(polecat.CleanupClean)},
 			wantState:    polecat.StateIdle,
-			wantVerdict:  polecat.WorkstateVerdictSafeToNuke,
-			wantReusable: true,
+			wantVerdict:  polecat.WorkstateVerdictUnverified,
+			wantReusable: false,
 		},
 		{
 			name:         "hooked running is working capacity",
@@ -107,12 +112,12 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			wantVerdict: polecat.WorkstateVerdictPendingMR,
 		},
 		{
-			name:         "done without active mr and clean cleanup is reusable",
+			name:         "done without active mr and clean cleanup is unverified",
 			polecatName:  "done",
 			fields:       &beads.AgentFields{AgentState: string(beads.AgentStateDone), CleanupStatus: string(polecat.CleanupClean)},
 			wantState:    polecat.StateDone,
-			wantVerdict:  polecat.WorkstateVerdictSafeToNuke,
-			wantReusable: true,
+			wantVerdict:  polecat.WorkstateVerdictUnverified,
+			wantReusable: false,
 		},
 		{
 			name:         "done without active mr blocks reuse when cleanup is dirty",
@@ -195,14 +200,23 @@ func TestBuildPolecatInventoryItemSurfacesRefusedMR(t *testing.T) {
 	}
 
 	// Control: the same polecat without the refusal record is the ordinary
-	// completed polecat this surface has always called safe. If this arm ever
+	// completed polecat, and must NOT take the refusal path. If this arm ever
 	// starts failing too, the test above is passing for the wrong reason.
+	//
+	// It reads UNVERIFIED rather than SAFE_TO_NUKE because this constructor runs
+	// no git and no merge-queue check — the refusal is bead-recorded and fires
+	// anywhere, but clearing it does not turn a bead-only surface into one that
+	// looked (gt-49dp). The discrimination the control exists for is intact:
+	// UNVERIFIED is not NEEDS_MQ_SUBMIT, and it still refuses reuse.
 	clean := *fields
 	clean.MRRefused = false
 	control := buildPolecatInventoryItem("gastown", "dag", &clean, nil, polecatSessionSet{}, nil)
-	if control.Disposition.Verdict != polecat.WorkstateVerdictSafeToNuke {
-		t.Fatalf("control verdict = %q, want SAFE_TO_NUKE (disposition=%+v)",
+	if control.Disposition.Verdict != polecat.WorkstateVerdictUnverified {
+		t.Fatalf("control verdict = %q, want UNVERIFIED (disposition=%+v)",
 			control.Disposition.Verdict, control.Disposition)
+	}
+	if control.Disposition.NeedsMQSubmit || control.Disposition.MQStatus == "refused_closed_source" {
+		t.Fatalf("control must not take the refusal path: %+v", control.Disposition)
 	}
 }
 
@@ -243,9 +257,19 @@ func TestBuildPolecatInventoryItemRescueMRClearsRefusal(t *testing.T) {
 		submitted: map[string]bool{"polecat/dag/bd-uh0": true},
 	}
 	merged := buildPolecatInventoryItem("gastown", "dag", fields, nil, polecatSessionSet{}, closedIndex)
-	if merged.Disposition.Verdict != polecat.WorkstateVerdictSafeToNuke {
-		t.Fatalf("merged verdict = %q, want SAFE_TO_NUKE (disposition=%+v)",
+	// Discharging the refusal is as far as this surface can get. It ran no git
+	// and no merge-queue check, so it reports UNVERIFIED rather than borrowing
+	// the reuse gate's SAFE_TO_NUKE — which is the point: the refusal being
+	// cleared is not the same claim as the polecat being safe (gt-49dp).
+	if merged.Disposition.Verdict != polecat.WorkstateVerdictUnverified {
+		t.Fatalf("merged verdict = %q, want UNVERIFIED (disposition=%+v)",
 			merged.Disposition.Verdict, merged.Disposition)
+	}
+	if merged.Disposition.NeedsMQSubmit || merged.Disposition.Reason == "mq-refused-closed-source" {
+		t.Fatalf("rescue MR must discharge the recorded refusal: %+v", merged.Disposition)
+	}
+	if merged.Disposition.SafeToNuke || merged.Disposition.Reusable {
+		t.Fatalf("a surface that ran no git check must not authorize anything: %+v", merged.Disposition)
 	}
 }
 
@@ -311,7 +335,12 @@ func TestBuildPolecatInventoryItemResolvesRecordedActiveMR(t *testing.T) {
 				&beads.Issue{ID: "bd-wisp-6td", Status: "closed", Description: "branch: polecat/slit/bd-6n5\nsource_issue: bd-6n5\n"},
 				&beads.Issue{ID: "bd-6n5", Status: "closed"},
 			),
-			wantVerdict: polecat.WorkstateVerdictSafeToNuke,
+			// The active-MR blocker is gone, which is what this case is about.
+			// What remains is this surface admitting it never ran git or the
+			// merge-queue check — it stops blocking without claiming safety
+			// (gt-49dp).
+			wantVerdict: polecat.WorkstateVerdictUnverified,
+			wantBlocker: "reuse_facts=unmeasured (no git or merge-queue check was run for this polecat)",
 		},
 		{
 			// Fail-closed control. Same closed MR, but the work it was carrying

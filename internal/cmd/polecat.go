@@ -15,7 +15,6 @@ import (
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/testguard"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -70,6 +69,14 @@ all polecats with their states:
   - working: Actively working on an issue
   - done: Completed work, waiting for cleanup
   - stuck: Needs assistance
+
+This surface reads beads only — it never runs git or consults the merge queue.
+A polecat that nothing blocks therefore reports verdict UNVERIFIED and
+reuse_status idle-unverified: nothing is known to be wrong with it, and nothing
+was checked. Use 'gt polecat check-recovery <rig>/<name>' for a measured verdict
+before acting. (Until gt-49dp this surface printed the same 'idle-preserved'
+string the reuse gate prints for polecats it has cleared, including for polecats
+'gt sling' went on to refuse.)
 
 Examples:
   gt polecat list greenplace
@@ -514,9 +521,6 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 	}
 	sessions := newPolecatSessionSet(sessionNames)
 	allPolecats := make([]PolecatListItem, 0)
-	// Resolved once for the whole listing. An unreadable town root leaves this
-	// empty and recording becomes a no-op — the listing itself is unaffected.
-	journalRoot, _ := workspace.FindFromCwd()
 
 	for _, r := range rigs {
 		bd := beads.New(r.Path)
@@ -556,13 +560,6 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				item = buildPolecatInventoryItemFromEvidence(r.Name, name, fields, polecatActiveWorkLookupError(activeWorkErr), sessions, mrIndex)
 			}
 			disposition := item.Disposition
-			recordNeedsMQSubmitObservation(journalRoot, polecat.MQSubmitObservation{
-				Rig:     r.Name,
-				Polecat: name,
-				Issue:   item.Issue,
-				Branch:  item.Branch,
-				Source:  "polecat-list",
-			}, disposition)
 			state := effectivePolecatState(PolecatListItem{
 				State:                item.State,
 				Issue:                item.Issue,
@@ -1120,6 +1117,10 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		SessionBusy:   mgr.SessionBusy(polecatName),
 		CleanupStatus: polecat.CleanupUnknown,
 		Branch:        p.Branch,
+		// This command exists to gather the git and merge-queue facts (see
+		// loadGitState and applyMQFactsToWorkstateInput below), so its verdict
+		// is a measured one (gt-49dp).
+		ReuseFactsMeasured: true,
 	}
 	var gitState *GitState
 	var gitErr error
@@ -1236,25 +1237,6 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// and the permitted witness action must track the verdict actually reported.
 	status.WitnessAction = witnessActionFor(status.Verdict)
 
-	// Recorded from the final status, not from `disposition`: reconcile above can
-	// still change the verdict, and the journal must agree with what this command
-	// actually reported.
-	if journalRoot, rootErr := workspace.FindFromCwd(); rootErr == nil {
-		recordNeedsMQSubmitObservation(journalRoot, polecat.MQSubmitObservation{
-			Rig:     rigName,
-			Polecat: polecatName,
-			Issue:   status.Issue,
-			Branch:  status.Branch,
-			Source:  "check-recovery",
-		}, polecat.WorkstateDisposition{
-			Verdict:       status.Verdict,
-			Reason:        status.Reason,
-			NeedsMQSubmit: status.NeedsMQSubmit,
-			MQStatus:      status.MQStatus,
-			Blockers:      status.Blockers,
-		})
-	}
-
 	// JSON output
 	if polecatCheckRecoveryJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -1322,6 +1304,16 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
 		}
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
+	case "UNVERIFIED":
+		// Unreachable from this command — it measures, so its input carries
+		// ReuseFactsMeasured. Listed anyway because the default arm below prints
+		// SAFE_TO_NUKE, and "no facts were gathered" is the last verdict that
+		// should render as permission to destroy anything (gt-49dp).
+		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("UNVERIFIED"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
+		fmt.Println()
+		fmt.Println("  No git or merge-queue facts were gathered for this polecat, so nothing")
+		fmt.Println("  has been ruled out. Treat it as unknown, not as safe.")
 	default:
 		// Deliberately NOT success-styled (gt-y20). This verdict says "no work
 		// is at risk", not "you may destroy this polecat" — and the Witness is
@@ -1396,25 +1388,6 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	}
 	polecat.ApplyBranchMRToWorkstateInput(input, mr.ID, !beads.IssueStatus(mr.Status).IsTerminal())
 	status.ActiveMR = input.ActiveMR
-}
-
-// recordNeedsMQSubmitObservation journals the needs_mq_submit transitions for
-// one polecat. The verdict itself stays computed-on-read; this is what makes the
-// EPISODE durable, so that a fired check is still answerable minutes later and a
-// check that silently stops firing stops leaving lines (gt-7i07).
-//
-// Failures are reported on stderr and never returned: the caller was asked to
-// report on a polecat, not to maintain the journal, and a listing that aborts
-// because a log line could not be written is a worse outcome than a gap. The
-// warning exists because a silent gap is exactly the failure mode being fixed.
-// A test binary's refusal to touch a live town is expected, not a defect.
-func recordNeedsMQSubmitObservation(townRoot string, obs polecat.MQSubmitObservation, disposition polecat.WorkstateDisposition) {
-	if townRoot == "" {
-		return
-	}
-	if _, err := polecat.RecordNeedsMQSubmit(townRoot, obs, disposition); err != nil && !errors.Is(err, testguard.ErrRefused) {
-		fmt.Fprintf(os.Stderr, "warning: failed to record needs_mq_submit for %s/%s: %v\n", obs.Rig, obs.Polecat, err)
-	}
 }
 
 func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, disposition polecat.WorkstateDisposition) {

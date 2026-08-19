@@ -1047,7 +1047,9 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
 	rigBeads := beads.New(workDir)
 	_, fields, err := rigBeads.ForAgentBead().GetAgentBead(agentID)
-	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil}
+	// ReuseFactsMeasured: the git and merge-queue checks this function runs below
+	// are what entitle it to a reuse verdict at all (gt-49dp).
+	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil, ReuseFactsMeasured: true}
 	issueID := ""
 	hookSafe := true
 	hookTerminal := false

@@ -43,14 +43,6 @@ const (
 	// Session death events (for crash investigation)
 	EventSessionDeath EventType = "session_death" // Session terminated (with reason)
 	EventMassDeath    EventType = "mass_death"    // Multiple sessions died in short window
-
-	// Merge-queue stranding events. needs_mq_submit is computed on read from
-	// state that keeps moving, so the condition it reports — a pushed branch
-	// sitting outside the merge queue — is invisible again minutes later, and
-	// "the check never fired" looks identical to "nothing was ever wrong"
-	// (gt-7i07). These mark the transitions so the episode survives the moment.
-	EventNeedsMQSubmit        EventType = "needs_mq_submit"
-	EventNeedsMQSubmitCleared EventType = "needs_mq_submit_cleared"
 )
 
 // Event represents a single agent lifecycle event.
@@ -232,16 +224,6 @@ func formatLogLine(e Event) string {
 			detail = fmt.Sprintf("MASS SESSION DEATH (%s)", e.Context)
 		} else {
 			detail = "MASS SESSION DEATH"
-		}
-	case EventNeedsMQSubmit:
-		detail = "needs merge-queue submit"
-		if e.Context != "" {
-			detail += fmt.Sprintf(" (%s)", e.Context)
-		}
-	case EventNeedsMQSubmitCleared:
-		detail = "needs_mq_submit cleared"
-		if e.Context != "" {
-			detail += fmt.Sprintf(" (%s)", e.Context)
 		}
 	default:
 		detail = string(e.Type)
