@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/BurntSushi/toml"
 )
 
 // Formulas live in internal/formula/formulas/ (source of truth).
@@ -98,47 +96,6 @@ func ResolveFormulaContent(name, townRoot, rigName string) ([]byte, error) {
 
 	// Tier 3: embedded (system fallback)
 	return GetEmbeddedFormulaContent(name)
-}
-
-// Pours reports whether a formula asks for its steps to be materialized as
-// child wisps (pour = true) rather than read inline from the formula itself.
-//
-// ref is either a formula name — resolved through the same rig > town >
-// embedded tiers as ResolveFormulaContent, so the answer describes the copy
-// that actually executes — or a path to a formula file, which is what sling
-// passes when it has extracted the embedded formula to a temp file for bd.
-//
-// pour is read from the formula's own declaration and is deliberately not
-// inherited through extends: resolveChain copies the child's value verbatim,
-// so a formula that says nothing about pour does not pour, whatever its
-// parents do.
-func Pours(ref, townRoot, rigName string) (bool, error) {
-	var content []byte
-	if hasFormulaSuffix(ref) {
-		// Path form: only a ref that is already a readable formula file is
-		// taken as one; a name carrying the suffix still resolves by tier.
-		if data, err := os.ReadFile(ref); err == nil { //nolint:gosec // G304: ref is a gt-generated temp path or a formula name
-			content = data
-		}
-	}
-	if content == nil {
-		resolved, err := ResolveFormulaContent(ref, townRoot, rigName)
-		if err != nil {
-			return false, err
-		}
-		content = resolved
-	}
-
-	// Decode only the pour key. Parse would also Validate, and a formula that
-	// bd cooks happily but gastown's validator rejects must still be able to
-	// answer this question — the alternative is a warning on every dispatch.
-	var declaration struct {
-		Pour bool `toml:"pour"`
-	}
-	if _, err := toml.Decode(string(content), &declaration); err != nil {
-		return false, fmt.Errorf("parsing formula %q: %w", ref, err)
-	}
-	return declaration.Pour, nil
 }
 
 // GetEmbeddedFormulaContent returns the raw content of an embedded formula by name.

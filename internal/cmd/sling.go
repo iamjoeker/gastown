@@ -945,15 +945,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		if formulaName != "" {
 			fmt.Printf("Would instantiate formula %s:\n", formulaName)
 			fmt.Printf("  1. bd cook %s\n", formulaName)
-			// Which instantiation verb runs depends on the formula's pour
-			// setting (gt-pzx), so preview the one that would actually run.
-			rigName := beads.GetRigNameForPrefix(townRoot, beads.ExtractPrefix(beadID))
-			if formulaPoursSteps(formulaName, townRoot, rigName) {
-				fmt.Printf("  2. bd mol bond %s %s --json --ephemeral --var feature=\"%s\" --var issue=\"%s\"\n", formulaName, beadID, info.Title, beadID)
-			} else {
-				fmt.Printf("  2. bd mol wisp create %s --root-only --json --var feature=\"%s\" --var issue=\"%s\"\n", formulaName, info.Title, beadID)
-				fmt.Printf("     bd dep add <wisp-root> %s\n", beadID)
-			}
+			fmt.Printf("  2. bd mol bond %s %s --json --ephemeral --var feature=\"%s\" --var issue=\"%s\"\n", formulaName, beadID, info.Title, beadID)
 			fmt.Printf("  3. bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
 		} else {
 			fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
