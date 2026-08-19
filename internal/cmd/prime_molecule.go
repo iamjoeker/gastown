@@ -114,7 +114,7 @@ func showMoleculeExecutionPrompt(workDir, moleculeID string) {
 // extraVars is an optional list of "key=value" overrides that are substituted into
 // step descriptions before rendering, taking precedence over formula defaults.
 func showFormulaSteps(formulaName, label, townRoot, rigName string, extraVars ...[]string) {
-	f, varMap, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
+	f, varMap, driftNotice, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
 	if err != nil {
 		style.PrintWarning("%v", err)
 		return
@@ -125,6 +125,10 @@ func showFormulaSteps(formulaName, label, townRoot, rigName string, extraVars ..
 	}
 
 	fmt.Println()
+	if driftNotice != "" {
+		fmt.Print(driftNotice)
+		fmt.Println()
+	}
 	fmt.Printf("**%s** (%d steps from %s):\n", label, len(f.Steps), formulaName)
 	for i, step := range f.Steps {
 		desc := applyFormulaVars(step.Description, varMap)
@@ -147,20 +151,28 @@ func showFormulaStepsFull(formulaName, townRoot, rigName string, extraVars ...[]
 }
 
 func renderFormulaStepsFull(formulaName, townRoot, rigName string, extraVars ...[]string) (string, error) {
-	f, varMap, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
+	f, varMap, driftNotice, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
 	if err != nil {
 		return "", err
 	}
-	return renderFormulaStepsFullParsed(formulaName, f, varMap), nil
+	rendered := renderFormulaStepsFullParsed(formulaName, f, varMap)
+	if driftNotice == "" || rendered == "" {
+		return rendered, nil
+	}
+	return "\n" + driftNotice + strings.TrimPrefix(rendered, "\n"), nil
 }
 
 func renderFormulaRootAndStepsFull(formulaName, townRoot, rigName string, extraVars ...[]string) (string, error) {
-	f, varMap, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
+	f, varMap, driftNotice, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
 	if err != nil {
 		return "", err
 	}
 
 	var sb strings.Builder
+	if driftNotice != "" {
+		sb.WriteString(driftNotice)
+		sb.WriteString("\n")
+	}
 	if desc := strings.TrimSpace(applyFormulaVars(f.Description, varMap)); desc != "" {
 		sb.WriteString(desc)
 		sb.WriteString("\n\n")
@@ -169,18 +181,25 @@ func renderFormulaRootAndStepsFull(formulaName, townRoot, rigName string, extraV
 	return strings.TrimSpace(sb.String()), nil
 }
 
-func resolveFormulaForRendering(formulaName, townRoot, rigName string, vars []string) (*formula.Formula, map[string]string, error) {
-	content, err := formula.ResolveFormulaContent(formulaName, townRoot, rigName)
+// resolveFormulaForRendering loads the formula copy that will actually execute
+// and, alongside it, a drift notice describing the case where that copy is not
+// the default shipped in this gt build.
+//
+// The notice is rendered inline with the steps rather than logged separately:
+// an agent reads the checklist, so a warning that a fix which looks landed is
+// not in these steps has to travel with them (gt-0wm7).
+func resolveFormulaForRendering(formulaName, townRoot, rigName string, vars []string) (*formula.Formula, map[string]string, string, error) {
+	resolved, err := formula.ResolveFormula(formulaName, townRoot, rigName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not load formula %s: %w", formulaName, err)
+		return nil, nil, "", fmt.Errorf("could not load formula %s: %w", formulaName, err)
 	}
 
-	f, err := formula.Parse(content)
+	f, err := formula.Parse(resolved.Content)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not parse formula %s: %w", formulaName, err)
+		return nil, nil, "", fmt.Errorf("could not parse formula %s: %w", formulaName, err)
 	}
 	applyFormulaOverlays(f, formulaName, townRoot, rigName)
-	return f, buildFormulaVarMap(f, vars), nil
+	return f, buildFormulaVarMap(f, vars), resolved.DriftNotice(), nil
 }
 
 func firstFormulaVars(extraVars [][]string) []string {
