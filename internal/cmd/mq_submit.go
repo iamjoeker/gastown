@@ -314,10 +314,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 						continue // skip the one we just created
 					}
 					reason := fmt.Sprintf("superseded by %s", mrIssue.ID)
-					// Force: MR beads are pinned so `bd purge` cannot destroy
-					// them (gt-6dp). The pin must not stop the merge queue from
-					// retiring its own record (gt-obth).
-					if err := bd.ForceCloseWithReason(reason, old.ID); err != nil {
+					if err := bd.CloseWithReason(reason, old.ID); err != nil {
 						style.PrintWarning("could not supersede old MR %s: %v", old.ID, err)
 						continue
 					}

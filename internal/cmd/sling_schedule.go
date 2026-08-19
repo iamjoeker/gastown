@@ -82,15 +82,21 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return err
 	}
 
+	// Resolve ownership before the cross-rig guard: for a bead moved across rigs
+	// the id prefix names the rig that closed it, not the rig holding the open
+	// row, and the guard would reject the only target that can do the work
+	// (gt-ad32).
+	owner, err := resolveBeadOwner(townRoot, beadID)
+	if err != nil {
+		return fmt.Errorf("checking bead status: %w", err)
+	}
+	reportMovedBead(beadID, owner)
+	info := owner.Info
+
 	if !opts.Force {
 		if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
 			return err
 		}
-	}
-
-	info, err := getBeadInfo(beadID)
-	if err != nil {
-		return fmt.Errorf("checking bead status: %w", err)
 	}
 
 	// Idempotency: check for existing open sling context for this work bead.
@@ -121,7 +127,7 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	// fresh ghost convoy is created for already-completed work. Not bypassed by
 	// --force — if you need to re-dispatch, reopen the bead first.
 	if info.Status == "closed" || info.Status == "tombstone" {
-		return fmt.Errorf("bead %s is %s (work already completed)", beadID, info.Status)
+		return closedBeadError(beadID, owner)
 	}
 
 	if (info.Status == "pinned" || info.Status == "hooked" || info.Status == "in_progress") && !opts.Force {
