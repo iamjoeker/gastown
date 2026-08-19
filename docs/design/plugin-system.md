@@ -117,47 +117,18 @@ bd list --all --label type:plugin-run --label plugin:rebuild-gt --created-after 
 | Last result | Parse `result:` label from latest wisp |
 | Failure rate | Count `result:failure` vs total |
 
-### Receipt Retention
+### Digest Pattern
 
-A receipt is not a report, and the difference decides its TTL. Because gate
-evaluation queries the receipts, a receipt is load-bearing for as long as the
-longest gate that reads it — so it cannot be squashed on a fixed daily schedule,
-and it cannot carry a `wisp_type`: since gt-ktvs an untyped wisp is SKIPPED by
-`gt compact`, while a `gc_report` (which is what a receipt looks like) is DELETED
-once it is closed and 24h old. Receipts are closed the moment they are written,
-so typing them would delete `tool-updater`'s on day 1 of its 168h cooldown and
-the daemon would re-dispatch a brew upgrade on every scan for the remaining six
-days (gt-fqd5).
-
-Retention is therefore derived from the gates themselves, in the plugin layer,
-and `gt compact` stays out of the way:
-
-| Plugin | Retention |
-|--------|-----------|
-| cooldown gate with a duration | `max(48h, duration × 2)` |
-| cooldown gate whose duration cannot be parsed | the longest window in town |
-| any other gate type | 48h |
-| receipt whose `plugin:` label matches no discovered plugin | the longest window in town |
-
-The 48h floor covers readers no gate declares — `gt plugin history`, and plugin
-bodies that query receipts directly (quality-review reads `--created-after=-24h`
-over receipts the Refinery writes). A plugin whose body needs a longer window
-must declare it as a cooldown gate; nothing else is visible to the policy.
+Like cost digests, plugin wisps accumulate and get squashed daily:
 
 ```bash
-gt plugin prune --dry-run   # Show the derived policy and what would be deleted
-gt plugin prune             # Delete expired receipts
+gt plugin digest --yesterday
 ```
 
-The daemon runs the same prune hourly, capped at 500 deletions per pass, and
-declines to run at all when plugin discovery yields nothing — an empty gate set
-is indistinguishable from an unreadable plugins directory, and the plugin with
-the longest gate is exactly the one a defaulted short window would destroy.
+Creates: `Plugin Digest 2026-01-10` bead with summary
+Deletes: Individual plugin-run wisps from that day
 
-Never deleted, whatever their age: pinned receipts, receipts carrying a
-`reaper.ProtectedWispLabels` label, receipts with a keep label, and receipts with
-comments. Deletion is permanent — wisp tables are dolt-ignored, so there is no
-history to read `AS OF` and no backup to restore from.
+This keeps the ledger clean while preserving audit history.
 
 ---
 

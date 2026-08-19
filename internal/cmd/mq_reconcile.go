@@ -53,6 +53,11 @@ Hooked beads are reported separately. Their own in-flight commits live on the
 polecat's branch, so a hooked bead with commits already on the target is either
 a second round of work or a polecat re-dispatched onto a merged fix.
 
+Beads excluded from the search are named alongside the reason they were
+excluded. The exclusions are correct, but a benign one and a bead wrongly
+labelled no_merge produce the same count, and the second is a missed close
+hiding inside it.
+
 The target branch is fetched first. A commit that exists on the remote but not
 in this clone is invisible to the search and reads exactly like work that was
 never done, so a report built on a stale clone is worse than no report.
@@ -83,6 +88,13 @@ type reconcileFinding struct {
 	Commits []git.CommitRef `json:"commits"`
 }
 
+// reconcileSkip is one bead the sweep excluded before searching the branch,
+// paired with the exclusion that fired.
+type reconcileSkip struct {
+	IssueID string `json:"issue_id"`
+	Reason  string `json:"reason"`
+}
+
 // reconcileReport is the full result of one sweep. Scope is reported alongside
 // the findings: a reader cannot tell a clean rig from an empty scan otherwise.
 type reconcileReport struct {
@@ -91,6 +103,13 @@ type reconcileReport struct {
 	Fetched bool   `json:"fetched"`
 	Scanned int    `json:"scanned"`
 	Skipped int    `json:"skipped"`
+	// SkippedBeads names every bead behind the Skipped count. The exclusions
+	// themselves are correct, but a benign one and a bead wrongly labelled
+	// no_merge produce the same increment, and the second hides exactly the
+	// missed close this command exists to find. Same reasoning as Unsearchable
+	// below: an unattributable count is indistinguishable from a bead that was
+	// searched and found clean.
+	SkippedBeads []reconcileSkip `json:"skipped_beads"`
 	// Unsearchable are beads whose ID cannot be turned into a commit search.
 	// Reported rather than dropped: a bead the sweep could not examine is not
 	// a bead the sweep found clean.
@@ -168,6 +187,7 @@ func runMQReconcile(_ *cobra.Command, args []string) error {
 	report := reconcileReport{
 		Rig:          rigName,
 		Ref:          "origin/" + target,
+		SkippedBeads: []reconcileSkip{},
 		MissedCloses: []reconcileFinding{},
 		InFlight:     []reconcileFinding{},
 	}
@@ -192,8 +212,8 @@ func runMQReconcile(_ *cobra.Command, args []string) error {
 			continue
 		}
 		seen[issue.ID] = true
-		if reconcileSkipReason(issue) != "" {
-			report.Skipped++
+		if reason := reconcileSkipReason(issue); reason != "" {
+			report.SkippedBeads = append(report.SkippedBeads, reconcileSkip{IssueID: issue.ID, Reason: reason})
 			continue
 		}
 		// One malformed ID must not abort the sweep, but it must not vanish
@@ -225,9 +245,21 @@ func runMQReconcile(_ *cobra.Command, args []string) error {
 		}
 	}
 
+	report.finalize()
+	return printReconcileReport(report)
+}
+
+// finalize derives the counts a reader sees from the lists behind them and puts
+// every list in a stable order. Skipped is derived rather than incremented
+// alongside the append: two independently maintained tallies of the same thing
+// drift, and the count is the number an operator reads first.
+func (report *reconcileReport) finalize() {
+	report.Skipped = len(report.SkippedBeads)
+	sort.Slice(report.SkippedBeads, func(i, j int) bool {
+		return report.SkippedBeads[i].IssueID < report.SkippedBeads[j].IssueID
+	})
 	sortReconcileFindings(report.MissedCloses)
 	sortReconcileFindings(report.InFlight)
-	return printReconcileReport(report)
 }
 
 func sortReconcileFindings(findings []reconcileFinding) {
@@ -255,6 +287,7 @@ func printReconcileReport(report reconcileReport) error {
 		fmt.Printf("⚠ %d bead(s) could not be searched and are NOT covered by this result: %s\n",
 			len(report.Unsearchable), strings.Join(report.Unsearchable, ", "))
 	}
+	printReconcileSkips(report.SkippedBeads)
 
 	if len(report.MissedCloses) == 0 && len(report.InFlight) == 0 {
 		fmt.Println("No beads found with work on the branch and no close.")
@@ -276,6 +309,33 @@ func printReconcileReport(report reconcileReport) error {
 			"if the landed commit is the whole fix, the polecat is redoing merged work.\n")
 	}
 	return nil
+}
+
+// printReconcileSkips names the beads behind the skipped count, grouped by the
+// exclusion that fired. Every reason here is a correct exclusion, so this is
+// not a warning — but the reader has to be able to check that, and a bare "1
+// skipped" on a report that runs every patrol cycle trains its reader to skip
+// the line.
+func printReconcileSkips(skips []reconcileSkip) {
+	if len(skips) == 0 {
+		return
+	}
+	byReason := make(map[string][]string, len(skips))
+	for _, skip := range skips {
+		byReason[skip.Reason] = append(byReason[skip.Reason], skip.IssueID)
+	}
+	reasons := make([]string, 0, len(byReason))
+	for reason := range byReason {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+
+	fmt.Printf("%d bead(s) skipped before the branch search:\n", len(skips))
+	for _, reason := range reasons {
+		ids := byReason[reason]
+		sort.Strings(ids)
+		fmt.Printf("  %s: %s\n", reason, strings.Join(ids, ", "))
+	}
 }
 
 func printReconcileFindings(findings []reconcileFinding) {

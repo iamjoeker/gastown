@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -28,10 +27,6 @@ var (
 	pluginSyncSource   string
 	pluginSyncClean    bool
 	pluginSyncDryRun   bool
-	pluginPruneDryRun  bool
-	pluginPruneJSON    bool
-	pluginPruneVerbose bool
-	pluginPruneLimit   int
 	pluginRecordPlugin string
 	pluginRecordResult string
 	pluginRecordTitle  string
@@ -146,41 +141,6 @@ Examples:
 	RunE: runPluginHistory,
 }
 
-var pluginPruneCmd = &cobra.Command{
-	Use:   "prune",
-	Short: "Delete plugin run receipts that have outlived every gate that reads them",
-	Long: `Delete plugin run receipts past their retention window.
-
-Every plugin dispatch writes one closed "type:plugin-run" receipt. Those receipts
-ARE the cooldown ledger — the daemon gates dispatch on
-CountRunsSince(plugin, gate.Duration) > 0 — so they are load-bearing for as long
-as the longest gate that reads them, and they carry NO wisp_type precisely so
-that "gt compact" leaves them alone (a gc_report is deleted at 24h; tool-updater's
-gate reads its receipts for 168h).
-
-The consequence is unbounded growth, which this command bounds. Retention is
-derived from the gates themselves, not from a fixed TTL bucket:
-
-  cooldown gate with a duration    max(48h, duration x 2)
-  cooldown gate, duration unreadable   the longest window in town
-  any other gate type              48h
-  receipt whose plugin is unknown  the longest window in town
-
-Never deleted, whatever their age: pinned receipts, receipts carrying a protected
-label (gt:merge-request, gt:escalation), receipts with a keep label, and receipts
-with comments. Open receipts are left alone and counted.
-
-Deletion is PERMANENT. Wisp tables are dolt-ignored, so there is no history to
-read AS OF and no backup to restore from.
-
-Examples:
-  gt plugin prune --dry-run    # Show the policy and what would be deleted
-  gt plugin prune              # Delete them
-  gt plugin prune --json       # Machine-readable result
-  gt plugin prune --limit 500  # Bound one run`,
-	RunE: runPluginPrune,
-}
-
 var pluginRecordRunCmd = &cobra.Command{
 	Use:   "record-run",
 	Short: "Record a plugin run receipt",
@@ -207,12 +167,6 @@ func init() {
 	pluginHistoryCmd.Flags().BoolVar(&pluginHistoryJSON, "json", false, "Output as JSON")
 	pluginHistoryCmd.Flags().IntVar(&pluginHistoryLimit, "limit", 10, "Maximum number of runs to show")
 
-	// Prune subcommand flags
-	pluginPruneCmd.Flags().BoolVar(&pluginPruneDryRun, "dry-run", false, "Show what would be deleted without deleting")
-	pluginPruneCmd.Flags().BoolVar(&pluginPruneJSON, "json", false, "Output as JSON")
-	pluginPruneCmd.Flags().BoolVarP(&pluginPruneVerbose, "verbose", "v", false, "List each deleted receipt")
-	pluginPruneCmd.Flags().IntVar(&pluginPruneLimit, "limit", 0, "Maximum receipts to delete this run (0 = no limit)")
-
 	// Record-run subcommand flags
 	pluginRecordRunCmd.Flags().StringVar(&pluginRecordPlugin, "plugin", "", "Plugin name")
 	pluginRecordRunCmd.Flags().StringVar(&pluginRecordResult, "result", "", "Run result label value")
@@ -231,7 +185,6 @@ func init() {
 	pluginCmd.AddCommand(pluginShowCmd)
 	pluginCmd.AddCommand(pluginRunCmd)
 	pluginCmd.AddCommand(pluginHistoryCmd)
-	pluginCmd.AddCommand(pluginPruneCmd)
 	pluginCmd.AddCommand(pluginRecordRunCmd)
 	pluginCmd.AddCommand(pluginSyncCmd)
 
@@ -700,115 +653,6 @@ func runPluginHistory(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-func runPluginPrune(cmd *cobra.Command, args []string) error {
-	scanner, townRoot, err := getPluginScanner()
-	if err != nil {
-		return err
-	}
-
-	plugins, err := scanner.DiscoverAll()
-	if err != nil {
-		// Fatal, not a fallback to the floor. Retention is derived from the
-		// discovered gates, so pruning on a failed discovery would apply the
-		// shortest policy to the plugin whose gate is longest — which is the
-		// exact failure gt-fqd5 caught and reverted.
-		return fmt.Errorf("discovering plugins (refusing to prune on an unknown gate set): %w", err)
-	}
-	if len(plugins) == 0 {
-		return fmt.Errorf("no plugins discovered — refusing to prune receipts without the gate set that decides their retention")
-	}
-
-	policy := plugin.NewRetentionPolicy(plugins)
-	recorder := plugin.NewRecorder(townRoot)
-
-	result, err := recorder.PruneReceipts(policy, time.Now().UTC(), plugin.ReceiptPruneOptions{
-		DryRun: pluginPruneDryRun,
-		Limit:  pluginPruneLimit,
-	})
-	if err != nil {
-		return err
-	}
-
-	if pluginPruneJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(struct {
-			Policy   []plugin.RetentionEntry    `json:"policy"`
-			Fallback string                     `json:"fallback"`
-			DryRun   bool                       `json:"dry_run"`
-			Result   *plugin.ReceiptPruneResult `json:"result"`
-		}{policy.Entries(plugins), policy.Fallback().String(), pluginPruneDryRun, result})
-	}
-
-	printPluginPruneSummary(policy, plugins, result)
-	return nil
-}
-
-func printPluginPruneSummary(policy plugin.RetentionPolicy, plugins []*plugin.Plugin, result *plugin.ReceiptPruneResult) {
-	// The policy is printed before the counts, unconditionally. It is the part
-	// an operator has to be able to check before believing a delete was safe,
-	// and it is derived at runtime from files that can change under them.
-	fmt.Printf("%s\n", style.Bold.Render("Receipt retention (derived from plugin gates):"))
-	for _, e := range policy.Entries(plugins) {
-		gate := e.Gate
-		if gate == "" {
-			gate = "(no gate)"
-		}
-		fmt.Printf("  %-24s %-16s %s\n", e.Plugin, style.Dim.Render(gate), e.Retention)
-	}
-	fmt.Printf("  %-24s %-16s %s\n", style.Dim.Render("(unknown plugin)"), "", policy.Fallback())
-
-	if pluginPruneDryRun {
-		fmt.Printf("\n%s Dry run: %d receipt(s) scanned\n", style.Dim.Render("ℹ"), result.Scanned)
-	} else {
-		fmt.Printf("\n%s Prune complete\n", style.Success.Render("✓"))
-	}
-
-	deleted := len(result.Deleted)
-	held := len(result.Held)
-	verb := "Deleted:  "
-	if pluginPruneDryRun {
-		verb = "Would delete:"
-	}
-	fmt.Printf("  Scanned:   %d\n", result.Scanned)
-	fmt.Printf("  %s %d\n", verb, deleted)
-	fmt.Printf("  Kept:      %d (within retention)\n", result.Kept)
-	if result.Open > 0 {
-		fmt.Printf("  %s %d (receipts are closed at write time — a non-zero count is a defect report)\n",
-			style.Warning.Render("Open:"), result.Open)
-	}
-	if held > 0 {
-		fmt.Printf("  Held:      %d (past retention, held by pin, protected label, keep label or comment)\n", held)
-	}
-	if result.Deferred > 0 {
-		fmt.Printf("  Deferred:  %d (eligible, beyond --limit this run)\n", result.Deferred)
-	}
-	// Remaining is the re-read, and it is what the operator should believe over
-	// the counts above: those describe what this process thinks it did.
-	fmt.Printf("  Remaining: %d receipt(s) in the table\n", result.Remaining)
-
-	if accounted := deleted + held + result.Open + result.Kept + result.Deferred + len(result.Errors); accounted != result.Scanned {
-		fmt.Printf("  %s %d scanned but %d accounted for — summary is incomplete\n",
-			style.Warning.Render("⚠"), result.Scanned, accounted)
-	}
-
-	if pluginPruneVerbose {
-		for _, r := range result.Deleted {
-			fmt.Printf("  %s %s %s (%s)\n", style.Warning.Render("delete "), r.ID, r.Plugin, r.Reason)
-		}
-		for _, r := range result.Held {
-			fmt.Printf("  %s %s %s (%s)\n", style.Dim.Render("hold   "), r.ID, r.Plugin, r.Reason)
-		}
-	}
-
-	if len(result.Errors) > 0 {
-		fmt.Printf("\n%s %d error(s):\n", style.Warning.Render("⚠"), len(result.Errors))
-		for _, e := range result.Errors {
-			fmt.Printf("  - %s\n", e)
-		}
-	}
 }
 
 func runPluginRecordRun(cmd *cobra.Command, args []string) error {
