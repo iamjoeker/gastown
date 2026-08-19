@@ -47,6 +47,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   town overlay for that formula is currently pinned, so the step is live only
   after the overlay is merged — check `gt formula drift`.
 
+- **`gt patrol branches --deletable`: the landed rows nothing collects**
+  (gt-l65a). "landed" was two situations under one name, and the difference
+  decided who could act on the branch. The git-hygiene plugin deletes a remote
+  branch only when `merge-base --is-ancestor` puts it in the target's history;
+  this sweep also proves containment by an empty merge and by patch identity. So
+  a branch rebased before landing — patch in the target, commit never in the
+  target's history — was reachable by nothing: hygiene would not take it because
+  it is not an ancestor, and the short list would not raise it because it is not
+  a check. It was reported as landed on every sweep, forever, by a tool whose
+  worth is its shortness. Measured on gastown the day this was filed: of three
+  landed branches, two were ancestors and `gt-wz3y` was not.
+
+  And it was the safest deletion candidate in the listing, which is the part
+  worth sitting with, because the classes implied the opposite priority.
+  Patch-id EQUALITY — `git cherry` `-` — is the reliable direction: the same
+  patch is provably in the target, cheaply, and it scales. The CHECK rows are
+  patch-id INEQUALITY, the unreliable direction, settled only by inspecting
+  content by hand. The branch carrying the strongest evidence of redundancy got
+  the least attention.
+
+  The classification was already right and the distinction already computed, so
+  the fix is routing. Each finding now carries `hygiene_unreachable`, the human
+  summary splits `3 landed` into `(2 ancestor, 1 not an ancestor)`, such rows are
+  marked `landed*`, and the DEFAULT view — where landed rows are not shown at
+  all — names the count and points at `--deletable`. That mode lists exactly
+  those branches with the `git cherry` verification printed above the `git push
+  --delete`, and performs neither: these are shared remote refs, and emitting
+  evidence rather than verdicts is the design. `--json` is unfiltered as before,
+  now with `hygiene_unreachable` on every row and as a total separate from
+  `attention` — one asks for a decision, the other for a deletion. An evidence
+  string this build does not recognise counts as not-an-ancestor, because naming
+  a branch costs a line and assuming hygiene has it costs the branch forever.
+
 - **`gt:record` marks a bead as a durable archive, not work** (gt-f8td). After
   seven closed MR wisps were destroyed, the standing defence became writing
   incident and merge-ledger state onto a *normal* bead rather than a wisp —
