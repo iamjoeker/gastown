@@ -137,7 +137,7 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading scheduler state: %w", err)
 	}
 
-	scheduled, err := listScheduledBeads(townRoot)
+	scheduled, scan, err := listScheduledBeads(townRoot)
 	if err != nil {
 		return fmt.Errorf("listing scheduled beads: %w", err)
 	}
@@ -157,6 +157,10 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 			Capacity       polecatCapacitySnapshot `json:"capacity"`
 			LastDispatchAt string                  `json:"last_dispatch_at,omitempty"`
 			Beads          []scheduledBeadInfo     `json:"beads"`
+			// Scan is always emitted, never omitempty: a consumer that has to
+			// distinguish "complete" from "field absent because this gt is old"
+			// cannot, and would read a degraded scan as a healthy one (gt-vpds).
+			Scan slingContextScanHealth `json:"scan"`
 		}{
 			Paused:         state.Paused,
 			PausedBy:       state.PausedBy,
@@ -165,6 +169,7 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 			Capacity:       capacitySnapshot,
 			LastDispatchAt: state.LastDispatchAt,
 			Beads:          scheduled,
+			Scan:           scan,
 		}
 		for _, b := range scheduled {
 			if !b.Blocked {
@@ -189,6 +194,7 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("  State:    active\n")
 	}
+	printScanIncompleteWarning(scan)
 	fmt.Printf("  Scheduled: %d total, %d ready\n", len(scheduled), readyCount)
 	fmt.Printf("  Active:    %d polecats\n", capacitySnapshot.ActiveSessions)
 	if capacitySnapshot.Max > 0 {
@@ -217,17 +223,24 @@ func runSchedulerList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	scheduled, err := listScheduledBeads(townRoot)
+	scheduled, scan, err := listScheduledBeads(townRoot)
 	if err != nil {
 		return fmt.Errorf("listing scheduled beads: %w", err)
 	}
 
 	if schedulerListJSON {
+		// The JSON shape here is a bare array by contract, so the degradation
+		// goes to stderr rather than changing what consumers parse (gt-vpds).
+		// `gt scheduler status --json` carries the structured "scan" field.
+		if warn := scan.Warning(); warn != "" {
+			fmt.Fprintf(os.Stderr, "%s %s\n", style.Warning.Render("⚠"), warn)
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(scheduled)
 	}
 
+	printScanIncompleteWarning(scan)
 	if len(scheduled) == 0 {
 		fmt.Println("No beads scheduled.")
 		fmt.Println("Enable deferred dispatch with: gt config set scheduler.max_polecats <N>")
@@ -376,15 +389,20 @@ func runSchedulerRun(cmd *cobra.Command, args []string) error {
 	return err
 }
 
-// listScheduledBeads returns info about all scheduled beads for display.
-// Reconciles sling context beads with work bead readiness to mark blocked status.
-// Uses batch fetch for work bead info to avoid N+1 subprocess spawns.
-func listScheduledBeads(townRoot string) ([]scheduledBeadInfo, error) {
-	assessments, err := assessScheduledContexts(townRoot)
+// listScheduledBeads returns info about all scheduled beads for display, plus
+// how complete the scan behind that list was. Reconciles sling context beads
+// with work bead readiness to mark blocked status. Uses batch fetch for work
+// bead info to avoid N+1 subprocess spawns.
+//
+// Display callers MUST report an incomplete scan: the list they render is the
+// operator's whole picture of the scheduler, so an unqualified count from a
+// half-read town is worse than no answer (gt-vpds).
+func listScheduledBeads(townRoot string) ([]scheduledBeadInfo, slingContextScanHealth, error) {
+	assessments, scan, err := assessScheduledContexts(townRoot)
 	if err != nil {
-		return nil, err
+		return nil, scan, err
 	}
-	return scheduledBeadInfosFromAssessments(assessments), nil
+	return scheduledBeadInfosFromAssessments(assessments), scan, nil
 }
 
 func scheduledBeadInfosFromAssessments(assessments []scheduledContextAssessment) []scheduledBeadInfo {
