@@ -40,6 +40,22 @@ from `docs/dolt-health-guide.md` in the escalation or follow-up bead.
 `sql-server` after SIGQUIT; only use it if the current Dolt version has been
 verified not to exit on that signal.
 
+### Dolt may have a second supervisor
+
+If this town runs Dolt under a systemd unit (typically `gt-dolt.service`), then
+**`{{cmd}} dolt stop` and `{{cmd}} down` cannot stop it.** They signal the process;
+systemd restarts it seconds later with a new PID. Both commands now say so
+explicitly — if you see "it is NOT stopped", the server is coming back and
+re-running the command will not help. `{{cmd}} dolt restart` refuses outright.
+
+The real stop is `systemctl --user stop gt-dolt.service`, which takes the whole
+town's data plane down. Do not run it casually.
+
+Note that `dolt.auto-start: false` only stops a bd/gt *client* from spawning its
+own server. It says nothing about a systemd unit, so the message "Dolt server
+auto-start is disabled (dolt.auto-start: false)" can be true and irrelevant at the
+same time. Check `systemctl --user status gt-dolt.service` before acting on it.
+
 **Escalation path** (any agent can do this):
 ```bash
 {{cmd}} escalate -s HIGH "Dolt: <describe symptom>"     # Most failures
