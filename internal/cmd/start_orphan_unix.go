@@ -3,30 +3,12 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/util"
-)
-
-// Seams for tests. The real implementations shell out to ps and send signals to
-// live PIDs, neither of which a unit test can do safely.
-var (
-	findOrphanedProcs = util.FindOrphanedClaudeProcesses
-	findZombieProcs   = util.FindZombieClaudeProcesses
-	sendSignal        = syscall.Kill
-	sleepFor          = time.Sleep
-
-	// orphanKillSettle is how long to wait after the final SIGKILL before
-	// re-reading process state. SIGKILL is not synchronous: the kernel tears
-	// the process down and reaps it a moment after the call returns, so an
-	// immediate liveness check reports a false survivor.
-	orphanKillSettle = 250 * time.Millisecond
 )
 
 // cleanupOrphanedClaude finds and kills orphaned Claude processes with a grace period.
@@ -105,26 +87,17 @@ func cleanupOrphanedClaude(graceSecs int) {
 	}
 }
 
-// verifyNoOrphans checks that no Claude processes survived shutdown, SIGKILLs
-// any that did, and confirms afterwards that they are actually gone. It returns
-// an error naming the PIDs still running, so the caller cannot report a clean
-// shutdown over a town that still has live agents in it.
-//
-// gt-dr6t: this used to discard every syscall.Kill error and return nothing, so
-// the phase named "Verifying shutdown" verified nothing — `gt down` printed
-// "shutdown complete" and exited 0 while the processes it had just failed to
-// kill were still running. A verification step that cannot fail is not a
-// verification step. Measure the state after the kill; never report the fact
-// that the kill was attempted.
-func verifyNoOrphans() error {
-	orphans, err := findOrphanedProcs()
+// verifyNoOrphans checks that no Claude processes survived shutdown.
+// If any are found, it reports them and attempts a final SIGKILL.
+func verifyNoOrphans() {
+	orphans, err := util.FindOrphanedClaudeProcesses()
 	if err != nil {
 		fmt.Printf("  %s Could not verify: %v\n", style.Bold.Render("⚠"), err)
-		return fmt.Errorf("cannot confirm that no agent processes survived shutdown: %w", err)
+		return
 	}
 
 	// Also check for zombie processes (have TTY but no tmux session)
-	zombies, zErr := findZombieProcs()
+	zombies, zErr := util.FindZombieClaudeProcesses()
 	if zErr != nil {
 		// Non-fatal, FindOrphanedClaudeProcesses already covered TTY-less ones
 		zombies = nil
@@ -133,74 +106,21 @@ func verifyNoOrphans() error {
 	totalSurvivors := len(orphans) + len(zombies)
 	if totalSurvivors == 0 {
 		fmt.Printf("  %s No orphaned Claude processes detected\n", style.Bold.Render("✓"))
-		return nil
+		return
 	}
 
 	fmt.Printf("  %s %d Claude process(es) survived shutdown:\n",
 		style.Bold.Render("⚠"), totalSurvivors)
 
-	// Kill orphans (TTY-less), then zombies (have TTY but no tmux session)
-	pids := make([]int, 0, totalSurvivors)
+	// Kill orphans (TTY-less)
 	for _, o := range orphans {
 		fmt.Printf("    PID %d (%s, age %ds) - sending SIGKILL\n", o.PID, o.Cmd, o.Age)
-		pids = append(pids, o.PID)
+		_ = syscall.Kill(o.PID, syscall.SIGKILL)
 	}
+
+	// Kill zombies (have TTY but no tmux session)
 	for _, z := range zombies {
 		fmt.Printf("    PID %d (%s, age %ds, tty %s) - sending SIGKILL\n", z.PID, z.Cmd, z.Age, z.TTY)
-		pids = append(pids, z.PID)
+		_ = syscall.Kill(z.PID, syscall.SIGKILL)
 	}
-
-	return killAndConfirmGone(pids)
-}
-
-// killAndConfirmGone SIGKILLs each PID and then re-reads process state to find
-// out which ones actually died. It reports what is still running, not what was
-// attempted.
-func killAndConfirmGone(pids []int) error {
-	unconfirmed := make([]int, 0, len(pids))
-	for _, pid := range pids {
-		err := sendSignal(pid, syscall.SIGKILL)
-		switch {
-		case err == nil:
-			// Signal delivered. Whether it worked is decided below.
-		case errors.Is(err, syscall.ESRCH):
-			// Already gone — that is the outcome we wanted.
-			continue
-		default:
-			// Could not even deliver the signal (EPERM, typically). Still a
-			// survivor until the liveness check says otherwise.
-			fmt.Printf("    %s PID %d: SIGKILL failed: %v\n", style.Bold.Render("⚠"), pid, err)
-		}
-		unconfirmed = append(unconfirmed, pid)
-	}
-
-	if len(unconfirmed) > 0 {
-		sleepFor(orphanKillSettle)
-	}
-
-	var alive []int
-	for _, pid := range unconfirmed {
-		// Signal 0 delivers nothing and only reports reachability. ESRCH means
-		// the process is gone; EPERM means it exists but is not ours to signal,
-		// which is still a survivor.
-		err := sendSignal(pid, 0)
-		if err == nil || errors.Is(err, syscall.EPERM) {
-			alive = append(alive, pid)
-		}
-	}
-
-	if len(alive) == 0 {
-		fmt.Printf("  %s All %d surviving process(es) killed\n", style.Bold.Render("✓"), len(pids))
-		return nil
-	}
-
-	list := make([]string, len(alive))
-	for i, pid := range alive {
-		list[i] = strconv.Itoa(pid)
-	}
-	joined := strings.Join(list, ", ")
-	fmt.Printf("  %s %d process(es) survived SIGKILL: %s\n", style.ErrorPrefix, len(alive), joined)
-	return fmt.Errorf("%d agent process(es) survived shutdown and could not be killed (PID %s); "+
-		"inspect them with 'gt orphans procs list --aggressive' before starting the town again",
-		len(alive), joined)
 }

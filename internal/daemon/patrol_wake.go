@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -37,6 +38,14 @@ import (
 //
 // What it keys on instead is the pane, which carries the turn-ended signal
 // itself: see [tmux.TurnState].
+//
+// The PRESENCE of an await is a different signal from its absence, and that one
+// is used: see [awaitProbe]. An ended turn is read here as "nothing is pending",
+// which is false for an agent whose await was backgrounded — the await outlives
+// the turn that started it, and the wake lands on a healthy wait. Two such wakes
+// were measured on gastown/witness seven minutes apart with the await pid alive
+// at both (gt-ghw7). Presence is decisive where absence is not, so a live await
+// suppresses the wake and nothing else about the decision changes.
 
 // patrolWakeConfirmDelay is the pause between the two pane samples that must
 // agree before a wake is sent. A pane caught between a tool result and the next
@@ -51,6 +60,11 @@ type patrolWakeTarget struct {
 	role    string // patrol config key: "witness", "refinery", "deacon"
 	rig     string // empty for town-level agents
 	session string
+	// bead is the agent bead ID this role passes to its await step as
+	// --agent-bead. It is what makes an await in the process table attributable
+	// to this agent rather than to another rig's patrol loop on the same host.
+	// Empty means "cannot attribute", and the await check is then skipped.
+	bead string
 }
 
 func (t patrolWakeTarget) label() string {
@@ -120,9 +134,23 @@ func (d *Daemon) wakeStoppedTargets(targets []patrolWakeTarget) {
 
 	time.Sleep(patrolWakeConfirmDelay)
 
+	// One snapshot of the process table for the whole sweep, taken after the
+	// confirm delay so it is as close in time to the wake decision as possible.
+	probe := &awaitProbe{}
+
 	for _, tgt := range candidates {
 		if state := d.tmux.TurnState(tgt.session); state != tmux.TurnEnded {
 			d.logger.Printf("patrol-wake: %s read %s on the second sample, not waking", tgt.label(), state)
+			continue
+		}
+		// An ended turn does not mean nothing is pending: an await that was
+		// backgrounded outlives the turn that launched it, and waking then
+		// interrupts a healthy wait. Only a confirmed live await suppresses the
+		// wake — awaitUnknown leaves the pre-check behavior intact, because a
+		// wake that was not needed costs one cycle whereas a wake that was
+		// needed and withheld costs the loop.
+		if state := probe.state(tgt.bead); state == awaitPending {
+			d.logger.Printf("patrol-wake: %s has a live await (%s), not waking", tgt.label(), tgt.bead)
 			continue
 		}
 		d.wakePatrolAgent(tgt)
@@ -139,25 +167,30 @@ func (d *Daemon) patrolWakeTargets() []patrolWakeTarget {
 		targets = append(targets, patrolWakeTarget{
 			role:    "deacon",
 			session: d.getDeaconSessionName(),
+			bead:    beads.DeaconBeadIDTown(),
 		})
 	}
 
 	if d.isPatrolActive("witness") {
 		for _, rigName := range d.getPatrolRigs("witness") {
+			prefix := session.PrefixFor(rigName)
 			targets = append(targets, patrolWakeTarget{
 				role:    "witness",
 				rig:     rigName,
-				session: session.WitnessSessionName(session.PrefixFor(rigName)),
+				session: session.WitnessSessionName(prefix),
+				bead:    beads.WitnessBeadIDWithPrefix(prefix, rigName),
 			})
 		}
 	}
 
 	if d.isPatrolActive("refinery") {
 		for _, rigName := range d.getPatrolRigs("refinery") {
+			prefix := session.PrefixFor(rigName)
 			targets = append(targets, patrolWakeTarget{
 				role:    "refinery",
 				rig:     rigName,
-				session: session.RefinerySessionName(session.PrefixFor(rigName)),
+				session: session.RefinerySessionName(prefix),
+				bead:    beads.RefineryBeadIDWithPrefix(prefix, rigName),
 			})
 		}
 	}

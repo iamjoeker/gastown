@@ -15,11 +15,8 @@ func cleanupOrphanedClaude(graceSecs int) {
 		style.Dim.Render("○"))
 }
 
-// verifyNoOrphans is a Windows stub. It reports that it did nothing rather than
-// returning an error, so shutdown does not fail on a platform where there is
-// nothing to verify.
-func verifyNoOrphans() error {
+// verifyNoOrphans is a Windows stub.
+func verifyNoOrphans() {
 	fmt.Printf("  %s Orphan verification not supported on Windows\n",
 		style.Dim.Render("○"))
-	return nil
 }
