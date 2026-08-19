@@ -100,6 +100,12 @@ func (l DiskSpaceLevel) String() string {
 
 // CheckDiskSpace evaluates disk space at the given path and returns the level
 // and a human-readable message. Returns DiskSpaceOK with empty message if fine.
+//
+// The message names the path that was measured. A host commonly has several
+// filesystems with wildly different pressure — /tmp is frequently a small
+// tmpfs — so a bare "only 1.2 GB free" sends the reader to `df /`, which
+// reports terabytes free and makes a full filesystem look like a code
+// regression in whatever they just changed (gt-yb33).
 func CheckDiskSpace(path string) (DiskSpaceLevel, string, error) {
 	info, err := GetDiskSpace(path)
 	if err != nil {
@@ -109,18 +115,27 @@ func CheckDiskSpace(path string) (DiskSpaceLevel, string, error) {
 	availMB := info.AvailableMB()
 
 	if availMB < DiskSpaceMinimumMB || info.UsedPercent >= DiskSpaceCriticalPercent {
-		return DiskSpaceCritical,
-			fmt.Sprintf("CRITICAL: only %s free (%.1f%% used) — disk space exhausted, operations blocked",
-				info.AvailableHuman(), info.UsedPercent),
-			nil
+		return DiskSpaceCritical, diskSpaceMessage(DiskSpaceCritical, info, path), nil
 	}
 
 	if availMB < DiskSpaceWarningMB {
-		return DiskSpaceWarning,
-			fmt.Sprintf("WARNING: only %s free (%.1f%% used) — disk space low, reduce workload",
-				info.AvailableHuman(), info.UsedPercent),
-			nil
+		return DiskSpaceWarning, diskSpaceMessage(DiskSpaceWarning, info, path), nil
 	}
 
 	return DiskSpaceOK, "", nil
+}
+
+// diskSpaceMessage renders the human-readable half of a disk space verdict.
+// DiskSpaceOK has nothing to say and returns an empty message.
+func diskSpaceMessage(level DiskSpaceLevel, info *DiskSpaceInfo, path string) string {
+	switch level {
+	case DiskSpaceCritical:
+		return fmt.Sprintf("CRITICAL: only %s free (%.1f%% used) on the filesystem holding %s — disk space exhausted, operations blocked",
+			info.AvailableHuman(), info.UsedPercent, path)
+	case DiskSpaceWarning:
+		return fmt.Sprintf("WARNING: only %s free (%.1f%% used) on the filesystem holding %s — disk space low, reduce workload",
+			info.AvailableHuman(), info.UsedPercent, path)
+	default:
+		return ""
+	}
 }
