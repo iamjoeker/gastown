@@ -64,7 +64,7 @@ func (m *mockTmux) SetAutoRespawnHook(_ string) error             { return nil }
 func (m *mockTmux) AcceptStartupDialogs(_ string) error           { return nil }
 func (m *mockTmux) AcceptWorkspaceTrustDialog(_ string) error     { return nil }
 func (m *mockTmux) AcceptBypassPermissionsWarning(_ string) error { return nil }
-func (m *mockTmux) SendKeysRaw(_, _ string) error                 { return m.sendKeysErr }
+func (m *mockTmux) InterruptAgent(_, _ string) error              { return m.sendKeysErr }
 func (m *mockTmux) GetSessionInfo(_ string) (*tmux.SessionInfo, error) {
 	return m.sessionInfo, m.sessionInfoErr
 }
