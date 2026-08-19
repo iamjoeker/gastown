@@ -69,20 +69,6 @@ Read the `witness_action` field for what *you* may do:
 The verdict name `SAFE_TO_NUKE` is legacy vocabulary describing git state, not
 an instruction to you. Treat it as `restart`.
 
-### UNVERIFIED — only from `gt polecat list`
-
-`gt polecat list` reads beads and never runs git, so it cannot answer the
-question `check-recovery` answers. Polecats that nothing blocks come back as
-`verdict: UNVERIFIED`, `reuse_status: idle-unverified`, `witness_action:
-leave-alone`. That is not a finding about the polecat — it means nobody looked.
-
-Do not act on it. Run `gt polecat check-recovery {{RIG}}/<name>` to get a
-measured verdict, then use the table above.
-
-This verdict exists because the list view used to print `idle-preserved` —
-the same string the reuse gate prints for a polecat it has actually cleared —
-for polecats `gt sling` then refused (gt-49dp).
-
 ### If NEEDS_RECOVERY
 
 **CRITICAL: Do NOT auto-nuke polecats with unpushed work.**

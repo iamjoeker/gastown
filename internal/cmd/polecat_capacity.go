@@ -29,7 +29,6 @@ type polecatCapacitySnapshot struct {
 	Working         int `json:"working"`
 	RecoveryBlocked int `json:"recovery_blocked"`
 	ReusableIdle    int `json:"reusable_idle"`
-	UnverifiedIdle  int `json:"unverified_idle"`
 	PendingMR       int `json:"pending_mr"`
 	Reservations    int `json:"reservations"`
 	Free            int `json:"free"`
@@ -50,7 +49,6 @@ type measuredPolecatCapacityJSON struct {
 	Working         int    `json:"working"`
 	RecoveryBlocked int    `json:"recovery_blocked"`
 	ReusableIdle    int    `json:"reusable_idle"`
-	UnverifiedIdle  int    `json:"unverified_idle"`
 	PendingMR       int    `json:"pending_mr"`
 	Reservations    int    `json:"reservations"`
 	Free            int    `json:"free"`
@@ -99,7 +97,6 @@ func (s polecatCapacitySnapshot) MarshalJSON() ([]byte, error) {
 		Working:         s.Working,
 		RecoveryBlocked: s.RecoveryBlocked,
 		ReusableIdle:    s.ReusableIdle,
-		UnverifiedIdle:  s.UnverifiedIdle,
 		PendingMR:       s.PendingMR,
 		Reservations:    s.Reservations,
 		Free:            s.Free,
@@ -121,19 +118,6 @@ func (s *polecatCapacitySnapshot) addRecoveryBlocked(countsTowardCapacity bool) 
 
 func (s *polecatCapacitySnapshot) addReusableIdle() {
 	s.ReusableIdle++
-}
-
-// addUnverifiedIdle counts a polecat that nothing blocked and nothing checked.
-//
-// This snapshot is built from the bead-only inventory constructor, which runs no
-// git and no merge-queue lookup, so these polecats were previously counted as
-// reusable_idle on the strength of facts nobody gathered — and `gt sling` then
-// refused them one by one at the measured gate (gt-49dp). They are counted
-// separately rather than dropped: like reusable_idle they hold no capacity, but
-// a reader comparing this projection against dispatch reality needs to see that
-// the pool's apparent depth is unconfirmed.
-func (s *polecatCapacitySnapshot) addUnverifiedIdle() {
-	s.UnverifiedIdle++
 }
 
 func (s *polecatCapacitySnapshot) addPendingMR() {
@@ -178,7 +162,7 @@ func (e *polecatCapacityAdmissionError) Error() string {
 		return fmt.Sprintf("polecat admission denied: %s", e.Reason)
 	}
 	return fmt.Sprintf(
-		"polecat admission denied: %s (max=%d occupied=%d working=%d recovery_blocked=%d reservations=%d reusable_idle=%d unverified_idle=%d pending_mr=%d free=%d). Resolve recovery-needed polecats or raise scheduler.max_polecats; inspect with `gt scheduler status --json` or `gt polecat list --all --json`",
+		"polecat admission denied: %s (max=%d occupied=%d working=%d recovery_blocked=%d reservations=%d reusable_idle=%d pending_mr=%d free=%d). Resolve recovery-needed polecats or raise scheduler.max_polecats; inspect with `gt scheduler status --json` or `gt polecat list --all --json`",
 		e.Reason,
 		e.Snapshot.Max,
 		e.Snapshot.occupied(),
@@ -186,7 +170,6 @@ func (e *polecatCapacityAdmissionError) Error() string {
 		e.Snapshot.RecoveryBlocked,
 		e.Snapshot.Reservations,
 		e.Snapshot.ReusableIdle,
-		e.Snapshot.UnverifiedIdle,
 		e.Snapshot.PendingMR,
 		e.Snapshot.Free,
 	)
@@ -367,10 +350,6 @@ func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapsh
 	}
 	if disposition.Reusable {
 		snapshot.addReusableIdle()
-		return
-	}
-	if disposition.Verdict == polecat.WorkstateVerdictUnverified {
-		snapshot.addUnverifiedIdle()
 		return
 	}
 	if disposition.NeedsRecovery {

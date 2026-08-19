@@ -2396,64 +2396,19 @@ func StateEligibleForPoolReuse(s State) bool {
 	return s == StateIdle || s == StateDone
 }
 
-// PoolReuseCandidate records one polecat the reuse gate considered and the
-// verdict it got. It exists so the refusal can be written down: FindIdlePolecat
-// returns nil for "every candidate was rejected" and nil for "the pool is
-// empty", and its caller could not tell those apart or name a single reason
-// (gt-49dp).
-type PoolReuseCandidate struct {
-	Name string `json:"name"`
-	// State is the polecat's lifecycle state as listed.
-	State State `json:"state"`
-	// StateEligible reports whether State passed StateEligibleForPoolReuse. When
-	// false no reuse decision was computed and Reason says so, because the gate
-	// deliberately does not pay for git on a working polecat.
-	StateEligible bool `json:"state_eligible"`
-	// Reusable is the measured reuse verdict, false when StateEligible is false.
-	Reusable bool `json:"reusable"`
-	// Reason is the disposition's reason — "mq-not-submitted", "git-dirty",
-	// "cleanup-unknown", and so on. This is the field that was never recorded.
-	Reason string `json:"reason,omitempty"`
-}
-
 // FindIdlePolecat returns the first idle polecat in the rig, or nil if none.
 // Idle means no hook, no active session, and no pending completion/MR cleanup state.
 func (m *Manager) FindIdlePolecat() (*Polecat, error) {
-	p, _, err := m.FindIdlePolecatWithCandidates()
-	return p, err
-}
-
-// FindIdlePolecatWithCandidates is FindIdlePolecat plus the verdict for every
-// polecat it considered, in the order considered.
-//
-// The candidate list stops at the polecat returned: the gate short-circuits on
-// the first reusable one and evaluating the rest would cost git calls per
-// polecat for information nobody asked for. So a non-nil polecat comes with the
-// rejections that preceded it, and a nil polecat comes with the complete set —
-// which is the case worth logging, since that is the one where `gt sling`
-// allocates a fresh worktree and the pool grows.
-func (m *Manager) FindIdlePolecatWithCandidates() (*Polecat, []PoolReuseCandidate, error) {
 	polecats, err := m.List()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	candidates := make([]PoolReuseCandidate, 0, len(polecats))
 	for _, p := range polecats {
-		c := PoolReuseCandidate{Name: p.Name, State: p.State, StateEligible: StateEligibleForPoolReuse(p.State)}
-		if !c.StateEligible {
-			c.Reason = "state-not-eligible"
-			candidates = append(candidates, c)
-			continue
-		}
-		d := m.reuseDecisionForPolecat(p.Name, p.State)
-		c.Reusable = d.Reusable
-		c.Reason = d.Reason
-		candidates = append(candidates, c)
-		if d.Reusable {
-			return p, candidates, nil
+		if StateEligibleForPoolReuse(p.State) && m.reuseDecisionForPolecat(p.Name, p.State).Reusable {
+			return p, nil
 		}
 	}
-	return nil, candidates, nil
+	return nil, nil
 }
 
 // ReuseDecisionForPolecat exposes the same reuse verdict used by FindIdlePolecat
@@ -2474,12 +2429,7 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 }
 
 func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
-	// ReuseFactsMeasured: this constructor runs CurrentBranch, CheckUncommittedWork,
-	// BranchPreservationStatus, and the merge-request lookup below, so it is
-	// entitled to a reuse verdict. It is set here rather than at the end so a
-	// future early return cannot drop it and silently turn the reuse gate into a
-	// gate that refuses everything (gt-49dp).
-	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown, SessionBusy: m.SessionBusy(name), ReuseFactsMeasured: true}
+	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown, SessionBusy: m.SessionBusy(name)}
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""

@@ -259,6 +259,10 @@ func printEvent(e townlog.Event) {
 		typeStr = style.Error.Render("[escalation_sent]")
 	case townlog.EventPatrolComplete:
 		typeStr = style.Success.Render("[patrol_complete]")
+	case townlog.EventNeedsMQSubmit:
+		typeStr = style.Warning.Render("[needs_mq_submit]")
+	case townlog.EventNeedsMQSubmitCleared:
+		typeStr = style.Dim.Render("[needs_mq_submit_cleared]")
 	default:
 		typeStr = fmt.Sprintf("[%s]", e.Type)
 	}
@@ -340,6 +344,16 @@ func formatEventDetail(e townlog.Event) string {
 			return fmt.Sprintf("patrol complete (%s)", e.Context)
 		}
 		return "patrol complete"
+	case townlog.EventNeedsMQSubmit:
+		if e.Context != "" {
+			return fmt.Sprintf("needs merge-queue submit (%s)", e.Context)
+		}
+		return "needs merge-queue submit"
+	case townlog.EventNeedsMQSubmitCleared:
+		if e.Context != "" {
+			return fmt.Sprintf("needs_mq_submit cleared (%s)", e.Context)
+		}
+		return "needs_mq_submit cleared"
 	default:
 		if e.Context != "" {
 			return fmt.Sprintf("%s (%s)", e.Type, e.Context)
