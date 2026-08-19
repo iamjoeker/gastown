@@ -3447,8 +3447,9 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
 	// Deliberately before every other check and not gated on force: this is the
-	// only guard that covers `gt dolt cleanup --force`, `gt doctor --fix` and
-	// AddRig's orphan drop alike, all three of which pass force=true. (gt-xhjb)
+	// only guard that covers `gt dolt cleanup --force` and AddRig's orphan drop,
+	// both of which pass force=true, so the checks below them never run.
+	// (gt-xhjb; `gt doctor --fix` passes force=false since gt-baj6)
 	protected, err := ProtectedDatabases(townRoot)
 	if err != nil {
 		return fmt.Errorf("refusing to remove %q: cannot determine which databases are protected: %w", dbName, err)
