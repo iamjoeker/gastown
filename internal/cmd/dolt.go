@@ -1088,6 +1088,55 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// orphanCleanupGlobs are the directory patterns that match test-pollution
+// databases in .dolt-data/. They are deliberately narrow: production databases
+// (hq, the rig databases) match none of them.
+const orphanCleanupGlobs = "testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*"
+
+// filesystemCleanupRemedy renders the operator instructions printed when there
+// are too many orphans for SQL-based cleanup to finish in reasonable time.
+//
+// gt never executes these lines — they are instruction text — but an operator
+// following them literally does execute them, so they have to be correct for
+// the machine they are printed on. Two things they must get right (gt-xvwu):
+//
+//   - The stop step must stop whatever will otherwise restart the server. Under
+//     a systemd unit with Restart=always, `gt dolt stop` signals the process and
+//     the supervisor starts a new one on the same data directory ~5s later, so
+//     the rm then runs against a LIVE server — exactly the filesystem
+//     interference that corrupts Dolt databases irrecoverably.
+//   - The reassurance must say what it actually covers. "These globs match no
+//     production data" is a claim about which directories are deleted; it says
+//     nothing about whether the server is down, which is the variable that
+//     decides whether the deletion corrupts anything.
+func filesystemCleanupRemedy(townRoot string, sup *doltserver.Supervisor) string {
+	var b strings.Builder
+
+	b.WriteString("  Instead, stop the server and clean the filesystem.\n\n")
+
+	if desc := sup.Describe(); desc != "" {
+		b.WriteString(fmt.Sprintf("  ! This server is supervised by %s.\n", desc))
+		if sup.AutoRestarts() {
+			b.WriteString("    `gt dolt stop` would only signal the process — the supervisor starts\n")
+			b.WriteString("    a new server on the same data directory seconds later. Stop the unit.\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("    %s\n", sup.StopCommand()))
+	b.WriteString("    gt dolt status    # REQUIRED: must say \"not running\" before you delete\n")
+	b.WriteString(fmt.Sprintf("    cd %s/.dolt-data && rm -rf %s\n", townRoot, orphanCleanupGlobs))
+	b.WriteString(fmt.Sprintf("    %s\n\n", sup.StartCommand()))
+
+	b.WriteString("  Those globs match only orphan test databases — they hold no production\n")
+	b.WriteString("  data, and the databases gt found are listed above. That is not a claim\n")
+	b.WriteString("  that the rm is safe at any moment: deleting a database directory while\n")
+	b.WriteString("  any Dolt server still holds it open can corrupt data unrecoverably.\n")
+	b.WriteString("  Verify the server is stopped first — do not skip the status check.\n")
+
+	return b.String()
+}
+
 func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -1141,11 +1190,8 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
 			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
 		fmt.Printf("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
-		fmt.Printf("  Instead, stop the server and clean the filesystem:\n\n")
-		fmt.Printf("    gt dolt stop\n")
-		fmt.Printf("    cd %s/.dolt-data && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*\n", townRoot)
-		fmt.Printf("    gt dolt start\n\n")
-		fmt.Printf("  This is safe — orphan databases have no production data.\n")
+		_, pid, _ := doltserver.IsRunning(townRoot)
+		fmt.Print(filesystemCleanupRemedy(townRoot, doltserver.DetectSupervisor(pid)))
 		return fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans))
 	}
 
