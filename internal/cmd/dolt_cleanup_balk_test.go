@@ -154,14 +154,14 @@ func TestEvaluateCleanupBalksForceOverridesRatio(t *testing.T) {
 
 func TestEvaluateCleanupBalksTooManyOrphansSurvivesForce(t *testing.T) {
 	townRoot := t.TempDir()
-	orphans := fixtureOrphans(doltserver.MaxSQLCleanup+1, true)
-	allDBs := make([]string, doltserver.MaxSQLCleanup+1)
+	orphans := fixtureOrphans(maxSQLCleanup+1, true)
+	allDBs := make([]string, maxSQLCleanup+1)
 
 	// The SQL-cleanup ceiling is about how long DROP takes, not about whether
 	// the operator trusts the detection, so --force does not clear it.
 	balk := evaluateCleanupBalks(townRoot, orphans, allDBs, true)
 	if balk == nil {
-		t.Fatal("more than doltserver.MaxSQLCleanup orphans must balk even with --force")
+		t.Fatal("more than maxSQLCleanup orphans must balk even with --force")
 	}
 	if !strings.Contains(balk.Message, "rm -rf") {
 		t.Errorf("too-many-orphans balk must print the filesystem remedy:\n%s", balk.Message)

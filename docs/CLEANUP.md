@@ -155,16 +155,6 @@ Reporting surfaces — `gt dolt status`, `gt dolt init`, `gt doctor` — list
 orphans but deliberately name no deleting command. They report; the operator
 decides (gt-xhjb).
 
-`gt doctor --fix` reaches the same deletion, so it evaluates the same refusal:
-above the orphan ratio its fix refuses and explains instead of deleting, and
-below it the fix deletes with the per-database user-tables check in force
-(`--force` has no equivalent here). The balk predicate lives in
-`internal/doltserver` precisely so the two commands cannot answer differently —
-it used to live in `internal/cmd`, where `internal/doctor` could not reach it,
-and `gt doctor --fix` force-deleted every orphan with no threshold check at all
-(gt-baj6). `gt doctor` names the refusal in its report, so the fix cannot be a
-surprise.
-
 ### Keeping an unreferenced database
 
 A database with no rig `metadata.json` pointing at it is reported as an orphan
@@ -179,8 +169,7 @@ even when it is deliberate. To keep one permanently, name it in
 
 Orphan detection then skips it, `gt dolt list` labels it protected, and
 `gt dolt cleanup` refuses to remove it **with or without `--force`** — which
-also covers `gt doctor --fix` and `gt rig add`'s orphan drop, since the refusal
-lives in `RemoveDatabase` rather than in any one command.
+also covers `gt doctor --fix`, since that path force-removes orphans too.
 Write the decision here rather than relying on operators remembering it.
 
 ## Bead / Hook Cleanup

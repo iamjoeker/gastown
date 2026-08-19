@@ -1283,16 +1283,42 @@ func staleManifestRemedy(dataDir string, missing []string, sup *doltserver.Super
 	return b.String()
 }
 
+// Thresholds for the orphan-ratio balk (gt-xvh). A high ratio means the run is
+// about to delete most of the town, which is worth a stop either way — but see
+// orphanRatioBalkMessage for why it is not evidence that detection broke.
+const (
+	orphanRatioBalkFraction = 0.5
+	orphanRatioBalkMinimum  = 3
+)
+
 // orphanFixtureBurstWindow is how close together creation times have to be
 // before the balk will call them the signature of a single test run. Real
 // databases are created when a town or rig is set up, minutes to months apart.
 const orphanFixtureBurstWindow = 5 * time.Minute
 
+// maxSQLCleanup is the number of orphans past which DROP DATABASE per orphan
+// takes hours against an overloaded server, so cleanup sends the operator to
+// the filesystem instead. (Clown Show #18: 245 orphans at 27s latency)
+const maxSQLCleanup = 50
+
+// cleanupBalkKind names which refusal was raised, so a surface that only needs
+// to say THAT cleanup will refuse does not have to re-derive it from the
+// thresholds and get a different answer than evaluateCleanupBalks did. The
+// order the two balks are evaluated in is part of that answer. (gt-xhjb)
+type cleanupBalkKind int
+
+const (
+	// balkOrphanRatio: too large a share of the town's databases is flagged.
+	balkOrphanRatio cleanupBalkKind = iota + 1
+	// balkTooManyOrphans: more orphans than DROP DATABASE can clear by SQL.
+	balkTooManyOrphans
+)
+
 // cleanupBalk is a refusal `gt dolt cleanup` raises before deleting anything:
 // which refusal it is, the operator-facing explanation, and the error the real
 // run returns.
 type cleanupBalk struct {
-	Kind    doltserver.CleanupBalkKind
+	Kind    cleanupBalkKind
 	Message string
 	Err     error
 }
@@ -1300,34 +1326,31 @@ type cleanupBalk struct {
 // evaluateCleanupBalks returns the first refusal the real run would hit, or nil
 // if it would proceed to delete.
 //
-// The decision is doltserver.EvaluateCleanupBalk's; this only renders it. The
-// thresholds used to live here, where internal/doctor could not reach them, and
-// `gt doctor --fix` reached the same bulk deletion with no threshold check at
-// all. (gt-baj6)
-//
 // Both balks are evaluated before the --dry-run return so the rehearsal and the
 // performance cannot diverge. Previously --dry-run returned first and printed a
 // clean deletion list with exit 0 while the real run refused, so the operator
 // who did the responsible thing came away with MORE confidence than the one who
 // did not — the single failure mode a dry run exists to prevent. (gt-ti84)
 func evaluateCleanupBalks(townRoot string, orphans []doltserver.OrphanedDatabase, allDBs []string, force bool) *cleanupBalk {
-	switch doltserver.EvaluateCleanupBalk(len(orphans), len(allDBs), force) {
-	case doltserver.BalkOrphanRatio:
-		return &cleanupBalk{
-			Kind:    doltserver.BalkOrphanRatio,
-			Message: orphanRatioBalkMessage(orphans, len(allDBs)),
-			Err:     fmt.Errorf("refusing to clean %d/%d databases without --force (safety check, gt-xvh)", len(orphans), len(allDBs)),
+	if len(allDBs) > 0 && !force {
+		if msg := orphanRatioBalkMessage(orphans, len(allDBs)); msg != "" {
+			return &cleanupBalk{
+				Kind:    balkOrphanRatio,
+				Message: msg,
+				Err:     fmt.Errorf("refusing to clean %d/%d databases without --force (safety check, gt-xvh)", len(orphans), len(allDBs)),
+			}
 		}
+	}
 
-	case doltserver.BalkTooManyOrphans:
+	if len(orphans) > maxSQLCleanup {
 		var b strings.Builder
 		fmt.Fprintf(&b, "\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
-			style.Bold.Render("!"), len(orphans), doltserver.MaxSQLCleanup)
+			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
 		b.WriteString("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
 		_, pid, _ := doltserver.IsRunning(townRoot)
 		b.WriteString(filesystemCleanupRemedy(townRoot, doltserver.DetectSupervisor(pid)))
 		return &cleanupBalk{
-			Kind:    doltserver.BalkTooManyOrphans,
+			Kind:    balkTooManyOrphans,
 			Message: b.String(),
 			Err:     fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans)),
 		}
@@ -1372,8 +1395,8 @@ func orphanCleanupGuidance(townRoot string, orphans []doltserver.OrphanedDatabas
 	case balk == nil:
 		line("Cleanup would remove these, skipping any that still hold user tables.")
 		line("It has not run.")
-	case balk.Kind == doltserver.BalkTooManyOrphans:
-		line("Cleanup will REFUSE these: %d orphans is past the %d it can drop by SQL", len(orphans), doltserver.MaxSQLCleanup)
+	case balk.Kind == balkTooManyOrphans:
+		line("Cleanup will REFUSE these: %d orphans is past the %d it can drop by SQL", len(orphans), maxSQLCleanup)
 		line("in reasonable time. Its refusal prints a filesystem procedure that")
 		line("deletes database directories by hand.")
 	default:
@@ -1402,12 +1425,13 @@ func orphanCleanupGuidance(townRoot string, orphans []doltserver.OrphanedDatabas
 // not real orphans" at the moment they were, and then pointed at --force to
 // override a warning it had just told them to disbelieve. (gt-ti84)
 func orphanRatioBalkMessage(orphans []doltserver.OrphanedDatabase, totalDBs int) string {
-	// The thresholds are doltserver's, so this cannot describe a refusal the
-	// deletion path would not raise. (gt-baj6)
-	if !doltserver.OrphanRatioBalks(len(orphans), totalDBs) {
+	if totalDBs <= 0 {
 		return ""
 	}
 	ratio := float64(len(orphans)) / float64(totalDBs)
+	if ratio <= orphanRatioBalkFraction || len(orphans) <= orphanRatioBalkMinimum {
+		return ""
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n%s %d of %d databases (%.0f%%) are flagged as orphans.\n\n",
@@ -1502,12 +1526,7 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s\n", style.Dim.Render(o.Path))
 	}
 
-	// Fail closed: without the town's total the orphan ratio cannot be computed,
-	// and an unknown ratio must not read as an acceptable one. (gt-baj6)
-	allDBs, err := doltserver.ListDatabases(townRoot)
-	if err != nil {
-		return fmt.Errorf("counting databases for the orphan-ratio safety check: %w", err)
-	}
+	allDBs, _ := doltserver.ListDatabases(townRoot)
 	balk := evaluateCleanupBalks(townRoot, orphans, allDBs, doltCleanupForce)
 
 	if doltCleanupDry {
