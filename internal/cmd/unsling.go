@@ -77,18 +77,11 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 		targetAgent = args[1]
 	}
 
-	// Resolve target agent (default: self).
-	//
-	// Identity only — everything below is bead reads and writes, and none of it
-	// touches the target's session. Resolving through resolveTargetAgent made a
-	// live pane a precondition, so unslinging a dead agent failed with "getting
-	// pane for gt-<name>: exit status 1". That is every agent this command is
-	// prescribed for: check-recovery escalates NEEDS_RECOVERY to the Mayor, and
-	// a polecat in that state has no session left to resolve (gt-dh3d).
+	// Resolve target agent (default: self)
 	var agentID string
 	var err error
 	if targetAgent != "" {
-		agentID, err = resolveTargetAgentID(targetAgent)
+		agentID, _, _, err = resolveTargetAgent(targetAgent)
 		if err != nil {
 			return fmt.Errorf("resolving target agent: %w", err)
 		}
@@ -368,7 +361,11 @@ func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBe
 // used by sendHandoffMail (via mail.AddressToIdentity).
 // "rig/crew/name" → "rig/name", "rig/polecats/name" → "rig/name".
 func mailNormalizedAgentID(agentID string) string {
-	return beads.NormalizedAgentPathAddress(agentID)
+	parts := strings.Split(agentID, "/")
+	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
+		return parts[0] + "/" + parts[2]
+	}
+	return agentID
 }
 
 // isAgentTarget checks if a string looks like an agent target rather than a bead ID.

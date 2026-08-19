@@ -1146,16 +1146,9 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		input.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
 		status.ActiveMR = fields.ActiveMR
 		input.ActiveMR = fields.ActiveMR
-		assignee := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
 		hookBead := agentHookBead(agentIssue, fields)
-		hook := assessHookBead(bd, hookBead, assignee)
-		// Reported whether or not the hook blocks: the surfaces this predicate
-		// read are the fact a reader needs to tell a real hook from a stale
-		// association, and the old output named neither (gt-dh3d).
-		if hook.Diagnostic != "" {
-			status.Diagnostics = append(status.Diagnostics, hook.Diagnostic)
-		}
-		workTerminal = beadTerminal || hook.Terminal
+		hookSafe, hookTerminal, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
+		workTerminal = beadTerminal || hookTerminal
 		sourceHint := agentSourceIssueHint(status.Issue, fields)
 		targetRefs, targetRefLookupFailed = recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch, sourceHint)
 		if status.Issue == "" && sourceHint != "" {
@@ -1163,14 +1156,15 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		}
 		if !beadTerminal && sourceHint != "" {
 			beadTerminal = isAssignedBeadTerminal(bd, sourceHint)
-			workTerminal = beadTerminal || hook.Terminal
+			workTerminal = beadTerminal || hookTerminal
 		}
-		if hook.Blocker != "" {
+		if hookBlocker != "" {
 			input.HookBead = hookBead
 		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		input.MRRefused = fields.MRRefused
+		assignee := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
 		partialSpawn, diagnostic := partialSpawnWithoutDurableHook(bd, fields, assignee, status.Issue)
 		if diagnostic != "" {
 			status.Diagnostics = append(status.Diagnostics, diagnostic)
@@ -1203,7 +1197,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 				loadGitState()
 			}
 			gitSafe := activeMRGitSafeForWorktree(p.ClonePath)
-			if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, workTerminal, hook.Safe, !activeMRAssessment.Pending, gitSafe) {
+			if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, workTerminal, hookSafe, !activeMRAssessment.Pending, gitSafe) {
 				input.IgnoreCleanupStatus = true
 				status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("ignored_stale_cleanup_status=%s direct_git_state=safe work_ref=terminal", input.CleanupStatus))
 			}
@@ -1379,7 +1373,7 @@ func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, dispositi
 	status.ReuseStatus = disposition.ReuseStatus
 	status.MQStatus = disposition.MQStatus
 	status.Blockers = disposition.Blockers
-	status.RecoveryActions = recoveryActionsForBlockers(disposition.Blockers, status.Rig, status.Polecat)
+	status.RecoveryActions = recoveryActionsForBlockers(disposition.Blockers)
 }
 
 type issueShower interface {
@@ -1433,62 +1427,24 @@ func activeMRGitSafeForWorktree(worktreePath string) bool {
 	return pushed && unpushed == 0
 }
 
-// hookBeadDisposition is what reading an agent bead's hook slot actually
-// established. Diagnostic names the surfaces that were read, so a caller can
-// report a disagreement between them instead of presenting one surface's answer
-// as the fact (gt-dh3d).
-type hookBeadDisposition struct {
-	Safe       bool // the hook slot does not block cleanup
-	Terminal   bool // the work bead it names has reached a terminal status
-	Unverified bool // the work bead could not be read, so nothing was established
-	Blocker    string
-	Diagnostic string
-}
-
-// assessHookBead decides whether the hook slot recorded on an agent bead still
-// names work this polecat holds, and reports which surfaces said so.
-//
-// check-recovery refused cleanup on "has work on hook (gt-2uqy)" for a bead
-// that was simultaneously open, unassigned, and sitting in `bd ready` — see
-// beads.HookSlotReleased for why the slot outlives the assignment and why the
-// work bead settles it (gt-dh3d).
-func assessHookBead(bd issueShower, hookBead, assignee string) hookBeadDisposition {
+func hookBeadSafeForCleanup(bd issueShower, hookBead string) (safe bool, terminal bool, blocker string) {
 	if hookBead == "" {
-		return hookBeadDisposition{Safe: true}
+		return true, false, ""
 	}
 	if bd == nil {
-		return hookBeadDisposition{Unverified: true, Blocker: fmt.Sprintf("hook_bead=%s status=unverified", hookBead)}
+		return false, false, fmt.Sprintf("hook_bead=%s status=unverified", hookBead)
 	}
 	issue, err := bd.Show(hookBead)
 	if err != nil {
-		return hookBeadDisposition{Unverified: true, Blocker: fmt.Sprintf("hook_bead=%s status=lookup_error: %v", hookBead, err)}
+		return false, false, fmt.Sprintf("hook_bead=%s status=lookup_error: %v", hookBead, err)
 	}
 	if issue == nil {
-		return hookBeadDisposition{Unverified: true, Blocker: fmt.Sprintf("hook_bead=%s status=missing", hookBead)}
+		return false, false, fmt.Sprintf("hook_bead=%s status=missing", hookBead)
 	}
-
-	status := beads.IssueStatus(issue.Status)
-	beadAssignee := strings.TrimSpace(issue.Assignee)
-	surface := fmt.Sprintf("hook_bead=%s source=agent_bead.hook_bead store_status=%s store_assignee=%s",
-		hookBead, issue.Status, hookBeadAssigneeForDiagnostic(beadAssignee))
-
-	if status.IsTerminal() {
-		return hookBeadDisposition{Safe: true, Terminal: true, Diagnostic: surface + " hook=released (work terminal)"}
+	if !beads.IssueStatus(issue.Status).IsTerminal() {
+		return false, false, fmt.Sprintf("hook_bead=%s status=%s", hookBead, issue.Status)
 	}
-	if beads.HookSlotReleased(issue, assignee) {
-		return hookBeadDisposition{Safe: true, Diagnostic: surface + " hook=stale (issue store does not hold it for this polecat)"}
-	}
-	return hookBeadDisposition{
-		Blocker:    fmt.Sprintf("hook_bead=%s status=%s", hookBead, issue.Status),
-		Diagnostic: surface + " hook=held",
-	}
-}
-
-func hookBeadAssigneeForDiagnostic(beadAssignee string) string {
-	if beadAssignee == "" {
-		return "<none>"
-	}
-	return beadAssignee
+	return true, true, ""
 }
 
 type cleanupStatusUpdater interface {
@@ -1580,24 +1536,13 @@ func recoveryGitStateBlocker(worktreePath string, gitState *GitState, gitErr err
 	return fmt.Sprintf("git_state=has_uncommitted uncommitted_files=%d", len(gitState.UncommittedFiles))
 }
 
-func recoveryActionsForBlockers(blockers []string, rigName, polecatName string) []string {
-	var actions []string
+func recoveryActionsForBlockers(blockers []string) []string {
 	for _, blocker := range blockers {
-		switch {
-		case strings.HasPrefix(blocker, "git_state=has_stash"):
-			actions = append(actions, "preserve branch-owned stash entries to auditable recovery refs before cleanup, then rerun check-recovery")
-		case strings.HasPrefix(blocker, "has work on hook ("):
-			// The escalation used to end here, at "escalate to Mayor", with no
-			// operable next step: the Mayor's tool is `gt unsling`, and it
-			// resolved its target through tmux, so it could not run for any
-			// agent this verdict names (gt-dh3d). It resolves through the store
-			// now, so the escalation can carry the command that clears the hook.
-			hookBead := strings.TrimSuffix(strings.TrimPrefix(blocker, "has work on hook ("), ")")
-			actions = append(actions, fmt.Sprintf("release the hook once the work is accounted for: gt unsling %s %s/%s (the Diagnostics line names the surfaces this hook was read from)",
-				hookBead, rigName, polecatName))
+		if strings.HasPrefix(blocker, "git_state=has_stash") {
+			return []string{"preserve branch-owned stash entries to auditable recovery refs before cleanup, then rerun check-recovery"}
 		}
 	}
-	return actions
+	return nil
 }
 
 func activeMRBlocker(bd issueShower, mrID, sourceHint string, requireGitSafe, gitSafe bool) string {
