@@ -774,3 +774,18 @@ exit 0
 		t.Fatalf("ListAgentBeads outside a town lost the local result; got %v", agents)
 	}
 }
+
+// TestWispListArgs pins the --all opt-in. `bd mol wisp list` is open-only
+// without it, so a caller asking "does this exist at all" and not passing --all
+// gets a zero that means "not open", not "not there" (gt-kb63).
+func TestWispListArgs(t *testing.T) {
+	open := wispListArgs(false)
+	if got := strings.Join(open, " "); got != "mol wisp list --json" {
+		t.Errorf("wispListArgs(false) = %q, want %q", got, "mol wisp list --json")
+	}
+
+	all := wispListArgs(true)
+	if got := strings.Join(all, " "); got != "mol wisp list --json --all" {
+		t.Errorf("wispListArgs(true) = %q, want %q", got, "mol wisp list --json --all")
+	}
+}

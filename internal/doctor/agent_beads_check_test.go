@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // TestAgentBeadsExistCheck_NoRoutes verifies the check handles missing routes.
@@ -384,4 +386,128 @@ func TestListPolecats_FiltersWorktrees(t *testing.T) {
 	if len(polecats) != 1 || polecats[0] != "scout" {
 		t.Errorf("listPolecats should return only [scout], got: %v", polecats)
 	}
+}
+
+// TestClassifyAgentBead_ClosedIsNotMissing pins the gt-kb63 distinction: a
+// closed agent bead exists, and must not be reported as missing. ListWispIDs is
+// open-only, so before this the closed case was indistinguishable from a
+// destroyed record — a false zero in the alarming direction, with the wrong
+// remedy attached (create instead of reopen).
+func TestClassifyAgentBead_ClosedIsNotMissing(t *testing.T) {
+	labelled := &beads.Issue{ID: "gt-gastown-witness", Labels: []string{"gt:agent"}}
+	unlabelled := &beads.Issue{ID: "gt-gastown-refinery"}
+
+	tests := []struct {
+		name      string
+		id        string
+		issues    map[string]*beads.Issue
+		openWisps map[string]bool
+		anyWisps  map[string]bool
+		want      agentBeadState
+	}{
+		{
+			name:   "in issues table with label",
+			id:     "gt-gastown-witness",
+			issues: map[string]*beads.Issue{"gt-gastown-witness": labelled},
+			want:   agentBeadOK,
+		},
+		{
+			name:   "in issues table without label",
+			id:     "gt-gastown-refinery",
+			issues: map[string]*beads.Issue{"gt-gastown-refinery": unlabelled},
+			want:   agentBeadMissingLabel,
+		},
+		{
+			name:      "open wisp",
+			id:        "gt-gastown-polecat-scavenger",
+			openWisps: map[string]bool{"gt-gastown-polecat-scavenger": true},
+			anyWisps:  map[string]bool{"gt-gastown-polecat-scavenger": true},
+			want:      agentBeadOK,
+		},
+		{
+			name:      "closed wisp is closed, not missing",
+			id:        "gt-gastown-polecat-scavenger",
+			openWisps: map[string]bool{},
+			anyWisps:  map[string]bool{"gt-gastown-polecat-scavenger": true},
+			want:      agentBeadClosed,
+		},
+		{
+			name:      "absent from every source",
+			id:        "gt-gastown-crew-nux",
+			openWisps: map[string]bool{},
+			anyWisps:  map[string]bool{},
+			want:      agentBeadMissing,
+		},
+		{
+			name:   "issues table wins over wisps",
+			id:     "gt-gastown-witness",
+			issues: map[string]*beads.Issue{"gt-gastown-witness": labelled},
+			// Present as a closed wisp too; the issues-table hit still decides.
+			anyWisps: map[string]bool{"gt-gastown-witness": true},
+			want:     agentBeadOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyAgentBead(tt.id, tt.issues, tt.openWisps, tt.anyWisps)
+			if got != tt.want {
+				t.Errorf("classifyAgentBead(%q) = %v, want %v", tt.id, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAgentBeadsResult_ReportsClosedSeparately verifies the verdict keeps the
+// two faults apart in message, details, and fix hint.
+func TestAgentBeadsResult_ReportsClosedSeparately(t *testing.T) {
+	c := NewAgentBeadsCheck()
+
+	t.Run("all clean", func(t *testing.T) {
+		got := c.agentBeadsResult(4, nil, nil, nil)
+		if got.Status != StatusOK {
+			t.Errorf("status = %v, want StatusOK", got.Status)
+		}
+	})
+
+	t.Run("label only is a warning", func(t *testing.T) {
+		got := c.agentBeadsResult(4, nil, nil, []string{"gt-gastown-witness"})
+		if got.Status != StatusWarning {
+			t.Errorf("status = %v, want StatusWarning", got.Status)
+		}
+	})
+
+	t.Run("closed only is an error naming reopen", func(t *testing.T) {
+		got := c.agentBeadsResult(4, nil, []string{"gt-gastown-witness"}, nil)
+		if got.Status != StatusError {
+			t.Errorf("status = %v, want StatusError", got.Status)
+		}
+		if strings.Contains(got.Message, "missing") {
+			t.Errorf("closed beads must not be reported as missing: %q", got.Message)
+		}
+		if !strings.Contains(got.FixHint, "reopen") {
+			t.Errorf("fix hint should mention reopen, got %q", got.FixHint)
+		}
+		if len(got.Details) != 1 || !strings.Contains(got.Details[0], "closed") {
+			t.Errorf("details should mark the bead closed, got %v", got.Details)
+		}
+	})
+
+	t.Run("all three buckets are counted", func(t *testing.T) {
+		got := c.agentBeadsResult(9,
+			[]string{"gt-gastown-crew-nux"},
+			[]string{"gt-gastown-witness"},
+			[]string{"gt-gastown-refinery"})
+		if got.Status != StatusError {
+			t.Errorf("status = %v, want StatusError", got.Status)
+		}
+		for _, want := range []string{"1 agent bead(s) missing", "1 closed", "1 missing gt:agent label"} {
+			if !strings.Contains(got.Message, want) {
+				t.Errorf("message %q missing %q", got.Message, want)
+			}
+		}
+		if len(got.Details) != 3 {
+			t.Errorf("details = %v, want 3 entries", got.Details)
+		}
+	})
 }

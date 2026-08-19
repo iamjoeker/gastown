@@ -71,7 +71,12 @@ func closeTerminalMR(b *beads.Beads, mrID string, opts terminalMRCloseOptions) (
 		if err := b.Update(mrID, beads.UpdateOptions{Description: &newDesc}); err != nil {
 			return result, fmt.Errorf("record MR close metadata: %w", err)
 		}
-		if err := b.CloseWithReason(opts.Reason, mrID); err != nil {
+		// Force-close: MR beads are pinned to protect the record from
+		// `bd purge --force`, which skips pinned beads (gt-6dp). The pin is
+		// meant to stop every OTHER writer, not the merge queue completing
+		// its own lifecycle step, so the queue closes its own record with
+		// --force rather than tripping over its own protection (gt-obth).
+		if err := b.ForceCloseWithReason(opts.Reason, mrID); err != nil {
 			return result, fmt.Errorf("close MR: %w", err)
 		}
 		result.Closed = true

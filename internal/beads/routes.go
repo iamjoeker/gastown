@@ -515,18 +515,10 @@ func GetRigNameForPrefix(townRoot, prefix string) string {
 // (typically the town-level .beads). If the bead ID's prefix maps to a different
 // rig via routes.jsonl, the resolved rig's beads directory is returned.
 // Returns currentBeadsDir if no routing is needed or prefix can't be resolved.
-//
-// A registered store override wins over the prefix: after a cross-rig move the
-// prefix names the rig the bead was filed in, not the one holding its live row
-// (gt-ad32). See RegisterBeadStore.
 func ResolveBeadsDirForID(currentBeadsDir, beadID string) string {
 	prefix := ExtractPrefix(beadID)
 	if prefix == "" {
 		return currentBeadsDir
-	}
-
-	if store, ok := LookupBeadStore(beadID); ok {
-		return store.BeadsDir
 	}
 
 	routesBeadsDir := currentBeadsDir
@@ -584,14 +576,7 @@ func ValidateRigPrefix(townRoot, rigName, beadID string) error {
 // Since bd update doesn't support routing or redirects, we must resolve the
 // actual rig directory from the bead's prefix. hookWorkDir is only used as
 // a fallback if prefix resolution fails.
-//
-// A registered store override wins over the prefix, so a moved bead's hook is
-// written to the store holding its live row rather than the closed source copy
-// (gt-ad32). See RegisterBeadStore.
 func ResolveHookDir(townRoot, beadID, hookWorkDir string) string {
-	if store, ok := LookupBeadStore(beadID); ok {
-		return store.WorkDir
-	}
 	// Always try prefix resolution first - bd update needs the actual rig dir
 	prefix := ExtractPrefix(beadID)
 	if rigPath := GetRigPathForPrefix(townRoot, prefix); rigPath != "" {

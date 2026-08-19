@@ -1190,6 +1190,156 @@ func filesystemCleanupRemedy(townRoot string, sup *doltserver.Supervisor) string
 	return b.String()
 }
 
+// Thresholds for the orphan-ratio balk (gt-xvh). A high ratio means the run is
+// about to delete most of the town, which is worth a stop either way — but see
+// orphanRatioBalkMessage for why it is not evidence that detection broke.
+const (
+	orphanRatioBalkFraction = 0.5
+	orphanRatioBalkMinimum  = 3
+)
+
+// orphanFixtureBurstWindow is how close together creation times have to be
+// before the balk will call them the signature of a single test run. Real
+// databases are created when a town or rig is set up, minutes to months apart.
+const orphanFixtureBurstWindow = 5 * time.Minute
+
+// maxSQLCleanup is the number of orphans past which DROP DATABASE per orphan
+// takes hours against an overloaded server, so cleanup sends the operator to
+// the filesystem instead. (Clown Show #18: 245 orphans at 27s latency)
+const maxSQLCleanup = 50
+
+// cleanupBalk is a refusal `gt dolt cleanup` raises before deleting anything:
+// the operator-facing explanation, and the error the real run returns.
+type cleanupBalk struct {
+	Message string
+	Err     error
+}
+
+// evaluateCleanupBalks returns the first refusal the real run would hit, or nil
+// if it would proceed to delete.
+//
+// Both balks are evaluated before the --dry-run return so the rehearsal and the
+// performance cannot diverge. Previously --dry-run returned first and printed a
+// clean deletion list with exit 0 while the real run refused, so the operator
+// who did the responsible thing came away with MORE confidence than the one who
+// did not — the single failure mode a dry run exists to prevent. (gt-ti84)
+func evaluateCleanupBalks(townRoot string, orphans []doltserver.OrphanedDatabase, allDBs []string, force bool) *cleanupBalk {
+	if len(allDBs) > 0 && !force {
+		if msg := orphanRatioBalkMessage(orphans, len(allDBs)); msg != "" {
+			return &cleanupBalk{
+				Message: msg,
+				Err:     fmt.Errorf("refusing to clean %d/%d databases without --force (safety check, gt-xvh)", len(orphans), len(allDBs)),
+			}
+		}
+	}
+
+	if len(orphans) > maxSQLCleanup {
+		var b strings.Builder
+		fmt.Fprintf(&b, "\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
+			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
+		b.WriteString("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
+		_, pid, _ := doltserver.IsRunning(townRoot)
+		b.WriteString(filesystemCleanupRemedy(townRoot, doltserver.DetectSupervisor(pid)))
+		return &cleanupBalk{
+			Message: b.String(),
+			Err:     fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans)),
+		}
+	}
+
+	return nil
+}
+
+// orphanRatioBalkMessage renders the orphan-ratio refusal, or "" when the ratio
+// does not trip the check.
+//
+// The message deliberately does not rank the two explanations. It used to say a
+// high ratio "usually means metadata.json files are missing or incorrect, not
+// that the databases are actually orphaned" — an assertion the check has no
+// evidence for, and one that is wrong in the case it meets most often. The ratio
+// crosses 50% because a town is SMALL: with 11 databases, six real test fixtures
+// are already 55%. So the message reliably told the operator "these are probably
+// not real orphans" at the moment they were, and then pointed at --force to
+// override a warning it had just told them to disbelieve. (gt-ti84)
+func orphanRatioBalkMessage(orphans []doltserver.OrphanedDatabase, totalDBs int) string {
+	if totalDBs <= 0 {
+		return ""
+	}
+	ratio := float64(len(orphans)) / float64(totalDBs)
+	if ratio <= orphanRatioBalkFraction || len(orphans) <= orphanRatioBalkMinimum {
+		return ""
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n%s %d of %d databases (%.0f%%) are flagged as orphans.\n\n",
+		style.Bold.Render("!"), len(orphans), totalDBs, ratio*100)
+	b.WriteString("  Two different situations produce a ratio this high, and this check\n")
+	b.WriteString("  cannot tell them apart:\n\n")
+	b.WriteString("    - Detection is wrong: metadata.json files are missing or unreadable,\n")
+	b.WriteString("      so real databases look unreferenced.\n")
+	fmt.Fprintf(&b, "    - Detection is right and the town is small: %d databases total, so a\n", totalDBs)
+	b.WriteString("      handful of genuine test fixtures is already a majority.\n\n")
+	b.WriteString(orphanCreationEvidence(orphans))
+	b.WriteString("  To proceed anyway: gt dolt cleanup --force\n")
+	b.WriteString("  To diagnose: gt dolt list   (owner for every database, not just these)\n")
+	return b.String()
+}
+
+// orphanCreationEvidence renders what the operator can actually decide on.
+// Creation times discriminate where the ratio cannot: fixtures are born in a
+// burst during a test run, real databases when a town or rig was set up.
+func orphanCreationEvidence(orphans []doltserver.OrphanedDatabase) string {
+	var known []time.Time
+	for _, o := range orphans {
+		if !o.CreatedAt.IsZero() {
+			known = append(known, o.CreatedAt)
+		}
+	}
+	if len(known) == 0 {
+		return "  Creation times, which would discriminate, are not available here — no\n" +
+			"  birth time is recorded for these directories. Inspect the databases\n" +
+			"  themselves before deleting.\n\n"
+	}
+
+	earliest, latest := known[0], known[0]
+	for _, t := range known[1:] {
+		if t.Before(earliest) {
+			earliest = t
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+
+	var b strings.Builder
+	first := earliest.Format("2006-01-02 15:04:05")
+	last := latest.Format("2006-01-02 15:04:05")
+	b.WriteString("  The creation times listed above are what discriminates.\n")
+	if len(known) < len(orphans) {
+		fmt.Fprintf(&b, "  %d of the %d flagged databases record one; those were created\n  between %s and %s.\n",
+			len(known), len(orphans), first, last)
+	} else {
+		fmt.Fprintf(&b, "  All %d were created between %s and\n  %s.\n", len(orphans), first, last)
+	}
+	if len(known) > 1 && latest.Sub(earliest) <= orphanFixtureBurstWindow {
+		fmt.Fprintf(&b, "  That is a %s window — the signature of one test run, not of a town's\n",
+			latest.Sub(earliest).Round(time.Second))
+		b.WriteString("  real databases, which are created when a town or rig is set up.\n\n")
+	} else {
+		b.WriteString("  Databases born in a burst are test fixtures; databases born when the\n")
+		b.WriteString("  town or a rig was set up are real.\n\n")
+	}
+	return b.String()
+}
+
+// orphanCreatedSuffix renders ", created <time>" for the listing, or "" when
+// the platform records no birth time for the directory.
+func orphanCreatedSuffix(o doltserver.OrphanedDatabase) string {
+	if o.CreatedAt.IsZero() {
+		return ""
+	}
+	return ", created " + o.CreatedAt.Format("2006-01-02 15:04:05")
+}
+
 func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -1208,44 +1358,26 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Found %d orphaned database(s) in .dolt-data/:\n\n", len(orphans))
 	for _, o := range orphans {
-		fmt.Printf("  %s %s (%s)\n", style.Bold.Render("!"), o.Name, formatBytes(o.SizeBytes))
+		fmt.Printf("  %s %s (%s%s)\n", style.Bold.Render("!"), o.Name, formatBytes(o.SizeBytes), orphanCreatedSuffix(o))
 		fmt.Printf("    %s\n", style.Dim.Render(o.Path))
 	}
 
+	allDBs, _ := doltserver.ListDatabases(townRoot)
+	balk := evaluateCleanupBalks(townRoot, orphans, allDBs, doltCleanupForce)
+
 	if doltCleanupDry {
+		if balk != nil {
+			fmt.Print(balk.Message)
+			fmt.Printf("\n%s This is not a preview of a successful cleanup: the real run stops\n", style.Bold.Render("!"))
+			fmt.Printf("  at the refusal above and deletes nothing.\n")
+		}
 		fmt.Println("\nDry run: no changes made.")
 		return nil
 	}
 
-	// BALK: If orphans are a large fraction of all databases, something is likely
-	// wrong with the orphan detection (e.g., metadata files not found). Refuse to
-	// proceed without --force to prevent accidentally dropping production databases. (gt-xvh)
-	allDBs, _ := doltserver.ListDatabases(townRoot)
-	if len(allDBs) > 0 && !doltCleanupForce {
-		orphanRatio := float64(len(orphans)) / float64(len(allDBs))
-		if orphanRatio > 0.5 && len(orphans) > 3 {
-			fmt.Printf("\n%s %d of %d databases (%.0f%%) flagged as orphans — this is suspicious.\n",
-				style.Bold.Render("!"), len(orphans), len(allDBs), orphanRatio*100)
-			fmt.Printf("  This usually means metadata.json files are missing or incorrect,\n")
-			fmt.Printf("  not that the databases are actually orphaned.\n\n")
-			fmt.Printf("  To proceed anyway: gt dolt cleanup --force\n")
-			fmt.Printf("  To diagnose: gt dolt list   (check owner column for mismatches)\n")
-			return fmt.Errorf("refusing to clean %d/%d databases without --force (safety check, gt-xvh)", len(orphans), len(allDBs))
-		}
-	}
-
-	// BALK: If there are too many orphans, SQL-based cleanup will take hours
-	// because each DROP DATABASE is a separate query against an overloaded server.
-	// Force the user to stop the server and clean the filesystem directly.
-	// (Clown Show #18: 245 orphans at 27s latency = ~2 hour cleanup)
-	const maxSQLCleanup = 50
-	if len(orphans) > maxSQLCleanup {
-		fmt.Printf("\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
-			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
-		fmt.Printf("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
-		_, pid, _ := doltserver.IsRunning(townRoot)
-		fmt.Print(filesystemCleanupRemedy(townRoot, doltserver.DetectSupervisor(pid)))
-		return fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans))
+	if balk != nil {
+		fmt.Print(balk.Message)
+		return balk.Err
 	}
 
 	fmt.Println()
@@ -1287,6 +1419,26 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// doltDatabaseLabel renders the parenthesised annotation `gt dolt list` prints
+// after a database name.
+//
+// Only databases `gt dolt cleanup` would actually remove are labelled "orphan":
+// that column is read as a deletion list, and a database claimed by orphan
+// detection through something other than a metadata.json — the rig-prefix
+// safety net — gets a label that says so instead. (gt-ti84)
+func doltDatabaseLabel(townRoot, db string, owners map[string]string, referenced map[string]bool) string {
+	if owner, ok := owners[db]; ok {
+		return owner
+	}
+	if !doltserver.IsOrphanDatabase(referenced, db) {
+		if doltserver.IsRigPrefixDatabase(townRoot, db) {
+			return "rig prefix — no metadata.json owner"
+		}
+		return "claimed — no metadata.json owner"
+	}
+	return "orphan"
+}
+
 func runDoltList(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -1306,14 +1458,16 @@ func runDoltList(cmd *cobra.Command, args []string) error {
 	}
 
 	owners := doltserver.CollectDatabaseOwners(townRoot)
+	// Decide "orphan" with the predicate `gt dolt cleanup` deletes by, not with
+	// the owner map. An owner label is missing whenever no metadata.json names
+	// the database, which is a strictly narrower question — that gap put "gt",
+	// a real database claimed by the rig-prefix safety net, in this list under
+	// the same word cleanup uses for what it removes. (gt-ti84)
+	referenced := doltserver.ReferencedDatabases(townRoot)
 	fmt.Printf("Rig databases in %s:\n\n", config.DataDir)
 	for _, db := range databases {
 		dbDir := doltserver.RigDatabaseDir(townRoot, db)
-		if owner, ok := owners[db]; ok {
-			fmt.Printf("  %s (%s)\n    %s\n", style.Bold.Render(db), owner, style.Dim.Render(dbDir))
-		} else {
-			fmt.Printf("  %s (orphan)\n    %s\n", style.Bold.Render(db), style.Dim.Render(dbDir))
-		}
+		fmt.Printf("  %s (%s)\n    %s\n", style.Bold.Render(db), doltDatabaseLabel(townRoot, db, owners, referenced), style.Dim.Render(dbDir))
 	}
 
 	return nil
