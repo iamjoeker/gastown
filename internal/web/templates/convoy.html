@@ -79,11 +79,11 @@
                     <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{.Summary.HookCount}}</span>
+                    <span class="stat-value">{{if .Summary.HooksUnavailable}}?{{else}}{{.Summary.HookCount}}{{end}}</span>
                     <span class="stat-label">🪝 Hooks</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{.Summary.IssueCount}}</span>
+                    <span class="stat-value">{{if .Summary.IssuesUnavailable}}?{{else}}{{.Summary.IssueCount}}{{end}}</span>
                     <span class="stat-label">📋 Work</span>
                 </div>
                 <div class="stat">
@@ -105,6 +105,12 @@
                 {{end}}
                 {{if .Summary.ConvoysUnavailable}}
                 <span class="alert-item alert-red">🚚 convoys unreadable</span>
+                {{end}}
+                {{if .Summary.HooksUnavailable}}
+                <span class="alert-item alert-red">🪝 hooks unreadable</span>
+                {{end}}
+                {{if .Summary.IssuesUnavailable}}
+                <span class="alert-item alert-red">📋 work unreadable</span>
                 {{end}}
                 {{if .Summary.StuckPolecats}}
                 <span class="alert-item alert-red">💀 {{.Summary.StuckPolecats}} stuck</span>
@@ -918,7 +924,7 @@
             <div class="panel" id="work-panel">
                 <div class="panel-header">
                     <h2>📋 Work</h2>
-                    <span class="count">{{len .Issues}}{{if .IssuesWarning}}+{{end}}</span>
+                    <span class="count">{{if .IssuesUnavailable}}?{{else}}{{len .Issues}}{{if .IssuesWarning}}+{{end}}{{end}}</span>
                     <button class="new-issue-btn" onclick="openIssueModal()">+ New</button>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
@@ -929,7 +935,9 @@
                     <button class="tab-btn" data-tab="all" onclick="switchWorkTab('all')">All</button>
                 </div>
                 <div class="panel-body">
-                    {{if .IssuesWarning}}
+                    {{if .IssuesUnavailable}}
+                    <p class="truncation-notice">⚠️ Work backlog unavailable: {{.IssuesUnavailable}}</p>
+                    {{else if .IssuesWarning}}
                     <p class="truncation-notice">⚠️ Work backlog {{.IssuesWarning}} — count is incomplete</p>
                     {{end}}
                     <!-- Issues List View -->
@@ -966,7 +974,7 @@
                                 {{end}}
                             </tbody>
                         </table>
-                        {{else}}
+                        {{else if not .IssuesUnavailable}}
                         <div class="empty-state">
                             <p>No work items</p>
                         </div>
@@ -1033,14 +1041,16 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🪝 Hooks</h2>
-                    <span class="count{{if .Hooks}} {{end}}">{{len .Hooks}}{{if .HooksWarning}}+{{end}}</span>
+                    <span class="count{{if .Hooks}} {{end}}">{{if .HooksUnavailable}}?{{else}}{{len .Hooks}}{{if .HooksWarning}}+{{end}}{{end}}</span>
                     <button class="hook-attach-btn" onclick="openHookAttachForm()">+ Attach</button>
                     {{if .Hooks}}<button class="hook-clear-all-btn" onclick="clearAllHooks()">Clear All</button>{{end}}
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .HooksWarning}}
+                    {{if .HooksUnavailable}}
+                    <p class="truncation-notice">⚠️ Hooks unavailable: {{.HooksUnavailable}}</p>
+                    {{else if .HooksWarning}}
                     <p class="truncation-notice">⚠️ Hooks {{.HooksWarning}} — count is incomplete</p>
                     {{end}}
                     <!-- Attach Hook Form (hidden by default) -->
@@ -1080,7 +1090,7 @@
                             {{end}}
                         </tbody>
                     </table>
-                    {{else}}
+                    {{else if not .HooksUnavailable}}
                     <div class="empty-state">
                         <p>No hooked work</p>
                     </div>
