@@ -326,17 +326,7 @@ func TestRunDoneCreatesNoMRForClosedSourceIssue(t *testing.T) {
 
 	log := readSubmitSourceBDLog(t, logPath)
 	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
-	// The gt-7qm invariant is that no MERGE REQUEST is produced — that is what
-	// restarts the submit/reject loop. It was originally pinned as "no bead is
-	// created at all", which gt-rbul had to loosen: the refusal now files a
-	// stranded-work report when the branch it refused on behalf of is not in the
-	// target. Narrow the negative to the MR rather than dropping it.
-	assertBDLogNotContains(t, log, currentBeadsDir, "create --json --title=Merge: bd-source")
-	assertBDLogNotContains(t, log, currentBeadsDir, "--labels=gt:merge-request")
-	// gt-rbul: and the stranding must be reported, not merely refused. This
-	// branch is 1 commit ahead of an unpushed origin/main, so it is stranded.
-	assertBDLogContains(t, log, currentBeadsDir, "create --json --title=Stranded by gt done: bd-source is closed, branch feature/routed-submit left unmerged")
-	assertBDLogContains(t, log, currentBeadsDir, "update gt-mr --assignee=gastown/witness")
+	assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
 }
 
 func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBeadsDir string) {

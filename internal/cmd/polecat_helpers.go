@@ -135,6 +135,7 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 		}
 		sourceHint := agentSourceIssueHint(currentIssue, fields)
 		hookBead := agentHookBead(agentIssue, fields)
+		hook := assessHookBead(bd, hookBead, fmt.Sprintf("%s/polecats/%s", target.rigName, target.polecatName))
 		var gitState *GitState
 		gitStateLoaded := false
 		loadGitState := func() {
@@ -172,28 +173,28 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 			if polecatInfo != nil {
 				gitSafe = activeMRGitSafeForWorktree(polecatInfo.ClonePath)
 			}
-			hookSafe, hookTerminal, _ := hookBeadSafeForCleanup(bd, hookBead)
 			activeMRSafe := !activeMRAssessment.Pending
-			if polecat.CanIgnoreStaleCleanupStatus(result.CleanupStatus, beadTerminal || hookTerminal, hookSafe, activeMRSafe, gitSafe) {
+			if polecat.CanIgnoreStaleCleanupStatus(result.CleanupStatus, beadTerminal || hook.Terminal, hook.Safe, activeMRSafe, gitSafe) {
 				// OK: stale self-report after terminal source and direct clean git.
 			} else {
 				result.Reasons = append(result.Reasons, cleanupStatusBlocker(result.CleanupStatus))
 			}
 		}
 
-		// Check 3: Work on hook
+		// Check 3: Work on hook.
+		// The agent bead's hook slot alone does not establish that this polecat
+		// holds the work — see assessHookBead. A slot the work bead contradicts
+		// is a stale association, and blocking a nuke on it is the same false
+		// refusal check-recovery was making (gt-dh3d).
 		if hookBead != "" {
 			result.HookBead = hookBead
-			// Check if hooked bead is still active (not closed)
-			hookedIssue, err := bd.Show(hookBead)
-			if err == nil && hookedIssue != nil {
-				if hookedIssue.Status != "closed" {
-					result.Reasons = append(result.Reasons, fmt.Sprintf("has work on hook (%s)", hookBead))
-				} else {
-					result.HookStale = true
-				}
-			} else {
+			switch {
+			case hook.Unverified:
 				result.Reasons = append(result.Reasons, fmt.Sprintf("has work on hook (%s, unverified)", hookBead))
+			case hook.Blocker != "":
+				result.Reasons = append(result.Reasons, fmt.Sprintf("has work on hook (%s)", hookBead))
+			default:
+				result.HookStale = true
 			}
 		}
 
