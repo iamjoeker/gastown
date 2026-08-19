@@ -3075,26 +3075,72 @@ func (g *Git) mergeTreeNoopBetweenRefs(head, ref string) (bool, error) {
 // fetch/push remotes are classified against the listed hash, not stale tracking
 // refs.
 func (g *Git) PushRemoteRefTargetStatus(remote string, ref RemoteRef, target string) (BranchPreservationStatus, error) {
-	var status BranchPreservationStatus
+	if err := g.fetchPushRemoteRefExactly(remote, ref); err != nil {
+		return BranchPreservationStatus{}, err
+	}
+	return g.preservationOfRefAgainstRef("FETCH_HEAD", target)
+}
+
+// PushRemoteRefTargetStatusAny checks a push-remote ref against several targets
+// and returns the first that contains it, with ComparisonBase naming which one.
+//
+// One repository can have more than one ref that is honestly "the trunk": a rig
+// whose origin is a fork carries both origin/main and upstream/main, and which
+// of them work lands on is a property of the rig, not of git. Comparing against
+// only one of them turns every commit the other has into apparent unmerged
+// work — measured on gastown at 289 commits, which doubled a stranded-branch
+// short list with branches that had already landed.
+//
+// Preservation in ANY target is preservation: the work exists somewhere it can
+// be reached from. When no target contains the ref, the status for the FIRST
+// target is returned, so callers report against their primary base.
+//
+// The candidate ref is fetched once regardless of how many targets are checked.
+func (g *Git) PushRemoteRefTargetStatusAny(remote string, ref RemoteRef, targets []string) (BranchPreservationStatus, error) {
+	targets = nonEmptyUnique(targets)
+	if len(targets) == 0 {
+		return BranchPreservationStatus{}, fmt.Errorf("no comparison targets given")
+	}
+	if err := g.fetchPushRemoteRefExactly(remote, ref); err != nil {
+		return BranchPreservationStatus{}, err
+	}
+
+	var first BranchPreservationStatus
+	var firstErr error
+	for i, target := range targets {
+		status, err := g.preservationOfRefAgainstRef("FETCH_HEAD", target)
+		if i == 0 {
+			first, firstErr = status, err
+		}
+		if err == nil && status.Preserved {
+			return status, nil
+		}
+	}
+	return first, firstErr
+}
+
+// fetchPushRemoteRefExactly brings the listed hash into the object store and
+// verifies the remote has not moved underneath the listing. Classifying against
+// a stale remote-tracking ref instead would answer about a different commit.
+func (g *Git) fetchPushRemoteRefExactly(remote string, ref RemoteRef) error {
 	refName := strings.TrimSpace(ref.Name)
 	expectedHash := strings.TrimSpace(ref.Hash)
 	if refName == "" || expectedHash == "" {
-		return status, fmt.Errorf("remote ref is missing name or hash")
+		return fmt.Errorf("remote ref is missing name or hash")
 	}
 
 	if _, err := g.run("fetch", "--no-tags", g.pushTarget(remote), refName); err != nil {
-		return status, fmt.Errorf("fetching candidate %s: %w", refName, err)
+		return fmt.Errorf("fetching candidate %s: %w", refName, err)
 	}
 	fetchedHash, err := g.Rev("FETCH_HEAD")
 	if err != nil {
-		return status, fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
+		return fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
 	}
 	fetchedHash = strings.TrimSpace(fetchedHash)
 	if fetchedHash != expectedHash {
-		return status, fmt.Errorf("candidate %s changed while pruning: expected %s, fetched %s", refName, shortSHA(expectedHash), shortSHA(fetchedHash))
+		return fmt.Errorf("candidate %s changed while pruning: expected %s, fetched %s", refName, shortSHA(expectedHash), shortSHA(fetchedHash))
 	}
-
-	return g.preservationOfRefAgainstRef("FETCH_HEAD", target)
+	return nil
 }
 
 // CountCherryUnmergedCommits counts `git cherry` lines whose patches are not
