@@ -697,14 +697,6 @@ func readySlingContextsFromAssessments(assessments []scheduledContextAssessment)
 				style.Dim.Render("○"), assessment.fields.WorkBeadID, workLabels)
 			continue
 		}
-		// Durable archival records are read, not implemented (gt-f8td). Skipping
-		// at plan time keeps them from burning the context's dispatch-failure
-		// quota on a refusal that will never change.
-		if beads.HasRecordLabel(workLabels) {
-			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=record_label bead=%s labels=%v\n",
-				style.Dim.Render("○"), assessment.fields.WorkBeadID, workLabels)
-			continue
-		}
 
 		result = append(result, capacity.PendingBead{
 			ID:              assessment.context.issue.ID,
