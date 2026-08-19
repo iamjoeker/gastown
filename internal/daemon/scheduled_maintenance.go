@@ -17,9 +17,20 @@ const (
 	defaultMaintenanceCheckInterval = 5 * time.Minute
 
 	// defaultMaintenanceThreshold is the minimum commit count before maintenance
-	// triggers. Lower than compactor_dog (10k) since this is user-configured
-	// scheduled maintenance, not emergency compaction.
+	// triggers. Lower than compactor_dog (defaultCompactorCommitThreshold) since
+	// this is user-configured scheduled maintenance, not emergency compaction.
 	defaultMaintenanceThreshold = 1000
+
+	// defaultMaintenanceWindow is the window `gt init` provisions. Unlike the
+	// other defaults in this file it is NOT a fallback: maintenanceWindow()
+	// returns "" for an unconfigured town, which means "never run", and that is
+	// the correct reading of an absent key. Provisioning a window is an opt-in.
+	defaultMaintenanceWindow = "03:00"
+
+	// defaultMaintenanceInterval is the fallback maintenanceInterval() returns
+	// when the key is absent. Read it there, and provision it from here — the
+	// two must not be separate literals (gt-r4lv).
+	defaultMaintenanceInterval = "daily"
 )
 
 // ScheduledMaintenanceConfig holds configuration for the scheduled_maintenance patrol.
@@ -80,7 +91,7 @@ func maintenanceInterval(config *DaemonPatrolConfig) string {
 			return config.Patrols.ScheduledMaintenance.Interval
 		}
 	}
-	return "daily"
+	return defaultMaintenanceInterval
 }
 
 // parseWindowTime parses an HH:MM string and returns the hour and minute.
