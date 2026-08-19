@@ -229,8 +229,17 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 
 const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 
-// protectedWispLabels lists labels whose wisps purge must never delete,
+// ProtectedWispLabels lists labels whose wisps purge must never delete,
 // whatever their age, status, or caller.
+//
+// Exported because it is the town's single list of never-delete types, and
+// gastown has more than one deleter. gt-6dp's whole shape is a guard that
+// holds on one path and is inert on the next: `bd purge` skips these labels,
+// this package's native SQL delete skips them, and `gt compact` — which reaches
+// the database by a third route, `bd delete --force` — did not, because
+// --force is documented as the deliberate override that BYPASSES the bd-side
+// skip. A second copy of this list would drift; a second list would be a second
+// bug. Add a deleter, import this.
 //
 // gt:merge-request is here because "closed" is not a proxy for "worthless" for
 // this one type, and that is a property of the type rather than of the caller
@@ -253,7 +262,7 @@ const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 //
 // Anything added here must be a type whose closed rows are evidence, not
 // residue. It is not a place to park beads that are merely inconvenient to lose.
-var protectedWispLabels = []string{"gt:merge-request"}
+var ProtectedWispLabels = []string{"gt:merge-request"}
 
 // purgeProtectWhere returns a WHERE fragment, for queries that alias wisps as
 // "w", selecting only rows purge is permitted to delete.
@@ -265,7 +274,7 @@ var protectedWispLabels = []string{"gt:merge-request"}
 //     record right now. bd purge already honours it; this path did not, so a
 //     responder who pinned a record was protected from one deleter and not the
 //     other (gt-nmg). COALESCE because the column is nullable.
-//   - protectedWispLabels — protection by type, which needs nobody to have
+//   - ProtectedWispLabels — protection by type, which needs nobody to have
 //     anticipated the specific record.
 //
 // Deliberately an uncorrelated NOT IN over wisp_labels, mirroring the stale-issue
@@ -279,8 +288,8 @@ var protectedWispLabels = []string{"gt:merge-request"}
 // protected rows from selection — rather than declining them at DELETE time —
 // is what makes that impossible.
 func purgeProtectWhere() string {
-	quoted := make([]string, len(protectedWispLabels))
-	for i, label := range protectedWispLabels {
+	quoted := make([]string, len(ProtectedWispLabels))
+	for i, label := range ProtectedWispLabels {
 		quoted[i] = "'" + label + "'"
 	}
 	return fmt.Sprintf(
