@@ -54,6 +54,7 @@ Commands:
   show    Display formula details (steps, variables, composition)
   run     Execute a formula (pour and dispatch)
   create  Create a new formula template
+  drift   Show formulas whose executing copy shadows a newer shipped default
 
 Search paths: 'list' and 'show' delegate to bd, which owns the search order.
 Run 'bd formula list --help' for the authoritative, current list.
@@ -67,11 +68,15 @@ A disk copy shadows the embedded one, so editing it takes effect on the next
 'gt prime' with no rebuild -- and a rebuild will not undo it. See
 docs/design/directives-and-overlays.md for what survives 'gt upgrade'.
 
+That shadowing is also how a merged fix goes unnoticed: run 'gt formula drift'
+to see which executing copies are NOT the default shipped in this build.
+
 Examples:
   gt formula list                    # List all formulas
   gt formula show shiny              # Show formula details
   gt formula run shiny --pr=123      # Run formula on PR #123
-  gt formula create my-workflow      # Create new formula template`,
+  gt formula create my-workflow      # Create new formula template
+  gt formula drift                   # Which copies shadow a newer default?`,
 }
 
 var formulaListCmd = &cobra.Command{
