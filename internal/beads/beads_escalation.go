@@ -106,19 +106,8 @@ func FormatEscalationDescription(title string, fields *EscalationFields) string 
 }
 
 // ParseEscalationFields extracts escalation fields from an issue's description.
-//
-// Two description shapes reach here. Escalation RECORDS carry the structured
-// block FormatEscalationDescription writes ("escalated_by: ..."). Delivered
-// COPIES are usually the mail bead, whose body is formatEscalationMailBody and
-// spells the same field "From: ..." — and the copies are what `gt escalate list`
-// renders, so every row of the live queue printed "From:" with nothing after it
-// (measured on hq 2026-08-18: 10 of 10). "from" is therefore accepted as a
-// fallback, never an override: an explicit escalated_by always wins, whichever
-// order the two appear in.
 func ParseEscalationFields(description string) *EscalationFields {
 	fields := &EscalationFields{}
-	var mailFrom string
-	escalatedByExplicit := false
 
 	for _, line := range strings.Split(description, "\n") {
 		line = strings.TrimSpace(line)
@@ -146,9 +135,6 @@ func ParseEscalationFields(description string) *EscalationFields {
 			fields.Source = value
 		case "escalated_by":
 			fields.EscalatedBy = value
-			escalatedByExplicit = true
-		case "from":
-			mailFrom = value
 		case "escalated_at":
 			fields.EscalatedAt = value
 		case "acked_by":
@@ -174,10 +160,6 @@ func ParseEscalationFields(description string) *EscalationFields {
 		case "fingerprint":
 			fields.Fingerprint = value
 		}
-	}
-
-	if !escalatedByExplicit && mailFrom != "" {
-		fields.EscalatedBy = mailFrom
 	}
 
 	return fields
@@ -209,22 +191,6 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 	// Add severity as a label for easy filtering
 	if fields != nil && fields.Severity != "" {
 		args = append(args, fmt.Sprintf("--labels=severity:%s", fields.Severity))
-	}
-	// ...and as the bead's PRIORITY, which is the field every generic reader
-	// renders and every generic filter keys on (gt-nhp). Without it bd's default
-	// applies and the record reads P2 whatever was filed: hq-wisp-yro9 went in as
-	// -s HIGH about a live nuke hazard and showed up in `bd show` as an ordinary
-	// P2. Measured on hq 2026-08-18, ALL 12 most recent escalation records sat at
-	// priority 2 regardless of their severity label.
-	//
-	// It is not cosmetic. AutoClose exempts P0/P1 from staleness closure, so a
-	// severity that does not reach the priority column also forfeits the
-	// protection that column buys. The delivery copy has carried this since
-	// gt-3i4e; the record was left behind.
-	if fields != nil {
-		if priority, ok := escalationPriority(fields.Severity); ok {
-			args = append(args, fmt.Sprintf("--priority=%d", priority))
-		}
 	}
 	if fields != nil && fields.Fingerprint != "" {
 		args = append(args, "--labels="+fields.Fingerprint)
@@ -804,23 +770,12 @@ func (b *Beads) ReescalateEscalation(id, reescalatedBy string, maxReescalations 
 	// Format new description
 	description := FormatEscalationDescription(issue.Title, fields)
 
-	// Update the bead with new description, severity label and priority.
-	//
-	// The priority moves with the severity for the same reason it is set at
-	// creation (gt-nhp): a re-escalation exists to make an ignored escalation
-	// louder, and leaving the priority where it was means the one surface most
-	// readers sort by never registers the bump. It also restores the P0/P1
-	// staleness exemption that a low-severity escalation does not have — which
-	// matters most here, since being ignored is what triggered the bump.
-	opts := UpdateOptions{
+	// Update the bead with new description and severity label
+	if err := b.forIssueID(id).Update(id, UpdateOptions{
 		Description:  &description,
 		AddLabels:    []string{"reescalated", "severity:" + newSeverity},
 		RemoveLabels: []string{"severity:" + result.OldSeverity},
-	}
-	if priority, ok := escalationPriority(newSeverity); ok {
-		opts.Priority = &priority
-	}
-	if err := b.forIssueID(id).Update(id, opts); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("updating escalation: %w", err)
 	}
 

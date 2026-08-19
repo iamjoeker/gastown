@@ -67,6 +67,55 @@ func TestDeaconStatusJSON_Schema(t *testing.T) {
 	}
 }
 
+// The wedged verdict is a claim about two things a consumer cannot re-derive
+// from the rest of this payload: whether an await process was pending, and what
+// the pane said. Both are reported alongside it so a witness can check the
+// verdict rather than trust it, and so an unreadable probe is visible as
+// "unknown" rather than silently weakening the verdict.
+func TestDeaconStatusJSON_CarriesTheVerdictEvidence(t *testing.T) {
+	out := DeaconStatusOutput{
+		Running: true,
+		Session: "gt-deacon",
+		Heartbeat: &HeartbeatStatus{
+			Cycle:   421,
+			Verdict: "wedged",
+			Healthy: false,
+			Await:   "absent",
+			Turn:    "stranded",
+		},
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	hb, ok := m["heartbeat"].(map[string]interface{})
+	if !ok {
+		t.Fatal("heartbeat is not an object")
+	}
+
+	for key, want := range map[string]interface{}{
+		"verdict": "wedged",
+		"healthy": false,
+		"await":   "absent",
+		"turn":    "stranded",
+	} {
+		got, present := hb[key]
+		if !present {
+			t.Errorf("missing heartbeat key %q — the verdict's evidence must travel with it", key)
+			continue
+		}
+		if got != want {
+			t.Errorf("heartbeat[%q] = %v, want %v", key, got, want)
+		}
+	}
+}
+
 // TestDeaconStatusJSON_NoHeartbeat verifies heartbeat is omitted when nil.
 func TestDeaconStatusJSON_NoHeartbeat(t *testing.T) {
 	out := DeaconStatusOutput{

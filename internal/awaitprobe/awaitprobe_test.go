@@ -1,4 +1,4 @@
-package daemon
+package awaitprobe
 
 import (
 	"fmt"
@@ -41,37 +41,37 @@ func TestAwaitStateFromProcesses(t *testing.T) {
 		name  string
 		bead  string
 		lines []string
-		want  awaitState
+		want  State
 	}{
 		{
 			name:  "the agent's own await is pending",
 			bead:  "hq-deacon",
 			lines: []string{psDeaconAwait},
-			want:  awaitPending,
+			want:  StatePending,
 		},
 		{
 			name:  "the wrapper alone counts — same wait, one process up",
 			bead:  "hq-deacon",
 			lines: []string{psWrappedDeaconAwait},
-			want:  awaitPending,
+			want:  StatePending,
 		},
 		{
 			name:  "wrapper and child together are still one pending wait",
 			bead:  "hq-deacon",
 			lines: []string{psWrappedDeaconAwait, psDeaconAwait},
-			want:  awaitPending,
+			want:  StatePending,
 		},
 		{
 			name:  "an await wrapped in timeout still counts",
 			bead:  "bd-beads-witness",
 			lines: []string{psOtherRigWitnessAwait},
-			want:  awaitPending,
+			want:  StatePending,
 		},
 		{
 			name:  "await-event counts for refineries",
 			bead:  "bd-beads-refinery",
 			lines: []string{psRefineryAwait},
-			want:  awaitPending,
+			want:  StatePending,
 		},
 		{
 			// The failure this whole bead is about: a table full of other
@@ -79,25 +79,25 @@ func TestAwaitStateFromProcesses(t *testing.T) {
 			name:  "another rig's await is not this agent's",
 			bead:  "hq-deacon",
 			lines: []string{psOtherRigWitnessAwait, psRefineryAwait},
-			want:  awaitAbsent,
+			want:  StateAbsent,
 		},
 		{
 			name:  "empty table",
 			bead:  "hq-deacon",
 			lines: nil,
-			want:  awaitAbsent,
+			want:  StateAbsent,
 		},
 		{
 			name:  "the bead appearing without an await is not a wait",
 			bead:  "hq-deacon",
 			lines: []string{psDeaconHeartbeat},
-			want:  awaitAbsent,
+			want:  StateAbsent,
 		},
 		{
 			name:  "a defunct await is not waiting",
 			bead:  "hq-deacon",
 			lines: []string{psDefunctAwait},
-			want:  awaitAbsent,
+			want:  StateAbsent,
 		},
 		{
 			// Prefix matching would make gt-gastown-witness satisfy a probe for
@@ -105,13 +105,13 @@ func TestAwaitStateFromProcesses(t *testing.T) {
 			name:  "a longer bead ID sharing this one's prefix does not match",
 			bead:  "hq-deacon",
 			lines: []string{`gt mol step await-signal --agent-bead hq-deacon-shadow --backoff-base 60s`},
-			want:  awaitAbsent,
+			want:  StateAbsent,
 		},
 		{
 			name:  "--agent-bead=value form",
 			bead:  "hq-deacon",
 			lines: []string{`gt mol step await-signal --agent-bead=hq-deacon --backoff-base 60s`},
-			want:  awaitPending,
+			want:  StatePending,
 		},
 		{
 			// The flag must belong to the await, not to something chained after
@@ -119,14 +119,14 @@ func TestAwaitStateFromProcesses(t *testing.T) {
 			name:  "a bead flag belonging to a different command does not match",
 			bead:  "hq-deacon",
 			lines: []string{`sh -c gt deacon heartbeat --agent-bead hq-deacon && gt mol step await-signal --agent-bead bd-beads-witness`},
-			want:  awaitAbsent,
+			want:  StateAbsent,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := awaitStateFromProcesses(tc.bead, tc.lines); got != tc.want {
-				t.Errorf("awaitStateFromProcesses(%q) = %v, want %v", tc.bead, got, tc.want)
+			if got := stateFromProcesses(tc.bead, tc.lines); got != tc.want {
+				t.Errorf("stateFromProcesses(%q) = %v, want %v", tc.bead, got, tc.want)
 			}
 		})
 	}
@@ -139,8 +139,8 @@ func TestAwaitProbeUnreadableTableIsUnknown(t *testing.T) {
 	restore := stubProcessTable(t, nil, fmt.Errorf("ps: command not found"))
 	defer restore()
 
-	if got := (&awaitProbe{}).state("hq-deacon"); got != awaitUnknown {
-		t.Errorf("state with an unreadable process table = %v, want %v", got, awaitUnknown)
+	if got := (&Probe{}).State("hq-deacon"); got != StateUnknown {
+		t.Errorf("state with an unreadable process table = %v, want %v", got, StateUnknown)
 	}
 }
 
@@ -151,8 +151,8 @@ func TestAwaitProbeEmptyBeadIsUnknown(t *testing.T) {
 	restore := stubProcessTable(t, []string{psDeaconAwait}, nil)
 	defer restore()
 
-	if got := (&awaitProbe{}).state(""); got != awaitUnknown {
-		t.Errorf("state with an empty agent bead = %v, want %v", got, awaitUnknown)
+	if got := (&Probe{}).State(""); got != StateUnknown {
+		t.Errorf("state with an empty agent bead = %v, want %v", got, StateUnknown)
 	}
 }
 
@@ -160,16 +160,16 @@ func TestAwaitProbeEmptyBeadIsUnknown(t *testing.T) {
 // runs this on every heartbeat, and a call per target scales with rig count.
 func TestAwaitProbeSnapshotsOnce(t *testing.T) {
 	calls := 0
-	prev := listProcessArgs
-	listProcessArgs = func() ([]string, error) {
+	prev := ListProcessArgs
+	ListProcessArgs = func() ([]string, error) {
 		calls++
 		return []string{psDeaconAwait}, nil
 	}
-	defer func() { listProcessArgs = prev }()
+	defer func() { ListProcessArgs = prev }()
 
-	p := &awaitProbe{}
+	p := &Probe{}
 	for _, bead := range []string{"hq-deacon", "bd-beads-witness", "bd-beads-refinery"} {
-		p.state(bead)
+		p.State(bead)
 	}
 
 	if calls != 1 {
@@ -182,7 +182,7 @@ func TestAwaitProbeSnapshotsOnce(t *testing.T) {
 // usable on this host — the failure mode where every probe silently reads
 // absent and the daemon nudges healthy agents forever.
 func TestListProcessArgsSeesThisProcess(t *testing.T) {
-	lines, err := listProcessArgs()
+	lines, err := ListProcessArgs()
 	if err != nil {
 		t.Skipf("no readable process table on this host: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestListProcessArgsSeesThisProcess(t *testing.T) {
 // stubProcessTable replaces the host process table for the duration of a test.
 func stubProcessTable(t *testing.T, lines []string, err error) func() {
 	t.Helper()
-	prev := listProcessArgs
-	listProcessArgs = func() ([]string, error) { return lines, err }
-	return func() { listProcessArgs = prev }
+	prev := ListProcessArgs
+	ListProcessArgs = func() ([]string, error) { return lines, err }
+	return func() { ListProcessArgs = prev }
 }
