@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -330,9 +331,17 @@ func TestResolveHost(t *testing.T) {
 	}
 }
 
+// TestResolvePort is the one test in this module whose subject is the
+// unconfigured fallback, so it is also the one that has to step outside the
+// guard TestMain installs.
+//
+// WithoutDoltPortGuard and t.Setenv both restore on cleanup, which is the
+// point: the earlier version of this test cleared GT_DOLT_PORT and DOLT_PORT
+// with bare os.Unsetenv and never put them back, so every test that ran after
+// it in this binary was unguarded again. A guard undone halfway through the
+// run reads exactly like a guard.
 func TestResolvePort(t *testing.T) {
-	os.Unsetenv("GT_DOLT_PORT")
-	os.Unsetenv("DOLT_PORT")
+	WithoutDoltPortGuard(t)
 
 	// Flag takes precedence
 	if got := resolvePort("3308"); got != "3308" {
@@ -340,24 +349,38 @@ func TestResolvePort(t *testing.T) {
 	}
 
 	// GT_DOLT_PORT takes precedence over DOLT_PORT
-	os.Setenv("GT_DOLT_PORT", "3309")
-	os.Setenv("DOLT_PORT", "3310")
-	defer os.Unsetenv("GT_DOLT_PORT")
-	defer os.Unsetenv("DOLT_PORT")
+	t.Setenv("GT_DOLT_PORT", "3309")
+	t.Setenv("DOLT_PORT", "3310")
 	if got := resolvePort(""); got != "3309" {
 		t.Errorf("resolvePort with GT_DOLT_PORT = %q, want 3309", got)
 	}
 
-	// DOLT_PORT fallback
-	os.Unsetenv("GT_DOLT_PORT")
+	// DOLT_PORT fallback. resolvePort tests for a non-empty value, so blanking
+	// the variable is the same input as unsetting it, and t.Setenv restores it.
+	t.Setenv("GT_DOLT_PORT", "")
 	if got := resolvePort(""); got != "3310" {
 		t.Errorf("resolvePort with DOLT_PORT = %q, want 3310", got)
 	}
 
-	// Default
-	os.Unsetenv("DOLT_PORT")
-	if got := resolvePort(""); got != "3307" {
-		t.Errorf("resolvePort default = %q, want 3307", got)
+	// Default — the live server, which is why the guard exists.
+	t.Setenv("DOLT_PORT", "")
+	if got := resolvePort(""); got != strconv.Itoa(ProductionDoltPort) {
+		t.Errorf("resolvePort default = %q, want %d", got, ProductionDoltPort)
+	}
+}
+
+// TestGuardRedirectsTheDefault is the control for the file above: it asserts
+// that with the guard installed and nothing else configured, resolvePort — the
+// function every DSN in main.go is built from — returns the dead port rather
+// than the production one.
+//
+// TestResolvePort deliberately steps outside the guard, so on its own it would
+// pass identically whether or not TestMain ever ran.
+func TestGuardRedirectsTheDefault(t *testing.T) {
+	if got := resolvePort(""); got != strconv.Itoa(GuardedDoltPort) {
+		t.Errorf("resolvePort with the guard installed = %q, want %d; "+
+			"tests in this module can reach the production Dolt server on %d",
+			got, GuardedDoltPort, ProductionDoltPort)
 	}
 }
 
