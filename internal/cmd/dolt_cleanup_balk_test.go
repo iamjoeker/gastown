@@ -235,10 +235,6 @@ func TestDoltDatabaseLabelAgreesWithCleanup(t *testing.T) {
 	townRoot := newBalkTestTown(t)
 	referenced := doltserver.ReferencedDatabases(townRoot)
 	owners := doltserver.CollectDatabaseOwners(townRoot)
-	protected, err := doltserver.ProtectedDatabases(townRoot)
-	if err != nil {
-		t.Fatalf("ProtectedDatabases: %v", err)
-	}
 
 	orphans, err := doltserver.FindOrphanedDatabases(townRoot)
 	if err != nil {
@@ -254,7 +250,7 @@ func TestDoltDatabaseLabelAgreesWithCleanup(t *testing.T) {
 		t.Fatalf("ListDatabases: %v", err)
 	}
 	for _, db := range databases {
-		label := doltDatabaseLabel(townRoot, db, owners, protected, referenced)
+		label := doltDatabaseLabel(townRoot, db, owners, referenced)
 		if got := label == "orphan"; got != removable[db] {
 			t.Errorf("%s: gt dolt list says %q but cleanup removable=%v — the two surfaces must agree", db, label, removable[db])
 		}
@@ -265,10 +261,6 @@ func TestDoltDatabaseLabelRigPrefixDatabase(t *testing.T) {
 	townRoot := newBalkTestTown(t)
 	referenced := doltserver.ReferencedDatabases(townRoot)
 	owners := doltserver.CollectDatabaseOwners(townRoot)
-	protected, err := doltserver.ProtectedDatabases(townRoot)
-	if err != nil {
-		t.Fatalf("ProtectedDatabases: %v", err)
-	}
 
 	// Control: the fixture only reproduces the defect if "gt" really is the
 	// unowned-but-claimed case. If a metadata.json started naming it, the old
@@ -283,7 +275,7 @@ func TestDoltDatabaseLabelRigPrefixDatabase(t *testing.T) {
 
 	// "gt" is the gastown rig prefix. No metadata.json names it, so it has no
 	// owner — but cleanup will not touch it, so list must not call it an orphan.
-	label := doltDatabaseLabel(townRoot, "gt", owners, protected, referenced)
+	label := doltDatabaseLabel(townRoot, "gt", owners, referenced)
 	if label == "orphan" {
 		t.Fatal(`"gt" is claimed by the rig-prefix safety net; cleanup excludes it, so list must not call it an orphan`)
 	}
