@@ -108,17 +108,12 @@ func analyzeTurnState(escContent, promptPrefix string) TurnState {
 		lineDims = lineDims[:len(lineDims)-1]
 	}
 
-	text := make([]string, len(lines))
-	for i, line := range lines {
-		text[i] = string(line)
-	}
-
-	composer := findComposerLine(text, promptPrefix)
+	composer := findComposerLine(lines, promptPrefix)
 	if composer < 0 {
 		return TurnUnknown
 	}
 
-	if busyIndicatorNearAnchor(text, composer) {
+	if busyIndicatorNearComposer(lines, composer) {
 		return TurnActive
 	}
 
@@ -134,39 +129,33 @@ func analyzeTurnState(escContent, promptPrefix string) TurnState {
 }
 
 // findComposerLine returns the index of the last line that looks like the
-// agent's input prompt, or -1 if none is within range. Callers should pass a
-// snapshot with trailing blank lines already removed (see
-// trimTrailingBlankLines) so the bounded window starts at real content.
-func findComposerLine(lines []string, promptPrefix string) int {
+// agent's input prompt, or -1 if none is within range.
+func findComposerLine(lines [][]rune, promptPrefix string) int {
 	start := len(lines) - turnComposerScanLines
 	if start < 0 {
 		start = 0
 	}
 	for i := len(lines) - 1; i >= start; i-- {
-		if matchesPromptPrefix(lines[i], promptPrefix) {
+		if matchesPromptPrefix(string(lines[i]), promptPrefix) {
 			return i
 		}
 	}
 	return -1
 }
 
-// busyIndicatorNearAnchor reports whether a busy indicator appears in the
-// status region around anchor: the anchor line, everything below it, and up to
+// busyIndicatorNearComposer reports whether a busy indicator appears in the
+// status region: the composer line, everything below it, and up to
 // turnBusyLookback non-empty lines above it. Blank lines are skipped rather
 // than counted so gaps in the layout cannot shrink the window.
-//
-// The anchor is normally the composer line (see findComposerLine); idle
-// detection falls back to the mode-status line, which sits in the same footer
-// region, when the composer is not on screen.
-func busyIndicatorNearAnchor(lines []string, anchor int) bool {
-	for i := anchor; i < len(lines); i++ {
-		if hasBusyIndicator(lines[i]) {
+func busyIndicatorNearComposer(lines [][]rune, composer int) bool {
+	for i := composer; i < len(lines); i++ {
+		if hasBusyIndicator(string(lines[i])) {
 			return true
 		}
 	}
 	checked := 0
-	for i := anchor - 1; i >= 0 && checked < turnBusyLookback; i-- {
-		line := lines[i]
+	for i := composer - 1; i >= 0 && checked < turnBusyLookback; i-- {
+		line := string(lines[i])
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -176,18 +165,6 @@ func busyIndicatorNearAnchor(lines []string, anchor int) bool {
 		}
 	}
 	return false
-}
-
-// trimTrailingBlankLines drops trailing blank lines from a pane snapshot.
-//
-// capture-pane pads its output to the bottom of the pane and the split on "\n"
-// adds one more empty element, so without this the bounded windows above burn
-// their budget on padding and miss the footer entirely.
-func trimTrailingBlankLines(lines []string) []string {
-	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
-		lines = lines[:len(lines)-1]
-	}
-	return lines
 }
 
 // TurnState reports the turn state of an agent session from its visible pane.
