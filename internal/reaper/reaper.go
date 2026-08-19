@@ -109,8 +109,17 @@ type ScanResult struct {
 	// ProtectedFromPurge counts closed wisps past purge_age that purge will
 	// NOT delete because they are pinned or carry a protected label. They are
 	// excluded from PurgeCandidates, so the two never double-count.
-	ProtectedFromPurge int       `json:"protected_from_purge,omitempty"`
-	Anomalies          []Anomaly `json:"anomalies,omitempty"`
+	ProtectedFromPurge int `json:"protected_from_purge,omitempty"`
+	// ArchivableFromPurge counts the subset of ProtectedFromPurge that a purge
+	// running with an archive would export and then release: label-protected
+	// but not pinned.
+	//
+	// Reported unconditionally, because Scan is read-only and has no archive to
+	// ask. It answers the question the protected count alone cannot — "how much
+	// of this accumulation is retention policy would clear" — without which
+	// ProtectedFromPurge only ever grows and says nothing about why (gt-6xwt).
+	ArchivableFromPurge int       `json:"archivable_from_purge,omitempty"`
+	Anomalies           []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ReapResult holds the results of a reap operation.
@@ -129,13 +138,25 @@ type ReapResult struct {
 }
 
 // PurgeResult holds the results of a purge operation.
+//
+// WispsPurged, WispsArchived and WispsProtected PARTITION the closed-past-
+// purge_age window: every row in it is deleted outright, exported and then
+// deleted, or held back. No row is counted twice and none is counted nowhere,
+// which is what keeps a shrinking number readable — the reason the protected
+// count exists at all is that a purge which declines to delete must not look
+// like a purge that had less to do.
 type PurgeResult struct {
 	Database    string `json:"database"`
 	WispsPurged int    `json:"wisps_purged"`
 	MailPurged  int    `json:"mail_purged"`
+	// WispsArchived counts closed wisps past purge_age that were exported to
+	// the durable archive and then deleted. Zero when no archive is configured,
+	// which is also when protection is absolute (gt-6xwt).
+	WispsArchived int `json:"wisps_archived,omitempty"`
 	// WispsProtected counts closed wisps past purge_age that were skipped
-	// because they are pinned or carry a protected label. Reported so a purge
-	// that declines to delete says so, rather than looking like a smaller purge.
+	// because they are pinned, carry a protected label with no archive
+	// configured, or could not be archived. Reported so a purge that declines
+	// to delete says so, rather than looking like a smaller purge.
 	WispsProtected int       `json:"wisps_protected,omitempty"`
 	DryRun         bool      `json:"dry_run,omitempty"`
 	Anomalies      []Anomaly `json:"anomalies,omitempty"`
@@ -393,6 +414,31 @@ func purgeProtectWhere() string {
 		sqlLabelList(ProtectedWispLabels))
 }
 
+// archivableProtectWhere returns a WHERE fragment, for queries that alias wisps
+// as "w", selecting the protected rows a purge with an archive may export and
+// then delete: protected by TYPE, and not pinned.
+//
+// It is the exact complement of purgeProtectWhere within the closed-past-cutoff
+// window, and that is deliberate. purgeProtectWhere selects (not pinned AND not
+// labelled); its negation is (pinned OR labelled); this selects (not pinned AND
+// labelled). The three sets therefore partition the window into purge / archive
+// / hold, which is what lets PurgeResult report three counts that always add up
+// and never absorb one another.
+//
+// PINNED IS EXCLUDED ON PURPOSE, and it is the one line here worth arguing
+// about. Label protection is a standing judgement about a type; `pinned` is an
+// incident responder reaching for the one lever that protects one specific row
+// right now (`bd sql "update wisps set pinned=1 where id=..."`, gt-nmg). A
+// retention policy that quietly exported and deleted the row they pinned would
+// answer their instruction with a file they did not ask for and a row that is
+// gone from every query they were about to run. Retention releases the routine
+// accumulation; the pin stays a pin.
+func archivableProtectWhere() string {
+	return fmt.Sprintf(
+		"COALESCE(w.pinned, 0) = 0 AND w.id IN (SELECT DISTINCT al.issue_id FROM wisp_labels al WHERE al.label IN (%s))",
+		sqlLabelList(ProtectedWispLabels))
+}
+
 // closedMoleculeStepSubquery selects step-wisps whose parent molecule has already closed.
 // wisp_dependencies.issue_id is the child; depends_on_wisp_id is the parent molecule.
 const closedMoleculeStepSubquery = `
@@ -581,6 +627,15 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	protectedQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND NOT (" + purgeProtectWhere() + ")"
 	if err := db.QueryRowContext(ctx, protectedQuery, now.Add(-purgeAge)).Scan(&result.ProtectedFromPurge); err != nil {
 		return nil, fmt.Errorf("count purge-protected wisps: %w", err)
+	}
+
+	// Of those, how many a purge with an archive would export and release.
+	// Same window and the same fragment purgeClosedWisps archives by, so this
+	// cannot advertise rows the archive path would decline — the divergence the
+	// purge and reap counts above are both written to avoid.
+	archivableQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + archivableProtectWhere()
+	if err := db.QueryRowContext(ctx, archivableQuery, now.Add(-purgeAge)).Scan(&result.ArchivableFromPurge); err != nil {
+		return nil, fmt.Errorf("count archivable wisps: %w", err)
 	}
 
 	// Count mail candidates.
@@ -908,16 +963,52 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 	}
 }
 
+// PurgeOption configures an optional purge behaviour.
+//
+// Options rather than more positional parameters because the default must stay
+// exactly what it is today: with no options, purge protects by type absolutely
+// and deletes nothing it did not already delete. Every existing caller and test
+// keeps that contract without an edit, so "protection weakened" can only ever be
+// something a caller asked for explicitly.
+type PurgeOption func(*purgeOptions)
+
+type purgeOptions struct {
+	archive Archiver
+}
+
+// WithArchive lets purge export protected wisps to a durable store and then
+// delete their rows (gt-6xwt).
+//
+// Without it, ProtectedWispLabels means "never deleted", and the rows
+// accumulate for as long as the town runs. With it, protection means "never
+// deleted without a durable record first": a row is released only after
+// ArchiveWisps has returned nil for it, and any archive failure leaves it
+// exactly as protected as it was.
+//
+// A nil Archiver is the same as not passing the option, so callers can resolve
+// an archive that may be unavailable without branching.
+func WithArchive(archive Archiver) PurgeOption {
+	return func(o *purgeOptions) { o.archive = archive }
+}
+
 // Purge deletes old closed wisps and mail from a database.
-func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dryRun bool) (*PurgeResult, error) {
+func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dryRun bool, opts ...PurgeOption) (*PurgeResult, error) {
+	options := purgeOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	purged, protected, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
+	purged, archived, protected, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
 	result.WispsPurged = purged
+	result.WispsArchived = archived
 	result.WispsProtected = protected
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
@@ -934,7 +1025,12 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	return result, nil
 }
 
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (int, int, []Anomaly, error) {
+// purgeClosedWisps deletes closed wisps past purgeAge and, when an archive is
+// configured, exports the label-protected ones before deleting those too.
+//
+// Returns (purged, archived, protected, anomalies, error). The three counts
+// partition the closed-past-cutoff window; see PurgeResult.
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver) (int, int, int, []Anomaly, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -949,8 +1045,32 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	var protectedTotal int
 	protectedQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND NOT (" + protectWhere + ")"
 	if err := db.QueryRowContext(ctx, protectedQuery, deleteCutoff).Scan(&protectedTotal); err != nil {
-		return 0, 0, nil, fmt.Errorf("count protected wisps: %w", err)
+		return 0, 0, 0, nil, fmt.Errorf("count protected wisps: %w", err)
 	}
+
+	// Retention (gt-6xwt): export the label-protected rows, then release them.
+	// Runs BEFORE the ordinary purge so a failure here cannot be mistaken for a
+	// smaller purge — whatever it does not release stays counted as protected.
+	archived := 0
+	if archive != nil {
+		var archiveAnomalies []Anomaly
+		var err error
+		archived, archiveAnomalies, err = archiveProtectedWisps(ctx, db, dbName, deleteCutoff, dryRun, archive)
+		anomalies = append(anomalies, archiveAnomalies...)
+		if err != nil {
+			// Not fatal to the whole purge: the unprotected half below is
+			// independent of the archive and there is no reason to skip it
+			// because the retention path had a bad day.
+			anomalies = append(anomalies, Anomaly{
+				Type:    "wisp_archive_failed",
+				Message: fmt.Sprintf("archive of protected wisps failed, rows left protected: %v", err),
+			})
+		}
+	}
+	// Whatever was released is no longer being held back. Subtracting rather
+	// than re-counting keeps the partition exact when only some rows made it:
+	// an archive that exported 4 of 7 reports 4 archived and 3 protected.
+	protectedTotal -= archived
 
 	// Digest: count by wisp_type.
 	// No parent check — closed unprotected wisps past the delete age are purgeable.
@@ -959,7 +1079,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + protectWhere + " GROUP BY wtype"
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
-		return 0, protectedTotal, nil, fmt.Errorf("digest query: %w", err)
+		return 0, archived, protectedTotal, nil, fmt.Errorf("digest query: %w", err)
 	}
 	digestTotal := 0
 	for rows.Next() {
@@ -967,23 +1087,23 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		var cnt int
 		if err := rows.Scan(&wtype, &cnt); err != nil {
 			rows.Close()
-			return 0, protectedTotal, nil, fmt.Errorf("digest scan: %w", err)
+			return 0, archived, protectedTotal, nil, fmt.Errorf("digest scan: %w", err)
 		}
 		digestTotal += cnt
 	}
 	rows.Close()
 
 	if digestTotal == 0 {
-		return 0, protectedTotal, anomalies, nil
+		return 0, archived, protectedTotal, anomalies, nil
 	}
 
 	if dryRun {
-		return digestTotal, protectedTotal, anomalies, nil
+		return digestTotal, archived, protectedTotal, anomalies, nil
 	}
 
 	session, err := beginWriteSession(ctx, db)
 	if err != nil {
-		return 0, protectedTotal, nil, err
+		return 0, archived, protectedTotal, nil, err
 	}
 	defer session.release()
 
@@ -998,7 +1118,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
-		return 0, protectedTotal, anomalies, err
+		return 0, archived, protectedTotal, anomalies, err
 	}
 
 	if totalDeleted > 0 {
@@ -1007,7 +1127,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 				Type:    "sql_commit_failed",
 				Message: fmt.Sprintf("sql commit after purge failed, deletes rolled back: %v", err),
 			})
-			return 0, protectedTotal, anomalies, nil
+			return 0, archived, protectedTotal, anomalies, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
 		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
@@ -1019,7 +1139,150 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		}
 	}
 
-	return totalDeleted, protectedTotal, anomalies, nil
+	return totalDeleted, archived, protectedTotal, anomalies, nil
+}
+
+// wispArchiveAuxTables are the tables whose rows go with a wisp when it is
+// deleted. Identical to the purge path's list, because the retention path
+// deletes exactly what purge deletes — the difference is only that these rows
+// were written out first.
+var wispArchiveAuxTables = []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
+
+// archiveProtectedWisps exports closed, label-protected, unpinned wisps past the
+// cutoff to the archive and then deletes them.
+//
+// ORDER IS THE WHOLE SAFETY PROPERTY: every batch is written and fsynced by
+// ArchiveWisps before its DELETE is issued, and the DELETE names exactly the ids
+// that were archived. A crash, a failed write or a failed commit therefore
+// leaves rows in the database — possibly with a duplicate record already in the
+// archive — and never the other way round. Duplicates are cheap to live with
+// (each record carries its id, and the reader can fold them); a deletion with no
+// record is the thing that cost seven MR beads and one rejection rationale on
+// 2026-08-17 (gt-6dp), and it is unrecoverable because wisps are unversioned and
+// unbacked.
+//
+// The whole run shares one write session, so an error rolls back every delete
+// this call made and it reports zero released. That is why the caller can
+// subtract the returned count from the protected total and always get the truth:
+// partial success is not a state this can end in.
+func archiveProtectedWisps(ctx context.Context, db *sql.DB, dbName string, deleteCutoff time.Time, dryRun bool, archive Archiver) (int, []Anomaly, error) {
+	var anomalies []Anomaly
+	archivableWhere := archivableProtectWhere()
+
+	if dryRun {
+		var candidates int
+		countQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + archivableWhere
+		if err := db.QueryRowContext(ctx, countQuery, deleteCutoff).Scan(&candidates); err != nil {
+			return 0, nil, fmt.Errorf("count archivable wisps: %w", err)
+		}
+		return candidates, nil, nil
+	}
+
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer session.release()
+
+	idQuery := fmt.Sprintf(
+		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s ORDER BY w.id LIMIT %d",
+		archivableWhere, DefaultBatchSize)
+
+	archivedAt := time.Now().UTC()
+	total := 0
+	for {
+		// Selected on the session's own connection: the deletes below are
+		// uncommitted, so only this session sees them gone. Any other
+		// connection would keep returning the same batch forever.
+		ids, err := queryIDs(ctx, session.conn, idQuery, deleteCutoff)
+		if err != nil {
+			return 0, anomalies, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+
+		records, err := collectArchivableWisps(ctx, session.conn, dbName, ids, archivedAt)
+		if err != nil {
+			return 0, anomalies, err
+		}
+		if len(records) != len(ids) {
+			// A row vanished between the id query and the record query, or the
+			// record query silently returned fewer rows. Either way the set to
+			// archive and the set to delete no longer match, and deleting the
+			// larger one would delete something unrecorded.
+			return 0, anomalies, fmt.Errorf("archive batch mismatch: %d ids, %d records", len(ids), len(records))
+		}
+
+		if err := archive.ArchiveWisps(records); err != nil {
+			return 0, anomalies, fmt.Errorf("write archive: %w", err)
+		}
+
+		deleted, err := deleteRowsByID(ctx, session.conn, ids, "wisps", wispArchiveAuxTables)
+		if err != nil {
+			return 0, anomalies, err
+		}
+		if deleted == 0 {
+			// The batch was non-empty and nothing was deleted, so the next
+			// iteration would select the same ids and archive them again.
+			// Stop and say so rather than spin (the same reasoning as
+			// closeWispsInBatches' no-progress guard).
+			anomalies = append(anomalies, Anomaly{
+				Type:    "wisp_archive_stalled",
+				Message: fmt.Sprintf("archive selected %d wisps in %s but deleted none; stopping", len(ids), dbName),
+				Count:   len(ids),
+			})
+			return 0, anomalies, nil
+		}
+		total += deleted
+	}
+
+	if total == 0 {
+		return 0, anomalies, nil
+	}
+
+	if err := session.commit(ctx); err != nil {
+		// release rolls the deletes back. The archive keeps the records it
+		// already wrote, so the next run re-exports and re-deletes them.
+		anomalies = append(anomalies, Anomaly{
+			Type:    "sql_commit_failed",
+			Message: fmt.Sprintf("sql commit after wisp archive failed, deletes rolled back: %v", err),
+		})
+		return 0, anomalies, nil
+	}
+
+	commitMsg := fmt.Sprintf("reaper: archive and release %d protected wisps from %s", total, dbName)
+	if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		// Non-fatal: the rows are gone from the working set and the records are
+		// in the archive. Reported for the same reason the purge path reports
+		// it — the deletion is then unversioned (gt-u5c).
+		anomalies = append(anomalies, Anomaly{
+			Type:    "dolt_commit_failed",
+			Message: fmt.Sprintf("dolt commit after wisp archive failed: %v", err),
+		})
+	}
+	return total, anomalies, nil
+}
+
+// queryIDs runs an id-selecting query and returns the ids.
+func queryIDs(ctx context.Context, runner sqlRunner, query string, args ...interface{}) ([]string, error) {
+	rows, err := runner.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read ids: %w", err)
+	}
+	return ids, nil
 }
 
 // purgeOldMail deletes closed gt:message issues past mailDeleteAge.
@@ -1252,51 +1515,72 @@ func batchDeleteRows(ctx context.Context, db sqlRunner, idQuery string, cutoffAr
 			break
 		}
 
-		placeholders := make([]string, len(ids))
-		args := make([]interface{}, len(ids))
-		for i, id := range ids {
-			placeholders[i] = "?"
-			args[i] = id
-		}
-		inClause := "(" + strings.Join(placeholders, ",") + ")"
-
-		for _, tbl := range auxTables {
-			delAux := fmt.Sprintf("DELETE FROM `%s` WHERE issue_id IN %s", tbl, inClause) //nolint:gosec // G201: tbl is internal
-			if _, err := db.ExecContext(ctx, delAux, args...); err != nil {
-				// Non-fatal: log and continue.
-			}
-		}
-
-		// Clean up typed reverse dependency references to prevent dangling parent refs.
-		var reverseDeletes []string
-		switch primaryTable {
-		case "wisps":
-			reverseDeletes = []string{
-				fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_wisp_id IN %s", inClause),
-				fmt.Sprintf("DELETE FROM dependencies WHERE depends_on_wisp_id IN %s", inClause),
-			}
-		case "issues":
-			reverseDeletes = []string{
-				fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_issue_id IN %s", inClause),
-				fmt.Sprintf("DELETE FROM dependencies WHERE depends_on_issue_id IN %s", inClause),
-			}
-		}
-		for _, delReverse := range reverseDeletes {
-			if _, err := db.ExecContext(ctx, delReverse, args...); err != nil {
-				// Non-fatal.
-			}
-		}
-
-		delPrimary := fmt.Sprintf("DELETE FROM `%s` WHERE id IN %s", primaryTable, inClause) //nolint:gosec // G201: primaryTable is internal
-		sqlResult, err := db.ExecContext(ctx, delPrimary, args...)
+		affected, err := deleteRowsByID(ctx, db, ids, primaryTable, auxTables)
 		if err != nil {
-			return totalDeleted, fmt.Errorf("delete %s batch: %w", primaryTable, err)
+			return totalDeleted, err
 		}
-		affected, _ := sqlResult.RowsAffected()
-		totalDeleted += int(affected)
+		totalDeleted += affected
 	}
 
 	return totalDeleted, nil
+}
+
+// deleteRowsByID deletes one explicit set of ids from a primary table, its
+// auxiliary tables, and any typed reverse references to it.
+//
+// Split out of batchDeleteRows so the retention path can delete the exact rows
+// it has already archived (see archiveProtectedWisps) rather than re-deriving
+// them from a query. Re-deriving is what the id-query loop does, and it is the
+// wrong shape there: the rows to delete must be precisely the rows the archive
+// accepted, not whatever the predicate matches a moment later.
+func deleteRowsByID(ctx context.Context, db sqlRunner, ids []string, primaryTable string, auxTables []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := "(" + strings.Join(placeholders, ",") + ")"
+
+	for _, tbl := range auxTables {
+		delAux := fmt.Sprintf("DELETE FROM `%s` WHERE issue_id IN %s", tbl, inClause) //nolint:gosec // G201: tbl is internal
+		if _, err := db.ExecContext(ctx, delAux, args...); err != nil {
+			// Non-fatal: log and continue.
+			_ = err
+		}
+	}
+
+	// Clean up typed reverse dependency references to prevent dangling parent refs.
+	var reverseDeletes []string
+	switch primaryTable {
+	case "wisps":
+		reverseDeletes = []string{
+			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_wisp_id IN %s", inClause),
+			fmt.Sprintf("DELETE FROM dependencies WHERE depends_on_wisp_id IN %s", inClause),
+		}
+	case "issues":
+		reverseDeletes = []string{
+			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_issue_id IN %s", inClause),
+			fmt.Sprintf("DELETE FROM dependencies WHERE depends_on_issue_id IN %s", inClause),
+		}
+	}
+	for _, delReverse := range reverseDeletes {
+		if _, err := db.ExecContext(ctx, delReverse, args...); err != nil {
+			// Non-fatal.
+			_ = err
+		}
+	}
+
+	delPrimary := fmt.Sprintf("DELETE FROM `%s` WHERE id IN %s", primaryTable, inClause) //nolint:gosec // G201: primaryTable is internal
+	sqlResult, err := db.ExecContext(ctx, delPrimary, args...)
+	if err != nil {
+		return 0, fmt.Errorf("delete %s batch: %w", primaryTable, err)
+	}
+	affected, _ := sqlResult.RowsAffected()
+	return int(affected), nil
 }
 
 // ClosePluginReceiptResult holds the results of closing plugin run receipts.

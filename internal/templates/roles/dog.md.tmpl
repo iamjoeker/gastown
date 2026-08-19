@@ -130,7 +130,13 @@ gt reaper scan --db=<name> --json                   # Count candidates
 gt reaper reap --db=<name> --json                   # Close stale wisps
 gt reaper purge --db=<name> --json                  # Delete old closed wisps + mail
 gt reaper auto-close --db=<name> --json             # Close stale issues
+gt reaper archive --grep=<id>                       # Read wisps purge archived
 ```
+
+Purge exports protected wisp types (merge requests, escalations) to a durable
+archive and only then deletes them, so `wisps_purged`, `wisps_archived` and
+`wisps_protected` partition what was in the window. A `wisps_protected` that
+climbs every run means the archive is unavailable, not that there was less to do.
 
 `gt reaper` inherits `GT_DOLT_HOST` / `GT_DOLT_PORT` from the daemon environment.
 

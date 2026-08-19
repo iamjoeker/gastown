@@ -67,6 +67,8 @@ gt reaper scan --db=<name> --port=3307 \
 Inspect the JSON output:
 - `reap_candidates`: wisps eligible for closing
 - `purge_candidates`: closed wisps eligible for deletion
+- `protected_from_purge`: closed wisps deletion is holding back by type or pin
+- `archivable_from_purge`: the subset of those a purge with an archive releases
 - `open_wisps`: total open wisp count
 - `anomalies`: array of detected problems
 
@@ -103,6 +105,23 @@ gt reaper purge --db=<name> --port=3307 \
 ```
 
 Watch for `dolt_commit_failed` anomalies — purged data may not persist.
+Watch for `wisp_archive_failed` / `wisp_archive_stalled` anomalies — protected
+wisps were NOT released and are still accumulating.
+
+`wisps_purged`, `wisps_archived` and `wisps_protected` partition the
+closed-past-`purge_age` window; they always add up and none absorbs another.
+
+- `wisps_purged` — ordinary wisps, deleted outright.
+- `wisps_archived` — merge-request and escalation wisps, exported to the durable
+  archive (`~/.gt/wisp-archive/`, JSON Lines) and only then deleted. This is what
+  keeps type protection from being unbounded growth (gt-6xwt). Read them back
+  with `gt reaper archive --grep=<id>`.
+- `wisps_protected` — still held back: pinned rows, or anything the archive
+  refused. Climbing run after run means the archive is unavailable — check the
+  stderr warning from `gt reaper purge`.
+
+`--no-archive` restores the old contract (protected types are never deleted).
+Never pass it to work around an archive error: the accumulation is the bill.
 
 ### Step 6: Auto-close stale issues
 
@@ -129,6 +148,8 @@ Print a summary in this format:
 **Databases scanned**: N
 **Wisps reaped**: N (stale open wisps closed)
 **Wisps purged**: N (old closed wisps deleted)
+**Wisps archived**: N (protected wisps exported to the archive, then released)
+**Wisps protected**: N (still held back — pinned, or archive unavailable)
 **Mail purged**: N (old closed mail deleted)
 **Issues auto-closed**: N (stale issues past 720h)
 **Open wisps remaining**: N
