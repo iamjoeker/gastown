@@ -34,6 +34,11 @@ type SpawnedPolecatInfo struct {
 	BaseBranch  string // Effective base branch (e.g., "main", "integration/epic-id")
 	Branch      string // Git branch name (for cleanup on rollback)
 
+	// Reused reports that this polecat came from the idle pool instead of being
+	// created by this sling. Rollback MUST honor it: a reused sandbox pre-dates
+	// the sling that failed and has to survive it (gt-2uqy).
+	Reused bool
+
 	// Internal fields for deferred session start
 	account string
 	agent   string
@@ -76,7 +81,9 @@ func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error)
 	}
 
 	for _, candidate := range polecats {
-		if candidate == nil || candidate.State != polecat.StateIdle || candidate.Issue != "" {
+		// StateDone is eligible too, and in practice is most of the pool — a
+		// StateIdle-only scan here reclaimed almost nothing (gt-2uqy).
+		if candidate == nil || !polecat.StateEligibleForPoolReuse(candidate.State) || candidate.Issue != "" {
 			continue
 		}
 		verifyErr := verifyWorktreeExists(candidate.ClonePath)
@@ -267,6 +274,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				Pane:        "",
 				BaseBranch:  effectiveBranch,
 				Branch:      polecatObj.Branch,
+				Reused:      true,
 				account:     opts.Account,
 				agent:       opts.Agent,
 			}, nil
