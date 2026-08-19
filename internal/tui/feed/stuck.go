@@ -225,15 +225,6 @@ func (d *StuckDetector) analyzeAgent(id string, issue *beads.Issue) *ProblemAgen
 	// On error, treat session as alive (unknown) rather than falsely flagging as zombie
 	alive, err := d.source.IsSessionAlive(sessionName)
 	if err == nil && !alive {
-		// An agent bead marked "nuked" belongs to an agent that was removed on
-		// purpose: its session is supposed to be gone, and "may need restart" is
-		// the wrong advice. Removal closes the bead, which drops it from
-		// ListAgentBeads entirely — this is the fallback for when that
-		// best-effort close did not land, so a cleanup cannot leave a permanent
-		// tombstone in the problems pane (gt-qvx7).
-		if isNukedAgent(issue) {
-			return nil
-		}
 		agent.State = StateZombie
 		agent.ActionHint = "Session dead - may need restart"
 		return agent
@@ -277,16 +268,6 @@ func (d *StuckDetector) analyzeAgent(id string, issue *beads.Issue) *ProblemAgen
 // IsGUPPViolation checks if an agent is in GUPP violation.
 func IsGUPPViolation(hasHookedWork bool, minutesSinceProgress int) bool {
 	return hasHookedWork && minutesSinceProgress >= GUPPViolationMinutes
-}
-
-// isNukedAgent reports whether an agent bead has been marked as removed.
-// Removal paths set agent_state="nuked" before touching the filesystem, so this
-// is true for an agent whose worktree and session are gone by design.
-func isNukedAgent(issue *beads.Issue) bool {
-	if issue == nil {
-		return false
-	}
-	return beads.ResolveAgentState(issue.Description, issue.AgentState) == string(beads.AgentStateNuked)
 }
 
 // isRalphMode checks if an agent bead is in Ralph Wiggum loop mode.

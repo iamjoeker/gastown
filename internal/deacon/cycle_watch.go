@@ -23,37 +23,17 @@ const (
 	// must move forward while the cycle counter stays frozen before the Deacon
 	// is called wedged.
 	//
-	// WARNING — this signal does not occur in production. It was derived from a
-	// field report that has since been REFUTED (gt-s6r), and the verdict built
-	// on it cannot fire. Do not extend this detector without reading that bead.
-	//
-	// The premise was that a wedge shows a signature nothing else shows:
+	// This is the only signal that separates a wedge from legitimate sleep, and
+	// it is why the wedged verdict does not need — and must not use — a
+	// duration threshold:
 	//
 	//	healthy patrolling  timestamp advances, cycle advances
 	//	await-signal sleep  neither advances
 	//	dead session        neither advances
-	//	WEDGED              timestamp advances, cycle does NOT   <- WRONG
+	//	WEDGED              timestamp advances, cycle does NOT
 	//
-	// The last row came from two Mayor polls of a wedged hq-deacon that read
-	// 3m25s and then 4m10s old at a frozen cycle 421, believed to be "4 minutes
-	// apart". The Mayor's own transcript puts them 45.06s apart, and the ages
-	// differ by exactly 45s: the heartbeat was frozen too. Twelve polls of that
-	// cycle by four sessions all reconstruct the same single write. A sweep of
-	// 1182 polls across 161 sessions found no same-cycle timestamp advance,
-	// against a control that fires on 100% of cycle-advancing pairs.
-	//
-	// A real wedge is "neither advances" — indistinguishable, by this signal,
-	// from sleep and from death. Every production writer (Touch,
-	// TouchWithAction) sets Timestamp and Cycle in the same write, so
-	// NextObservation resets its window on each one and TimestampAdvances can
-	// never leave 0. The one path to a nonzero count is a lost update between
-	// concurrent writers, which would be a false positive on a healthy Deacon.
-	//
-	// heartbeat.LastAction is the field that does separate the two: the Deacon
-	// writes "pre-await checkpoint" immediately before parking in await-signal,
-	// so a frozen heartbeat resting on any other action stopped mid-patrol.
-	// EvaluateHealth does not use it yet.
-	//
+	// Only the wedge moves one without the other, so requiring this signal
+	// cannot condemn a sleeping or dead Deacon no matter how long it sits.
 	// Two confirmations rather than one, so a single interleaved read between
 	// a heartbeat write and its cycle increment cannot trip it.
 	CycleWedgeAdvanceConfirmations = 2
@@ -77,11 +57,6 @@ const (
 
 	// VerdictWedged means the session is alive and writing heartbeats but the
 	// wake-cycle counter is not advancing — the Deacon is frozen mid-patrol.
-	//
-	// Unreachable in production as written: it requires WedgeConfirmed, whose
-	// signal the coupled heartbeat writer cannot produce. See
-	// CycleWedgeAdvanceConfirmations for why, gt-s6r for the measurement, and
-	// gt-dndw for the rebuild.
 	VerdictWedged Verdict = "wedged"
 )
 
@@ -109,10 +84,8 @@ type CycleObservation struct {
 	HeartbeatTimestamp time.Time `json:"heartbeat_timestamp"`
 
 	// TimestampAdvances counts how many times the heartbeat timestamp moved
-	// forward while Cycle stayed frozen. Intended to mean the Deacon is writing
-	// heartbeats without completing wake cycles — but the writer couples the two
-	// fields, so in practice this stays 0 forever. See
-	// CycleWedgeAdvanceConfirmations.
+	// forward while Cycle stayed frozen. Non-zero means the Deacon is writing
+	// heartbeats without completing wake cycles.
 	TimestampAdvances int `json:"timestamp_advances"`
 }
 
@@ -177,10 +150,8 @@ func NextObservation(prev *CycleObservation, hb *Heartbeat, now time.Time) *Cycl
 	next := *prev
 	next.LastSeen = now
 
-	// The heartbeat timestamp moving forward under a frozen cycle was believed
-	// to be the signature of a wedge — count it. No production writer can
-	// produce it, so this branch is dead in the town; see
-	// CycleWedgeAdvanceConfirmations.
+	// The heartbeat timestamp moving forward under a frozen cycle is the
+	// signature of a wedge — count it.
 	if hb.Timestamp.After(prev.HeartbeatTimestamp) {
 		next.TimestampAdvances++
 		next.HeartbeatTimestamp = hb.Timestamp
@@ -230,11 +201,9 @@ func (o *CycleObservation) CycleFrozen(now time.Time, stallThreshold time.Durati
 // WedgeConfirmed reports whether the heartbeat timestamp has advanced under a
 // frozen cycle often enough to conclude the Deacon is wedged.
 //
-// This is the verdict signal, and it always returns false against the current
-// writer — the advance it counts does not happen, so this detects nothing. The
-// live town has recorded 0 advances in the ~7650 cycles since it shipped. See
-// CycleWedgeAdvanceConfirmations for the refuted premise and gt-s6r for the
-// measurement.
+// This is the verdict signal. It is deliberately time-independent: see
+// CycleWedgeAdvanceConfirmations for why elapsed time cannot distinguish a
+// wedge from legitimate sleep but this can.
 func (o *CycleObservation) WedgeConfirmed() bool {
 	return o != nil && o.TimestampAdvances >= CycleWedgeAdvanceConfirmations
 }
@@ -256,20 +225,13 @@ func DefaultHealthThresholds() HealthThresholds {
 	}
 }
 
-// EvaluateHealth returns the health verdict for a Deacon. It consults wake-cycle
-// advancement first and heartbeat age second — but only the second one decides
-// anything today.
+// EvaluateHealth returns the health verdict for a Deacon, deriving it from
+// wake-cycle ADVANCEMENT first and heartbeat age second.
 //
-// The wedge branch does not fire. It was built on a report that a Deacon frozen
-// mid-patrol keeps writing heartbeats and so reads "fresh" while completing no
-// cycles; the measurement in gt-s6r refutes that — the wedged Deacon's
-// heartbeat was frozen as well, and aged past the stale threshold like any
-// other stopped writer. What made gt-bvo's wedge look "fresh" was that the
-// Mayor happened to poll 3m25s and 4m10s in, both inside the 5m window.
-//
-// So in practice this function is the age verdict. The wedge branch is retained
-// because the state it names is real and still undetected, not because this
-// test detects it. Rebuilding it on heartbeat.LastAction is gt-dndw.
+// Age alone cannot distinguish a working Deacon from a wedged one: a Deacon
+// frozen mid-patrol with unsubmitted input in its composer keeps writing
+// heartbeats, so it reads as "fresh" while completing no cycles. That is the
+// case this function exists to catch, and it outranks the age verdict.
 //
 // The wedge test requires a young heartbeat as well as a confirmed wedge
 // signature. Those two conditions together mean the Deacon is demonstrably
