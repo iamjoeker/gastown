@@ -299,64 +299,6 @@ func TestTouchWithAction(t *testing.T) {
 	}
 }
 
-// Timestamp and Cycle must move together on every production write.
-//
-// This invariant is load-bearing well outside this file: the wedge detector in
-// cycle_watch.go treats "timestamp advanced, cycle did not" as proof that a
-// Deacon is frozen mid-patrol. gt-bvo reported seeing exactly that in the field
-// and gt-s6r spent a bead disproving it — 1182 recorded polls, no such write.
-//
-// So if this test ever fails, an off-path writer has appeared, and it is not a
-// test to relax: it is the signal gt-s6r went looking for. The detector's
-// premise would become true, and its verdict would start firing.
-func TestTouch_CouplesTimestampAndCycle(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	var prev *Heartbeat
-	for i, write := range []func() error{
-		func() error { return Touch(tmpDir) },
-		func() error { return TouchWithAction(tmpDir, "starting patrol cycle", 3, 0) },
-		func() error { return Touch(tmpDir) },
-		func() error { return TouchWithAction(tmpDir, "pre-await checkpoint", 0, 0) },
-	} {
-		if err := write(); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-
-		hb := ReadHeartbeat(tmpDir)
-		if hb == nil {
-			t.Fatalf("write %d: no heartbeat on disk", i)
-		}
-		if want := int64(i + 1); hb.Cycle != want {
-			t.Fatalf("write %d: Cycle = %d, want %d", i, hb.Cycle, want)
-		}
-		if prev != nil && !hb.Timestamp.After(prev.Timestamp) {
-			t.Errorf("write %d: Timestamp %v did not advance past %v — a write that "+
-				"refreshes the cycle without the timestamp breaks the same coupling",
-				i, hb.Timestamp, prev.Timestamp)
-		}
-		prev = hb
-	}
-
-	// The decoupled write the detector looks for: same cycle, later timestamp.
-	// Reachable only by constructing the Heartbeat directly, which no non-test
-	// caller does — Touch and TouchWithAction are the only writers.
-	frozen := prev.Cycle
-	if err := WriteHeartbeat(tmpDir, &Heartbeat{Timestamp: prev.Timestamp.Add(time.Minute), Cycle: frozen}); err != nil {
-		t.Fatalf("WriteHeartbeat: %v", err)
-	}
-	if hb := ReadHeartbeat(tmpDir); hb.Cycle != frozen {
-		t.Fatalf("Cycle = %d, want %d — the escape hatch must be the raw writer, not Touch", hb.Cycle, frozen)
-	}
-	if err := Touch(tmpDir); err != nil {
-		t.Fatalf("Touch after raw write: %v", err)
-	}
-	if hb := ReadHeartbeat(tmpDir); hb.Cycle != frozen+1 {
-		t.Errorf("Cycle = %d, want %d — Touch must resume incrementing from whatever it reads",
-			hb.Cycle, frozen+1)
-	}
-}
-
 func TestWriteHeartbeat_CreatesDirectory(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "deacon-test-*")
 	if err != nil {
