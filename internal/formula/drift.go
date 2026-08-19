@@ -110,6 +110,12 @@ func (r *Resolved) AutoFixable() bool {
 	return r.Drift == DriftOutdated || r.Drift == DriftUntracked
 }
 
+// driftNoticeSectionLimit bounds how many missing sections the prime-time
+// notice names before falling back to a count. The notice is printed into
+// every agent's prime output, so it stays short; `gt formula drift <name>`
+// prints them all.
+const driftNoticeSectionLimit = 2
+
 // DriftNotice renders a short operator-facing warning, or "" when the executing
 // copy is not shadowing a newer default. It is deliberately terse: it is
 // printed into every agent's prime output.
@@ -123,6 +129,14 @@ func (r *Resolved) DriftNotice() string {
 	fmt.Fprintf(&b, "    %s\n", r.Path)
 	b.WriteString("    which is NOT the default shipped in this gt build. Steps below may be missing\n")
 	b.WriteString("    fixes that look landed in git.\n")
+
+	// Name what is absent, not merely that something is. "Behind" is an
+	// unbounded risk an operator has to hand-diff to size; "missing step
+	// ledger-reconcile" is a finding (gt-yubx).
+	if missing := r.MissingSections(); len(missing) > 0 {
+		fmt.Fprintf(&b, "    %s\n", SummarizeMissingSections(missing, driftNoticeSectionLimit))
+		fmt.Fprintf(&b, "    Full list: gt formula drift %s\n", r.Name)
+	}
 
 	switch r.Drift {
 	case DriftPinned:
