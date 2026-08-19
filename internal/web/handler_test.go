@@ -22,18 +22,15 @@ type MockConvoyFetcher struct {
 	MergeQueue           []MergeQueueRow
 	MergeQueueFailedRigs []string
 	Workers              []WorkerRow
-	// WorkersFailedStores names stores whose assigned-bead query failed, so the
-	// "these workers may only look idle" caveat can be driven from a test.
-	WorkersFailedStores []string
-	Mail                []MailRow
-	Rigs                []RigRow
-	Dogs                []DogRow
-	Escalations         []EscalationRow
-	EscalationsError    error
-	Health              *HealthRow
-	Queues              []QueueRow
-	Sessions            []SessionRow
-	Hooks               []HookRow
+	Mail                 []MailRow
+	Rigs                 []RigRow
+	Dogs                 []DogRow
+	Escalations          []EscalationRow
+	EscalationsError     error
+	Health               *HealthRow
+	Queues               []QueueRow
+	Sessions             []SessionRow
+	Hooks                []HookRow
 	// HooksFailedStores names stores whose hooked-bead query failed, so the
 	// handler's partial-union caveat can be driven from a test.
 	HooksFailedStores []string
@@ -53,8 +50,8 @@ func (m *MockConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 	return MergeQueueResult{Rows: m.MergeQueue, FailedRigs: m.MergeQueueFailedRigs}, nil
 }
 
-func (m *MockConvoyFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
-	return StoreResult[WorkerRow]{Rows: m.Workers, FailedStores: m.WorkersFailedStores}, nil
+func (m *MockConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
+	return m.Workers, nil
 }
 
 func (m *MockConvoyFetcher) FetchMail() ([]MailRow, error) {
@@ -1182,8 +1179,8 @@ func (m *MockConvoyFetcherWithErrors) FetchMergeQueue() (MergeQueueResult, error
 	return MergeQueueResult{}, m.MergeQueueError
 }
 
-func (m *MockConvoyFetcherWithErrors) FetchWorkers() (StoreResult[WorkerRow], error) {
-	return StoreResult[WorkerRow]{}, m.WorkersError
+func (m *MockConvoyFetcherWithErrors) FetchWorkers() ([]WorkerRow, error) {
+	return nil, m.WorkersError
 }
 
 func (m *MockConvoyFetcherWithErrors) FetchMail() ([]MailRow, error) {
@@ -1414,12 +1411,10 @@ func (m *CountingMockFetcher) FetchConvoys() ([]ConvoyRow, error) {
 func (m *CountingMockFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 	return m.inner.FetchMergeQueue()
 }
-func (m *CountingMockFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
-	return m.inner.FetchWorkers()
-}
-func (m *CountingMockFetcher) FetchMail() ([]MailRow, error) { return m.inner.FetchMail() }
-func (m *CountingMockFetcher) FetchRigs() ([]RigRow, error)  { return m.inner.FetchRigs() }
-func (m *CountingMockFetcher) FetchDogs() ([]DogRow, error)  { return m.inner.FetchDogs() }
+func (m *CountingMockFetcher) FetchWorkers() ([]WorkerRow, error) { return m.inner.FetchWorkers() }
+func (m *CountingMockFetcher) FetchMail() ([]MailRow, error)      { return m.inner.FetchMail() }
+func (m *CountingMockFetcher) FetchRigs() ([]RigRow, error)       { return m.inner.FetchRigs() }
+func (m *CountingMockFetcher) FetchDogs() ([]DogRow, error)       { return m.inner.FetchDogs() }
 func (m *CountingMockFetcher) FetchEscalations() ([]EscalationRow, error) {
 	return m.inner.FetchEscalations()
 }
@@ -1570,63 +1565,5 @@ func TestConvoyHandler_PartialStoreNotices(t *testing.T) {
 	}
 	if !strings.Contains(body, `1+</span>`) {
 		t.Error("Incomplete Hooks count should render with a '+' suffix")
-	}
-}
-
-// TestConvoyHandler_WorkersPartialNotice asserts the Polecats panel says it
-// could not read a store rather than leaving the workers it lost their issue for
-// looking idle (gt-lf1n).
-//
-// The worker COUNT stays a total here — tmux supplies the rows, and tmux
-// answered — so unlike the Work and Hooks panels this notice must not claim the
-// count is incomplete. What is incomplete is the "Working On" column.
-func TestConvoyHandler_WorkersPartialNotice(t *testing.T) {
-	mock := &MockConvoyFetcher{
-		Convoys: []ConvoyRow{},
-		Workers: []WorkerRow{
-			{Name: "nux", Rig: "gastown", WorkStatus: "idle", AgentType: "polecat"},
-		},
-		WorkersFailedStores: []string{"gastown"},
-	}
-
-	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("NewConvoyHandler() error = %v", err)
-	}
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	body := w.Body.String()
-	if want := "Assigned work partial results (unreadable: gastown)"; !strings.Contains(body, want) {
-		t.Errorf("Response should name the unreadable store: missing %q", want)
-	}
-	if !strings.Contains(body, "status may read idle for workers that are not") {
-		t.Error("Notice should say what the failure does to the panel, not just that it happened")
-	}
-}
-
-// TestConvoyHandler_WorkersCompleteHasNoNotice is the control: a readable town
-// must not carry the caveat, or the caveat stops meaning anything.
-func TestConvoyHandler_WorkersCompleteHasNoNotice(t *testing.T) {
-	mock := &MockConvoyFetcher{
-		Convoys: []ConvoyRow{},
-		Workers: []WorkerRow{
-			{Name: "nux", Rig: "gastown", IssueID: "gt-1", WorkStatus: "working", AgentType: "polecat"},
-		},
-	}
-
-	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("NewConvoyHandler() error = %v", err)
-	}
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if strings.Contains(w.Body.String(), "Assigned work partial results") {
-		t.Error("A fully readable town should render no assigned-work caveat")
 	}
 }

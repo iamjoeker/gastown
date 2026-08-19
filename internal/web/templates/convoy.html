@@ -307,9 +307,6 @@
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .WorkersWarning}}
-                    <p class="truncation-notice">⚠️ Assigned work {{.WorkersWarning}} — "Working On" may be blank and status may read idle for workers that are not</p>
-                    {{end}}
                     {{if .Workers}}
                     <table>
                         <thead>
