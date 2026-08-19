@@ -374,14 +374,28 @@ func resolveRigFromBeadIDs(beadIDs []string, townRoot string) (string, error) {
 	return resolvedRig, nil
 }
 
+// rigRepoCandidates returns the two places getRepoGitForRig will look for a
+// rig's repository: the bare mirror and the mayor's worktree. A caller that
+// has to explain why neither worked needs both candidates, not just whichever
+// one was picked. Unlike rigRepoPaths, these are the paths tried, not the
+// paths verified — one or both may not exist.
+func rigRepoCandidates(rigPath string) (bare, worktree string) {
+	return filepath.Join(rigPath, ".repo.git"), filepath.Join(rigPath, "mayor", "rig")
+}
+
 // getRepoGitForRig creates a Git client for the rig's repository.
 // It tries the bare repo first, then falls back to the mayor/rig directory.
+//
+// The fallback is unconditional: if rigPath is not a rig at all, the returned
+// client points at a directory that does not exist and every command on it
+// fails at exec. Callers that resolved rigPath from anything other than an
+// explicit name should prove it first — see ensureRigRepoUsable.
 func getRepoGitForRig(rigPath string) *git.Git {
-	bareRepoPath := filepath.Join(rigPath, ".repo.git")
+	bareRepoPath, worktreePath := rigRepoCandidates(rigPath)
 	if info, statErr := os.Stat(bareRepoPath); statErr == nil && info.IsDir() {
 		return git.NewGitWithDir(bareRepoPath, "")
 	}
-	return git.NewGit(filepath.Join(rigPath, "mayor", "rig"))
+	return git.NewGit(worktreePath)
 }
 
 // deletePolecatBranch deletes a local git branch for a polecat.
