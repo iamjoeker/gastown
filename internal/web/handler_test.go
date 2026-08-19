@@ -26,6 +26,7 @@ type MockConvoyFetcher struct {
 	Rigs                 []RigRow
 	Dogs                 []DogRow
 	Escalations          []EscalationRow
+	EscalationsError     error
 	Health               *HealthRow
 	Queues               []QueueRow
 	Sessions             []SessionRow
@@ -61,7 +62,7 @@ func (m *MockConvoyFetcher) FetchDogs() ([]DogRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
-	return m.Escalations, nil
+	return m.Escalations, m.EscalationsError
 }
 
 func (m *MockConvoyFetcher) FetchHealth() (*HealthRow, error) {
@@ -384,6 +385,73 @@ func TestConvoyHandler_MergeQueueFailedRigNotice(t *testing.T) {
 	// The count must read as a floor, not a total.
 	if !strings.Contains(body, `<span class="count">2+</span>`) {
 		t.Error("Incomplete count should render with a '+' suffix")
+	}
+}
+
+// TestConvoyHandler_EscalationsUnavailableNotice asserts an unreadable
+// escalation panel renders as unreadable — not as a calm, empty town (gt-edty).
+func TestConvoyHandler_EscalationsUnavailableNotice(t *testing.T) {
+	mock := &MockConvoyFetcher{
+		Convoys:          []ConvoyRow{},
+		EscalationsError: errors.New("listing escalations: connection refused"),
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "Escalations unavailable") {
+		t.Error("Panel should say escalations are unavailable")
+	}
+	if !strings.Contains(body, "connection refused") {
+		t.Error("Notice should name the reason the query failed")
+	}
+	if strings.Contains(body, "<p>No escalations</p>") {
+		t.Error("An unreadable panel must not render the empty state")
+	}
+	// The count must not read as a confident zero.
+	if !strings.Contains(body, `<span class="count count-alert">?</span>`) {
+		t.Error("Unknown escalation count should render as '?', not a number")
+	}
+	// The banner is the part an operator reads at a glance.
+	if strings.Contains(body, "All clear") {
+		t.Error("A dashboard that cannot see escalations is not 'All clear'")
+	}
+	if !strings.Contains(body, "escalations unreadable") {
+		t.Error("Summary alerts should flag the unreadable escalation panel")
+	}
+}
+
+// TestConvoyHandler_NoEscalationsRendersEmptyState is the control for
+// TestConvoyHandler_EscalationsUnavailableNotice: when the query SUCCEEDS and
+// finds nothing, zero still means zero and the town is still all clear.
+func TestConvoyHandler_NoEscalationsRendersEmptyState(t *testing.T) {
+	mock := &MockConvoyFetcher{Convoys: []ConvoyRow{}}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "<p>No escalations</p>") {
+		t.Error("A successful empty query should render the empty state")
+	}
+	if strings.Contains(body, "Escalations unavailable") {
+		t.Error("A successful query must not render the unavailable notice")
+	}
+	if !strings.Contains(body, "All clear") {
+		t.Error("A quiet, readable town should still render 'All clear'")
 	}
 }
 
