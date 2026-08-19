@@ -3,15 +3,14 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/formula"
 )
 
 const (
@@ -25,7 +24,31 @@ const (
 	// failure back into a clean close instead of a permanent orphan.
 	dogCloseMaxAttempts = 3
 	dogCloseRetryDelay  = 500 * time.Millisecond
+
+	// dogClosePassLimit bounds the repeated close passes in closeRemainingSteps.
+	// A pass that closes nothing ends the loop, so this only guards against a
+	// close that reports success without changing the child's status — which
+	// would otherwise spin forever. Molecules have far fewer steps than this.
+	dogClosePassLimit = 64
 )
+
+// isBlockedCloseErr reports whether a `bd close` failure is bd refusing to close
+// an issue that still has an open blocker ("cannot close blocked issue: X is
+// blocked by [Y]"). That refusal is deterministic — it is the dependency guard
+// doing its job, not a transient Dolt error — so retrying the same close cannot
+// help. The blocker has to close first.
+func isBlockedCloseErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "cannot close blocked issue")
+}
+
+// isOpenStatus reports whether a child wisp status still needs closing.
+func isOpenStatus(status string) bool {
+	switch status {
+	case "open", "hooked", "in_progress":
+		return true
+	}
+	return false
+}
 
 // closeWisp runs `bd close <id>` (plus any extra args) with bounded retries so a
 // transient Dolt error does not leave the wisp open. Returns the final error if
@@ -36,6 +59,9 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 	for attempt := 1; attempt <= dogCloseMaxAttempts; attempt++ {
 		if _, err = dm.runBd(args...); err == nil {
 			return nil
+		}
+		if isBlockedCloseErr(err) {
+			return err // Deterministic: the blocker must close first.
 		}
 		if attempt < dogCloseMaxAttempts {
 			time.Sleep(time.Duration(attempt) * dogCloseRetryDelay)
@@ -48,11 +74,20 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 // Graceful degradation: if bd fails, the dog still does its work — molecule
 // tracking is observability, not control flow.
 type dogMol struct {
-	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
-	stepIDs  map[string]string // step slug -> wisp issue ID
+	rootID  string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
+	stepIDs map[string]string // step slug -> wisp issue ID
+	// childIDs is every child wisp discovered under rootID, including the ones
+	// discoverSteps could not map to a known slug. stepIDs drives lifecycle
+	// calls and so only holds recognized steps; wisp_type has to reach the
+	// unrecognized rows too, or a formula gaining a step nobody taught
+	// discoverSteps about would quietly go back to landing unclassified.
+	childIDs []string
 	bdPath   string
 	townRoot string
 	logger   interface{ Printf(string, ...interface{}) }
+
+	// runBdFn substitutes for the bd subprocess in tests. Nil in production.
+	runBdFn func(args ...string) (string, error)
 }
 
 // pourDogMolecule creates an ephemeral wisp molecule from a formula.
@@ -89,8 +124,51 @@ func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *do
 	// Discover step IDs by listing children of the root wisp.
 	dm.discoverSteps()
 
+	dm.stampWispType(formulaName)
+
 	d.logger.Printf("dog_molecule: poured %s → %s (%d steps)", formulaName, dm.rootID, len(dm.stepIDs))
 	return dm
+}
+
+// stampWispType writes wisp_type onto the dog molecule root and every child
+// wisp under it (gt-fqd5).
+//
+// bd exposes wisp_type only on `bd create --wisp-type`, and this molecule was
+// not created that way — `bd mol wisp <formula>` takes no such flag and
+// `bd update` has none either — so an UPDATE is the only write path. Dog
+// molecules were the largest untyped population in the wisps table.
+//
+// The type comes from the formula's [vars.wisp_type] when it declares one, and
+// otherwise defaults to gc_report: every mol-dog-* formula is an operational
+// maintenance run (reap, export, backup, compact, checkpoint, doctor), which is
+// what that bucket names. The fallback is not cosmetic — formulas provisioned
+// to a town's .beads/formulas/ shadow the embedded copies, so a town whose disk
+// copy predates any declaration would otherwise keep landing unclassified
+// rows. gc_report's TTL is 24h, identical to the untyped default these already
+// got, so nothing expires sooner than it does today.
+//
+// Non-fatal: dog molecules are observability, and an unclassified wisp is the
+// pre-gt-fqd5 status quo.
+func (dm *dogMol) stampWispType(formulaName string) {
+	if dm.rootID == "" {
+		return
+	}
+
+	wispType := formula.DeclaredWispType(formulaName, dm.townRoot, "")
+	if wispType == "" {
+		wispType = beads.WispTypeGCReport
+	}
+
+	ids := append([]string{dm.rootID}, dm.childIDs...)
+	stmt, err := beads.WispTypeUpdateSQL(wispType, ids)
+	if err != nil {
+		dm.logger.Printf("dog_molecule: wisp_type %q for %s unusable (non-fatal): %v", wispType, formulaName, err)
+		return
+	}
+	if _, err := dm.runBd("sql", stmt); err != nil {
+		dm.logger.Printf("dog_molecule: set wisp_type=%s on %s +%d children failed (non-fatal): %v",
+			wispType, dm.rootID, len(dm.childIDs), err)
+	}
 }
 
 // closeStep marks a molecule step as closed.
@@ -147,40 +225,76 @@ func (dm *dogMol) close() {
 // closeRemainingSteps queries all children of the root wisp and closes any that
 // are still open. This is the backstop that prevents step wisp leaks regardless
 // of whether individual callers remembered to close each step.
+//
+// Molecule steps are chained by `blocks` edges and `bd close` correctly refuses
+// to close a blocked issue, so a single pass in whatever order bd happens to
+// return children only closes the steps that appear after their blocker — the
+// rest are stranded, and the root close is then refused for having open
+// children (gt-g1q1). The pass is therefore repeated while it makes progress:
+// each pass closes at least the chain's current head, unblocking the next link,
+// and a pass that closes nothing means nothing closable is left. This needs no
+// knowledge of the dependency graph and is bounded by the number of children.
 func (dm *dogMol) closeRemainingSteps() {
 	if dm.rootID == "" {
 		return
 	}
 
+	totalClosed := 0
+	var stillOpen []string
+	for pass := 1; pass <= dogClosePassLimit; pass++ {
+		closed, remaining, err := dm.closeOnePass()
+		if err != nil {
+			dm.logger.Printf("dog_molecule: closeRemainingSteps: %v", err)
+			return
+		}
+		totalClosed += closed
+		stillOpen = remaining
+		if closed == 0 || len(stillOpen) == 0 {
+			break
+		}
+	}
+
+	if totalClosed > 0 {
+		dm.logger.Printf("dog_molecule: closeRemainingSteps: closed %d orphan step wisp(s) under %s", totalClosed, dm.rootID)
+	}
+	if len(stillOpen) > 0 {
+		dm.logger.Printf("dog_molecule: closeRemainingSteps: %d step wisp(s) under %s still open after closing %d: %s",
+			len(stillOpen), dm.rootID, totalClosed, strings.Join(stillOpen, " "))
+	}
+}
+
+// closeOnePass lists the root's children and attempts to close each one that is
+// still open, returning how many closed and the IDs that remain open.
+//
+// A close refused because the step is still blocked is expected mid-chain — the
+// next pass retries it once its blocker is closed — so it is not logged here;
+// closeRemainingSteps reports whatever is still open once the passes stop making
+// progress. Any other close failure is logged as it happens.
+func (dm *dogMol) closeOnePass() (closed int, stillOpen []string, err error) {
 	out, err := dm.runBd("show", dm.rootID, "--children", "--json")
 	if err != nil {
-		dm.logger.Printf("dog_molecule: closeRemainingSteps: list children of %s failed: %v", dm.rootID, err)
-		return
+		return 0, nil, fmt.Errorf("list children of %s failed: %w", dm.rootID, err)
 	}
 
 	children, parseErr := parseChildrenJSON(out)
 	if parseErr != nil {
-		dm.logger.Printf("dog_molecule: closeRemainingSteps: parse children JSON for %s failed: %v", dm.rootID, parseErr)
-		return
+		return 0, nil, fmt.Errorf("parse children JSON for %s failed: %w", dm.rootID, parseErr)
 	}
 
-	closed := 0
 	for _, child := range children {
-		if child.ID == "" || child.Status == "" {
+		if child.ID == "" || child.Status == "" || !isOpenStatus(child.Status) {
 			continue
 		}
-		// Close any child that is still open/hooked/in_progress.
-		if child.Status == "open" || child.Status == "hooked" || child.Status == "in_progress" {
-			if err := dm.closeWisp(child.ID); err != nil {
-				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed after %d attempts: %v", child.ID, dogCloseMaxAttempts, err)
-			} else {
-				closed++
+		if closeErr := dm.closeWisp(child.ID); closeErr != nil {
+			stillOpen = append(stillOpen, child.ID)
+			if !isBlockedCloseErr(closeErr) {
+				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed after %d attempts: %v", child.ID, dogCloseMaxAttempts, closeErr)
 			}
+			continue
 		}
+		closed++
 	}
-	if closed > 0 {
-		dm.logger.Printf("dog_molecule: closeRemainingSteps: closed %d orphan step wisp(s) under %s", closed, dm.rootID)
-	}
+	return closed, stillOpen, nil
 }
 
 // discoverSteps lists children of the root wisp and maps step slugs to IDs.
@@ -208,7 +322,13 @@ func (dm *dogMol) discoverSteps() {
 	// Map known step slugs from each child's title. The wisp title typically starts
 	// with the step title from the formula.
 	for _, child := range children {
-		if child.ID == "" || child.Title == "" {
+		if child.ID == "" {
+			continue
+		}
+		// Recorded before the title check: a child with no title is still a row
+		// in the wisps table and still needs a wisp_type.
+		dm.childIDs = append(dm.childIDs, child.ID)
+		if child.Title == "" {
 			continue
 		}
 
@@ -254,75 +374,14 @@ func (dm *dogMol) discoverSteps() {
 	}
 }
 
-// childInfo holds fields from child wisp JSON used by discoverSteps and
-// closeRemainingSteps.
-type childInfo struct {
-	ID     string `json:"id"`
-	Title  string `json:"title"`
-	Status string `json:"status"`
-}
+// childInfo is beads.ChildInfo. The parsing lives in internal/beads so the
+// cmd-side wisp classifier decodes bd's parent-keyed children envelope with the
+// same code rather than a second, subtly wrong copy of it (gt-fqd5).
+type childInfo = beads.ChildInfo
 
 // parseChildrenJSON parses the output of `bd show <id> --children --json`.
-// bd returns a map keyed by parent ID plus envelope metadata:
-// {"hq-wisp-abc": [{...}, ...], "schema_version": 1}.
-// For legacy compatibility, a bare array is also accepted.
 func parseChildrenJSON(raw string) ([]childInfo, error) {
-	data := bytes.TrimSpace([]byte(raw))
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty children JSON")
-	}
-
-	var arr []childInfo
-	if data[0] == '[' {
-		if err := json.Unmarshal(data, &arr); err != nil {
-			return nil, err
-		}
-		return arr, nil
-	}
-
-	if data[0] != '{' {
-		return nil, fmt.Errorf("unrecognized JSON shape: %.200s", raw)
-	}
-
-	var wrapped map[string]json.RawMessage
-	if err := json.Unmarshal(data, &wrapped); err != nil {
-		return nil, err
-	}
-
-	keys := make([]string, 0, len(wrapped))
-	for key := range wrapped {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	var children []childInfo
-	sawChildArray := false
-	for _, key := range keys {
-		if key == "schema_version" {
-			continue
-		}
-
-		value := bytes.TrimSpace(wrapped[key])
-		if len(value) == 0 {
-			return nil, fmt.Errorf("empty child payload for key %q", key)
-		}
-		if value[0] != '[' {
-			return nil, fmt.Errorf("non-array child payload for key %q", key)
-		}
-
-		var group []childInfo
-		if err := json.Unmarshal(value, &group); err != nil {
-			return nil, fmt.Errorf("parse child array for key %q: %w", key, err)
-		}
-		children = append(children, group...)
-		sawChildArray = true
-	}
-
-	if !sawChildArray {
-		return nil, fmt.Errorf("children JSON object has no child arrays")
-	}
-
-	return children, nil
+	return beads.ParseChildrenJSON(raw)
 }
 
 // knownSteps returns the list of known step slugs for debugging.
@@ -336,6 +395,10 @@ func (dm *dogMol) knownSteps() []string {
 
 // runBd executes a bd command and returns stdout.
 func (dm *dogMol) runBd(args ...string) (string, error) {
+	if dm.runBdFn != nil {
+		return dm.runBdFn(args...)
+	}
+
 	bdPath := dm.bdPath
 	if bdPath == "" {
 		bdPath = "bd"
