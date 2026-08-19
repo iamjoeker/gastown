@@ -151,6 +151,3 @@ catches what a reviewer remembers to look for, a test catches the rest.
 - [Verification Sweeps](verification-sweeps.md) — the same failure shape in
   search tooling: a recursive `grep` that returns a perfect all-clear over the
   subtrees most likely to be wrong.
-- [False-Zero Queries](false-zero-queries.md) — the read-side twin: a listing
-  that names neither the store nor the scope it queried, so a wrong-store zero
-  and a real one are the same characters on screen.

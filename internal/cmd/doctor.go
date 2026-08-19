@@ -245,6 +245,7 @@ func newDoctorForCommand(rig string) *doctor.Doctor {
 	d.Register(doctor.NewCheckJSONLBloat())
 	d.Register(doctor.NewStaleBeadsRedirectCheck())
 	d.Register(doctor.NewBeadsRedirectTargetCheck())
+	d.Register(doctor.NewMovedBeadCheck())
 	d.Register(doctor.NewStaleRuntimeFilesCheck())
 	d.Register(doctor.NewBranchCheck())
 	d.Register(doctor.NewCloneDivergenceCheck())

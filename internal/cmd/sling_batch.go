@@ -33,11 +33,22 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		}
 	}
 
-	// Cross-rig guard: check all beads match the target rig before spawning (gt-myecw)
+	// Cross-rig guard: check all beads match the target rig before spawning (gt-myecw).
+	// Ownership is resolved from the live row first: a bead moved across rigs keeps
+	// the prefix of the rig that closed it, and rejecting on the prefix alone would
+	// make it undispatchable everywhere (gt-ad32).
 	if !slingForce {
 		for _, beadID := range beadIDs {
 			prefix := beads.ExtractPrefix(beadID)
 			beadRig := beads.GetRigNameForPrefix(townRoot, prefix)
+			// Only consult the stores on the path that errors today, so batches of
+			// same-rig and town-level beads pay nothing.
+			if prefix != "" && beadRig != "" && beadRig != rigName {
+				if owner, err := resolveBeadOwner(townRoot, beadID); err == nil {
+					reportMovedBead(beadID, owner)
+					beadRig = owner.Rig
+				}
+			}
 			if prefix != "" && beadRig != "" && beadRig != rigName {
 				others := make([]string, 0, len(beadIDs)-1)
 				for _, id := range beadIDs {
