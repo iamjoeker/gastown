@@ -18,10 +18,18 @@ If `--dry-run` is passed, report counts without making changes.
 |-----------|---------|-------------|
 | max_age | 24h | Wisps older than this are reaped (closed) |
 | purge_age | 72h | Closed wisps older than this are purged (deleted) |
-| stale_issue_age | 168h | Issues stale longer than this are auto-closed |
+| stale_issue_age | 720h | Issues stale longer than this are auto-closed (30d) |
 | mail_delete_age | 72h | Closed mail older than this is purged |
 | alert_threshold | 3000 | Open wisp count that triggers escalation |
 | dolt_port | 3307 | Dolt server port |
+
+`stale_issue_age` is 720h (30d) because auto-close **mutates real issues**, and 30d
+is the value every other surface publishes: the `mol-dog-reaper` formula var, the
+`gt reaper auto-close --help` default, and the daemon constant. This file said 168h
+(7d) until gt-zjb — running it closed live issues 4.3x sooner than the town's
+documented policy, silently. If that number ever needs to change, change it in
+`internal/cmd/reaper.go` (the `--stale-age` flag default) and here in the same
+commit; `TestReaperSkillStaleAgeMatchesCLIDefault` fails if they drift apart.
 
 ## Execution Steps
 
@@ -52,7 +60,7 @@ For each database returned in Step 2:
 ```bash
 gt reaper scan --db=<name> --port=3307 \
   --max-age=24h --purge-age=72h \
-  --mail-age=72h --stale-age=168h \
+  --mail-age=72h --stale-age=720h \
   --json
 ```
 
@@ -93,10 +101,14 @@ For each database with stale candidates:
 
 ```bash
 gt reaper auto-close --db=<name> --port=3307 \
-  --stale-age=168h [--dry-run] --json
+  --stale-age=720h [--dry-run] --json
 ```
 
 Auto-close NEVER touches: P0/P1 issues, epics, or issues with active dependencies.
+It also never touches beads labeled `gt:standing-orders`, `gt:keep`, `gt:role`,
+`gt:rig`, `gt:agent`, or `gt:message` (unread mail). Scan reports candidates using
+the same exclusions, so a scan count that exceeds what auto-close does is a bug,
+not an expected artifact.
 
 ### Step 7: Report
 
@@ -109,7 +121,7 @@ Print a summary in this format:
 **Wisps reaped**: N (stale open wisps closed)
 **Wisps purged**: N (old closed wisps deleted)
 **Mail purged**: N (old closed mail deleted)
-**Issues auto-closed**: N (stale issues past 168h)
+**Issues auto-closed**: N (stale issues past 720h)
 **Open wisps remaining**: N
 **Anomalies**: <list or "none">
 ```
