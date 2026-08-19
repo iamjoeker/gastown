@@ -3,12 +3,14 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/daemon"
 )
 
 // setupTestTown creates a minimal Gas Town workspace for testing.
@@ -1036,6 +1038,76 @@ func TestParseBool(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("parseBool(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetLifecycleConfigDefaultsMatchProvisioned checks the "(default)" answers
+// `gt config get` prints for an unconfigured town against the tree gt init
+// provisions. It is phrased as a comparison, not as literals, because literals
+// typed here are exactly how this function came to answer "30m" for a reaper
+// running at 1h and "500" for a compactor threshold of 2000 (gt-r4lv): the
+// numbers were a third copy, and the copy nobody was reading was the wrong one.
+func TestGetLifecycleConfigDefaultsMatchProvisioned(t *testing.T) {
+	townRoot := setupTestTownForConfig(t) // no daemon.json — default branch
+	d := daemon.DefaultLifecycleConfig().Patrols
+
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"lifecycle.reaper.interval", d.WispReaper.IntervalStr},
+		{"lifecycle.reaper.delete_age", d.WispReaper.DeleteAgeStr},
+		{"lifecycle.reaper.stale_issue_age", d.WispReaper.StaleIssueAgeStr},
+		{"lifecycle.reaper.mail_delete_age", d.WispReaper.MailDeleteAgeStr},
+		{"lifecycle.compactor.interval", d.CompactorDog.IntervalStr},
+		{"lifecycle.compactor.threshold", strconv.Itoa(d.CompactorDog.Threshold)},
+		{"lifecycle.doctor.interval", d.DoctorDog.IntervalStr},
+		{"lifecycle.backup.interval", d.JsonlGitBackup.IntervalStr},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			var err error
+			out := captureStdout(t, func() { err = getLifecycleConfig(townRoot, tc.key) })
+			if err != nil {
+				t.Fatalf("getLifecycleConfig(%q): %v", tc.key, err)
+			}
+			out = strings.TrimSpace(out)
+			if !strings.HasPrefix(out, tc.want) {
+				t.Errorf("gt config get %s printed %q, want it to start with the provisioned default %q",
+					tc.key, out, tc.want)
+			}
+			if !strings.Contains(out, "(default") {
+				t.Errorf("gt config get %s printed %q for an unconfigured town, want it marked as a default",
+					tc.key, out)
+			}
+		})
+	}
+}
+
+// TestGetMaintenanceConfigDefaultsMatchProvisioned is the same guard for the
+// maintenance.* keys, which kept their own copy of the 1000-commit threshold.
+func TestGetMaintenanceConfigDefaultsMatchProvisioned(t *testing.T) {
+	townRoot := setupTestTownForConfig(t)
+	sm := daemon.DefaultLifecycleConfig().Patrols.ScheduledMaintenance
+
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"maintenance.interval", sm.Interval},
+		{"maintenance.threshold", strconv.Itoa(*sm.Threshold)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			var err error
+			out := captureStdout(t, func() { err = getMaintenanceConfig(townRoot, tc.key) })
+			if err != nil {
+				t.Fatalf("getMaintenanceConfig(%q): %v", tc.key, err)
+			}
+			if got := strings.TrimSpace(out); got != tc.want {
+				t.Errorf("gt config get %s printed %q, want the provisioned default %q", tc.key, got, tc.want)
 			}
 		})
 	}

@@ -1253,39 +1253,6 @@ For each open MR bead:
 
 **NEVER close an MR bead without verifying the work landed or is unrecoverable.**
 
-**Step 4: Reconcile the ledger — merged work whose bead never closed**
-
-Step 3 sweeps MR beads. This sweeps the other direction: work beads whose
-merge landed while their close did not. Closing the bead is a separate step
-from landing the merge, so anything that bypasses it — a hand-landed merge, an
-unresolvable work bead, a failed `bd` write — leaves a bead that looks like
-ordinary pending work and gets re-dispatched to a polecat who finds the fix
-already in main (gt-602).
-
-```bash
-gt mq reconcile <rig>
-```
-
-It fetches first and matches only commit *subjects*, anchored on both sides —
-the `git log | grep "<id>"` idiom above cannot do either, so it both misses
-work pushed since the last fetch and reports body cross-references and
-longer-ID beads (gt-60 matching gt-602's commits) as this bead's work.
-
-For each bead under **still open with work on origin/<target>**:
-1. `bd show <id>` and read it against the listed commits.
-2. If the landed commits are the whole fix:
-   `bd close <id> --reason "Merged in <sha>"`
-3. If they are a partial fix, leave the bead open and say so in a note. A
-   commit naming a bead is evidence someone touched its subject, not proof the
-   bead is finished.
-
-For each bead under **hooked beads already have work**: a polecat is on it now.
-If the landed commit is the whole fix, nudge the witness — the polecat is
-redoing merged work. If it is a second round, leave it alone.
-
-**Do NOT bulk-close the report.** Closing a bead whose work did not land is the
-false completion the ledger exists to prevent, and it is invisible afterwards.
-
 **Goal**: Inbox should have ≤3 active messages at end of cycle.
 Keep only: pending MRs in queue."""
 

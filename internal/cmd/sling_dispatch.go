@@ -278,7 +278,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	// 4. Auto-convoy (if !NoConvoy)
 	convoyID := ""
 	rollbackSpawnedPolecat := func(rollbackBeadID, reason string) {
-		fmt.Printf("  %s %s, rolling back polecat %s...\n", style.Warning.Render("⚠"), reason, spawnInfo.PolecatName)
+		fmt.Printf("  %s %s, rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), reason, spawnInfo.PolecatName)
 		rollbackSlingArtifactsFn(spawnInfo, rollbackBeadID, hookWorkDir, convoyID)
 		restoreRollbackRawWorkflowFieldsFromCurrent(rollbackBeadID, townRoot, hookWorkDir, info)
 		if params.Force && info.Status == "pinned" {

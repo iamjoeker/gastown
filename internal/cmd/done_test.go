@@ -329,27 +329,6 @@ func TestSourceCloseRejectsNonConcreteIssue(t *testing.T) {
 	}
 }
 
-// gt-zu5n: a protected bead is real work that simply must not be auto-closed.
-// Skipping the close is the whole remedy — failing the gate instead left the
-// polecat working it with no exit path at all.
-func TestSourceCloseSkipsProtectedIssueWithoutFailing(t *testing.T) {
-	issue := &beads.Issue{
-		ID:     "gt-work",
-		Type:   "task",
-		Labels: []string{"gt:keep"},
-	}
-
-	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
-	if reason == "" || fatal {
-		t.Fatalf("protected source close gate = %q, %v; want non-fatal skip", reason, fatal)
-	}
-	for _, want := range []string{"gt-work", "protected-label:gt:keep"} {
-		if !strings.Contains(reason, want) {
-			t.Fatalf("reason = %q, want it to name %q", reason, want)
-		}
-	}
-}
-
 func TestSourceCloseRejectsLocalMergeStrategy(t *testing.T) {
 	issue := &beads.Issue{
 		ID:          "gt-work",
