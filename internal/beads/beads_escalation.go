@@ -188,16 +188,9 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 		"--labels=gt:escalation",
 	}
 
-	// Add severity as a label for easy filtering, and as the bead's priority.
-	// The label alone was all the record ever carried, so a `--severity high`
-	// escalation landed at bd's default P2 while the help text documents HIGH as
-	// P1 (gt-psh) — anything triaging or sorting by priority, which is most
-	// things, read every escalation as routine work.
+	// Add severity as a label for easy filtering
 	if fields != nil && fields.Severity != "" {
 		args = append(args, fmt.Sprintf("--labels=severity:%s", fields.Severity))
-		if priority, ok := escalationPriority(fields.Severity); ok {
-			args = append(args, fmt.Sprintf("--priority=%d", priority))
-		}
 	}
 	if fields != nil && fields.Fingerprint != "" {
 		args = append(args, "--labels="+fields.Fingerprint)
@@ -331,28 +324,14 @@ func EscalationRecordID(issue *Issue) string {
 // resolveEscalation looks up the bead named by id and the escalation record it
 // belongs to.
 //
-// named is the bead the caller asked for, and is nil when that bead is a record
-// that has already been reaped. record is the bead holding the structured
-// escalation fields, and is nil when the record has been reaped (records are
-// ephemeral wisps with a TTL, so a long-lived copy can outlive its record).
-// recordID is returned even in that case, since it still identifies the copies
-// belonging to this escalation.
+// named is always the bead the caller asked for. record is the bead holding the
+// structured escalation fields, and is nil when the record has already been
+// reaped (records are ephemeral wisps with a TTL, so a long-lived copy can
+// outlive its record). recordID is returned even in that case, since it still
+// identifies the copies belonging to this escalation.
 func (b *Beads) resolveEscalation(id string) (named, record *Issue, recordID string, err error) {
 	named, err = b.forIssueID(id).Show(id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			// The reaped-record case, and the one every reader hits: the ID
-			// printed in the escalation mail body and in the delivery bead's
-			// "To close: gt escalate close <id>" is the RECORD's, and the record
-			// is an ephemeral wisp that ages out from under it. Failing here left
-			// the documented ack and close commands returning "not found" while
-			// the durable copies stayed live in the Mayor's queue forever — the
-			// copies are still reachable by the record's own link label, so
-			// resolve against them rather than giving up (gt-psh).
-			if copies, listErr := b.openEscalationCopies(id); listErr == nil && len(copies) > 0 {
-				return nil, nil, id, nil
-			}
-		}
 		return nil, nil, "", err
 	}
 
@@ -706,7 +685,6 @@ func (b *Beads) ListStaleEscalations(threshold time.Duration) ([]*Issue, error) 
 
 	cutoff := time.Now().Add(-threshold)
 	var stale []*Issue
-	seen := make(map[string]bool)
 
 	for _, issue := range escalations {
 		// Skip acknowledged escalations
@@ -720,20 +698,9 @@ func (b *Beads) ListStaleEscalations(threshold time.Duration) ([]*Issue, error) 
 			continue // Skip if can't parse
 		}
 
-		if !createdAt.Before(cutoff) {
-			continue
+		if createdAt.Before(cutoff) {
+			stale = append(stale, issue)
 		}
-
-		// One entry per escalation, not one per bead. A record and every one of
-		// its delivered copies carry "gt:escalation", so an un-deduped list
-		// re-escalated the same escalation once per bead in a single pass —
-		// low could reach high in one run, and each bump re-mails the targets.
-		recordID := EscalationRecordID(issue)
-		if seen[recordID] {
-			continue
-		}
-		seen[recordID] = true
-		stale = append(stale, issue)
 	}
 
 	return stale, nil
@@ -754,34 +721,21 @@ type ReescalationResult struct {
 // Returns the new severity if successful, or an error.
 // reescalatedBy should be the identity of the agent/process doing the reescalation.
 // maxReescalations limits how many times an escalation can be bumped (0 = unlimited).
-//
-// Either half's ID may be passed. The bump is written to the RECORD, which is
-// where the structured severity and reescalation history live — resolving first
-// matters because `gt escalate stale` feeds this whatever bead its list turned
-// up, and running the bump against a delivered copy would rewrite that copy's
-// mail body as a structured record and re-derive severity from it.
 func (b *Beads) ReescalateEscalation(id, reescalatedBy string, maxReescalations int) (*ReescalationResult, error) {
-	_, record, recordID, err := b.resolveEscalation(id)
+	// Get the escalation
+	issue, fields, err := b.GetEscalationBead(id)
 	if err != nil {
 		return nil, err
 	}
-
-	result := &ReescalationResult{ID: recordID}
-
-	// The record holds the severity, the reescalation count and the history. A
-	// reaped one leaves nothing to bump, and the copies' severity must not be
-	// re-derived from a mail body, so report the skip rather than guessing.
-	if record == nil {
-		result.Skipped = true
-		result.SkipReason = "escalation record has been reaped; only its delivered copies remain"
-		return result, nil
+	if issue == nil {
+		return nil, fmt.Errorf("escalation not found: %s", id)
 	}
 
-	// Whichever half was named, the record is the bead this bump writes to.
-	issue := record
-	fields := ParseEscalationFields(issue.Description)
-	result.Title = issue.Title
-	result.OldSeverity = fields.Severity
+	result := &ReescalationResult{
+		ID:          id,
+		Title:       issue.Title,
+		OldSeverity: fields.Severity,
+	}
 
 	// Check if already at max reescalations
 	if maxReescalations > 0 && fields.ReescalationCount >= maxReescalations {
@@ -816,55 +770,13 @@ func (b *Beads) ReescalateEscalation(id, reescalatedBy string, maxReescalations 
 	// Format new description
 	description := FormatEscalationDescription(issue.Title, fields)
 
-	// Priority moves with severity. Bumping only the label left a re-escalated
-	// escalation sorting and filtering at the priority it was filed with, so the
-	// mechanism meant to make an ignored escalation harder to ignore changed
-	// nothing on the surfaces that order by priority (gt-psh).
-	priority, hasPriority := escalationPriority(newSeverity)
-
 	// Update the bead with new description and severity label
-	recordUpdate := UpdateOptions{
+	if err := b.forIssueID(id).Update(id, UpdateOptions{
 		Description:  &description,
 		AddLabels:    []string{"reescalated", "severity:" + newSeverity},
 		RemoveLabels: []string{"severity:" + result.OldSeverity},
-	}
-	if hasPriority {
-		recordUpdate.Priority = &priority
-	}
-	if err := b.forIssueID(issue.ID).Update(issue.ID, recordUpdate); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("updating escalation: %w", err)
-	}
-
-	// Propagate to the delivered copies. They are what `gt escalate list` and
-	// the Mayor's queue render, so a bump that wrote only the record showed the
-	// original severity everywhere anyone actually looks — the same record/copy
-	// asymmetry gt-4xl fixed for close. Labels and priority only: a copy's
-	// description is the mail body, not the structured escalation record.
-	copies, err := b.openEscalationCopies(recordID)
-	if err != nil {
-		return result, fmt.Errorf("escalation record %s re-escalated to %s, but its delivered copies could not be listed and still show %s: %w",
-			recordID, newSeverity, result.OldSeverity, err)
-	}
-
-	var failures []string
-	for _, copied := range copies {
-		if copied.ID == issue.ID {
-			continue
-		}
-		copyUpdate := UpdateOptions{
-			AddLabels:    []string{"reescalated", "severity:" + newSeverity},
-			RemoveLabels: []string{"severity:" + result.OldSeverity},
-		}
-		if hasPriority {
-			copyUpdate.Priority = &priority
-		}
-		if err := b.forIssueID(copied.ID).Update(copied.ID, copyUpdate); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", copied.ID, err))
-		}
-	}
-	if len(failures) > 0 {
-		return result, fmt.Errorf("escalation record %s re-escalated to %s, but %s and still show %s: %s",
-			recordID, newSeverity, pluralCopies(len(failures), "could not be updated"), result.OldSeverity, strings.Join(failures, "; "))
 	}
 
 	return result, nil
