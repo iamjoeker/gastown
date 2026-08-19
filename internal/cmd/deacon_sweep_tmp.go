@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -21,12 +22,17 @@ var (
 
 var deaconSweepTmpCmd = &cobra.Command{
 	Use:   "sweep-tmp",
-	Short: "Reclaim orphaned Go build work directories from TMPDIR",
-	Long: `Reclaim orphaned Go toolchain work directories from TMPDIR.
+	Short: "Reclaim orphaned build and test scratch directories from TMPDIR",
+	Long: `Reclaim orphaned build and test scratch directories from TMPDIR.
 
-The Go toolchain creates a work directory under TMPDIR for every build, test,
-and vet run and removes it on normal exit. A KILLED build — OOM killer, test
-timeout, session recycle — leaves it behind, typically 100-300 MB each.
+Two families strand directories under TMPDIR on a gastown host:
+
+  go-work     Go toolchain work directories (go-build<n>, go-link-<n>). The
+              toolchain creates one for every build, test and vet run and
+              removes it on normal exit; a KILLED run — OOM killer, test
+              timeout, session recycle — leaves it behind at 100-300 MB each.
+  beads-test  beads test fixtures (beads-test-dolt-*, beads-bd-tests-*). A
+              suite killed mid-flight leaves its Dolt data directory behind.
 
 Where TMPDIR is a RAM-backed tmpfs, this is not a cosmetic leak. On the host
 that produced gt-yb33, 34 stranded work directories held 5.35 GB of a 31 GB
@@ -41,23 +47,31 @@ code regression to whoever hits it next.
 This command removes ONLY directories that pass every check, and refuses
 whenever a check cannot be answered:
 
-  - the name is exactly a Go work directory (go-build<n>, go-link-<n>)
+  - the name is exactly a member of one of the families above
   - it is a real directory, not a symlink, owned by you
   - the whole tree is readable — an unreadable subtree refuses the candidate
   - nothing in the tree was modified within --min-age (default 1h)
-  - no running process names the path in its argv, which is how a live build
-    identifies its own work directory
+  - no running process is using it: naming it in its argv (how a live build
+    identifies its work directory), having it as its working directory, or
+    holding an open file descriptor inside it (how a live dolt sql-server
+    holds a fixture)
 
 If the process table cannot be read, NOTHING is removed however old the
 directories are. Absence of evidence is not permission to delete.
 
-The two checks cover each other: the Go driver creates its work directory
-before it spawns the first compile, so for the first seconds of a build no
-process names it yet. A removing sweep therefore refuses a --min-age under
-5m; --dry-run accepts any value because it deletes nothing.
+Liveness is read from /proc, not lsof. lsof answers through an exit status
+that is non-zero for "nothing is open", for "I could not read that", for "I am
+not installed", and — on hosts with docker nsfs mounts — for every single
+invocation including ones that DID list live handles (gt-32z). /proc has no
+status to misread.
 
-It never touches /tmp/claude-1000 agent scratchpads, test fixture directories,
-or anything else it did not positively identify as a Go work directory.
+Age and process evidence cover each other: the Go driver creates its work
+directory before it spawns the first compile, so for the first seconds of a
+build no process names it yet. A removing sweep therefore refuses a --min-age
+under 5m; --dry-run accepts any value because it deletes nothing.
+
+It never touches /tmp/claude-1000 agent scratchpads, PID files, or anything
+else it did not positively identify as a member of a known family.
 
 Examples:
   gt deacon sweep-tmp --dry-run    # report what is stranded, remove nothing
@@ -72,7 +86,7 @@ func init() {
 		"Report reclaimable directories without removing them")
 	deaconSweepTmpCmd.Flags().BoolVar(&sweepTmpJSON, "json", false, "Output as JSON")
 	deaconSweepTmpCmd.Flags().DurationVar(&sweepTmpMinAge, "min-age", tmpgc.DefaultMinAge,
-		"How long a work directory's tree must be untouched before it is eligible")
+		"How long a directory's tree must be untouched before it is eligible")
 	deaconSweepTmpCmd.Flags().StringVar(&sweepTmpDir, "dir", "",
 		"Directory to sweep (default: TMPDIR)")
 
@@ -120,7 +134,8 @@ func printTmpSweepResult(res *tmpgc.Result) {
 		}
 	}
 
-	fmt.Printf("%sGo work directories in %s: %d\n", prefix, res.Dir, len(res.Candidates))
+	fmt.Printf("%sScratch directories in %s: %d (%s)\n", prefix, res.Dir,
+		len(res.Candidates), strings.Join(res.Families, ", "))
 	for _, c := range res.Candidates {
 		switch {
 		case c.Removed:
@@ -138,6 +153,14 @@ func printTmpSweepResult(res *tmpgc.Result) {
 	if res.Inconclusive {
 		fmt.Printf("\n%s Removed nothing: liveness evidence unavailable\n",
 			style.Warning.Render("⚠"))
+	}
+	// Naming the gap is the point. A sweep that silently dropped part of its
+	// coverage would print the same clean summary as one that saw everything.
+	if res.OpaqueProcesses > 0 {
+		fmt.Printf("\n%s %d running process(es) would not publish their working directory or\n"+
+			"  open files, so only their command lines were searched. The quiet period is\n"+
+			"  what covers them.\n",
+			style.Dim.Render("note:"), res.OpaqueProcesses)
 	}
 	for _, e := range res.Errors {
 		fmt.Fprintf(os.Stderr, "  %s %s\n", style.Warning.Render("⚠"), e)
