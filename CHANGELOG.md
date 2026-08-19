@@ -131,6 +131,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so an agent's own transcript cannot mask its state. See
   `docs/concepts/turn-boundaries.md`.
 
+- **User keybindings are no longer clobbered on tmux 3.7** (gt-u7z). tmux 3.7
+  returns an empty result for the filtered form `list-keys -T <table> <key>`
+  even for keys that are demonstrably bound — on tmux 3.7b, `list-keys -T prefix`
+  lists 90 bindings, and asking for one of those same keys by name returns zero
+  lines. Every binding probe in gt went through that query, so every binding read
+  as absent: `getKeyBinding` fell back to the tmux default instead of preserving
+  the user's existing binding, `isGTBinding`, `isGTBindingWithClient` and
+  `isGTBindingCurrent` all answered false, and `ConfigureGasTownSession` therefore
+  re-bound on *every* call, silently discarding a user's own `prefix-n`,
+  `prefix-p` and `prefix-g` bindings. The failure is silent and one-directional —
+  nothing errors, the user's binding is simply gone. Binding lookup now
+  enumerates the key table and matches the key in Go (`keyBindingLine` /
+  `bindKeyLineKey`), unescaping the backslashes tmux adds to `"`, `#`, `$` and
+  `;`, so it no longer depends on the broken filtered query.
+
 ### Changed
 
 - **`gt witness status`, `gt refinery status` and `gt rig list` report turn
