@@ -145,6 +145,20 @@ jobs:
           version: v2.11.4
           args: --timeout=5m
 
+      # Nothing else in PR CI compiles the build-tagged test files outside
+      # ./internal/cmd, so a tagged suite can rot to non-compiling with every
+      # gate green — internal/doltserver's integration tests did exactly that
+      # (gt-pp8o). vet is cheap and needs no Dolt, Docker or bd.
+      - name: Vet build-tagged tests
+        run: |
+          status=0
+          for tags in integration e2e browser 'integration scheduler_integration'; do
+            echo "::group::go vet -tags='$tags' ./..."
+            go vet -tags="$tags" ./... || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
