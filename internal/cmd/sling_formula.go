@@ -352,9 +352,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 		if resolved.NewPolecatInfo == nil {
 			return
 		}
-		// "spawned" is not assumed here: the polecat may have been reused from the
-		// pool, and cleanupSpawnedPolecat reports which rollback it actually did.
-		fmt.Printf("%s Rolling back polecat %s...\n", style.Warning.Render("⚠"), resolved.NewPolecatInfo.PolecatName)
+		fmt.Printf("%s Rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), resolved.NewPolecatInfo.PolecatName)
 		rollbackSlingArtifactsFn(resolved.NewPolecatInfo, beadID, formulaWorkDir, "")
 	}
 
