@@ -771,7 +771,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	isSelfSling := resolved.IsSelfSling
 	rollbackSpawnedPolecat := func(reason string) {
 		if newPolecatInfo != nil {
-			fmt.Printf("%s %s, rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), reason, newPolecatInfo.PolecatName)
+			fmt.Printf("%s %s, rolling back polecat %s...\n", style.Warning.Render("⚠"), reason, newPolecatInfo.PolecatName)
 			rollbackSlingArtifactsFn(newPolecatInfo, beadID, hookWorkDir, "")
 		}
 		restoreRollbackRawWorkflowFieldsFromCurrent(beadID, townRoot, hookWorkDir, info)
