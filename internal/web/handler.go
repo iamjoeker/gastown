@@ -196,17 +196,14 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		rigs        []RigRow
 		dogs        []DogRow
 		escalations []EscalationRow
-		// escalationsErr is rendered, not just logged: an unreadable escalation
-		// panel must not look like an empty one (gt-edty).
-		escalationsErr error
-		health         *HealthRow
-		queues         []QueueRow
-		sessions       []SessionRow
-		hooks          []HookRow
-		mayor          *MayorStatus
-		issues         []IssueRow
-		activity       []ActivityRow
-		wg             sync.WaitGroup
+		health      *HealthRow
+		queues      []QueueRow
+		sessions    []SessionRow
+		hooks       []HookRow
+		mayor       *MayorStatus
+		issues      []IssueRow
+		activity    []ActivityRow
+		wg          sync.WaitGroup
 	)
 
 	// Run all fetches in parallel with error logging
@@ -262,9 +259,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		escalations, escalationsErr = h.fetcher.FetchEscalations()
-		if escalationsErr != nil {
-			log.Printf("dashboard: FetchEscalations failed: %v", escalationsErr)
+		var err error
+		escalations, err = h.fetcher.FetchEscalations()
+		if err != nil {
+			log.Printf("dashboard: FetchEscalations failed: %v", err)
 		}
 	}()
 	go func() {
@@ -342,7 +340,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}
 
 	// Compute summary from already-fetched data
-	summary := computeSummary(workers, hooks, issues, convoys, escalations, escalationsErr, activity)
+	summary := computeSummary(workers, hooks, issues, convoys, escalations, activity)
 
 	data := ConvoyData{
 		Convoys:              convoys,
@@ -353,19 +351,16 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		Rigs:                 rigs,
 		Dogs:                 dogs,
 		Escalations:          escalations,
-		// A failed escalation query is reported, never rendered as an empty
-		// panel: zero must mean zero, and unknown must look different.
-		EscalationsUnavailable: escalationErrorMessage(escalationsErr),
-		Health:                 health,
-		Queues:                 queues,
-		Sessions:               sessions,
-		Hooks:                  hooks,
-		Mayor:                  mayor,
-		Issues:                 enrichIssuesWithAssignees(issues, hooks),
-		Activity:               activity,
-		Summary:                summary,
-		Expand:                 expandPanel,
-		CSRFToken:              h.csrfToken,
+		Health:               health,
+		Queues:               queues,
+		Sessions:             sessions,
+		Hooks:                hooks,
+		Mayor:                mayor,
+		Issues:               enrichIssuesWithAssignees(issues, hooks),
+		Activity:             activity,
+		Summary:              summary,
+		Expand:               expandPanel,
+		CSRFToken:            h.csrfToken,
 	}
 
 	var buf bytes.Buffer
@@ -378,21 +373,15 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 }
 
 // computeSummary calculates dashboard stats and alerts from fetched data.
-//
-// escalationsErr is taken alongside the rows because len(nil) is 0 whether the
-// town is quiet or the query failed, and the summary is where that difference
-// decides between "✓ All clear" and an alert (gt-edty).
 func computeSummary(workers []WorkerRow, hooks []HookRow, issues []IssueRow,
-	convoys []ConvoyRow, escalations []EscalationRow, escalationsErr error,
-	activity []ActivityRow) *DashboardSummary {
+	convoys []ConvoyRow, escalations []EscalationRow, activity []ActivityRow) *DashboardSummary {
 
 	summary := &DashboardSummary{
-		PolecatCount:           len(workers),
-		HookCount:              len(hooks),
-		IssueCount:             len(issues),
-		ConvoyCount:            len(convoys),
-		EscalationCount:        len(escalations),
-		EscalationsUnavailable: escalationsErr != nil,
+		PolecatCount:    len(workers),
+		HookCount:       len(hooks),
+		IssueCount:      len(issues),
+		ConvoyCount:     len(convoys),
+		EscalationCount: len(escalations),
 	}
 
 	// Count stuck workers (status = "stuck")
@@ -430,28 +419,14 @@ func computeSummary(workers []WorkerRow, hooks []HookRow, issues []IssueRow,
 		}
 	}
 
-	// Set HasAlerts flag. Not being able to read escalations is itself an
-	// alert — otherwise the banner reads "All clear" precisely when the
-	// dashboard has lost sight of the panel that reports trouble.
-	summary.HasAlerts = summary.EscalationsUnavailable ||
-		summary.StuckPolecats > 0 ||
+	// Set HasAlerts flag
+	summary.HasAlerts = summary.StuckPolecats > 0 ||
 		summary.StaleHooks > 0 ||
 		summary.UnackedEscalations > 0 ||
 		summary.DeadSessions > 0 ||
 		summary.HighPriorityIssues > 0
 
 	return summary
-}
-
-// escalationErrorMessage renders a failed escalation query for display, or ""
-// when the query succeeded. The reason is shown rather than a bare "failed"
-// because the operator's next move differs by cause — bd timing out points at
-// Dolt, a parse failure points at bd itself.
-func escalationErrorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
 
 // enrichIssuesWithAssignees adds Assignee info to issues by cross-referencing hooks.

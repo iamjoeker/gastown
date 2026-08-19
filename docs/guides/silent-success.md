@@ -61,48 +61,9 @@ found only because an unrelated investigation happened to count the population:
    the exit status deliberately — do not let "we chose to skip" and "we did it"
    share a code by accident.
 
-## The read-path variant: zero vs unknown (gt-edty)
-
-The same shape appears on reads, where the lie is a value rather than an exit
-status: a query that fails returns an empty result, and "I could not look" is
-served as "there is nothing there".
-
-```go
-// Before (internal/web/fetcher.go): FetchEscalations
-stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", ...)
-if err != nil {
-    return nil, nil // No escalations or bd not available
-}
-```
-
-The comment states the bug — those are two different facts sharing one return
-value. A Dolt outage, a `bd` crash, a timeout, and a genuinely quiet town all
-rendered as the same empty Escalation panel with no error indicator.
-
-**It is worst on exactly the panels that matter most.** The escalation panel
-exists to surface trouble, and bd is most likely to be failing when the town is
-in trouble — so the sicker the town, the calmer the dashboard looked.
-
-Two rules for read paths:
-
-4. **Zero must mean zero; unknown must look different from zero.** A failed
-   query returns an error, and the display renders an explicit unavailable
-   state — a `?` rather than a `0`, and never the "nothing here" empty state.
-
-5. **A partial answer must name what is missing.** Where a hard failure is worse
-   than a short answer (a union over several stores), carry the failed sources
-   BY NAME and render them, as `MergeQueueResult.FailedRigs` and
-   `StoreResult.FailedStores` do. A count that is a floor must not be displayed
-   as a total.
-
-Aggregates inherit the defect: a summary that counts an unreadable panel as 0
-will happily report "✓ All clear". Not being able to see is itself an alert.
-
 ## Reviewer checklist
 
 - Does any success path return `nil` without having confirmed the effect?
-- On a read path: can a failed query and an empty result return the same value?
-  (`return nil, nil` on an error branch is the signature of this bug.)
 - Does any helper that mutates state return no error at all? (`func(x) `, not
   `func(x) error`)
 - Is there an `_ =` or a bare call discarding an error on a mutation path?

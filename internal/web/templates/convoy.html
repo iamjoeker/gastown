@@ -85,16 +85,12 @@
                     <span class="stat-label">🚚 Convoys</span>
                 </div>
                 <div class="stat">
-                    <!-- "?" not "0": an unreadable count is not a count of zero. -->
-                    <span class="stat-value">{{if .Summary.EscalationsUnavailable}}?{{else}}{{.Summary.EscalationCount}}{{end}}</span>
+                    <span class="stat-value">{{.Summary.EscalationCount}}</span>
                     <span class="stat-label">⚠️ Escalations</span>
                 </div>
             </div>
             {{if .Summary.HasAlerts}}
             <div class="summary-alerts">
-                {{if .Summary.EscalationsUnavailable}}
-                <span class="alert-item alert-red">🚨 escalations unreadable</span>
-                {{end}}
                 {{if .Summary.StuckPolecats}}
                 <span class="alert-item alert-red">💀 {{.Summary.StuckPolecats}} stuck</span>
                 {{end}}
@@ -681,19 +677,12 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🚨 Escalations</h2>
-                    <span class="count{{if or .Escalations .EscalationsUnavailable}} count-alert{{end}}">{{if .EscalationsUnavailable}}?{{else}}{{len .Escalations}}{{end}}</span>
+                    <span class="count{{if .Escalations}} count-alert{{end}}">{{len .Escalations}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .EscalationsUnavailable}}
-                    <!-- Unreadable, not empty: the query failed, so there are no
-                         rows to show and no count to claim. -->
-                    <div class="empty-state">
-                        <p class="truncation-notice">⚠️ Escalations unavailable: {{.EscalationsUnavailable}}</p>
-                        <p>This is NOT "no escalations" — the dashboard could not read them.</p>
-                    </div>
-                    {{else if .Escalations}}
+                    {{if .Escalations}}
                     <table>
                         <thead>
                             <tr>
