@@ -386,6 +386,18 @@ var validNudgePriorities = map[string]bool{
 }
 
 func runNudge(cmd *cobra.Command, args []string) (retErr error) {
+	// Everything below this line is a runtime failure, not a usage error: the
+	// target is dead, the workspace is missing, tmux refused the keystrokes.
+	// Cobra prints its ~20-line usage block for any error returned from RunE,
+	// which buries an accurate diagnosis on line 1 and tells a reader whose
+	// caller uses a tail idiom that they typed the command wrong. Two careful
+	// operators lost a night to exactly that (gt-5h2).
+	//
+	// Set here rather than on nudgeCmd itself: flag parsing and Args validation
+	// both run before RunE, so malformed invocations — the case usage output is
+	// actually for — still get the usage block.
+	cmd.SilenceUsage = true
+
 	defer func() {
 		target := ""
 		if len(args) > 0 {
