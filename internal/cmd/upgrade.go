@@ -436,6 +436,15 @@ func upgradeFormulas(townRoot string) upgradeResult {
 	result.changed = updated + reinstalled
 	result.skipped = skipped
 
+	// A rebuild is exactly when "the fix I just shipped is not live" matters
+	// most, and UpdateFormulas reports those files only as "skipped (modified)".
+	// Name the ones that are shadowing a NEWER default (gt-0wm7).
+	if report, herr := formula.CheckFormulaHealth(townRoot); herr == nil && report.ModifiedDrift > 0 {
+		fmt.Printf("     %s %d formula(s) are pinned to a local edit and shadow a newer shipped default\n",
+			style.WarningPrefix, report.ModifiedDrift)
+		fmt.Printf("       %s\n", style.Dim.Render("gt formula drift   # list them and reconcile"))
+	}
+
 	if result.changed == 0 && result.skipped == 0 {
 		// Check total count for display
 		report, _ := formula.CheckFormulaHealth(townRoot)
