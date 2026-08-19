@@ -21,12 +21,13 @@ import (
 )
 
 var (
-	patrolBranchesJSON    bool
-	patrolBranchesAll     bool
-	patrolBranchesRig     string
-	patrolBranchesTarget  string
-	patrolBranchesRemote  string
-	patrolBranchesNoFetch bool
+	patrolBranchesJSON      bool
+	patrolBranchesAll       bool
+	patrolBranchesDeletable bool
+	patrolBranchesRig       string
+	patrolBranchesTarget    string
+	patrolBranchesRemote    string
+	patrolBranchesNoFetch   bool
 )
 
 var patrolBranchesCmd = &cobra.Command{
@@ -57,14 +58,25 @@ Each branch is classified:
 
 Only check and unknown are the short list. The rest are shown with --all.
 
+A landed branch is two situations under one name, and --deletable separates
+them. Branch hygiene deletes a remote branch only when it is an ANCESTOR of the
+target; this sweep also proves containment by an empty merge and by patch
+identity. A branch rebased before landing is contained but is not an ancestor,
+so hygiene will not collect it and the short list will not raise it — it is
+reported as landed on every future sweep, forever. Those rows carry the
+strongest evidence of redundancy in the listing (patch-id EQUALITY, the
+reliable direction) and are marked landed* in the table.
+
 This command WRITES NOTHING: it files no beads, reopens no issues and deletes
 no branches. It cannot tell a prematurely closed bead from a correctly closed
 one whose branch is redundant — that needs a rehearsal merge and a human — so
-it reports branches to CHECK and never claims work was lost.
+it reports branches to CHECK and never claims work was lost. --deletable is a
+listing too: these are shared remote refs, so it prints the commands and stops.
 
 Examples:
   gt patrol branches                    # short list for the current rig
   gt patrol branches --all              # every polecat branch, classified
+  gt patrol branches --deletable        # landed branches hygiene cannot reach
   gt patrol branches --json             # machine-readable
   gt patrol branches --rig gastown --target main`,
 	RunE: runPatrolBranches,
@@ -73,6 +85,7 @@ Examples:
 func init() {
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesJSON, "json", false, "Output as JSON")
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesAll, "all", false, "Show every branch, including landed, queued and active ones")
+	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesDeletable, "deletable", false, "List only landed branches that are NOT ancestors of the target — contained, but out of branch hygiene's reach (lists them; deletes nothing)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRig, "rig", "", "Rig to sweep (default: GT_RIG, else inferred from cwd, else the only registered rig)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesTarget, "target", "", "Target branch to compare against (default: the rig's default branch)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRemote, "remote", "origin", "Remote to sweep (branches are listed from its PUSH url)")
@@ -87,6 +100,11 @@ type PatrolBranchesOutput struct {
 	Timestamp string `json:"timestamp"`
 	*witness.BranchSweepResult
 	Attention int `json:"attention"`
+	// HygieneUnreachable is the size of the --deletable list: landed branches
+	// that are not ancestors of the target, which nothing collects. It is a
+	// separate total from Attention because it asks for a deletion rather than
+	// for a decision.
+	HygieneUnreachable int `json:"hygiene_unreachable"`
 }
 
 func runPatrolBranches(cmd *cobra.Command, args []string) error {
@@ -140,8 +158,14 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 	}
 	result.Errors = append(result.Errors, warnings...)
 
+	// JSON is not filtered by either mode: it carries every branch with
+	// hygiene_unreachable on each row, so a consumer selects for itself rather
+	// than having to re-run the sweep with a different flag.
 	if patrolBranchesJSON {
 		return writePatrolBranchesJSON(cmd.OutOrStdout(), rigName, result)
+	}
+	if patrolBranchesDeletable {
+		return writePatrolBranchesDeletable(cmd.OutOrStdout(), rigName, result)
 	}
 	return writePatrolBranchesHuman(cmd.OutOrStdout(), rigName, result, patrolBranchesAll)
 }
@@ -343,20 +367,24 @@ func slicesContains(haystack []string, needle string) bool {
 
 func writePatrolBranchesJSON(w io.Writer, rigName string, result *witness.BranchSweepResult) error {
 	out := PatrolBranchesOutput{
-		Rig:               rigName,
-		Timestamp:         time.Now().UTC().Format(time.RFC3339),
-		BranchSweepResult: result,
-		Attention:         result.AttentionCount(),
+		Rig:                rigName,
+		Timestamp:          time.Now().UTC().Format(time.RFC3339),
+		BranchSweepResult:  result,
+		Attention:          result.AttentionCount(),
+		HygieneUnreachable: result.HygieneUnreachableCount(),
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
 }
 
-func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.BranchSweepResult, showAll bool) error {
-	// Name every ref containment was tested against. A short list is only
-	// interpretable next to what it was measured against, and on a rig with
-	// two trunks the choice moves the answer.
+// writeBranchSweepHeader names every ref containment was tested against, and
+// every sweep-wide failure. A short list is only interpretable next to what it
+// was measured against, and on a rig with two trunks the choice moves the
+// answer. It reports whether anything was scanned at all: a zero there is about
+// the listing, not about the rig's health, and the two read identically unless
+// said apart.
+func writeBranchSweepHeader(w io.Writer, rigName string, result *witness.BranchSweepResult) (scannedAny bool) {
 	targets := result.Targets
 	if len(targets) == 0 {
 		targets = []string{result.Target}
@@ -374,10 +402,15 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 	}
 
 	if result.Scanned == 0 {
-		// A zero here is about the listing, not about the rig's health, and
-		// the two read identically unless said apart.
 		fmt.Fprintf(w, "%s no polecat branches on %s — nothing to classify.\n",
 			style.Dim.Render("○"), result.Remote)
+		return false
+	}
+	return true
+}
+
+func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.BranchSweepResult, showAll bool) error {
+	if !writeBranchSweepHeader(w, rigName, result) {
 		return nil
 	}
 
@@ -392,23 +425,9 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 	}
 
 	if len(rows) > 0 {
-		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "CLASS\tBRANCH\tBEAD\tBEAD STATUS\tMR\tMR STATUS\tNOTE")
-		for _, f := range rows {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				renderBranchSweepClass(f.Class),
-				f.Branch,
-				orDash(f.IssueID),
-				orDash(f.IssueStatus),
-				orDash(f.MRID),
-				orDash(branchSweepMRStatus(f)),
-				f.Note,
-			)
-		}
-		if err := tw.Flush(); err != nil {
+		if err := writeBranchSweepTable(w, rows); err != nil {
 			return err
 		}
-		fmt.Fprintln(w)
 	}
 
 	fmt.Fprintf(w, "%s  %s\n", style.Bold.Render("Summary:"), branchSweepSummary(result))
@@ -438,6 +457,108 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 		fmt.Fprintf(w, "  Then reopen the bead if the work is real, or leave it closed and delete the branch.\n")
 		fmt.Fprintf(w, "  %s\n", style.Dim.Render("This command does not do either — it writes nothing."))
 	}
+
+	writeBranchSweepHygieneNotice(w, result, showAll)
+	return nil
+}
+
+// writeBranchSweepHygieneNotice raises the landed rows that nothing collects.
+//
+// It prints in the DEFAULT view, where landed rows are not shown at all, and
+// that placement is the point: these branches were previously visible only
+// under --all, folded into a dim "landed" that reads as finished. A reader who
+// never passes --all never learns they exist, and they accumulate in a listing
+// whose worth is its shortness (gt-l65a).
+func writeBranchSweepHygieneNotice(w io.Writer, result *witness.BranchSweepResult, showAll bool) {
+	unreachable := result.HygieneUnreachableCount()
+	if unreachable == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%s %d landed branch(es) are NOT ancestors of %s.\n",
+		style.Warning.Render("⚠"), unreachable, result.Target)
+	if showAll {
+		fmt.Fprintln(w, "  Marked landed* in the table above.")
+	}
+	fmt.Fprintf(w, "  Their content is provably in the target — patch-id EQUALITY, the reliable\n")
+	fmt.Fprintf(w, "  direction, and the strongest evidence of redundancy this sweep produces. But\n")
+	fmt.Fprintf(w, "  branch hygiene deletes by ancestry alone, so nothing will ever collect them and\n")
+	fmt.Fprintf(w, "  every future sweep reports them again.\n")
+	fmt.Fprintf(w, "    gt patrol branches --deletable   # the list, with the commands to verify and delete\n")
+}
+
+// writeBranchSweepTable renders the shared row format. landed* marks a landed
+// branch that is not an ancestor: same class, different route out.
+func writeBranchSweepTable(w io.Writer, rows []witness.BranchSweepFinding) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "CLASS\tBRANCH\tBEAD\tBEAD STATUS\tMR\tMR STATUS\tNOTE")
+	for _, f := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			renderBranchSweepClass(f),
+			f.Branch,
+			orDash(f.IssueID),
+			orDash(f.IssueStatus),
+			orDash(f.MRID),
+			orDash(branchSweepMRStatus(f)),
+			f.Note,
+		)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintln(w)
+	return nil
+}
+
+// writePatrolBranchesDeletable renders the short list an operator can act on:
+// landed branches that branch hygiene cannot reach.
+//
+// It is a listing and not an action. These are shared remote refs — another
+// worktree may have one checked out, and a delete is not undoable from here —
+// and the whole design of this sweep is to emit evidence rather than verdicts.
+// So it prints the verification command next to the deletion command, in that
+// order, and performs neither.
+func writePatrolBranchesDeletable(w io.Writer, rigName string, result *witness.BranchSweepResult) error {
+	if !writeBranchSweepHeader(w, rigName, result) {
+		return nil
+	}
+
+	var rows []witness.BranchSweepFinding
+	for _, f := range result.Findings {
+		if f.HygieneUnreachable {
+			rows = append(rows, f)
+		}
+	}
+
+	counts := result.CountByClass()
+	if len(rows) == 0 {
+		// Say what was measured, not just that the answer was zero: "no
+		// deletable branches" and "no landed branches at all" are different
+		// facts about the rig and must not render identically.
+		fmt.Fprintf(w, "%s no landed branch is out of hygiene's reach — of %d scanned, %d landed and every one is an ancestor of %s.\n",
+			style.SuccessPrefix, result.Scanned, counts[witness.BranchSweepLanded], result.Target)
+		return nil
+	}
+
+	if err := writeBranchSweepTable(w, rows); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "%s  %s\n", style.Bold.Render("Summary:"), branchSweepSummary(result))
+	fmt.Fprintf(w, "%s %d of %d landed branch(es) are NOT ancestors of %s, so branch hygiene\n",
+		style.Warning.Render("⚠"), len(rows), counts[witness.BranchSweepLanded], result.Target)
+	fmt.Fprintf(w, "  will never delete them. Their content is in the target by patch identity, which\n")
+	fmt.Fprintf(w, "  is positive evidence of redundancy — stronger than anything on the CHECK list.\n")
+	fmt.Fprintf(w, "\n  Verify each one, then delete it:\n")
+	for _, f := range rows {
+		base := strings.TrimSpace(f.ContainedIn)
+		if base == "" {
+			base = result.Target
+		}
+		fmt.Fprintf(w, "    git cherry %s %s/%s\n", base, result.Remote, f.Branch)
+		fmt.Fprintf(w, "    git push %s --delete %s\n", result.Remote, f.Branch)
+	}
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("A '+' prefixed line from git cherry means a patch is NOT in the target — stop and check."))
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("This command deletes nothing: it writes nothing at all."))
 	return nil
 }
 
@@ -456,7 +577,15 @@ func branchSweepSummary(result *witness.BranchSweepResult) string {
 	parts := make([]string, 0, len(order)+1)
 	parts = append(parts, fmt.Sprintf("%d scanned", result.Scanned))
 	for _, class := range order {
-		parts = append(parts, fmt.Sprintf("%d %s", counts[class], class))
+		part := fmt.Sprintf("%d %s", counts[class], class)
+		// The landed tally is split because the two halves route to different
+		// places — one to branch hygiene, one to nobody — and a single number
+		// hides the half that accumulates.
+		if class == witness.BranchSweepLanded {
+			unreachable := result.HygieneUnreachableCount()
+			part += fmt.Sprintf(" (%d ancestor, %d not an ancestor)", counts[class]-unreachable, unreachable)
+		}
+		parts = append(parts, part)
 	}
 	if !result.MRsMeasured {
 		parts = append(parts, "MR column UNMEASURED")
@@ -464,16 +593,22 @@ func branchSweepSummary(result *witness.BranchSweepResult) string {
 	return strings.Join(parts, ", ")
 }
 
-func renderBranchSweepClass(class witness.BranchSweepClass) string {
-	switch class {
+// renderBranchSweepClass renders the class column. A landed branch that is not
+// an ancestor is marked landed*: the classification is the same, but nothing
+// deletes it, and the table is where a reader first meets that fact.
+func renderBranchSweepClass(f witness.BranchSweepFinding) string {
+	switch f.Class {
 	case witness.BranchSweepCheck:
-		return style.Warning.Render(string(class))
+		return style.Warning.Render(string(f.Class))
 	case witness.BranchSweepUnknown:
-		return style.Error.Render(string(class))
+		return style.Error.Render(string(f.Class))
 	case witness.BranchSweepLanded:
-		return style.Dim.Render(string(class))
+		if f.HygieneUnreachable {
+			return style.Warning.Render(string(f.Class) + "*")
+		}
+		return style.Dim.Render(string(f.Class))
 	default:
-		return string(class)
+		return string(f.Class)
 	}
 }
 
