@@ -355,15 +355,20 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 
 	// Compute summary from already-fetched data
 	summary := computeSummary(summaryInput{
-		workers:        workers.Rows,
-		workersErr:     workersErr,
-		hooks:          hooks.Rows,
-		issues:         issues.Rows,
-		convoys:        convoys,
-		convoysErr:     convoysErr,
-		escalations:    escalations,
-		escalationsErr: escalationsErr,
-		activity:       activity,
+		workers:    workers.Rows,
+		workersErr: workersErr,
+		hooks:      hooks.Rows,
+		// The union panels have no error to carry — every store failing
+		// separately still returns a result — so the banner is told whether the
+		// rows it is counting came from any store at all.
+		hooksUnreadable:  hooks.Unreadable(),
+		issues:           issues.Rows,
+		issuesUnreadable: issues.Unreadable(),
+		convoys:          convoys,
+		convoysErr:       convoysErr,
+		escalations:      escalations,
+		escalationsErr:   escalationsErr,
+		activity:         activity,
 	})
 
 	data := ConvoyData{
@@ -389,10 +394,12 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		SessionsUnavailable:    unavailableMessage(sessionsErr),
 		Hooks:                  hooks.Rows,
 		HooksWarning:           hooks.Warning(),
+		HooksUnavailable:       hooks.UnavailableReason(),
 		Mayor:                  mayor,
 		MayorUnavailable:       unavailableMessage(mayorErr),
 		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
 		IssuesWarning:          issues.Warning(),
+		IssuesUnavailable:      issues.UnavailableReason(),
 		Activity:               activity,
 		ActivityUnavailable:    unavailableMessage(activityErr),
 		Summary:                summary,
@@ -415,15 +422,19 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 // They travel together because len(nil) is 0 either way, and the summary is
 // where that difference decides between "✓ All clear" and an alert (gt-edty).
 type summaryInput struct {
-	workers        []WorkerRow
-	workersErr     error
-	hooks          []HookRow
-	issues         []IssueRow
-	convoys        []ConvoyRow
-	convoysErr     error
-	escalations    []EscalationRow
-	escalationsErr error
-	activity       []ActivityRow
+	workers    []WorkerRow
+	workersErr error
+	hooks      []HookRow
+	// hooksUnreadable and issuesUnreadable are the union panels' version of an
+	// error: no store answered, so the count below them is of nothing read.
+	hooksUnreadable  bool
+	issues           []IssueRow
+	issuesUnreadable bool
+	convoys          []ConvoyRow
+	convoysErr       error
+	escalations      []EscalationRow
+	escalationsErr   error
+	activity         []ActivityRow
 }
 
 // computeSummary calculates dashboard stats and alerts from fetched data.
@@ -437,6 +448,8 @@ func computeSummary(in summaryInput) *DashboardSummary {
 		EscalationsUnavailable: in.escalationsErr != nil,
 		PolecatsUnavailable:    in.workersErr != nil,
 		ConvoysUnavailable:     in.convoysErr != nil,
+		HooksUnavailable:       in.hooksUnreadable,
+		IssuesUnavailable:      in.issuesUnreadable,
 	}
 
 	workers, hooks, issues, escalations, activity :=
@@ -483,6 +496,8 @@ func computeSummary(in summaryInput) *DashboardSummary {
 	summary.HasAlerts = summary.EscalationsUnavailable ||
 		summary.PolecatsUnavailable ||
 		summary.ConvoysUnavailable ||
+		summary.HooksUnavailable ||
+		summary.IssuesUnavailable ||
 		summary.StuckPolecats > 0 ||
 		summary.StaleHooks > 0 ||
 		summary.UnackedEscalations > 0 ||
