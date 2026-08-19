@@ -3,11 +3,7 @@ package polecat
 import "testing"
 
 func TestDecideSlotReuse(t *testing.T) {
-	// ReuseFactsMeasured: every case here asserts what the reuse gate concludes
-	// from gathered facts. An unmeasured input short-circuits to UNVERIFIED
-	// before any of these predicates matter — that path is covered by
-	// TestDecideWorkstateUnmeasuredSurfaceCannotClaimReusable.
-	base := SlotReuseInput{State: StateIdle, CleanupStatus: CleanupClean, ReuseFactsMeasured: true}
+	base := SlotReuseInput{State: StateIdle, CleanupStatus: CleanupClean}
 	tests := []struct {
 		name   string
 		mutate func(*SlotReuseInput)
