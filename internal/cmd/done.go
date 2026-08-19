@@ -1836,10 +1836,28 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			mrRefused = true
 			style.PrintWarning("%s", closedRefusal)
 			fmt.Printf("  Skipping MR creation — completing without merge request.\n")
-			fmt.Printf("  Nothing is lost: branch %s is pushed to origin.\n", branch)
-			fmt.Printf("  If work genuinely remains, reopen %s and run:\n", issueID)
-			fmt.Printf("    gt mq submit --branch %s --issue %s\n", branch, issueID)
-			notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, closedRefusal)
+			fmt.Printf("  Branch %s is pushed to origin.\n", branch)
+
+			// gt-rbul: the refusal is correct, but by itself it says nothing
+			// about the branch it refuses on behalf of. "Nothing is lost" was
+			// only true when the work was already in the target; when it was
+			// not, the session was nuked seconds later and the commits sat on
+			// origin under a closed bead — the state every surface reads as
+			// finished. Ask the second question gt done already has the facts
+			// for, and report (never correct) what it answers.
+			strandReq := strandedDoneRequest{
+				IssueID:   issueID,
+				Branch:    branch,
+				BaseRef:   g.CleanBaseRef("origin", defaultBranch, target),
+				CommitSHA: commitSHA,
+				Worker:    worker,
+				Rig:       rigName,
+				Refusal:   closedRefusal,
+			}
+			// Remote refs were refreshed before the push above, so this compares
+			// against a current target without a second fetch.
+			strandNote := handleClosedSourceRefusal(g, bd, strandReq, os.Stdout)
+			notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, closedRefusal, strandNote)
 			goto notifyWitness
 		} else {
 			// Build MR bead title and description
@@ -2264,7 +2282,13 @@ func reportDetachedBranchUnresolvable(cwd, townRoot, rigName, polecatName, sende
 // notifyDoneMRRefused tells the witness that gt done declined to create a merge
 // request because the source issue was already closed (gt-7qm). The polecat is
 // nuked moments later, so this must survive its session: mail, not a nudge.
-func notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, reason string) {
+//
+// strandingNote carries what the ancestry probe concluded about the branch
+// (gt-rbul). Without it every refusal read identically, so the witness could not
+// tell a benign one — the work landed by another route — from one that abandoned
+// commits on origin, and both of the strandings that motivated the check were
+// found by a manual sweep rather than by this mail.
+func notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, reason, strandingNote string) {
 	if townRoot == "" || rigName == "" || issueID == "" {
 		return
 	}
@@ -2272,17 +2296,24 @@ func notifyDoneMRRefused(townRoot, rigName, sender, issueID, branch, reason stri
 		sender = fmt.Sprintf("%s/polecat", rigName)
 	}
 
+	body := fmt.Sprintf("gt done created no merge request for %s.\n\nReason: %s\n\n"+
+		"Branch %s is pushed to origin and holds whatever was committed.\n",
+		issueID, reason, branch)
+	if note := strings.TrimSpace(strandingNote); note != "" {
+		body += "\n" + note + "\n"
+	}
+	body += fmt.Sprintf("\nIf work genuinely remains, reopen %s and run:\n  gt mq submit --branch %s --issue %s\n"+
+		"Or, when the close itself was the mistake:\n  gt mq submit --branch %s --issue %s --allow-closed-issue\n\n"+
+		"Do NOT re-dispatch %s while it is closed — that is the loop this gate exists to stop.",
+		issueID, branch, issueID, branch, issueID, issueID)
+
 	router := mail.NewRouter(townRoot)
 	defer router.WaitPendingNotifications()
 	msg := &mail.Message{
 		To:      fmt.Sprintf("%s/witness", rigName),
 		From:    sender,
 		Subject: fmt.Sprintf("DONE_MR_REFUSED: %s", issueID),
-		Body: fmt.Sprintf("gt done created no merge request for %s.\n\nReason: %s\n\n"+
-			"Branch %s is pushed to origin and holds whatever was committed.\n"+
-			"If work genuinely remains, reopen %s and run:\n  gt mq submit --branch %s --issue %s\n\n"+
-			"Do NOT re-dispatch %s while it is closed — that is the loop this gate exists to stop.",
-			issueID, reason, branch, issueID, branch, issueID, issueID),
+		Body:    body,
 	}
 	if err := router.Send(msg); err != nil {
 		style.PrintWarning("could not notify witness about refused MR: %v", err)
