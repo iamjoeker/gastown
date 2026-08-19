@@ -1114,7 +1114,13 @@ func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
 		}
 	}
 	if len(failures) > 0 {
-		return fmt.Errorf("orphan database(s) for rig %q (prefix %q) could not be removed: %s — run `gt dolt cleanup --force` to resolve",
+		// Deliberately prescribes no command. This path already called
+		// RemoveDatabase with force=true and it failed, so pointing at
+		// `gt dolt cleanup --force` sent the operator to run the town's
+		// highest-blast-radius command in the one case where it is known not to
+		// work. The failure text below is what actually names the problem.
+		// (gt-xhjb)
+		return fmt.Errorf("orphan database(s) for rig %q (prefix %q) could not be removed: %s — inspect with `gt dolt list` before deleting anything by hand",
 			rigName, prefix, strings.Join(failures, "; "))
 	}
 	return nil

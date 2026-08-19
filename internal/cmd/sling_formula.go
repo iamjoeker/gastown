@@ -522,18 +522,13 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 
 	fmt.Printf("%s Wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
 
-	// Classify the wisp and its steps for gt compact (gt-fqd5). Whether there
-	// are steps to stamp is the same question formulaWispArgs just answered —
-	// since gt-pzx this path passes --root-only for a pour = false formula, so
-	// asking bd for children of a root that has none is a wasted call and a
-	// stale claim in a comment (gt-3gbt). Formulas that declare no wisp_type —
-	// mol-polecat-work and every other work formula — are left unclassified on
-	// purpose.
-	stampMoleculeWispType(formulaName, townRoot, "", wispRootID,
-		formulaPoursSteps(formulaName, townRoot, slingTargetRigName(targetAgent)),
-		func(c *bdCmd) *bdCmd {
-			return c.Dir(formulaWorkDir).WithAutoCommit().WithGTRoot(townRoot)
-		})
+	// Classify the wisp and its steps for gt compact (gt-fqd5). Unlike the
+	// patrol spawner this path materializes step rows, so the children are
+	// stamped too. Formulas that declare no wisp_type — mol-polecat-work and
+	// every other work formula — are left unclassified on purpose.
+	stampMoleculeWispType(formulaName, townRoot, "", wispRootID, true, func(c *bdCmd) *bdCmd {
+		return c.Dir(formulaWorkDir).WithAutoCommit().WithGTRoot(townRoot)
+	})
 
 	// Step 3: Hook the wisp bead with retry and verification.
 	// See: https://github.com/steveyegge/gastown/issues/148.
