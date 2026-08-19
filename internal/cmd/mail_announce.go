@@ -148,8 +148,9 @@ func readAnnounceChannel(townRoot string, cfg *config.MessagingConfig, channelNa
 		fmt.Printf("    %s from %s\n",
 			style.Dim.Render(msg.ID),
 			msg.From)
+		// Zone label: local here, UTC in bd — see readMessage's Date line.
 		fmt.Printf("    %s\n",
-			style.Dim.Render(msg.Created.Local().Format("2006-01-02 15:04")))
+			style.Dim.Render(msg.Created.Local().Format("2006-01-02 15:04 MST")))
 		if msg.Description != "" {
 			// Show first line of description as preview
 			lines := strings.SplitN(msg.Description, "\n", 2)

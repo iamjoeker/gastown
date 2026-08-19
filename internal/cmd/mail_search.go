@@ -82,8 +82,9 @@ func runMailSearch(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s from %s\n",
 			style.Dim.Render(msg.ID),
 			msg.From)
+		// Zone label: local here, UTC in bd — see readMessage's Date line.
 		fmt.Printf("    %s\n",
-			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04")))
+			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04 MST")))
 	}
 
 	return nil

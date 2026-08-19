@@ -383,51 +383,13 @@ func labelsForAgentBeadReuse(existing []string) []string {
 	return labels
 }
 
-// CloseAgentBead retires an agent bead whose agent no longer exists.
-//
-// Removal paths reset the bead's mutable fields (ResetAgentBeadForReuse) but
-// historically left it open. Open agent beads are what gt feed's problems pane
-// enumerates, and it flags any of them with no live tmux session as a zombie —
-// so every worktree removal left a permanent "dead" entry behind, and the
-// monitor got less trustworthy the more the town was cleaned up (gt-qvx7).
-//
-// Closing is safe for name reuse: CreateOrReopenAgentBead reopens a closed bead,
-// with an update-status fallback for Dolt backends where `bd reopen` fails.
-// Callers treat failures as non-fatal — a stale bead beats a stranded worktree.
-func (b *Beads) CloseAgentBead(id, reason string) error {
-	// Lock for the same reason ResetAgentBeadForReuse does: a concurrent
-	// CreateOrReopenAgentBead must not be interleaved with the close (gt-joazs).
-	fl, lockErr := b.lockAgentBead(id)
-	if lockErr != nil {
-		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
-	}
-	defer func() { _ = fl.Unlock() }()
-
-	target := b.agentBeadTarget()
-
-	issue, err := target.Show(id)
-	if err != nil {
-		return err
-	}
-	if issue.Status == "closed" {
-		// Already retired. Re-closing writes nothing but still costs a Dolt
-		// commit, so stop here.
-		return nil
-	}
-
-	// Force: a removed polecat can leave open molecule wisps behind, and a
-	// dependency check must not be what keeps the tombstone alive.
-	return target.ForceCloseWithReason(reason, id)
-}
-
 // ResetAgentBeadForReuse clears all mutable fields on an agent bead without closing it.
 // This is the preferred cleanup method during polecat nuke because it avoids the
 // close/reopen cycle that fails on Dolt backends (tombstone operations not supported,
 // bd reopen failures). By keeping the bead open with agent_state="nuked",
 // CreateOrReopenAgentBead can simply update it on re-spawn without needing reopen.
 //
-// This is the standard nuke path (gt-14b8o). Removal paths follow it with
-// CloseAgentBead once the worktree is actually gone.
+// This is the standard nuke path (gt-14b8o).
 func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	// Lock the agent bead to prevent concurrent read-modify-write races.
 	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
