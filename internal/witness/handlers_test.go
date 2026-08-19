@@ -2172,6 +2172,15 @@ func TestDetectOrphanedMolecules_WithMockBd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Step statuses are stateful: the cleanup path counts what it can confirm
+	// closed by re-reading the children, so a mock that answers with the same
+	// statuses forever would model a bd that closes nothing.
+	stepStatus := map[string]string{
+		"gt-step-001": "open",
+		"gt-step-002": "open",
+		"gt-step-003": "closed",
+	}
+
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
 			if len(args) == 0 {
@@ -2192,13 +2201,17 @@ func TestDetectOrphanedMolecules_WithMockBd(t *testing.T) {
 					return "[]", nil
 				}
 				if strings.Contains(joined, "--parent=gt-mol-orphan") {
-					return `[
-  {"id":"gt-step-001","status":"open"},
-  {"id":"gt-step-002","status":"open"},
-  {"id":"gt-step-003","status":"closed"}
-]`, nil
+					ids := []string{"gt-step-001", "gt-step-002", "gt-step-003"}
+					rows := make([]string, 0, len(ids))
+					for _, id := range ids {
+						rows = append(rows, fmt.Sprintf(`{"id":%q,"status":%q}`, id, stepStatus[id]))
+					}
+					return "[" + strings.Join(rows, ",") + "]", nil
 				}
 				return "[]", nil
+			case "query":
+				// No wisp children in this fixture.
+				return "No issues found.", nil
 			case "show":
 				if len(args) > 1 {
 					switch args[1] {
@@ -2212,7 +2225,19 @@ func TestDetectOrphanedMolecules_WithMockBd(t *testing.T) {
 			}
 			return "{}", nil
 		},
-		func(args []string) error { return nil },
+		func(args []string) error {
+			if len(args) > 0 && args[0] == "close" {
+				for _, id := range args[1:] {
+					if strings.HasPrefix(id, "-") {
+						break
+					}
+					if _, ok := stepStatus[id]; ok {
+						stepStatus[id] = "closed"
+					}
+				}
+			}
+			return nil
+		},
 	)
 
 	result := DetectOrphanedMolecules(bd, tmpDir, rigName, nil)
