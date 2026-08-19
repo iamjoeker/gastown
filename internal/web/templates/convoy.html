@@ -32,7 +32,12 @@
             <div class="mayor-info">
                 <span class="mayor-icon">🎩</span>
                 <span class="mayor-title">The Mayor</span>
-                {{if .Mayor}}
+                {{if .MayorUnavailable}}
+                <!-- "Detached" is a claim about tmux. When tmux could not be
+                     asked, the only honest badge is that we do not know. -->
+                <span class="badge badge-yellow">Unknown</span>
+                <span class="truncation-notice">⚠️ Mayor status unavailable: {{.MayorUnavailable}}</span>
+                {{else if .Mayor}}
                     {{if .Mayor.IsAttached}}
                     <span class="badge badge-green">Attached</span>
                     {{else}}
@@ -69,7 +74,8 @@
                 </div>
                 {{end}}
                 <div class="stat">
-                    <span class="stat-value">{{.Summary.PolecatCount}}</span>
+                    <!-- "?" not "0": an unreadable count is not a count of zero. -->
+                    <span class="stat-value">{{if .Summary.PolecatsUnavailable}}?{{else}}{{.Summary.PolecatCount}}{{end}}</span>
                     <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
@@ -81,11 +87,10 @@
                     <span class="stat-label">📋 Work</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{.Summary.ConvoyCount}}</span>
+                    <span class="stat-value">{{if .Summary.ConvoysUnavailable}}?{{else}}{{.Summary.ConvoyCount}}{{end}}</span>
                     <span class="stat-label">🚚 Convoys</span>
                 </div>
                 <div class="stat">
-                    <!-- "?" not "0": an unreadable count is not a count of zero. -->
                     <span class="stat-value">{{if .Summary.EscalationsUnavailable}}?{{else}}{{.Summary.EscalationCount}}{{end}}</span>
                     <span class="stat-label">⚠️ Escalations</span>
                 </div>
@@ -94,6 +99,12 @@
             <div class="summary-alerts">
                 {{if .Summary.EscalationsUnavailable}}
                 <span class="alert-item alert-red">🚨 escalations unreadable</span>
+                {{end}}
+                {{if .Summary.PolecatsUnavailable}}
+                <span class="alert-item alert-red">🦨 polecats unreadable</span>
+                {{end}}
+                {{if .Summary.ConvoysUnavailable}}
+                <span class="alert-item alert-red">🚚 convoys unreadable</span>
                 {{end}}
                 {{if .Summary.StuckPolecats}}
                 <span class="alert-item alert-red">💀 {{.Summary.StuckPolecats}} stuck</span>
@@ -126,7 +137,7 @@
             <div class="panel" id="convoy-panel">
                 <div class="panel-header">
                     <h2>🚚 Convoys</h2>
-                    <span class="count">{{len .Convoys}}</span>
+                    <span class="count">{{if .ConvoysUnavailable}}?{{else}}{{len .Convoys}}{{end}}</span>
                     <button class="new-convoy-btn" id="new-convoy-btn">+ New Convoy</button>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
@@ -134,7 +145,12 @@
                 <div class="panel-body">
                     <!-- Convoy List View -->
                     <div id="convoy-list">
-                        {{if .Convoys}}
+                        {{if .ConvoysUnavailable}}
+                        <div class="empty-state">
+                            <p class="truncation-notice">⚠️ Convoys unavailable: {{.ConvoysUnavailable}}</p>
+                            <p>This is NOT "no convoys" — the dashboard could not read them.</p>
+                        </div>
+                        {{else if .Convoys}}
                         <table>
                             <thead>
                                 <tr>
@@ -302,11 +318,17 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🦨 Polecats</h2>
-                    <span class="count">{{len .Workers}}</span>
+                    <span class="count">{{if .WorkersUnavailable}}?{{else}}{{len .Workers}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
+                    {{if .WorkersUnavailable}}
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ Polecats unavailable: {{.WorkersUnavailable}}</p>
+                        <p>This is NOT "no polecats" — the dashboard could not read them.</p>
+                    </div>
+                    {{else}}
                     {{if .WorkersWarning}}
                     <p class="truncation-notice">⚠️ Assigned work {{.WorkersWarning}} — "Working On" may be blank and status may read idle for workers that are not</p>
                     {{end}}
@@ -360,6 +382,7 @@
                         <p>No polecats</p>
                     </div>
                     {{end}}
+                    {{end}}
                 </div>
             </div>
 
@@ -367,12 +390,17 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>📟 Sessions</h2>
-                    <span class="count">{{len .Sessions}}</span>
+                    <span class="count">{{if .SessionsUnavailable}}?{{else}}{{len .Sessions}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Sessions}}
+                    {{if .SessionsUnavailable}}
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ Sessions unavailable: {{.SessionsUnavailable}}</p>
+                        <p>This is NOT "no sessions" — the dashboard could not read them.</p>
+                    </div>
+                    {{else if .Sessions}}
                     <table>
                         <thead>
                             <tr>
@@ -416,7 +444,7 @@
             <div class="panel" id="activity-panel">
                 <div class="panel-header">
                     <h2>📜 Activity</h2>
-                    <span class="count">{{len .Activity}}</span>
+                    <span class="count">{{if .ActivityUnavailable}}?{{else}}{{len .Activity}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
@@ -445,7 +473,12 @@
                 </div>
                 {{end}}
                 <div class="panel-body activity-feed">
-                    {{if .Activity}}
+                    {{if .ActivityUnavailable}}
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ Activity unavailable: {{.ActivityUnavailable}}</p>
+                        <p>This is NOT "no recent activity" — the dashboard could not read the event log.</p>
+                    </div>
+                    {{else if .Activity}}
                     <div class="tl-timeline" id="activity-timeline">
                         {{range .Activity}}
                         <div class="tl-entry {{activityTypeClass .Category}}" data-category="{{.Category}}" data-rig="{{.Rig}}" data-agent="{{.Actor}}" data-type="{{.Type}}" data-ts="{{.RawTimestamp}}">
@@ -825,16 +858,24 @@
                 </div>
             </div>
 
-            <!-- Queues Panel (optional, only show if there are queues) -->
-            {{if .Queues}}
+            <!-- Queues Panel (optional: shown when there are queues, and when
+                 the query failed — a hidden panel is the strongest possible
+                 claim that there is nothing to see). -->
+            {{if or .Queues .QueuesUnavailable}}
             <div class="panel">
                 <div class="panel-header">
                     <h2>📋 Queues</h2>
-                    <span class="count">{{len .Queues}}</span>
+                    <span class="count">{{if .QueuesUnavailable}}?{{else}}{{len .Queues}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
+                    {{if .QueuesUnavailable}}
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ Queues unavailable: {{.QueuesUnavailable}}</p>
+                        <p>This is NOT "no queues" — the dashboard could not read them.</p>
+                    </div>
+                    {{else}}
                     <table>
                         <thead>
                             <tr>
@@ -863,6 +904,7 @@
                             {{end}}
                         </tbody>
                     </table>
+                    {{end}}
                 </div>
             </div>
             {{end}}
