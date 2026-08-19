@@ -638,11 +638,66 @@ func TestManager_RejectMR_ClearsMatchingActiveMR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RejectMR() error: %v", err)
 	}
-	if result.Status != MRClosed {
-		t.Fatalf("RejectMR() status = %s, want closed", result.Status)
+	if result.MR.Status != MRClosed {
+		t.Fatalf("RejectMR() status = %s, want closed", result.MR.Status)
+	}
+	if result.SourceIssueStatus != string(beads.StatusOpen) {
+		t.Errorf("RejectMR() SourceIssueStatus = %q, want open", result.SourceIssueStatus)
+	}
+	if result.SourceIssueReopened {
+		t.Errorf("RejectMR() reopened an already-open issue")
 	}
 
 	assertAgentActiveMR(t, b, agentIssue.ID, "")
+	assertIssueStatus(t, b, srcIssue.ID, string(beads.StatusOpen))
+	assertMRCloseReason(t, b, mrIssue.ID, string(CloseReasonRejected))
+}
+
+// gt-a46b: a polecat that closes its own bead before submitting leaves the
+// source issue CLOSED under a live branch. Rejecting the MR used to leave it
+// that way — branch on origin, bead closed, nothing able to re-sling it.
+func TestManager_RejectMR_ReopensClosedSourceIssue(t *testing.T) {
+	mgr, rigPath := setupTestManager(t)
+	testutil.RequireDoltContainer(t)
+	port, _ := strconv.Atoi(testutil.DoltContainerPort())
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init(uniqueBeadsPrefix(t)); err != nil {
+		t.Skipf("bd init unavailable: %v", err)
+	}
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Implement feature X", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	mrIssue, err := b.Create(beads.CreateOptions{
+		Title:       "MR for feature X",
+		Labels:      []string{"gt:merge-request"},
+		Description: "branch: polecat/test/gt-xyz\nsource_issue: " + srcIssue.ID + "\nworker: test\ntarget: main",
+	})
+	if err != nil {
+		t.Fatalf("create MR issue: %v", err)
+	}
+
+	// The polecat closed its own bead before submitting.
+	if err := b.CloseWithReason("completed by polecat", srcIssue.ID); err != nil {
+		t.Fatalf("close source issue: %v", err)
+	}
+	assertIssueStatus(t, b, srcIssue.ID, string(beads.StatusClosed))
+
+	result, err := mgr.RejectMR(mrIssue.ID, "gates failed", false)
+	if err != nil {
+		t.Fatalf("RejectMR() error: %v", err)
+	}
+	if result.SourceIssueErr != nil {
+		t.Fatalf("RejectMR() SourceIssueErr = %v", result.SourceIssueErr)
+	}
+	if !result.SourceIssueReopened {
+		t.Errorf("RejectMR() SourceIssueReopened = false, want true")
+	}
+	if result.SourceIssueStatus != string(beads.StatusOpen) {
+		t.Errorf("RejectMR() SourceIssueStatus = %q, want open", result.SourceIssueStatus)
+	}
+
 	assertIssueStatus(t, b, srcIssue.ID, string(beads.StatusOpen))
 	assertMRCloseReason(t, b, mrIssue.ID, string(CloseReasonRejected))
 }
