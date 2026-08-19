@@ -125,18 +125,22 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 
-	// 1. Get bead info + status check
-	info, err := getBeadInfoFromTownRoot(townRoot, params.BeadID)
+	// 1. Get bead info + status check. Ownership follows the live row, so a bead
+	// moved across rigs is read from the store that actually holds it instead of
+	// the closed copy its id prefix names (gt-ad32).
+	owner, err := resolveBeadOwner(townRoot, params.BeadID)
 	if err != nil {
 		result.ErrMsg = err.Error()
 		return result, fmt.Errorf("could not get bead info: %w", err)
 	}
+	reportMovedBead(params.BeadID, owner)
+	info := owner.Info
 
 	// Guard against dispatching closed/tombstone beads (defense-in-depth).
 	// Not bypassed by --force — if you need to re-dispatch, reopen the bead first.
 	if info.Status == "closed" || info.Status == "tombstone" {
 		result.ErrMsg = "already " + info.Status
-		return result, fmt.Errorf("bead %s is %s (work already completed)", params.BeadID, info.Status)
+		return result, closedBeadError(params.BeadID, owner)
 	}
 
 	// Save explicit force state before dead-agent auto-force, so the deferred
