@@ -724,44 +724,6 @@ func findMRBeadForBranch(bd *BdCli, workDir, branch string) string {
 	return ""
 }
 
-// findOpenMRForSourceIssue returns the ID of an open merge-request bead whose
-// source_issue is issueID, or "" when there is none.
-//
-// Same wisps-table query as findMRBeadForBranch: MR beads are ephemeral, so a
-// listing that reads only the issues table sees none of them.
-//
-// A query failure returns "" — the caller then treats the bead as unqueued and
-// recovers it, which is the pre-existing behaviour. The opposite bias would let
-// one failed Dolt read strand a genuinely abandoned bead forever.
-func findOpenMRForSourceIssue(bd *BdCli, workDir, issueID string) string {
-	issueID = strings.TrimSpace(issueID)
-	if bd == nil || bd.Exec == nil || issueID == "" {
-		return ""
-	}
-	output, err := bd.Exec(workDir, "query",
-		"ephemeral=true AND label=gt:merge-request AND status=open",
-		"--json")
-	if err != nil || output == "" || output == "[]" || output == "null" {
-		return ""
-	}
-
-	var items []struct {
-		ID          string `json:"id"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal([]byte(output), &items); err != nil {
-		return ""
-	}
-
-	for _, item := range items {
-		mrFields := beads.ParseMRFields(&beads.Issue{Description: item.Description})
-		if mrFields != nil && strings.TrimSpace(mrFields.SourceIssue) == issueID {
-			return item.ID
-		}
-	}
-	return ""
-}
-
 // nudgeRefinery wakes the refinery session to check the merge queue.
 // Uses immediate delivery: sends directly to the tmux pane.
 // No cooperative queue — idle agents never call Drain(), so queued
@@ -2861,20 +2823,6 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
 			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
 		}
-		return false
-	}
-
-	// Guard: submitted is not abandoned (gt-429i). gt done no longer closes the
-	// source bead when it queues an MR — the refinery closes it on merge — so a
-	// dead polecat holding a hooked bead with an open MR is the ordinary state
-	// between submit and merge, not an orphan. Re-dispatching it would send a
-	// second polecat to redo work that is already pushed and queued.
-	//
-	// The MR is the thing that expires: once it merges, post-merge closes the
-	// bead and the first check above ends this; if it is rejected or reaped the
-	// query stops matching and the next patrol recovers the bead as before.
-	if mrID := findOpenMRForSourceIssue(bd, workDir, hookBead); mrID != "" {
-		fmt.Fprintf(os.Stderr, "witness: bead %s has open MR %s in the merge queue — leaving it for the refinery\n", hookBead, mrID)
 		return false
 	}
 
