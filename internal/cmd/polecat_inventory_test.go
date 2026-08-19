@@ -249,6 +249,154 @@ func TestBuildPolecatInventoryItemRescueMRClearsRefusal(t *testing.T) {
 	}
 }
 
+// TestBuildPolecatInventoryItemResolvesRecordedActiveMR is the gt-hx10
+// regression.
+//
+// Every polecat carrying an active_mr reported its blocker as
+// `active_mr=<id> status=unknown` — 19 of 19 town-wide, across two stores, and
+// including a wisp observed seconds after creation. The string was a literal:
+// this surface never read the MR's status at all. The cost is not the wrong
+// word. A pointer at an MR that closed a day ago and a pointer at one filed
+// seconds ago produced byte-identical output and the same PENDING_MR verdict,
+// so the polecat whose MR was gone could never be told from the one whose MR
+// was live, and it stayed out of the reuse pool permanently.
+func TestBuildPolecatInventoryItemResolvesRecordedActiveMR(t *testing.T) {
+	setupPolecatTestRegistry(t)
+
+	// byID is what the index's reader answers from without a process call. In
+	// production the queue listing fills it with MR beads and source issues fall
+	// through to bd; here it stands in for both so the classifier can be
+	// exercised without a store.
+	newIndex := func(beadsByID ...*beads.Issue) *polecatBranchMRIndex {
+		index := &polecatBranchMRIndex{
+			openMR:    map[string]string{},
+			submitted: map[string]bool{},
+			byID:      map[string]*beads.Issue{},
+		}
+		for _, issue := range beadsByID {
+			index.byID[issue.ID] = issue
+		}
+		return index
+	}
+	doneFields := func() *beads.AgentFields {
+		return &beads.AgentFields{
+			AgentState:      string(beads.AgentStateDone),
+			CleanupStatus:   string(polecat.CleanupClean),
+			Branch:          "polecat/slit/bd-6n5",
+			ActiveMR:        "bd-wisp-6td",
+			LastSourceIssue: "bd-6n5",
+		}
+	}
+
+	tests := []struct {
+		name        string
+		index       *polecatBranchMRIndex
+		wantVerdict string
+		wantBlocker string
+	}{
+		{
+			// The 17 gastown polecats: correctly pending, and now they say why.
+			name: "open mr reports its real status",
+			index: newIndex(
+				&beads.Issue{ID: "bd-wisp-6td", Status: "open", Description: "branch: polecat/slit/bd-6n5\nsource_issue: bd-6n5\n"},
+			),
+			wantVerdict: polecat.WorkstateVerdictPendingMR,
+			wantBlocker: "active_mr=bd-wisp-6td status=open",
+		},
+		{
+			// beads/slit: MR closed by the 24h sweep, work bead closed with it.
+			// Nothing is at risk and nothing else will ever revisit this field.
+			name: "closed mr with terminal source stops blocking",
+			index: newIndex(
+				&beads.Issue{ID: "bd-wisp-6td", Status: "closed", Description: "branch: polecat/slit/bd-6n5\nsource_issue: bd-6n5\n"},
+				&beads.Issue{ID: "bd-6n5", Status: "closed"},
+			),
+			wantVerdict: polecat.WorkstateVerdictSafeToNuke,
+		},
+		{
+			// Fail-closed control. Same closed MR, but the work it was carrying
+			// is still open — a rejected or reaped MR, not a merged one — so the
+			// branch may hold the only copy and the polecat must stay blocked.
+			name: "closed mr with live source keeps blocking",
+			index: newIndex(
+				&beads.Issue{ID: "bd-wisp-6td", Status: "closed", Description: "branch: polecat/slit/bd-6n5\nsource_issue: bd-6n5\n"},
+				&beads.Issue{ID: "bd-6n5", Status: "open"},
+			),
+			wantVerdict: polecat.WorkstateVerdictPendingMR,
+			wantBlocker: "active_mr=bd-wisp-6td status=closed source_issue=bd-6n5 source_status=open",
+		},
+		{
+			// The queue was consulted and the MR is not in it — reaped. Absent
+			// proof the source is terminal, that is still a blocker.
+			name:        "missing mr is not an absence of risk",
+			index:       newIndex(),
+			wantVerdict: polecat.WorkstateVerdictPendingMR,
+			wantBlocker: "active_mr=bd-wisp-6td status=missing source_issue=bd-6n5 source_status=missing",
+		},
+		{
+			// The queue listing failed. "We never looked" must not be dressed up
+			// as a status, and must never resolve toward safe.
+			name:        "unconsulted queue reports unverified",
+			index:       nil,
+			wantVerdict: polecat.WorkstateVerdictPendingMR,
+			wantBlocker: "active_mr=bd-wisp-6td status=unverified",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := buildPolecatInventoryItem("beads", "slit", doneFields(), nil, polecatSessionSet{}, tt.index)
+			if item.Disposition.Verdict != tt.wantVerdict {
+				t.Fatalf("verdict = %q, want %q (disposition=%+v)", item.Disposition.Verdict, tt.wantVerdict, item.Disposition)
+			}
+			if tt.wantBlocker == "" {
+				if len(item.Disposition.Blockers) != 0 {
+					t.Fatalf("blockers = %v, want none", item.Disposition.Blockers)
+				}
+				return
+			}
+			if len(item.Disposition.Blockers) != 1 || item.Disposition.Blockers[0] != tt.wantBlocker {
+				t.Fatalf("blockers = %v, want [%q]", item.Disposition.Blockers, tt.wantBlocker)
+			}
+			if strings.Contains(item.Disposition.Blockers[0], "status=unknown") {
+				t.Fatalf("blocker still reports the literal status=unknown: %q", item.Disposition.Blockers[0])
+			}
+		})
+	}
+}
+
+// TestBuildPolecatInventoryItemStaleActiveMRYieldsToLiveBranchMR covers the
+// composition of gt-hx10 with gt-46rk: once a recorded active_mr is proven
+// stale, the branch index gets its turn, and an MR someone else submitted for
+// the same branch still preserves the polecat.
+func TestBuildPolecatInventoryItemStaleActiveMRYieldsToLiveBranchMR(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	index := &polecatBranchMRIndex{
+		openMR:    map[string]string{"polecat/slit/bd-6n5": "bd-wisp-live"},
+		submitted: map[string]bool{"polecat/slit/bd-6n5": true},
+		byID: map[string]*beads.Issue{
+			"bd-wisp-6td": {ID: "bd-wisp-6td", Status: "closed", Description: "branch: polecat/slit/bd-6n5\nsource_issue: bd-6n5\n"},
+			"bd-6n5":      {ID: "bd-6n5", Status: "closed"},
+		},
+	}
+	fields := &beads.AgentFields{
+		AgentState:      string(beads.AgentStateDone),
+		CleanupStatus:   string(polecat.CleanupClean),
+		Branch:          "polecat/slit/bd-6n5",
+		ActiveMR:        "bd-wisp-6td",
+		LastSourceIssue: "bd-6n5",
+	}
+
+	item := buildPolecatInventoryItem("beads", "slit", fields, nil, polecatSessionSet{}, index)
+
+	if item.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR (disposition=%+v)", item.Disposition.Verdict, item.Disposition)
+	}
+	if item.ActiveMR != "bd-wisp-live" {
+		t.Fatalf("active_mr = %q, want bd-wisp-live — the stale pointer must not mask the live MR", item.ActiveMR)
+	}
+}
+
 func TestNewPolecatBranchMRIndexPrefersOpenMR(t *testing.T) {
 	// Two MRs for the same branch: an earlier rejected one and a live one.
 	// hasMR must be true for both cases; openMRFor must name only the open one.
