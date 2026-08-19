@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -447,6 +448,91 @@ func TestPurgeOldMailBehaviour(t *testing.T) {
 		if got := f.issueIDs(t, table); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s issue_ids = %v, want %v", table, got, want)
 		}
+	}
+}
+
+// TestPurgeReportsFailedDoltCommit is the acceptance test for gt-aqk.
+//
+// Purge has two halves. Both delete rows, COMMIT them into the Dolt working
+// set, then CALL DOLT_COMMIT to version the deletion. If that last call fails
+// the rows are gone but the deletion was never committed to a branch — and the
+// operator instruction in mol-polecat-work is to check `gt reaper purge --json`
+// for a dolt_commit_failed anomaly. The wisp half appended one; the mail half
+// had an empty error branch and a signature with nowhere to put one, so for
+// mail that check reported clean whatever the commit did.
+//
+// The row-level outcome cannot distinguish the two: the mail vanishes either
+// way, which is why a green suite never noticed. So the failure is injected at
+// the only place it exists — the stored procedure itself — via a database name
+// carrying doltCommitFailMarker, and the assertion is on what the result
+// REPORTS rather than on what it deleted.
+//
+// The wisp half is the positive control: it rides the same injected failure and
+// must produce its own anomaly. If it did not, a mail anomaly would prove
+// nothing about the injection. The clean-commit fixture is the negative
+// control: same rows, same code, no marker, and it must report no anomalies at
+// all — otherwise a path that always appended one would pass this test.
+func TestPurgeReportsFailedDoltCommit(t *testing.T) {
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+
+	seed := func(f *fixture) {
+		f.insertWisps(t, wispRow{id: "w-purge", status: "closed", wispType: "step", createdAt: old, closedAt: &old})
+		f.insertIssues(t, issueRow{id: "mail-old", status: "closed", priority: 2,
+			updatedAt: old, closedAt: &old, labels: []string{"gt:message"}})
+	}
+
+	// Negative control: commits succeed, so nothing is anomalous.
+	clean := newFixture(t, "purge_commit_ok")
+	seed(clean)
+	cleanResult, err := Purge(clean.db, clean.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge (clean): %v", err)
+	}
+	if len(cleanResult.Anomalies) != 0 {
+		t.Errorf("anomalies on a successful purge = %+v, want none", cleanResult.Anomalies)
+	}
+
+	// The commit for this database fails inside the engine.
+	f := newFixture(t, "purge_"+doltCommitFailMarker)
+	seed(f)
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+
+	// Instrument check. Both halves must have REACHED their commit; a half that
+	// deleted nothing, or stopped committing, would report no anomaly for a
+	// reason that has nothing to do with the fix.
+	if calls := f.doltCommitCalls(); len(calls) != 2 {
+		t.Fatalf("DOLT_COMMIT attempts = %+v, want 2 (one per purge half) — "+
+			"without both attempts the anomaly assertions below are vacuous", calls)
+	}
+	if result.WispsPurged != 1 || result.MailPurged != 1 {
+		t.Fatalf("WispsPurged = %d, MailPurged = %d, want 1 and 1", result.WispsPurged, result.MailPurged)
+	}
+
+	var wispAnomalies, mailAnomalies int
+	for _, a := range result.Anomalies {
+		if a.Type != "dolt_commit_failed" {
+			t.Errorf("unexpected anomaly %+v", a)
+			continue
+		}
+		if strings.Contains(a.Message, "mail") {
+			mailAnomalies++
+		} else {
+			wispAnomalies++
+		}
+	}
+	if wispAnomalies != 1 {
+		t.Fatalf("wisp dolt_commit_failed anomalies = %d, want 1 — the control half "+
+			"did not report, so the failure was not injected and this test proves nothing "+
+			"about the mail half (anomalies: %+v)", wispAnomalies, result.Anomalies)
+	}
+	if mailAnomalies != 1 {
+		t.Errorf("mail dolt_commit_failed anomalies = %d, want 1 — the mail rows were "+
+			"deleted with no versioning commit and `gt reaper purge --json` reported clean, "+
+			"so the operator check for unpersisted purges cannot fire for mail (gt-aqk); "+
+			"anomalies: %+v", mailAnomalies, result.Anomalies)
 	}
 }
 

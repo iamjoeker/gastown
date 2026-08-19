@@ -754,8 +754,10 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result.WispsProtected = protected
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
-	// Purge old mail.
-	mailPurged, err := purgeOldMail(db, dbName, mailDeleteAge, dryRun)
+	// Purge old mail. Anomalies are collected before the error check so a
+	// half-completed mail purge still reports what it noticed.
+	mailPurged, mailAnomalies, err := purgeOldMail(db, dbName, mailDeleteAge, dryRun)
+	result.Anomalies = append(result.Anomalies, mailAnomalies...)
 	if err != nil {
 		return result, fmt.Errorf("purge mail: %w", err)
 	}
@@ -852,10 +854,19 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	return totalDeleted, protectedTotal, anomalies, nil
 }
 
-func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {
+// purgeOldMail deletes closed gt:message issues past mailDeleteAge and returns
+// the number deleted alongside any anomalies.
+//
+// The anomaly return mirrors purgeClosedWisps deliberately (gt-aqk). A failed
+// DOLT_COMMIT here leaves the rows gone from the working set but the deletion
+// unversioned, and operators are told to check `gt reaper purge --json` for
+// dolt_commit_failed. When this half had no route to report one, that check read
+// clean by construction for mail no matter what the commit did.
+func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, []Anomaly, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	var anomalies []Anomaly
 	mailCutoff := time.Now().UTC().Add(-mailDeleteAge)
 
 	countQuery := fmt.Sprintf(
@@ -864,21 +875,21 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 	var count int
 	if err := db.QueryRowContext(ctx, countQuery, mailCutoff).Scan(&count); err != nil {
 		if isTableNotFound(err) {
-			return 0, nil // issues/labels not on this server
+			return 0, nil, nil // issues/labels not on this server
 		}
-		return 0, fmt.Errorf("count mail: %w", err)
+		return 0, nil, fmt.Errorf("count mail: %w", err)
 	}
 	if count == 0 {
-		return 0, nil
+		return 0, anomalies, nil
 	}
 
 	if dryRun {
-		return count, nil
+		return count, anomalies, nil
 	}
 
 	session, err := beginWriteSession(ctx, db)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer session.release()
 
@@ -890,20 +901,26 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, mailCutoff, "issues", auxTables)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
-		return 0, err
+		return 0, anomalies, err
 	}
 
 	if totalDeleted > 0 {
 		if err := session.commit(ctx); err != nil {
-			return 0, fmt.Errorf("sql commit: %w", err)
+			return 0, anomalies, fmt.Errorf("sql commit: %w", err)
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
 		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// Non-fatal.
+			// Non-fatal — the rows are already gone from the working set, so the
+			// purge stands; what is lost is the version. Report it rather than
+			// swallowing it: this is the only signal the deletion went unversioned.
+			anomalies = append(anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after mail purge failed: %v", err),
+			})
 		}
 	}
 
-	return totalDeleted, nil
+	return totalDeleted, anomalies, nil
 }
 
 // AutoClose closes issues that have been open with no updates past staleAge.

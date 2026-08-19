@@ -87,6 +87,16 @@ func quietServer() {
 	quietServerOn.Do(func() { logrus.SetLevel(logrus.ErrorLevel) })
 }
 
+// doltCommitFailMarker makes the fixture's DOLT_COMMIT fail.
+//
+// A failed versioning commit is the state the reaper's dolt_commit_failed
+// anomaly exists to report, and it cannot be produced from the client side —
+// the procedure either works or it does not. The reaper puts the database name
+// into every commit message, so naming a fixture database with this marker
+// turns its commits into failures, without any per-test wiring and without
+// disturbing the other fixtures sharing this process-wide registration.
+const doltCommitFailMarker = "doltcommitfails"
+
 // registerDoltCommitStub installs a DOLT_COMMIT stored procedure on the fixture
 // engine. Dolt supplies this procedure in production; go-mysql-server does not,
 // and without it every reaper commit path would report a dolt_commit_failed
@@ -99,10 +109,17 @@ func registerDoltCommitStub() {
 				Name:   "dolt_commit",
 				Schema: gmssql.Schema{&gmssql.Column{Name: "hash", Type: gmstypes.LongText}},
 				Function: func(ctx *gmssql.Context, args ...string) (gmssql.RowIter, error) {
+					message := strings.Join(args, " ")
+					// Record the attempt before failing: a test asserting on the
+					// anomaly needs to know the commit was reached at all, or a
+					// path that silently stopped committing would look the same.
 					doltCommits.record(doltCommitCall{
-						message:    strings.Join(args, " "),
+						message:    message,
 						autocommit: sessionAutocommit(ctx),
 					})
+					if strings.Contains(message, doltCommitFailMarker) {
+						return nil, fmt.Errorf("dolt_commit: injected failure (%s)", doltCommitFailMarker)
+					}
 					return gmssql.RowsToRowIter(gmssql.Row{"0000000000000000000000000000000000000000"}), nil
 				},
 			})
