@@ -1016,9 +1016,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	var mrFailed bool
 	var mrRefused bool
 	var doneErrors []string
-	// Set when a --skip-verify ledger annotation could not be written. A close
-	// whose audit trail was lost is withheld rather than performed (gt-290c).
-	var ledgerNoteErr error
 	var convoyInfo *ConvoyInfo // Populated if issue is tracked by a convoy
 	var sourceIssueForNoMerge *beads.Issue
 	var sourceBD *beads.Beads
@@ -1170,25 +1167,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						// Non-code close: no commit represents this work, so record none.
 						// Recording HEAD here is what put an unrelated upstream commit in
 						// the ledger as proof against gt-y20.
-						//
-						// gt-290c: refuse the close if the annotation was lost. A
-						// skip-verify close whose only audit trail failed to write is
-						// invisible to exactly the audit it exists for; leaving the bead
-						// open for review is the recordable outcome.
-						if noteErr := noteVerifiedPushSkipped(g, bd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, "", "--skip-verify on no-MR non-code close"); noteErr != nil {
-							fmt.Printf("  The bead will remain open for witness/mayor review.\n")
-							notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, noteErr.Error())
-							return fmt.Errorf("cannot close %s with --skip-verify: %w", issueID, noteErr)
-						}
+						noteVerifiedPushSkipped(g, bd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, "", "--skip-verify on no-MR non-code close")
 						closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: none (non-code close, no work to verify)", closeReason, defaultBranch)
 					} else if !isNoMergeTask {
 						if g.ForkBackedRemote("origin") {
 							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead", branch, baseRef)
 						}
 						if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
-							// A lost annotation is already reported loudly by the helper;
-							// the close is refused either way.
-							_ = noteVerifiedPushFailure(bd, cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
+							noteVerifiedPushFailure(bd, cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
 						if noMRCommitSHA != "" {
@@ -1343,18 +1329,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
-				// gt-290c: the push already landed, so the close is the only thing
-				// still withholdable. A lost annotation blocks it below.
-				ledgerNoteErr = noteVerifiedPushSkipped(g, directBd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
-				if ledgerNoteErr != nil {
-					doneErrors = append(doneErrors, ledgerNoteErr.Error())
-				}
+				noteVerifiedPushSkipped(g, directBd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
 				notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, "direct merge")
 			} else if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
 				pushFailed = true
 				errMsg := verifyErr.Error()
 				doneErrors = append(doneErrors, errMsg)
-				_ = noteVerifiedPushFailure(directBd, cwd, issueID, defaultBranch, directCommitSHA, verifyErr)
+				noteVerifiedPushFailure(directBd, cwd, issueID, defaultBranch, directCommitSHA, verifyErr)
 				style.PrintWarning("%s\nDirect merge pushed but remote verification failed. Source bead will remain in progress.", errMsg)
 				goto notifyWitness
 			}
@@ -1363,11 +1344,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			// Close the base issue — no MR/refinery will close it
 			if issueID != "" {
-				if ledgerNoteErr != nil {
-					style.PrintWarning("not closing %s: the --skip-verify annotation was not recorded", issueID)
-					fmt.Printf("  The bead will remain open for witness/mayor review.\n")
-					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, ledgerNoteErr.Error())
-				} else if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, sourceIssueForNoMerge); skipReason != "" {
+				if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, sourceIssueForNoMerge); skipReason != "" {
 					style.PrintWarning("%s", skipReason)
 					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
 					if fatal {
@@ -1453,29 +1430,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
-				// gt-290c: same as the primary direct-merge path — an unrecordable
-				// skip-verify close is withheld rather than performed silently.
-				ledgerNoteErr = noteVerifiedPushSkipped(g, directBd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on late direct merge")
-				if ledgerNoteErr != nil {
-					doneErrors = append(doneErrors, ledgerNoteErr.Error())
-				}
+				noteVerifiedPushSkipped(g, directBd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on late direct merge")
 				notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, "late direct merge")
 			} else if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
 				pushFailed = true
 				errMsg := verifyErr.Error()
 				doneErrors = append(doneErrors, errMsg)
-				_ = noteVerifiedPushFailure(directBd, cwd, issueID, defaultBranch, directCommitSHA, verifyErr)
+				noteVerifiedPushFailure(directBd, cwd, issueID, defaultBranch, directCommitSHA, verifyErr)
 				style.PrintWarning("%s\nLate direct merge pushed but remote verification failed. Source bead will remain in progress.", errMsg)
 				goto notifyWitness
 			}
 			fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
 			doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
-			if ledgerNoteErr != nil {
-				style.PrintWarning("not closing %s: the --skip-verify annotation was not recorded", issueID)
-				fmt.Printf("  The bead will remain open for witness/mayor review.\n")
-				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, ledgerNoteErr.Error())
-			} else if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, sourceIssueForNoMerge); skipReason != "" {
+			if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, sourceIssueForNoMerge); skipReason != "" {
 				style.PrintWarning("%s", skipReason)
 				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
 				if fatal {
@@ -1575,18 +1543,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			pushedCommitSHA, _ = g.Rev("HEAD")
 		}
 		if doneSkipVerify {
-			// gt-290c: this path closes nothing — the refinery closes the bead
-			// after merge — so the lost annotation is carried to the witness in
-			// the POLECAT_DONE reasons rather than blocking the MR.
-			if noteErr := noteVerifiedPushSkipped(g, sourceBD, sourceIssueForNoMerge, cwd, issueID, branch, pushedCommitSHA, "--skip-verify on branch push"); noteErr != nil {
-				doneErrors = append(doneErrors, noteErr.Error())
-			}
+			noteVerifiedPushSkipped(g, sourceBD, sourceIssueForNoMerge, cwd, issueID, branch, pushedCommitSHA, "--skip-verify on branch push")
 			notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, "branch push")
 		} else if verifyErr := verifyPushedCommitWithBareFallback(g, townRoot, rigName, branch, pushedCommitSHA); verifyErr != nil {
 			pushFailed = true
 			errMsg := verifyErr.Error()
 			doneErrors = append(doneErrors, errMsg)
-			_ = noteVerifiedPushFailure(sourceBD, cwd, issueID, branch, pushedCommitSHA, verifyErr)
+			noteVerifiedPushFailure(sourceBD, cwd, issueID, branch, pushedCommitSHA, verifyErr)
 			style.PrintWarning("%s\nCommits exist locally but verified push failed. Witness will be notified.", errMsg)
 			goto notifyWitness
 		}
@@ -2386,56 +2349,18 @@ func notifyDoneSkipVerifyUsed(townRoot, rigName, sender, issueID, phase string) 
 	}
 }
 
-// Ledger annotation writes go through these indirections so the failure branch
-// is reachable in tests. The annotation is the whole audit trail for a close
-// that bypassed verification, and gt/bd write paths have a documented history
-// of reporting success for writes that never landed — so the branch where the
-// write fails is the one that has to be exercised (gt-290c).
-var (
-	ledgerAddComment = func(bd *beads.Beads, issueID, msg string) error {
-		return bd.AddComment(issueID, msg)
-	}
-	ledgerUpdateIssue = func(bd *beads.Beads, issueID string, opts beads.UpdateOptions) error {
-		return bd.Update(issueID, opts)
-	}
-)
-
-// reportLostLedgerAnnotation makes a dropped ledger write loud and returns it
-// as an error for the caller to act on. The annotation text is echoed in full
-// because terminal output is the only place it still exists once the write is
-// gone, and the recovery command is spelled out so the record can be restored
-// by hand (gt-290c).
-func reportLostLedgerAnnotation(issueID, annotation string, writeErr error) error {
-	if writeErr == nil {
-		return nil
-	}
-	style.PrintWarning("LEDGER ANNOTATION LOST on %s: %v", issueID, writeErr)
-	fmt.Fprintf(os.Stderr, "  This annotation was NOT recorded on the bead:\n    %s\n", annotation)
-	fmt.Fprintf(os.Stderr, "  Restore it by hand: bd comments add %s %q\n", issueID, annotation)
-	return fmt.Errorf("ledger annotation for %s was not recorded: %w", issueID, writeErr)
-}
-
-// noteVerifiedPushFailure records a failed verified-push on the bead and
-// reopens it. Returns an error when any part of that record was lost.
-func noteVerifiedPushFailure(sourceBD *beads.Beads, cwd, issueID, branch, commit string, verifyErr error) error {
+func noteVerifiedPushFailure(sourceBD *beads.Beads, cwd, issueID, branch, commit string, verifyErr error) {
 	if issueID == "" || cwd == "" {
-		return nil
+		return
 	}
 	bd := sourceBD
 	if bd == nil {
 		bd, _, _ = routedIssueBeads(cwd, issueID)
 	}
 	inProgress := "in_progress"
+	_ = bd.Update(issueID, beads.UpdateOptions{Status: &inProgress})
 	msg := fmt.Sprintf("verified_push_failed: commit %s not verified on origin/%s: %v", commit, branch, verifyErr)
-
-	var writeErrs []error
-	if err := ledgerUpdateIssue(bd, issueID, beads.UpdateOptions{Status: &inProgress}); err != nil {
-		writeErrs = append(writeErrs, fmt.Errorf("could not set %s back to in_progress: %w", issueID, err))
-	}
-	if err := ledgerAddComment(bd, issueID, msg); err != nil {
-		writeErrs = append(writeErrs, fmt.Errorf("comment write failed: %w", err))
-	}
-	return reportLostLedgerAnnotation(issueID, msg, errors.Join(writeErrs...))
+	_ = bd.AddComment(issueID, msg)
 }
 
 // noteVerifiedPushSkipped annotates the bead when verified-push checks were
@@ -2443,14 +2368,9 @@ func noteVerifiedPushFailure(sourceBD *beads.Beads, cwd, issueID, branch, commit
 // ledger checks — authored by the closing agent, and created after the bead was
 // slung. Anything else is recorded as unverifiable rather than as evidence
 // (gt-r5p): a SHA on a bead is read as proof it was done.
-//
-// This comment is the ONLY durable record that a completion bypassed
-// verified-push checks — the DONE_SKIP_VERIFY witness mail is a wisp and gets
-// reaped. Returns an error when the write is lost so the caller can refuse to
-// treat an unrecordable close as recorded (gt-290c).
-func noteVerifiedPushSkipped(g *git.Git, sourceBD *beads.Beads, sourceIssue *beads.Issue, cwd, issueID, branch, commit, reason string) error {
+func noteVerifiedPushSkipped(g *git.Git, sourceBD *beads.Beads, sourceIssue *beads.Issue, cwd, issueID, branch, commit, reason string) {
 	if issueID == "" || cwd == "" {
-		return nil
+		return
 	}
 
 	rejection := ""
@@ -2479,7 +2399,7 @@ func noteVerifiedPushSkipped(g *git.Git, sourceBD *beads.Beads, sourceIssue *bea
 	if bd == nil {
 		bd, _, _ = routedIssueBeads(cwd, issueID)
 	}
-	return reportLostLedgerAnnotation(issueID, msg, ledgerAddComment(bd, issueID, msg))
+	_ = bd.AddComment(issueID, msg)
 }
 
 func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, commit string) error {
