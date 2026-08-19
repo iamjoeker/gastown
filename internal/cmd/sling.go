@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -640,6 +641,15 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Use --force to override when intentionally re-activating deferred work.
 	if isDeferredBead(info) && !slingForce {
 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
+	}
+
+	// Guard against slinging durable archival records (gt-f8td).
+	// Incident write-ups and merge ledgers are deliberately filed as ordinary
+	// beads so the wisp GC cannot reach them. That durability makes them look
+	// like open work forever: a polecat reads the ledger, finds nothing to
+	// build, and the bead is dispatched again on the next cycle.
+	if refusal := beads.RecordDispatchRefusal(beadID, info.Labels); refusal != "" && !slingForce {
+		return errors.New(refusal)
 	}
 
 	// Guard against duplicate work: an open MR means this bead's branch is

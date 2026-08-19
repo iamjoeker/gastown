@@ -67,14 +67,6 @@ type WispReaperConfig struct {
 	StaleIssueAgeStr string   `json:"stale_issue_age,omitempty"`
 	MailDeleteAgeStr string   `json:"mail_delete_age,omitempty"`
 	Databases        []string `json:"databases,omitempty"`
-	// ArchiveDir overrides where purge exports protected wisps before deleting
-	// them. Empty uses reaper.DefaultArchiveDir().
-	ArchiveDir string `json:"archive_dir,omitempty"`
-	// ArchiveDisabled restores the pre-retention contract: protected wisp types
-	// are never deleted, and their rows accumulate for as long as the town runs
-	// (gt-6xwt). Off by default, because that accumulation is the bill this
-	// patrol exists to stop deferring.
-	ArchiveDisabled bool `json:"archive_disabled,omitempty"`
 }
 
 // wispReaperInterval returns the configured interval, or the default (1h).
@@ -226,32 +218,6 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 	return nil
 }
 
-// wispArchive resolves the archive the inline purge exports protected wisps to
-// before deleting them (gt-6xwt).
-//
-// Returns nil — meaning protected types are kept, exactly as before retention
-// existed — when the patrol is configured to skip archiving or the directory
-// cannot be created. A daemon that cannot write the record must not delete the
-// row, and this is the only place that decision is made for the inline path.
-func (d *Daemon) wispArchive(config *WispReaperConfig) reaper.Archiver {
-	if config != nil && config.ArchiveDisabled {
-		return nil
-	}
-	dir := ""
-	if config != nil {
-		dir = config.ArchiveDir
-	}
-	if dir == "" {
-		dir = reaper.DefaultArchiveDir()
-	}
-	archive, err := reaper.NewFileArchive(dir)
-	if err != nil {
-		d.logger.Printf("wisp_reaper: archive unavailable (%v); protected wisps will be kept, not released", err)
-		return nil
-	}
-	return archive
-}
-
 // reapWispsInline is the fallback that runs the reaper cycle inline when
 // Dog dispatch is unavailable. Delegates to the reaper package for SQL execution.
 //
@@ -273,8 +239,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 
 	port := d.doltServerPort()
 	dryRun := config.DryRun
-	archive := d.wispArchive(config)
-	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalArchived, totalProtected, totalAutoClosed int
+	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalProtected, totalAutoClosed int
 
 	// Step 2: Reap
 	reapErrors := 0
@@ -332,7 +297,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 			db.Close()
 			continue
 		}
-		result, err := reaper.Purge(db, dbName, deleteAge, mailAge, dryRun, reaper.WithArchive(archive))
+		result, err := reaper.Purge(db, dbName, deleteAge, mailAge, dryRun)
 		db.Close()
 		if err != nil {
 			d.logger.Printf("wisp_reaper: %s: purge error: %v", dbName, err)
@@ -341,12 +306,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 		}
 		totalPurged += result.WispsPurged
 		totalMailPurged += result.MailPurged
-		totalArchived += result.WispsArchived
 		totalProtected += result.WispsProtected
-		if result.WispsArchived > 0 && archive != nil {
-			d.logger.Printf("wisp_reaper: %s: archived and released %d protected wisps to %s",
-				dbName, result.WispsArchived, archive.Location())
-		}
 		for _, a := range result.Anomalies {
 			d.logger.Printf("wisp_reaper: %s: ANOMALY: %s", dbName, a.Message)
 		}
@@ -452,8 +412,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 	if totalMoleculeSteps > 0 {
 		summary += fmt.Sprintf(" molecule_steps_closed=%d", totalMoleculeSteps)
 	}
-	summary += fmt.Sprintf(" purged=%d archived=%d protected=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalPurged, totalArchived, totalProtected, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	summary += fmt.Sprintf(" purged=%d protected=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalPurged, totalProtected, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
 	// Report the acting ages. This path never slings the formula, so the digest
 	// vars — the only other place these surface — are not written for it. Without
 	// this line an inline cycle reports what it closed but not the policy it used.

@@ -141,6 +141,8 @@ func runReady(cmd *cobra.Command, args []string) error {
 				// Otherwise the dashboard can render a row that `gt sling <same-id>`
 				// cannot resolve because routes.jsonl points that prefix elsewhere.
 				filtered = filterReadyIssuesByRoute(townRoot, "town", filtered)
+				// Filter durable archival records (gt-f8td) - read, not implemented
+				filtered = filterRecordBeads(filtered, getRecordBeadIDs(townBeadsPath))
 				// Filter identity beads (agents, roles, rigs) - not actionable work
 				src.Issues = filterIdentityBeads(filtered)
 			}
@@ -174,6 +176,8 @@ func runReady(cmd *cobra.Command, args []string) error {
 				// Ready Across Rigs surface honest: every displayed ID must be
 				// usable by the stock `gt sling <id> <rig>` command.
 				filtered = filterReadyIssuesByRoute(townRoot, r.Name, filtered)
+				// Filter durable archival records (gt-f8td) - read, not implemented
+				filtered = filterRecordBeads(filtered, getRecordBeadIDs(r.BeadsPath()))
 				// Filter identity beads (agents, roles, rigs) - not actionable work
 				src.Issues = filterIdentityBeads(filtered)
 			}
@@ -419,6 +423,91 @@ func getWispIDs(beadsPath string) map[string]bool {
 		wispIDs[w.ID] = true
 	}
 	return wispIDs
+}
+
+// getRecordBeadIDs returns the IDs of durable archival records (gt-f8td).
+//
+// A separate query is required: `bd ready --json` omits the labels field
+// entirely, so filtering the ready rows on issue.Labels alone would match
+// nothing and silently pass every record through. The ID set is built the same
+// way the wisp exclusion set is (getWispIDs).
+//
+// Returns nil on any error — a record that slips into the ready list is a
+// cosmetic problem, and the dispatch-time guard in executeSling/runSling reads
+// labels from `bd show` and still refuses it.
+func getRecordBeadIDs(beadsPath string) map[string]bool {
+	recordIDs := make(map[string]bool)
+	for _, label := range []string{beads.RecordLabel, beads.LedgerLabel, beads.IncidentLabel} {
+		output, err := BdCmd("list", "--label="+label, "--json", "--limit=0").
+			Dir(beadsPath).
+			StripBeadsDir().
+			Stderr(io.Discard).
+			Output()
+		if err != nil {
+			continue
+		}
+		for _, row := range parseReadyBeadIDs(output) {
+			recordIDs[row] = true
+		}
+	}
+	if len(recordIDs) == 0 {
+		return nil
+	}
+	return recordIDs
+}
+
+// parseReadyBeadIDs decodes bd list output, accepting both the bare array bd
+// returns today and the {"issues": [...]} envelope other bd surfaces use. A
+// decoder that handles only one shape returns zero rows for the other with a
+// nil error, which reads as "no records exist" forever.
+func parseReadyBeadIDs(output []byte) []string {
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil
+	}
+	type row struct {
+		ID string `json:"id"`
+	}
+	var rows []row
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal(output, &rows); err != nil {
+			return nil
+		}
+	} else {
+		var envelope struct {
+			Issues []row `json:"issues"`
+		}
+		if err := json.Unmarshal(output, &envelope); err != nil {
+			return nil
+		}
+		rows = envelope.Issues
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.ID != "" {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids
+}
+
+// filterRecordBeads removes durable archival records from the list.
+// Records (incident write-ups, merge ledgers) are filed as ordinary beads so
+// the wisp GC cannot reach them; they are read, not implemented, and offering
+// them as ready work costs a polecat session per dispatch (gt-f8td).
+func filterRecordBeads(issues []*beads.Issue, recordIDs map[string]bool) []*beads.Issue {
+	filtered := make([]*beads.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if recordIDs[issue.ID] {
+			continue
+		}
+		// Defense in depth for callers whose rows do carry labels.
+		if beads.IsRecordBead(issue) {
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+	return filtered
 }
 
 // filterIdentityBeads removes agent, role, and rig identity beads from the list.
