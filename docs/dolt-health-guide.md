@@ -68,6 +68,41 @@ the server. Dolt handles SIGTERM and exits 0, and systemd counts SIGTERM as a
 clean exit regardless, so `on-failure`, `on-abnormal`, `on-abort` and
 `on-watchdog` all leave a gt-issued stop standing.
 
+### Starting a supervised server
+
+`gt dolt start` starts the **unit**, not a bare process, when one owns this
+town's server:
+
+```
+Dolt is supervised by systemd unit gt-dolt.service (Restart=on-failure) — starting through the supervisor
+```
+
+That is not cosmetic. A `dolt` spawned directly while the unit is stopped is a
+server systemd believes does not exist: nothing restarts it when it dies, it dies
+with whatever shell started it, and a later `systemctl --user start
+gt-dolt.service` fails on an occupied port while `systemctl status` still reads
+`inactive`. Under `Restart=on-failure` there is no second instance to paper over
+it either — a graceful stop stays stopped.
+
+gt finds the unit from a record in `daemon/dolt-state.json`, written whenever a
+command sees a running supervised server (`gt dolt start`, `stop`, `status`,
+`down`, `migrate`). Consequences worth knowing:
+
+- **A town gt has never seen supervised will still spawn directly.** Run `gt dolt
+  status` once against the running server to teach it the unit.
+- **The record stores the unit name only.** `Restart=`, `NRestarts` and the
+  start-limit properties are re-read from systemd each time, so a policy change
+  (like the 2026-08-18 switch to `on-failure`) takes effect immediately.
+- **A removed or masked unit is ignored**, and gt starts the server itself.
+- `GT_DOLT_DIRECT_START=1 gt dolt start` forces a direct spawn — for recovering
+  from a unit that points at the wrong data directory or port. It is the
+  unsupervised path, deliberately.
+
+`gt dolt migrate` uses the same record for a refusal it could not make before: it
+moves database directories on disk, so if the remembered unit is not confirmed
+`ActiveState=inactive` it stops before touching anything, rather than trusting a
+point-in-time "no server is running" for the several minutes a migration takes.
+
 ### Reading `journalctl --user -u gt-dolt.service`
 
 Two exit signatures, two very different causes:

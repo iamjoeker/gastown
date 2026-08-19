@@ -201,18 +201,63 @@ func TestServerAppearedRemedyUnderSupervisor(t *testing.T) {
 	}
 }
 
-// `gt dolt migrate` starts a server itself when it finishes, and that process
-// belongs to no unit. An operator who followed step 1 and stopped the unit ends
-// up with an unsupervised server unless the remedy says how to hand it back.
-func TestServerAppearedRemedyHandsTheServerBackToTheSupervisor(t *testing.T) {
+// `gt dolt migrate` starts a server itself when it finishes. That process used
+// to belong to no unit, so this remedy told the operator to stop it and start
+// the unit by hand. doltserver.Start now routes through the unit itself
+// (gt-cru5), which makes that instruction wrong in the worse direction: it
+// sends an operator to start a unit that is already running, and its failure
+// reads as a broken recovery.
+func TestServerAppearedRemedySaysTheAutoStartIsSupervised(t *testing.T) {
 	out := serverAppearedDuringMigrationRemedy(
 		supervisedUnit(), "/home/op/gt/.dolt-data", []string{"hq"}, []string{"gastown"})
 
-	if !strings.Contains(out, "systemctl --user start gt-dolt.service") {
-		t.Errorf("remedy must restart the unit, not the bare process, got:\n%s", out)
+	if !strings.Contains(out, "starts a server again when it finishes") {
+		t.Errorf("remedy must account for the auto-start that follows a successful re-run, got:\n%s", out)
 	}
-	if !strings.Contains(out, "starts a server itself when it finishes") {
-		t.Errorf("remedy must say why a start step is needed after a successful re-run, got:\n%s", out)
+	if !strings.Contains(out, "gt-dolt.service, so it comes back supervised") {
+		t.Errorf("remedy must say the auto-start goes through the unit, got:\n%s", out)
+	}
+	if strings.Contains(out, "systemctl --user start gt-dolt.service") {
+		t.Errorf("no hand-off step is needed any more — telling the operator to start a running unit is a failing command:\n%s", out)
+	}
+	// The stop step is still the operator's job and must survive this change.
+	if !strings.Contains(out, "systemctl --user stop gt-dolt.service") {
+		t.Errorf("remedy must still stop the unit, got:\n%s", out)
+	}
+}
+
+// The refusal that gt-2xsa could not implement: with the server down,
+// DetectSupervisor has no PID to read a cgroup from, so migration could only
+// bound the restart window rather than refuse. The unit remembered in
+// dolt-state.json closes that gap (gt-cru5) — but only if the message tells the
+// operator which state was read and how to confirm the fix.
+func TestUnitNotStoppedRemedy(t *testing.T) {
+	out := unitNotStoppedRemedy(supervisedUnit(), "activating")
+
+	if !strings.Contains(out, "ActiveState=activating") {
+		t.Errorf("remedy must report the state it actually read, got:\n%s", out)
+	}
+	if !strings.Contains(out, "systemctl --user stop gt-dolt.service") {
+		t.Errorf("remedy must name the unit's stop command, got:\n%s", out)
+	}
+	if !strings.Contains(out, "must print: inactive") {
+		t.Errorf("remedy must give a confirmation step with a pass condition, got:\n%s", out)
+	}
+	if !strings.Contains(out, "systemctl --user show -p ActiveState --value gt-dolt.service") {
+		t.Errorf("confirmation must be a command the operator can run, got:\n%s", out)
+	}
+}
+
+// An unreadable ActiveState is why the refusal fires at all in that case, so
+// the message must not invent a state systemd never reported.
+func TestUnitNotStoppedRemedyWithNoAnswerFromSystemd(t *testing.T) {
+	out := unitNotStoppedRemedy(supervisedUnit(), "")
+
+	if strings.Contains(out, "ActiveState=") {
+		t.Errorf("no state was read, so none may be quoted, got:\n%s", out)
+	}
+	if !strings.Contains(out, "gave no ActiveState") {
+		t.Errorf("remedy must say systemd did not answer, got:\n%s", out)
 	}
 }
 
