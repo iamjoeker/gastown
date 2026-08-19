@@ -122,10 +122,7 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	// The work bead itself is the authoritative source — no need to read
 	// the agent bead's hook_bead slot.
 	hookedBeadID := ""
-	// Match every address form: a bead hooked as "deacon" belongs to the same
-	// agent as one hooked as "deacon/", and an agent that cannot see its own
-	// hook cannot clear it either.
-	hookedBeads, listErr := listAcrossAssigneeForms(b.List, beads.ListOptions{
+	hookedBeads, listErr := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
 		Priority: -1,
@@ -269,7 +266,7 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 // Returns true if any stale beads were cleaned up.
 func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBeadID, townRoot, beadsPath string, dryRun bool) bool {
 	// Collect stale beads from local rig beads
-	staleBeads, err := listAcrossAssigneeForms(b.List, beads.ListOptions{
+	staleBeads, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
 		Priority: -1,

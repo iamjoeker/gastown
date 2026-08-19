@@ -124,10 +124,7 @@ func findHookedFormulaSingleton(workDir, targetAgent, formulaName string) (*bead
 	}
 
 	b := beads.New(workDir)
-	// Match every address form: a wisp written as assignee "deacon" is the same
-	// agent's hook as one written "deacon/", and missing it here makes the sling
-	// create a duplicate hooked wisp instead of reusing the singleton.
-	hookedBeads, err := listAcrossAssigneeForms(b.List, beads.ListOptions{
+	hookedBeads, err := b.List(beads.ListOptions{
 		Status:    beads.StatusHooked,
 		Assignee:  targetAgent,
 		Priority:  -1,
@@ -356,13 +353,11 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 		rollbackSlingArtifactsFn(resolved.NewPolecatInfo, beadID, formulaWorkDir, "")
 	}
 
-	// Resolve working directory for bd commands (routes to correct rig beads).
-	// The resolved target's WorkDir is the agent's own directory, which for a
-	// role target (deacon, mayor, daemon) holds no .beads at all — every bd call
-	// below would die with "no beads database found". Resolving the database
-	// from identity rather than from the target covers that case and the empty
-	// case together.
-	formulaWorkDir = beads.AgentBeadsWorkDir(targetAgent, formulaWorkDir, townRoot)
+	// Resolve working directory for bd commands (routes to correct rig beads)
+	// Fall back to townRoot (HQ beads) if no specific rig directory was determined
+	if formulaWorkDir == "" {
+		formulaWorkDir = townRoot
+	}
 
 	var wispRootID string
 

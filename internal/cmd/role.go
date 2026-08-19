@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
@@ -344,7 +343,7 @@ func parseRoleString(s string) (Role, string, string) {
 	for strings.Contains(s, "//") {
 		s = strings.ReplaceAll(s, "//", "/")
 	}
-	s = beads.BareAgentAddress(s)
+	s = strings.TrimSuffix(s, "/")
 
 	// Simple roles
 	switch s {

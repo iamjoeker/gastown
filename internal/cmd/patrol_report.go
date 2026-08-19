@@ -58,14 +58,11 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	var cfg PatrolConfig
 	switch roleInfo.Role {
 	case RoleDeacon:
-		// Assignee uses the canonical form: the deacon's beads are addressed
-		// "deacon/". Writing the bare form here is what made gt hook report
-		// "Nothing on hook" for a wisp that was genuinely hooked.
 		cfg = PatrolConfig{
 			RoleName:      "deacon",
 			PatrolMolName: constants.MolDeaconPatrol,
 			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      beads.CanonicalAgentAddress("deacon"),
+			Assignee:      "deacon",
 		}
 	case RoleWitness:
 		cfg = PatrolConfig{
