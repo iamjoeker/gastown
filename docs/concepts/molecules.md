@@ -110,14 +110,6 @@ through each step in order.
 **Heuristic**: If you would curse losing the progress after a crash, set `pour = true`.
 High frequency + cheap steps = inline (default). Low frequency + expensive steps = pour.
 
-Every instantiation path honors this. `gt patrol` and `gt sling` both create
-root-only wisps for a formula that declares no `pour`; only `pour = true`
-formulas get their steps as rows. The two paths reach that through different bd
-verbs — `bd mol wisp create --root-only` for root-only work, `bd mol bond` for
-poured work — because bond spawns the whole proto tree and has no --root-only
-flag. Daemon dogs are the exception: they materialize steps regardless, because
-they close each step by ID as their Go code runs.
-
 ## Patrol Workflow
 
 Patrol agents (Deacon, Witness, Refinery) cycle through patrol formulas:
