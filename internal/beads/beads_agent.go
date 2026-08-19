@@ -760,8 +760,13 @@ func mergeAgentBeadSources(issuesByID, wispsByID map[string]*Issue) map[string]*
 
 // ListAgentBeadsFromWisps queries the wisps table for agent beads.
 // Returns nil, nil if the wisps table doesn't exist yet or has no agent beads.
+//
+// Scope: OPEN wisps only, because that is what `bd mol wisp list` returns
+// without --all (see wispListArgs). Callers that need "does this record exist
+// at all" must not read an absence here as non-existence — a closed agent bead
+// is absent from this map (gt-kb63).
 func (b *Beads) ListAgentBeadsFromWisps() (map[string]*Issue, error) {
-	out, err := b.run("mol", "wisp", "list", "--json")
+	out, err := b.run(wispListArgs(false)...)
 	if err != nil {
 		return nil, nil // Wisps table may not exist yet
 	}
@@ -815,11 +820,33 @@ func isAgentBeadByID(id string) bool {
 	return false
 }
 
-// ListWispIDs returns a set of all wisp IDs in the wisps table.
+// wispListArgs builds the `bd mol wisp list --json` argv, adding --all when
+// closed wisps must be included.
+//
+// `bd mol wisp list` is open-only by default; --all is what widens it to closed
+// wisps. Its help text makes this easy to miss — the Short line reads "List all
+// wisps" and the field legend lists "Status: Current status (open, in_progress,
+// closed)" right above the flag, which describes the COLUMN's possible values,
+// not the listing's scope. Every call site in gastown therefore states its
+// intent through this helper rather than hand-writing the argv (gt-kb63).
+func wispListArgs(includeClosed bool) []string {
+	args := []string{"mol", "wisp", "list", "--json"}
+	if includeClosed {
+		args = append(args, "--all")
+	}
+	return args
+}
+
+// ListWispIDs returns the IDs of the OPEN wisps in the wisps table.
 // This is useful for existence checks where wisp metadata (type, labels)
 // may not be available in the list output.
+//
+// This set is NOT every wisp: closed wisps are excluded. Ask ListWispStatuses
+// when the question is "does this record exist at all?", because a closed wisp
+// is indistinguishable from a destroyed one here, and reading that absence as
+// non-existence is the false-zero defect in gt-kb63.
 func (b *Beads) ListWispIDs() (map[string]bool, error) {
-	out, err := b.run("mol", "wisp", "list", "--json")
+	out, err := b.run(wispListArgs(false)...)
 	if err != nil {
 		return nil, nil
 	}
@@ -836,6 +863,37 @@ func (b *Beads) ListWispIDs() (map[string]bool, error) {
 	result := make(map[string]bool, len(wrapper.Wisps))
 	for _, w := range wrapper.Wisps {
 		result[w.ID] = true
+	}
+	return result, nil
+}
+
+// ListWispStatuses returns every wisp in the wisps table as ID -> status, open
+// and closed. Callers that need to tell "closed" from "absent" want this — it
+// answers both in one bd invocation, and it is the only listing here that can
+// distinguish them at all.
+//
+// Still scoped to ONE store: the database this Beads handle points at. Wisps in
+// another rig's store are invisible no matter what this returns, so an empty
+// result means "not in this store", never "nowhere".
+func (b *Beads) ListWispStatuses() (map[string]string, error) {
+	out, err := b.run(wispListArgs(true)...)
+	if err != nil {
+		return nil, nil
+	}
+
+	var wrapper struct {
+		Wisps []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"wisps"`
+	}
+	if err := json.Unmarshal(out, &wrapper); err != nil {
+		return nil, nil
+	}
+
+	result := make(map[string]string, len(wrapper.Wisps))
+	for _, w := range wrapper.Wisps {
+		result[w.ID] = w.Status
 	}
 	return result, nil
 }
