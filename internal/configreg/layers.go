@@ -108,8 +108,9 @@ func collectTownSettings(b *builder, townRoot string) {
 //
 // Defaults for this layer are the ones gt init provisions
 // (daemon.DefaultLifecycleConfig). Individual patrols carry their own
-// compiled-in fallbacks for a genuinely absent file, and those are not always
-// the same number — see gt-il30 notes.
+// compiled-in fallbacks for a genuinely absent file; the provisioned tree is now
+// built from those same constants, so the number listed here is the number that
+// acts either way (gt-r4lv — before that fix wisp_reaper listed 30m and ran 1h).
 func collectDaemonJSON(b *builder, townRoot string) {
 	path := daemon.PatrolConfigFile(townRoot)
 	const scope = "town/daemon"
