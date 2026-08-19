@@ -3,9 +3,19 @@ package deacon
 import (
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/awaitprobe"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func at(base time.Time, d time.Duration) time.Time { return base.Add(d) }
+
+// parked is what a Deacon asleep in await-signal looks like to both signals: a
+// live await process, and a pane whose turn is in flight inside it.
+var parked = LivenessSignals{Await: awaitprobe.StatePending, Turn: tmux.TurnActive}
+
+// stopped is the wedge: no turn running, and no await pending to start one.
+var stopped = LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnEnded}
 
 func TestNextObservation_FirstReadingStartsWindow(t *testing.T) {
 	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
@@ -21,9 +31,6 @@ func TestNextObservation_FirstReadingStartsWindow(t *testing.T) {
 	}
 	if !obs.FirstSeen.Equal(now) {
 		t.Errorf("FirstSeen = %v, want %v", obs.FirstSeen, now)
-	}
-	if obs.TimestampAdvances != 0 {
-		t.Errorf("TimestampAdvances = %d, want 0", obs.TimestampAdvances)
 	}
 }
 
@@ -42,7 +49,6 @@ func TestNextObservation_CycleAdvanceResetsWindow(t *testing.T) {
 		FirstSeen:          base,
 		LastSeen:           at(base, 5*time.Minute),
 		HeartbeatTimestamp: base,
-		TimestampAdvances:  3,
 	}
 	hb := &Heartbeat{Timestamp: at(base, 6*time.Minute), Cycle: 422}
 
@@ -54,34 +60,11 @@ func TestNextObservation_CycleAdvanceResetsWindow(t *testing.T) {
 	if !obs.FirstSeen.Equal(at(base, 6*time.Minute)) {
 		t.Errorf("FirstSeen = %v, want the advance time — the stall window must reset", obs.FirstSeen)
 	}
-	if obs.TimestampAdvances != 0 {
-		t.Errorf("TimestampAdvances = %d, want 0 after a cycle advance", obs.TimestampAdvances)
-	}
 }
 
-// A frozen cycle whose heartbeat timestamp keeps moving is the exact signature
-// reported in gt-bvo: the Deacon writes heartbeats but completes no wake cycles.
-func TestNextObservation_CountsTimestampAdvancesUnderFrozenCycle(t *testing.T) {
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-
-	obs := NextObservation(nil, &Heartbeat{Timestamp: base, Cycle: 421}, base)
-
-	for i := 1; i <= 3; i++ {
-		tick := at(base, time.Duration(i)*time.Minute)
-		obs = NextObservation(obs, &Heartbeat{Timestamp: tick, Cycle: 421}, tick)
-	}
-
-	if obs.TimestampAdvances != 3 {
-		t.Errorf("TimestampAdvances = %d, want 3", obs.TimestampAdvances)
-	}
-	if !obs.FirstSeen.Equal(base) {
-		t.Errorf("FirstSeen = %v, want %v — the stall window must not reset", obs.FirstSeen, base)
-	}
-}
-
-// A Deacon parked in await-signal advances neither timestamp nor cycle. It must
-// not accumulate wedge confirmations, or every legitimate sleep reads as a wedge.
-func TestNextObservation_IdleSleepDoesNotCountAsAdvance(t *testing.T) {
+// A frozen cycle extends one stall window rather than starting a new one, so
+// StallDuration measures the whole freeze however many times it is polled.
+func TestNextObservation_FrozenCycleExtendsOneWindow(t *testing.T) {
 	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 	frozen := &Heartbeat{Timestamp: base, Cycle: 421}
 
@@ -91,47 +74,284 @@ func TestNextObservation_IdleSleepDoesNotCountAsAdvance(t *testing.T) {
 		obs = NextObservation(obs, frozen, tick)
 	}
 
-	if obs.TimestampAdvances != 0 {
-		t.Errorf("TimestampAdvances = %d, want 0 when the heartbeat itself is frozen", obs.TimestampAdvances)
+	if !obs.FirstSeen.Equal(base) {
+		t.Errorf("FirstSeen = %v, want %v — the stall window must not reset", obs.FirstSeen, base)
+	}
+	if got := obs.StallDuration(at(base, 5*time.Minute)); got != 5*time.Minute {
+		t.Errorf("StallDuration = %v, want 5m", got)
 	}
 }
 
-func TestWedgeConfirmed(t *testing.T) {
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-
+// The two signals cover each other's blind spot, so each one alone must be
+// inconclusive. Getting either direction wrong reintroduces a known failure:
+// treating an ended turn as stopped wakes agents whose await was backgrounded
+// (gt-ghw7), and treating an absent await as stopped condemns a Deacon that is
+// simply computing.
+func TestLivenessSignals_Stopped(t *testing.T) {
 	tests := []struct {
 		name string
-		obs  *CycleObservation
+		sig  LivenessSignals
 		want bool
 	}{
 		{
-			name: "nil observation is not a wedge",
-			obs:  nil,
-			want: false,
-		},
-		{
-			name: "no advances",
-			obs:  &CycleObservation{Cycle: 421, FirstSeen: base},
-			want: false,
-		},
-		{
-			name: "one timestamp advance is not yet confirmation",
-			obs:  &CycleObservation{Cycle: 421, FirstSeen: base, TimestampAdvances: 1},
-			want: false,
-		},
-		{
-			name: "two timestamp advances confirm a wedge",
-			obs:  &CycleObservation{Cycle: 421, FirstSeen: base, TimestampAdvances: 2},
+			name: "no await and an ended turn is stopped",
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnEnded},
 			want: true,
+		},
+		{
+			name: "no await and a stranded composer is stopped",
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnStranded},
+			want: true,
+		},
+		{
+			name: "a live await means parked, whatever the pane says",
+			sig:  LivenessSignals{Await: awaitprobe.StatePending, Turn: tmux.TurnEnded},
+			want: false,
+		},
+		{
+			name: "a turn in flight means working, even with no await",
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnActive},
+			want: false,
+		},
+		{
+			name: "an unreadable process table decides nothing",
+			sig:  LivenessSignals{Await: awaitprobe.StateUnknown, Turn: tmux.TurnEnded},
+			want: false,
+		},
+		{
+			name: "an unreadable pane decides nothing",
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnUnknown},
+			want: false,
+		},
+		{
+			name: "the zero value decides nothing",
+			sig:  LivenessSignals{},
+			want: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.obs.WedgeConfirmed(); got != tt.want {
-				t.Errorf("WedgeConfirmed() = %v, want %v", got, tt.want)
+			if got := tt.sig.Stopped(); got != tt.want {
+				t.Errorf("Stopped() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// The regression that guards the Mayor's safety correction on gt-bvo: a Deacon
+// parked in await-signal advances neither cycle nor heartbeat, and must stay
+// unwedged for an unbounded sleep. An earlier design used a 20m elapsed-stall
+// backstop here, which condemned healthy sleeping Deacons.
+func TestEvaluateHealth_LongIdleSleepIsNeverWedged(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	frozen := &Heartbeat{Timestamp: base, Cycle: 421}
+
+	for i := 1; i <= 240; i++ { // four hours of polling a sleeping Deacon
+		tick := at(base, time.Duration(i)*time.Minute)
+
+		if got := EvaluateHealth(frozen, tick, DefaultHealthThresholds(), parked); got == VerdictWedged {
+			t.Fatalf("EvaluateHealth() = %q after %dm of legitimate sleep, want any non-wedged verdict", got, i)
+		}
+	}
+}
+
+// The core acceptance criterion from gt-bvo, rebuilt on signals that exist: a
+// Deacon sitting at its prompt with no await pending is wedged, and says so
+// while every other probe the town has still reads healthy.
+func TestEvaluateHealth_StoppedMidPatrolIsWedged(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	th := DefaultHealthThresholds()
+	hb := &Heartbeat{Timestamp: base, Cycle: 421, LastAction: "cycle 415 closed (abbreviated)"}
+	now := at(base, 6*time.Minute)
+
+	// Precondition: the age flags this replaces still read as an ordinary stale
+	// heartbeat, so the wedge verdict is carrying information nothing else does.
+	if age := now.Sub(hb.Timestamp); age < th.Stale || age >= th.VeryStale {
+		t.Fatalf("precondition: age %s must be an ordinary stale heartbeat, or this test proves nothing", age)
+	}
+
+	got := EvaluateHealth(hb, now, th, stopped)
+
+	if got != VerdictWedged {
+		t.Errorf("EvaluateHealth() = %q, want %q", got, VerdictWedged)
+	}
+	if got.Healthy() {
+		t.Error("a wedged Deacon must not report Healthy()")
+	}
+}
+
+func TestEvaluateHealth(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		hb   *Heartbeat
+		now  time.Time
+		sig  LivenessSignals
+		want Verdict
+	}{
+		{
+			name: "no heartbeat is unknown",
+			hb:   nil,
+			now:  base,
+			sig:  stopped,
+			want: VerdictUnknown,
+		},
+		{
+			name: "recent heartbeat is fresh",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, time.Minute),
+			sig:  parked,
+			want: VerdictFresh,
+		},
+		{
+			// The age gate is what buys out the races: a turn that ended a
+			// moment ago, a session mid-respawn, and a Deacon between two steps
+			// all read stopped for an instant, and all refresh the heartbeat
+			// well inside this window.
+			name: "a fresh heartbeat outranks the stopped signals",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 4*time.Minute),
+			sig:  stopped,
+			want: VerdictFresh,
+		},
+		{
+			name: "aging heartbeat with a live await is stale",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 6*time.Minute),
+			sig:  parked,
+			want: VerdictStale,
+		},
+		{
+			// A long patrol step freezes the heartbeat and has no await
+			// process. The pane is what tells it apart from a stopped Deacon.
+			name: "a working Deacon with no await is stale, not wedged",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 6*time.Minute),
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnActive},
+			want: VerdictStale,
+		},
+		{
+			// Absence of an await cannot be established without a process
+			// table, so a host that cannot be read falls back to age.
+			name: "no process table means no wedge verdict",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 25*time.Minute),
+			sig:  LivenessSignals{Await: awaitprobe.StateUnknown, Turn: tmux.TurnEnded},
+			want: VerdictVeryStale,
+		},
+		{
+			// TurnState reports unknown for a session that does not exist, so a
+			// Deacon that died keeps the age verdict. That is the right remedy
+			// signal: restart it, do not go looking at its composer.
+			name: "a dead session is very stale, not wedged",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 25*time.Minute),
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnUnknown},
+			want: VerdictVeryStale,
+		},
+		{
+			name: "old heartbeat with a live await is very stale",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 25*time.Minute),
+			sig:  parked,
+			want: VerdictVeryStale,
+		},
+		{
+			name: "stopped past the very stale threshold is still wedged",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 25*time.Minute),
+			sig:  stopped,
+			want: VerdictWedged,
+		},
+		{
+			// patrol-wake refuses to type into a stranded composer, so nothing
+			// in the town recovers this one automatically. It must be reported.
+			name: "a stranded composer is wedged",
+			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
+			now:  at(base, 6*time.Minute),
+			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnStranded},
+			want: VerdictWedged,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := EvaluateHealth(tt.hb, tt.now, DefaultHealthThresholds(), tt.sig); got != tt.want {
+				t.Errorf("EvaluateHealth() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// gt-dndw proposed keying the verdict on heartbeat.LastAction: the patrol
+// formula writes "pre-await checkpoint" immediately before parking, so a frozen
+// heartbeat resting on anything else would mean stopped mid-patrol. LastAction
+// is typed by the Deacon rather than written by the code that parks, and the
+// strings below are what it actually contains — every one transcribed from a
+// recorded `gt deacon status --json` poll of a LEGITIMATELY SLEEPING hq-deacon.
+// Of 323 recorded readings only 9 carry the exact string; 157 paraphrase it.
+//
+// So the verdict must not read the field at all: parked is parked whatever the
+// Deacon called it.
+func TestEvaluateHealth_SleepVerdictIgnoresLastAction(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	now := at(base, 25*time.Minute) // past very stale, where an exact-match rule would condemn
+
+	sleeping := []string{
+		"pre-await checkpoint",                      // the formula's spelling
+		"await-signal blocking, patrol 2761 closed", // the most common paraphrase
+		"patrol 3070 closed, awaiting signal",
+		"patrol 2668 complete, awaiting signal",
+		"patrol 2751 closing",
+		"recovering from 48th await-signal kill",
+		"", // heartbeats written by Touch carry no action at all
+	}
+
+	for _, action := range sleeping {
+		t.Run(action, func(t *testing.T) {
+			hb := &Heartbeat{Timestamp: base, Cycle: 421, LastAction: action}
+			if got := EvaluateHealth(hb, now, DefaultHealthThresholds(), parked); got == VerdictWedged {
+				t.Errorf("EvaluateHealth() = %q for a parked Deacon whose last action was %q, want any non-wedged verdict",
+					got, action)
+			}
+		})
+	}
+
+	// The mirror: a Deacon that stopped just after writing the formula's own
+	// pre-await string is wedged, which is the false NEGATIVE an exact-match
+	// suppression rule would have produced. The await it announced is not there.
+	hb := &Heartbeat{Timestamp: base, Cycle: 421, LastAction: "pre-await checkpoint"}
+	if got := EvaluateHealth(hb, now, DefaultHealthThresholds(), stopped); got != VerdictWedged {
+		t.Errorf("EvaluateHealth() = %q for a Deacon stopped after announcing a park it never entered, want %q",
+			got, VerdictWedged)
+	}
+}
+
+func TestObserveCycle_RoundTripsThroughDisk(t *testing.T) {
+	townRoot := t.TempDir()
+	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+
+	first := ObserveCycle(townRoot, &Heartbeat{Timestamp: base, Cycle: 421}, base)
+	if first == nil {
+		t.Fatal("ObserveCycle returned nil on first observation")
+	}
+
+	// Second poll, same cycle: the stall window must survive the disk round-trip
+	// rather than restarting at every poll.
+	tick := at(base, 2*time.Minute)
+	second := ObserveCycle(townRoot, &Heartbeat{Timestamp: base, Cycle: 421}, tick)
+
+	if !second.FirstSeen.Equal(base) {
+		t.Errorf("FirstSeen = %v, want %v", second.FirstSeen, base)
+	}
+	if got := second.StallDuration(tick); got != 2*time.Minute {
+		t.Errorf("StallDuration = %v, want 2m", got)
+	}
+
+	if stored := ReadCycleObservation(townRoot); stored == nil || !stored.FirstSeen.Equal(base) {
+		t.Errorf("ReadCycleObservation() = %+v, want the persisted second observation", stored)
 	}
 }
 
@@ -152,181 +372,26 @@ func TestCycleFrozen_IsElapsedTimeOnly(t *testing.T) {
 	}
 }
 
-// The regression that guards the Mayor's safety correction on gt-bvo: a Deacon
-// parked in await-signal advances neither timestamp nor cycle. It must stay
-// unwedged for an unbounded sleep — an earlier design used a 20m elapsed-stall
-// backstop here, which condemned healthy sleeping Deacons.
-func TestEvaluateHealth_LongIdleSleepIsNeverWedged(t *testing.T) {
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-	frozen := &Heartbeat{Timestamp: base, Cycle: 421}
-
-	obs := NextObservation(nil, frozen, base)
-	for i := 1; i <= 240; i++ { // four hours of polling a sleeping Deacon
-		tick := at(base, time.Duration(i)*time.Minute)
-		obs = NextObservation(obs, frozen, tick)
-
-		if got := EvaluateHealth(frozen, obs, tick, DefaultHealthThresholds()); got == VerdictWedged {
-			t.Fatalf("EvaluateHealth() = %q after %dm of legitimate sleep, want any non-wedged verdict", got, i)
-		}
-	}
-}
-
-// The core acceptance criterion from gt-bvo: a frozen cycle counter must be
-// reported unhealthy even though the heartbeat is young enough to read "fresh".
-func TestEvaluateHealth_FrozenCycleWithFreshHeartbeatIsWedged(t *testing.T) {
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-	now := at(base, 4*time.Minute)
-
-	// Heartbeat written 45s ago — comfortably inside the 5m "fresh" window.
-	hb := &Heartbeat{Timestamp: at(now, -45*time.Second), Cycle: 421}
-	obs := &CycleObservation{
-		Cycle:             421,
-		FirstSeen:         base,
-		TimestampAdvances: CycleWedgeAdvanceConfirmations,
-	}
-
-	// Precondition on the injected clock — hb.IsFresh() reads the wall clock,
-	// which these synthetic timestamps are not anchored to.
-	if age := now.Sub(hb.Timestamp); age >= HeartbeatStaleThreshold {
-		t.Fatalf("precondition: heartbeat age %s must be inside the %s fresh window, or this test proves nothing",
-			age, HeartbeatStaleThreshold)
-	}
-
-	got := EvaluateHealth(hb, obs, now, DefaultHealthThresholds())
-
-	if got != VerdictWedged {
-		t.Errorf("EvaluateHealth() = %q, want %q — a frozen cycle must outrank a fresh heartbeat age", got, VerdictWedged)
-	}
-	if got.Healthy() {
-		t.Error("a wedged Deacon must not report Healthy()")
-	}
-}
-
-func TestEvaluateHealth(t *testing.T) {
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-
-	// recentlyAdvanced models a healthy Deacon: the cycle changed at `seen`, so
-	// the stall window restarted then.
-	recentlyAdvanced := func(seen time.Time) *CycleObservation {
-		return &CycleObservation{Cycle: 421, FirstSeen: seen, LastSeen: seen}
-	}
-
-	tests := []struct {
-		name string
-		hb   *Heartbeat
-		obs  *CycleObservation
-		now  time.Time
-		want Verdict
-	}{
-		{
-			name: "no heartbeat is unknown",
-			hb:   nil,
-			obs:  nil,
-			now:  base,
-			want: VerdictUnknown,
-		},
-		{
-			name: "recent heartbeat, advancing cycle",
-			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			obs:  recentlyAdvanced(base),
-			now:  at(base, time.Minute),
-			want: VerdictFresh,
-		},
-		{
-			name: "aging heartbeat is stale",
-			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			obs:  recentlyAdvanced(base),
-			now:  at(base, 6*time.Minute),
-			want: VerdictStale,
-		},
-		{
-			name: "old heartbeat is very stale",
-			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			obs:  recentlyAdvanced(base),
-			now:  at(base, 25*time.Minute),
-			want: VerdictVeryStale,
-		},
-		{
-			// A Deacon that stopped writing entirely is not a wedge, even though
-			// its cycle is equally frozen. It needs a poke/restart, not an
-			// input-unsticking, so it must keep the age verdict.
-			name: "fully stopped Deacon stays very stale, not wedged",
-			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			obs:  &CycleObservation{Cycle: 421, FirstSeen: base, LastSeen: at(base, 25*time.Minute)},
-			now:  at(base, 25*time.Minute),
-			want: VerdictVeryStale,
-		},
-		{
-			name: "nil observation falls back to age",
-			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			obs:  nil,
-			now:  at(base, time.Minute),
-			want: VerdictFresh,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := EvaluateHealth(tt.hb, tt.obs, tt.now, DefaultHealthThresholds()); got != tt.want {
-				t.Errorf("EvaluateHealth() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestObserveCycle_RoundTripsThroughDisk(t *testing.T) {
-	townRoot := t.TempDir()
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-
-	first := ObserveCycle(townRoot, &Heartbeat{Timestamp: base, Cycle: 421}, base)
-	if first == nil {
-		t.Fatal("ObserveCycle returned nil on first observation")
-	}
-
-	// Second poll: cycle frozen, heartbeat refreshed.
-	tick := at(base, 2*time.Minute)
-	second := ObserveCycle(townRoot, &Heartbeat{Timestamp: tick, Cycle: 421}, tick)
-
-	if second.TimestampAdvances != 1 {
-		t.Errorf("TimestampAdvances = %d, want 1 — prior state must survive the disk round-trip", second.TimestampAdvances)
-	}
-	if !second.FirstSeen.Equal(base) {
-		t.Errorf("FirstSeen = %v, want %v", second.FirstSeen, base)
-	}
-
-	if stored := ReadCycleObservation(townRoot); stored == nil || stored.TimestampAdvances != 1 {
-		t.Errorf("ReadCycleObservation() = %+v, want the persisted second observation", stored)
-	}
-}
-
-// Replays the field trace recorded in gt-bvo through the real persistence
-// path: hq-deacon at a frozen cycle 421 whose heartbeat timestamp kept moving.
-// The old age-only verdict called this "fresh" at every poll; it must now
-// surface as wedged.
 // The gt-bvo wedge as it was actually recorded, replayed against the detector
-// built to catch it. The detector does not catch it.
+// built to catch it.
 //
-// An earlier version of this test replayed the trace as gt-bvo described it —
-// two polls "4 minutes apart" whose ages differed by only 45s, implying the
-// timestamp advanced under a frozen cycle — plus an invented third poll to
-// reach the confirmation count. It passed, and certified a state that has never
-// occurred. gt-s6r recovered the Mayor's transcript: the polls were 45.06s
-// apart, so the 45s age delta means the heartbeat was FROZEN, not advancing.
+// The timings are the Mayor's transcript, not the bead's retelling of it. The
+// bead reported two polls "4 minutes apart" whose ages differed by 45s, which
+// implied the heartbeat timestamp advanced under a frozen cycle; gt-s6r
+// recovered the raw records and the polls are 45.06s apart, so the heartbeat was
+// FROZEN. Twelve polls of cycle 421 by four sessions reconstruct one write:
 //
-// The timings below are the transcript's, not a reconstruction:
-//
+//	23:23:49.4    the only write cycle 421 ever got
 //	23:27:14.437  age 3m25s  cycle 421   Mayor poll 1
 //	23:27:59.497  age 4m10s  cycle 421   Mayor poll 2
 //
-// Both reconstruct the same write at 23:23:49.4, which twelve polls of cycle
-// 421 by four different sessions also agree on.
+// The Mayor's own account of the session supplies the liveness signals the
+// heartbeat file cannot: the pane held "continue patrolling", typed and never
+// submitted, so the turn had ended with real text in the composer and no await
+// was running.
 func TestEvaluateHealth_FieldTraceFromBead(t *testing.T) {
-	townRoot := t.TempDir()
 	th := DefaultHealthThresholds()
 
-	// The single write that served all of cycle 421, and the two Mayor polls of
-	// it. Deriving both heartbeats from one timestamp is the point: that is what
-	// the field data shows, and what a coupled writer can only produce.
 	write := time.Date(2026, 8, 2, 23, 23, 49, 437_000_000, time.UTC)
 	hb := &Heartbeat{Timestamp: write, Cycle: 421, LastAction: "cycle 415 closed (abbreviated)"}
 
@@ -341,43 +406,89 @@ func TestEvaluateHealth_FieldTraceFromBead(t *testing.T) {
 			age2-age1, p2.Sub(p1))
 	}
 
-	obs := ObserveCycle(townRoot, hb, p1)
-	obs = ObserveCycle(townRoot, hb, p2)
+	wedged := LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnStranded}
 
-	// No advance to count, so no confirmation, so no wedge verdict — for the
-	// one wedge the town has ever recorded in full.
-	if obs.TimestampAdvances != 0 {
-		t.Errorf("TimestampAdvances = %d, want 0 — the recorded wedge froze the timestamp too",
-			obs.TimestampAdvances)
-	}
-	if obs.WedgeConfirmed() {
-		t.Error("WedgeConfirmed() = true, want false — this signal cannot fire on the real trace")
-	}
-
-	// It reads fresh, which is the reporting bug gt-bvo filed, still unfixed:
-	// not because the wedge writes heartbeats, but because the Mayor polled
-	// 3m25s and 4m10s in and the stale threshold is 5m.
-	if got := EvaluateHealth(hb, obs, p2, th); got != VerdictFresh {
-		t.Errorf("EvaluateHealth() = %q, want %q — the wedge is invisible to this verdict", got, VerdictFresh)
+	// Both Mayor polls land inside the 5m fresh window, so both still read
+	// fresh. That is the reporting bug gt-bvo filed and it is not fixable by a
+	// verdict: at 3m25s the Deacon is not yet distinguishable from one that is
+	// simply between steps.
+	for _, p := range []time.Time{p1, p2} {
+		if got := EvaluateHealth(hb, p, th, wedged); got != VerdictFresh {
+			t.Errorf("EvaluateHealth() at %s = %q, want %q — inside the fresh window nothing is concluded",
+				p.Sub(write), got, VerdictFresh)
+		}
 	}
 
-	// Age alone would have caught it 50s after the Mayor gave up waiting. That
-	// is the detection the town actually has today.
-	if got := EvaluateHealth(hb, obs, write.Add(th.Stale), th); got != VerdictStale {
-		t.Errorf("EvaluateHealth() at the stale threshold = %q, want %q", got, VerdictStale)
+	// 50s after the Mayor gave up waiting, the heartbeat crosses stale and the
+	// two signals are still saying the same thing. Age alone reported "stale"
+	// here — the same verdict a Deacon asleep in backoff gets.
+	atStale := write.Add(th.Stale)
+	if got := EvaluateHealth(hb, atStale, th, wedged); got != VerdictWedged {
+		t.Errorf("EvaluateHealth() at the stale threshold = %q, want %q", got, VerdictWedged)
 	}
 
-	// LastAction is what separates this from a Deacon legitimately parked in
-	// await-signal, which is equally frozen. Nothing reads it yet (gt-s6r).
-	if hb.LastAction == deaconPreAwaitAction {
-		t.Fatalf("precondition: the wedged trace must not rest on %q", deaconPreAwaitAction)
+	// The counterfactual that makes the assertion above mean something: the same
+	// heartbeat, at the same instant, on a Deacon that was merely asleep.
+	if got := EvaluateHealth(hb, atStale, th, parked); got != VerdictStale {
+		t.Errorf("EvaluateHealth() for a parked Deacon on the same trace = %q, want %q", got, VerdictStale)
 	}
 }
 
-// deaconPreAwaitAction is the LastAction the Deacon writes immediately before
-// parking in await-signal (mol-deacon-patrol.formula.toml). A frozen heartbeat
-// resting on it is asleep; on anything else, it stopped mid-patrol.
-const deaconPreAwaitAction = "pre-await checkpoint"
+// The three false positives duly_noted/witness recorded on 2026-08-02, which
+// are the reason the Mayor's safety correction forbids condemning a Deacon on a
+// frozen counter alone. All three were the SAME Deacon, healthy, mid-turn:
+//
+//	cycle 423 frozen 2m+     live spinner "Crunching... 2m 34s", empty input
+//	cycle 425 frozen ~3m     active Bash tool call, "esc to interrupt", empty input
+//	cycle 425 frozen 4m9s    live spinner "Crunching... 9m 26s", empty input
+//
+// The witness nearly escalated the first one and then derived the rule this
+// verdict implements: "WORKING = frozen cycle + live spinner or active tool call
+// + EMPTY input box". A working turn has no await process either, so the pane is
+// the only thing separating these from the wedge.
+//
+// The last one matters most: the spinner had been running 9m26s, so a Deacon
+// turn can legitimately outlive the stale threshold. The age gate alone does not
+// save this case — the pane does.
+func TestEvaluateHealth_KnownFalsePositivesStayUnwedged(t *testing.T) {
+	base := time.Date(2026, 8, 2, 23, 0, 0, 0, time.UTC)
+	th := DefaultHealthThresholds()
+
+	// Empty input box with a live spinner: no turn ended, nothing stranded.
+	working := LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnActive}
+
+	frozen := []struct {
+		name string
+		age  time.Duration
+	}{
+		{"cycle 423 frozen 2m", 2 * time.Minute},
+		{"cycle 425 frozen 3m", 3 * time.Minute},
+		{"cycle 425 frozen 4m9s", 4*time.Minute + 9*time.Second},
+		{"the same turn still crunching at 9m26s", 9*time.Minute + 26*time.Second},
+	}
+
+	for _, f := range frozen {
+		t.Run(f.name, func(t *testing.T) {
+			hb := &Heartbeat{Timestamp: base, Cycle: 425, LastAction: "starting patrol cycle 416"}
+			now := at(base, f.age)
+
+			if got := EvaluateHealth(hb, now, th, working); got == VerdictWedged {
+				t.Errorf("EvaluateHealth() = %q for a Deacon working with an empty composer, want any non-wedged verdict", got)
+			}
+
+			// Non-vacuity: at this same age, the same heartbeat on a Deacon whose
+			// turn had ended is judged on the pane alone, so the case above is
+			// being decided by the signal it claims to be decided by.
+			want := VerdictWedged
+			if f.age < th.Stale {
+				want = VerdictFresh
+			}
+			if got := EvaluateHealth(hb, now, th, stopped); got != want {
+				t.Errorf("EvaluateHealth() with an ended turn = %q, want %q", got, want)
+			}
+		})
+	}
+}
 
 func TestObserveCycle_NoHeartbeat(t *testing.T) {
 	townRoot := t.TempDir()
