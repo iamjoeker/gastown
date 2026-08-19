@@ -1729,9 +1729,7 @@ type EscalationConfig struct {
 	// Routes maps severity levels to action lists.
 	// Actions are executed in order for each escalation.
 	// Action formats:
-	//   - "bead"        → Record the escalation as a durable bead. This is the
-	//                     half that outlives the ephemeral escalation record;
-	//                     a route without it delivers nothing durable (gt-3i4e).
+	//   - "bead"        → Create escalation bead (always first, implicit)
 	//   - "mail:<target>" → Send gt mail to target (e.g., "mail:mayor")
 	//   - "email:human" → Send email to contacts.human_email
 	//   - "sms:human"   → Send SMS to contacts.human_sms

@@ -25,9 +25,6 @@ var escalateCmd = &cobra.Command{
 	GroupID: GroupComm,
 	Short:   "Escalation system for critical issues",
 	RunE:    runEscalate,
-	// An undelivered escalation exits non-zero (gt-3i4e). That is a routing
-	// result, not a misuse of the command, so it must not print the usage block.
-	SilenceUsage: true,
 	Long: `Create and manage escalations for critical issues.
 
 The escalation system provides severity-based routing for issues that need
@@ -47,17 +44,11 @@ WORKFLOW:
   5. After resolution: gt escalate close <id> --reason "fixed"
 
 CONFIGURATION:
-  Routing is configured in $GT_ROOT/settings/escalation.json (the town root this
-  command resolves from your cwd — NOT ~/gt, which is not a town root):
+  Routing is configured in ~/gt/settings/escalation.json:
   - routes: Map severity to action lists (bead, mail:mayor, email:human, sms:human)
   - contacts: Human email/SMS for external notifications
   - stale_threshold: When unacked escalations are re-escalated (default: 4h)
   - max_reescalations: How many times to bump severity (default: 2)
-
-  The "bead" action records the escalation as a durable bead — the half that
-  outlives the ephemeral escalation record and that 'gt escalate list' renders.
-  A route that delivers nothing at all exits non-zero rather than reporting
-  success.
 
 Examples:
   gt escalate "Build failing" --severity critical --reason "CI blocked"
