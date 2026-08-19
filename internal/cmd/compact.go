@@ -404,44 +404,17 @@ func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 // COALESCE() forces it through string conversion. wispAge accepts both, but
 // only one of them is what the rest of gastown means by a timestamp.
 //
-// comment_count, labels and parent come from the pre-aggregated derived tables
-// in wispSideJoins, one row per issue_id, so joining them still yields exactly
-// one row per wisp without a GROUP BY over every selected column.
-//
-// They used to be three correlated subqueries instead, which is the same result
-// at ~3 executions per output row. That is invisible on a rig and fatal on the
-// town database (gt-g60l): at 28.5k rows it is ~85k subquery runs, and the whole
-// of `gt compact` died on the 60s bd subprocess timeout — so hq, which holds 28k
-// of the ~29.5k wisps town-wide, was the one database compaction could not open.
-// Measured against live hq on 2026-08-19: correlated >120s (killed), joined
-// 0.18s, byte-identical output on every database that could run both.
+// comment_count, labels and parent arrive as correlated subqueries rather than
+// joins so that one row per wisp is guaranteed without a GROUP BY over every
+// selected column.
 const wispSelectColumns = `w.id, w.title, w.status, w.issue_type, ` +
 	`COALESCE(w.wisp_type, '') AS wisp_type, ` +
 	`w.created_at, w.updated_at, ` +
 	`COALESCE(w.pinned, 0) AS pinned, ` +
-	`COALESCE(c.comment_count, 0) AS comment_count, ` +
-	`COALESCE(l.labels_csv, '') AS labels_csv, ` +
-	`COALESCE(d.parent, '') AS parent`
-
-// wispSideJoins supplies the three aggregate columns above.
-//
-// Each derived table groups its side table by issue_id before the join, so it
-// is scanned once per query rather than once per wisp. LEFT JOIN keeps wisps
-// with no comments, no labels and no parent, which the COALESCEs above then
-// render as the same zero values the correlated form produced.
-//
-// parent is MIN() rather than the old `LIMIT 1`: an aggregate is required to
-// collapse the group, and where the old form picked an arbitrary row of a
-// multi-parent wisp this picks a deterministic one. No wisp in any live
-// database has more than one parent-child dependency, so the two agree today
-// and MIN only makes the tie-break stable if that ever changes.
-const wispSideJoins = `LEFT JOIN (SELECT issue_id, COUNT(*) AS comment_count ` +
-	`FROM wisp_comments GROUP BY issue_id) c ON c.issue_id = w.id ` +
-	`LEFT JOIN (SELECT issue_id, GROUP_CONCAT(label) AS labels_csv ` +
-	`FROM wisp_labels GROUP BY issue_id) l ON l.issue_id = w.id ` +
-	`LEFT JOIN (SELECT issue_id, MIN(depends_on_wisp_id) AS parent ` +
-	`FROM wisp_dependencies WHERE type = 'parent-child' AND depends_on_wisp_id IS NOT NULL ` +
-	`GROUP BY issue_id) d ON d.issue_id = w.id`
+	`(SELECT COUNT(*) FROM wisp_comments c WHERE c.issue_id = w.id) AS comment_count, ` +
+	`COALESCE((SELECT GROUP_CONCAT(l.label) FROM wisp_labels l WHERE l.issue_id = w.id), '') AS labels_csv, ` +
+	`COALESCE((SELECT d.depends_on_wisp_id FROM wisp_dependencies d ` +
+	`WHERE d.issue_id = w.id AND d.type = 'parent-child' AND d.depends_on_wisp_id IS NOT NULL LIMIT 1), '') AS parent`
 
 // wispRow is one row of the wisps-table projection above. It is separate from
 // compactIssue because the SQL column names (labels_csv, pinned as 0/1) do not
@@ -496,16 +469,8 @@ func mutableWispWhere() string {
 }
 
 // wispQuery assembles the shared projection with an optional WHERE clause.
-//
-// The WHERE goes after the joins, which is where it has to be and also where it
-// is harmless: every caller filters on columns of w alone, so it prunes the left
-// side and cannot turn a LEFT JOIN back into an inner one.
 func wispQuery(where string) string {
-	q := "SELECT " + wispSelectColumns + " FROM wisps w " + wispSideJoins + " "
-	if where != "" {
-		q += where + " "
-	}
-	return q + "ORDER BY w.id"
+	return "SELECT " + wispSelectColumns + " FROM wisps w " + where + " ORDER BY w.id"
 }
 
 // queryWisps runs the shared projection with an optional WHERE clause.
