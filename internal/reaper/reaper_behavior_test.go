@@ -335,13 +335,13 @@ func TestPurgeProtectsMergeRequestWispsBehaviour(t *testing.T) {
 }
 
 // TestPurgeProtectionIsNotHardcodedToOneLabel guards the mechanism rather than
-// the current list: protection is driven by ProtectedWispLabels, so a future
+// the current list: protection is driven by protectedWispLabels, so a future
 // entry takes effect everywhere without a second edit. A guard that inlined
 // 'gt:merge-request' into the SQL passes the test above and fails this one.
 func TestPurgeProtectionIsNotHardcodedToOneLabel(t *testing.T) {
-	original := ProtectedWispLabels
-	ProtectedWispLabels = append(append([]string{}, original...), "gt:test-protected")
-	t.Cleanup(func() { ProtectedWispLabels = original })
+	original := protectedWispLabels
+	protectedWispLabels = append(append([]string{}, original...), "gt:test-protected")
+	t.Cleanup(func() { protectedWispLabels = original })
 
 	f := newFixture(t, "purge_protect_list")
 	oldClose := time.Now().UTC().Add(-30 * 24 * time.Hour)
@@ -361,7 +361,7 @@ func TestPurgeProtectionIsNotHardcodedToOneLabel(t *testing.T) {
 			"would pass the survival check below for the wrong reason", result.WispsPurged)
 	}
 	if got := f.ids(t, "wisps"); !reflect.DeepEqual(got, []string{"w-added"}) {
-		t.Errorf("surviving wisps = %v, want [w-added] — adding a label to ProtectedWispLabels "+
+		t.Errorf("surviving wisps = %v, want [w-added] — adding a label to protectedWispLabels "+
 			"must protect it, without editing any query", got)
 	}
 }
