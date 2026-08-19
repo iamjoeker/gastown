@@ -109,18 +109,18 @@ func TestBuildReport(t *testing.T) {
 	}
 }
 
-func TestListReportWispsIncludesInfrastructure(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell script command stubs not supported on Windows")
-	}
+// stubBDWispQuery installs a fake bd that answers `bd sql` with one
+// wisps-table row and logs every argument list it is called with.
+func stubBDWispQuery(t *testing.T) (argsLog string) {
+	t.Helper()
 
 	binDir := t.TempDir()
-	argsLog := filepath.Join(t.TempDir(), "bd-args.log")
+	argsLog = filepath.Join(t.TempDir(), "bd-args.log")
 	bdScript := `#!/bin/sh
 printf '%s\n' "$*" >> "$BD_ARGS_LOG"
 case "$*" in
-  *list*)
-    printf '[{"id":"hq-wisp-patrol","title":"mol-deacon-patrol","status":"hooked","issue_type":"molecule","ephemeral":true,"wisp_type":"patrol"}]\n'
+  *FROM\ wisps*)
+    printf '[{"id":"hq-wisp-patrol","title":"mol-deacon-patrol","status":"hooked","issue_type":"molecule","wisp_type":"patrol","created_at":"2026-08-19T02:00:00Z","updated_at":"2026-08-19T02:00:00Z","pinned":0,"comment_count":0,"labels_csv":"","parent":""}]\n'
     ;;
   *)
     printf 'bd test stub\n'
@@ -135,20 +135,72 @@ esac
 	beads.ResetBdAllowStaleCacheForTest()
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 
+	return argsLog
+}
+
+// TestListReportWispsReadsWispsTable is the end-to-end half of gt-ktvs for the
+// digest. The digest's Active column was reading `bd list --include-infra`,
+// which does not query the wisps table however many flags it is given, so the
+// column reported an empty database on every run. --include-infra was covering
+// a distinction that does not exist on this route.
+func TestListReportWispsReadsWispsTable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+
+	argsLog := stubBDWispQuery(t)
+
 	wisps, err := listReportWisps(beads.New(t.TempDir()))
 	if err != nil {
 		t.Fatalf("listReportWisps: %v", err)
 	}
 	if len(wisps) != 1 || wisps[0].ID != "hq-wisp-patrol" {
-		t.Fatalf("wisps = %#v, want patrol infrastructure wisp", wisps)
+		t.Fatalf("wisps = %#v, want the patrol wisp from the wisps table", wisps)
+	}
+	if wisps[0].WispType != "patrol" {
+		t.Errorf("WispType = %q, want patrol — the digest categorises on this field",
+			wisps[0].WispType)
 	}
 
 	args, err := os.ReadFile(argsLog)
 	if err != nil {
 		t.Fatalf("read bd args: %v", err)
 	}
-	if !strings.Contains(string(args), "--include-infra") {
-		t.Fatalf("bd args = %q, want --include-infra", string(args))
+	if !strings.Contains(string(args), "FROM wisps") {
+		t.Fatalf("bd args = %q, want a query against the wisps table", string(args))
+	}
+	// The report counts; it does not delete. Infra wisps belong in its total.
+	if strings.Contains(string(args), "issue_type NOT IN") {
+		t.Fatalf("bd args = %q, want NO infra exclusion — listReportWisps counts everything",
+			string(args))
+	}
+}
+
+// TestListWispsExcludesInfrastructure is the paired negative. listWisps feeds
+// deletion, so unlike the report it must not see infra beads: agent rows are
+// live identity, and bd list's default view had been hiding them from this path
+// by accident until it started reading the table.
+func TestListWispsExcludesInfrastructure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+
+	argsLog := stubBDWispQuery(t)
+
+	if _, err := listWisps(beads.New(t.TempDir())); err != nil {
+		t.Fatalf("listWisps: %v", err)
+	}
+
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("read bd args: %v", err)
+	}
+	if !strings.Contains(string(args), "FROM wisps") {
+		t.Fatalf("bd args = %q, want a query against the wisps table", string(args))
+	}
+	if !strings.Contains(string(args), "issue_type NOT IN ('agent'") {
+		t.Fatalf("bd args = %q, want agent beads excluded from the deleting path",
+			string(args))
 	}
 }
 
@@ -617,6 +669,9 @@ case "$1" in
   list)
     printf '[]\n'
     ;;
+  sql)
+    printf '[]\n'
+    ;;
   create)
     printf 'warning: beads.role not configured (GH#2950).\n  Fix: git config beads.role maintainer\n  Or:  git config beads.role contributor\nh25-mrd\n'
     ;;
@@ -666,5 +721,49 @@ func assertNoMailSent(t *testing.T, mailLog string) {
 	}
 	if len(data) > 0 {
 		t.Fatalf("mail was sent unexpectedly: %s", string(data))
+	}
+}
+
+// TestDigestReportsScannedAndUnclassified covers the digest half of gt-ktvs.
+// The per-category rows skip themselves when empty, so before this the digest
+// for a run that saw nothing was byte-identical to the digest for a tidy town.
+func TestDigestReportsScannedAndUnclassified(t *testing.T) {
+	result := &compactResult{Scanned: 760, Unclassified: 760}
+	report := buildReport("2026-08-19", result, nil)
+	report.Anomalies = detectAnomalies(report)
+
+	if report.Scanned != 760 || report.Unclassified != 760 {
+		t.Fatalf("report scanned/unclassified = %d/%d, want 760/760",
+			report.Scanned, report.Unclassified)
+	}
+
+	markdown := formatDailyDigest(report)
+	if !strings.Contains(markdown, "760 wisps scanned") {
+		t.Errorf("digest does not state the input size:\n%s", markdown)
+	}
+	if !strings.Contains(markdown, "no wisp_type") {
+		t.Errorf("digest does not say why nothing happened:\n%s", markdown)
+	}
+
+	var flagged bool
+	for _, a := range report.Anomalies {
+		if strings.Contains(a, "no wisp_type") {
+			flagged = true
+		}
+	}
+	if !flagged {
+		t.Errorf("anomalies = %v, want the untyped-wisp backlog flagged", report.Anomalies)
+	}
+
+	// Control: a genuinely clean run must NOT raise the untyped anomaly, or the
+	// flag carries no information.
+	clean := buildReport("2026-08-19", &compactResult{Scanned: 12, Skipped: 12}, nil)
+	for _, a := range detectAnomalies(clean) {
+		if strings.Contains(a, "no wisp_type") {
+			t.Errorf("clean run raised the untyped anomaly: %q", a)
+		}
+	}
+	if !strings.Contains(formatDailyDigest(clean), "12 wisps scanned") {
+		t.Errorf("clean digest does not state its input size:\n%s", formatDailyDigest(clean))
 	}
 }

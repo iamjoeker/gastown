@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -2024,15 +2023,7 @@ notifyWitness:
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
 	// false SLOT_BLOCKED/SLOT_OPEN signals.
-	// gt-h7p: carry the failure reasons, not just the fact of failure. Every
-	// error path above appends to doneErrors, but nothing had ever read the
-	// slice, so a witness saw MRFailed=true with no cause and the polecat's
-	// printed warning died with its terminal.
-	doneMessage := fmt.Sprintf("POLECAT_DONE %s exit=%s", polecatName, exitType)
-	if reasons := summarizeDoneErrors(doneErrors); reasons != "" {
-		doneMessage += " errors=" + reasons
-	}
-	nudgeWitness(rigName, doneMessage)
+	nudgeWitness(rigName, fmt.Sprintf("POLECAT_DONE %s exit=%s", polecatName, exitType))
 	fmt.Printf("%s Witness notified of %s (via nudge)\n", style.Bold.Render("✓"), exitType)
 
 	// Clean successful polecats are retired after durable handoff. Preserve the
@@ -2404,31 +2395,6 @@ func clearDoneIntentLabel(bd *beads.Beads, agentBeadID string) {
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't clear done-intent label on %s: %v\n", agentBeadID, err)
 	}
-}
-
-// maxDoneErrorSummary bounds the failure summary carried on the witness nudge.
-// The nudge is typed into a tmux pane and copied into a single-line channel
-// event, so an unbounded bd error would swamp both.
-const maxDoneErrorSummary = 400
-
-// summarizeDoneErrors renders accumulated gt done failures as one line fit for
-// a nudge. bd errors are multi-line often enough that flattening is required:
-// a newline here would submit the composer mid-message and corrupt the
-// "message=" field of the channel event.
-func summarizeDoneErrors(errs []string) string {
-	if len(errs) == 0 {
-		return ""
-	}
-	summary := strings.Join(strings.Fields(strings.Join(errs, "; ")), " ")
-	if len(summary) <= maxDoneErrorSummary {
-		return summary
-	}
-	// Cut on a rune boundary so the nudge never ends in a mangled character.
-	cut := maxDoneErrorSummary
-	for cut > 0 && !utf8.RuneStart(summary[cut]) {
-		cut--
-	}
-	return summary[:cut] + "…(truncated)"
 }
 
 // DoneCheckpoint represents a checkpoint stage in the gt done flow (gt-aufru).
