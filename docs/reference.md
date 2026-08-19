@@ -698,13 +698,23 @@ gt deacon health-state           # Show health check state for all agents
 ### Merge Queue (MQ)
 
 ```bash
-gt mq list [rig]             # Show the merge queue
+gt mq list [rig]             # Show the merge queue (open MRs only)
+gt mq list <rig> --status closed   # Merged/rejected MRs — THE audit surface
+gt mq list <rig> --status all      # Every MR regardless of status
 gt mq next [rig]             # Show highest-priority merge request
 gt mq submit                 # Submit current branch to merge queue
 gt mq status <id>            # Show detailed merge request status
 gt mq retry <id>             # Retry a failed merge request
 gt mq reject <id>            # Reject a merge request
 ```
+
+`gt mq list` is the only correct way to query merge requests. MR records are
+**wisps in the rig's store**, so `bd list --label gt:merge-request` returns
+`No issues found` no matter what (it queries the `issues` table), and
+`bd mol wisp list` is scoped to the cwd's store and hides closed wisps without
+`--all`. Merged MRs are closed, so the default `gt mq list` scope excludes them
+— ask for `--status closed`. See
+[False-Zero Queries](guides/false-zero-queries.md).
 
 #### Integration Branch Commands
 

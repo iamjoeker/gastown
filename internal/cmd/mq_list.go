@@ -183,11 +183,24 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		return outputJSON(filtered)
 	}
 
-	// Human-readable output
-	fmt.Printf("%s Merge queue for '%s':\n\n", style.Bold.Render("📋"), rigName)
+	// Human-readable output.
+	//
+	// Name the store and the status scope. MR wisps live in the RIG's store, and
+	// a listing that names neither renders a wrong-store or wrong-status zero
+	// identically to a real one — an unfalsifiable empty result that reads as
+	// data loss. Three of the four surfaces an operator might reach for return
+	// exactly that; this one is the surface that works, so it must show its
+	// work (gt-kb63).
+	fmt.Printf("%s Merge queue for '%s':\n", style.Bold.Render("📋"), rigName)
+	fmt.Printf("  %s\n\n", style.Dim.Render(fmt.Sprintf("store: %s   scope: %s",
+		r.BeadsPath(), describeMQListScope(mqListReady, mqListStatus))))
 
 	if len(filtered) == 0 {
 		fmt.Printf("  %s\n", style.Dim.Render("(empty)"))
+		if mqListExcludesClosed(mqListReady, mqListStatus) {
+			fmt.Printf("\n  %s\n", style.Dim.Render("Merged and rejected MRs are closed, and this scope excludes closed. To audit them:"))
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("    gt mq list %s --status closed", rigName)))
+		}
 		return nil
 	}
 
@@ -320,6 +333,37 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// describeMQListScope names the status scope a listing actually queried, for
+// display alongside the store. "open (default)" is spelled out because the
+// default is the one an operator did not choose and so the one they are most
+// likely to mistake for "everything" (gt-kb63).
+func describeMQListScope(ready bool, status string) string {
+	if ready {
+		return "ready (open, unblocked)"
+	}
+	switch {
+	case status == "":
+		return "status=open (default — closed MRs not shown)"
+	case strings.EqualFold(status, "all"):
+		return "status=all"
+	default:
+		return "status=" + strings.ToLower(status)
+	}
+}
+
+// mqListExcludesClosed reports whether the requested scope hides closed MRs.
+// Merged and rejected MRs are closed, so an empty result under such a scope is
+// not evidence that they never existed.
+func mqListExcludesClosed(ready bool, status string) bool {
+	if ready {
+		return true
+	}
+	if status == "" {
+		return true
+	}
+	return !strings.EqualFold(status, "all") && !strings.EqualFold(status, "closed")
 }
 
 // formatMRAge formats the age of an MR from its created_at timestamp.
