@@ -30,6 +30,7 @@ type SlotReuseInput struct {
 	AssignedBeadTerminal bool
 	MRSubmitted          bool
 	MQLookupFailed       bool
+	MRRefused            bool
 }
 
 // SlotReuseDecision explains whether a polecat can be reused and why not.
@@ -63,6 +64,7 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		AssignedBeadTerminal: in.AssignedBeadTerminal,
 		MRSubmitted:          in.MRSubmitted,
 		MQLookupFailed:       in.MQLookupFailed,
+		MRRefused:            in.MRRefused,
 	})
 	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
 }
