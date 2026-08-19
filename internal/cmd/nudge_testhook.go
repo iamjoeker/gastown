@@ -1,18 +1,19 @@
 package cmd
 
 import (
-	"github.com/steveyegge/gastown/internal/testguard"
+	"os"
+
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // testNudgeHookEnv marks the process as running under test and names the file
 // that nudges should be recorded to instead of being delivered.
 //
-// Aliased from internal/testguard rather than restated: the enforcing checks
-// now live at the two transports (tmux.NudgeSessionWithOpts for keystrokes,
-// nudge.Enqueue for the queue), and a third copy of this name could drift apart
-// from theirs silently — leaving one layer guarded and the others not, which is
-// the shape of the defect this whole mechanism exists to prevent.
-const testNudgeHookEnv = testguard.LogEnv
+// Aliased from the tmux package rather than restated: the enforcing check now
+// lives at the transport (tmux.NudgeSessionWithOpts), and two copies of this
+// name could drift apart silently — leaving one layer guarded and the other not,
+// which is the shape of the defect this whole mechanism exists to prevent.
+const testNudgeHookEnv = tmux.TestNudgeLogEnv
 
 // testNudgeHook reports whether the nudge test hook is active, and where (if
 // anywhere) nudges should be logged.
@@ -28,15 +29,25 @@ const testNudgeHookEnv = testguard.LogEnv
 // An empty path therefore means "test mode, nothing to record" — the caller
 // still returns without delivering.
 //
-// This is a fast path, not the backstop. The checks that actually enforce the
-// rule are the transports', which no call site can forget; this one returns
-// earlier so a guarded test skips the queue writes and idle polling on the way
-// there.
+// This is now a fast path, not the backstop. The check that actually enforces
+// the rule is tmux.NudgeSessionWithOpts's, which no call site can forget; this
+// one returns earlier so a guarded test skips the queue writes and idle polling
+// on the way there.
 func testNudgeHook() (logPath string, inTest bool) {
-	return testguard.TestLog()
+	return os.LookupEnv(testNudgeHookEnv)
 }
 
 // writeTestNudgeLog appends an entry to the test nudge log, if one was named.
+// Failures are ignored: the log exists for test observability, and losing an
+// entry must never change the behavior of the code under test.
 func writeTestNudgeLog(logPath, entry string) {
-	testguard.Record(logPath, entry)
+	if logPath == "" {
+		return
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(entry)
+	_ = f.Close()
 }

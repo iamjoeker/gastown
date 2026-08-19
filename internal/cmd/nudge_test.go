@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,21 +9,6 @@ import (
 
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
-	"github.com/steveyegge/gastown/internal/tmux"
-)
-
-// Test targets are deliberately names no agent answers to. gt-vmj was found by
-// reading logs/town.log and seeing hq-mayor, deacon, gt-witness, gt-refinery,
-// gastown/alpha and deacon/dogs/fido — all live addresses, which made the leak
-// look exactly like ordinary town traffic. A fixture name has no live twin, so
-// if one ever reaches the town log it is self-evidently a test that escaped.
-//
-// The role shortcuts in TestNudgeTrailingSlashNormalization are the exception:
-// there the live names ARE the subject, since the test exists to prove that
-// "mayor/" and "deacon/" resolve rather than being dropped.
-const (
-	nudgeTestTarget  = "gastown/nudge-test-fixture"
-	nudgeTestDogName = "nudge-test-fixture"
 )
 
 func setupNudgeTestRegistry(t *testing.T) {
@@ -61,7 +45,7 @@ func TestNudgeStdinConflict(t *testing.T) {
 	nudgeStdinFlag = true
 	nudgeMessageFlag = "some message"
 
-	err := runNudge(nudgeCmd, []string{nudgeTestTarget})
+	err := runNudge(nudgeCmd, []string{"gastown/alpha"})
 	if err == nil {
 		t.Fatal("expected error when --stdin and --message are both set")
 	}
@@ -276,7 +260,7 @@ func TestNudgeInvalidMode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			nudgeModeFlag = tt.mode
 			nudgePriorityFlag = "normal"
-			err := runNudge(nudgeCmd, []string{nudgeTestTarget, "hello"})
+			err := runNudge(nudgeCmd, []string{"gastown/alpha", "hello"})
 			if err == nil {
 				t.Fatal("expected error for invalid mode")
 			}
@@ -316,7 +300,7 @@ func TestNudgeInvalidPriority(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			nudgePriorityFlag = tt.priority
-			err := runNudge(nudgeCmd, []string{nudgeTestTarget, "hello"})
+			err := runNudge(nudgeCmd, []string{"gastown/alpha", "hello"})
 			if err == nil {
 				t.Fatal("expected error for invalid priority")
 			}
@@ -357,7 +341,7 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 	for _, mode := range []string{NudgeModeImmediate, NudgeModeQueue, NudgeModeWaitIdle} {
 		t.Run(mode, func(t *testing.T) {
 			nudgeModeFlag = mode
-			err := runNudge(nudgeCmd, []string{nudgeTestTarget, "hello"})
+			err := runNudge(nudgeCmd, []string{"gastown/alpha", "hello"})
 			// The error should NOT be about invalid mode — it will fail on
 			// tmux or workspace, which is fine.
 			if err != nil && strings.Contains(err.Error(), "invalid --mode") {
@@ -573,7 +557,7 @@ func TestNudgeDogTargetRoutesToDogSession(t *testing.T) {
 	nudgeStdinFlag = false
 	nudgeForceFlag = true
 
-	if err := runNudge(nudgeCmd, []string{"deacon/dogs/" + nudgeTestDogName}); err != nil {
+	if err := runNudge(nudgeCmd, []string{"deacon/dogs/fido"}); err != nil {
 		t.Fatalf("runNudge dog target returned error: %v", err)
 	}
 
@@ -581,7 +565,7 @@ func TestNudgeDogTargetRoutesToDogSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading nudge log: %v", err)
 	}
-	if got, want := string(data), "nudge:"+session.DogSessionName(nudgeTestDogName)+":"; !strings.Contains(got, want) {
+	if got, want := string(data), "nudge:hq-dog-fido:"; !strings.Contains(got, want) {
 		t.Fatalf("nudge log = %q, want containing %q", got, want)
 	}
 }
@@ -706,83 +690,5 @@ func TestQueueLen(t *testing.T) {
 	_, _ = nudge.Drain(tmpDir, "test-session")
 	if got := nudge.QueueLen(tmpDir, "test-session"); got != 0 {
 		t.Errorf("QueueLen after drain = %d, want 0", got)
-	}
-}
-
-// TestDeliverNudge_QueueRouteRefusesLiveTownFromTestBinary is the regression
-// gt-vmj asks for on the runNudge path rather than the helper paths. It sits at
-// deliverNudge because that is the funnel: every branch of runNudge — role
-// shortcut, dog, rig/polecat, raw session, channel fan-out — reaches an agent
-// only through this one function, and reaching it from runNudge itself first
-// requires a live tmux session, which is precisely what a test must not have.
-//
-// The route under test is the queue, not tmux. gt-kqf closed the keystroke route
-// at tmux.NudgeSessionWithOpts, and `gt nudge` does not use it by default: --mode
-// defaults to wait-idle and its ordinary outcome for a busy agent is a queue
-// write. So an unhooked test could still deliver — later, when the agent's
-// UserPromptSubmit hook drained the file — with no keystroke for the tmux guard
-// to see, and with runNudge going on to report success and append to town.log.
-//
-// The assertions are about what reached the town, not about the error: a queue
-// file written and then reported as a failure is still a delivery.
-func TestDeliverNudge_QueueRouteRefusesLiveTownFromTestBinary(t *testing.T) {
-	origMode := nudgeModeFlag
-	origPriority := nudgePriorityFlag
-	defer func() {
-		nudgeModeFlag = origMode
-		nudgePriorityFlag = origPriority
-	}()
-
-	// No hook: this test is the case where nobody remembered to set one. The
-	// t.Setenv is what registers the restore for the following Unsetenv.
-	t.Setenv(testNudgeHookEnv, "")
-	if err := os.Unsetenv(testNudgeHookEnv); err != nil {
-		t.Fatalf("unset %s: %v", testNudgeHookEnv, err)
-	}
-	t.Setenv(tmux.AllowTestNudgeEnv, "")
-	if err := os.Unsetenv(tmux.AllowTestNudgeEnv); err != nil {
-		t.Fatalf("unset %s: %v", tmux.AllowTestNudgeEnv, err)
-	}
-
-	// A town that looks live: a real workspace (mayor/town.json is the marker
-	// workspace.Find keys on) sitting outside the disposable boundary, so the
-	// queue guard treats it as a town agents drain from. Moving TMPDIR rather
-	// than using an unwritable path is deliberate — a regression must be able to
-	// actually write the file, or the test would pass for the wrong reason.
-	townRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
-		t.Fatalf("creating town marker dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
-		t.Fatalf("writing town marker: %v", err)
-	}
-	elsewhere := t.TempDir()
-	t.Setenv("TMPDIR", elsewhere)
-	if got := os.TempDir(); got != elsewhere {
-		t.Skipf("os.TempDir() = %q, not the TMPDIR just set; cannot stage a live town root on this platform", got)
-	}
-	t.Chdir(townRoot)
-
-	nudgeModeFlag = NudgeModeQueue
-	nudgePriorityFlag = nudge.PriorityNormal
-
-	const sessionName = "gt-nudge-test-fixture"
-	err := deliverNudge(nil, sessionName, "synthetic", "tester")
-	if !errors.Is(err, tmux.ErrTestNudgeRefused) {
-		t.Errorf("deliverNudge() into a live town = %v, want ErrTestNudgeRefused", err)
-	}
-
-	if n := nudge.QueueLen(townRoot, sessionName); n != 0 {
-		t.Errorf("QueueLen after a refused nudge = %d, want 0: the queue is a delivery path, not a staging area", n)
-	}
-	if entries, readErr := os.ReadDir(filepath.Join(townRoot, ".runtime", "nudge_queue")); readErr == nil && len(entries) > 0 {
-		t.Errorf("refused nudge created queue directories for %v; nothing may be written to a live town", entries)
-	}
-	// runNudge appends to logs/town.log only after deliverNudge reports success,
-	// so a refusal must leave the town log absent entirely. This is gt-vmj's
-	// stated acceptance ("zero entries in logs/town.log") at the seam that
-	// produced the 252 entries.
-	if _, statErr := os.Stat(filepath.Join(townRoot, "logs", "town.log")); !os.IsNotExist(statErr) {
-		t.Errorf("refused nudge produced a town log at %s", filepath.Join(townRoot, "logs", "town.log"))
 	}
 }

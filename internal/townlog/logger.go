@@ -55,12 +55,8 @@ type Event struct {
 
 // Logger handles writing events to the town log file.
 type Logger struct {
-	// townRoot is kept alongside logPath because it is the isolation boundary
-	// the test guard authorizes on — the same one internal/nudge uses for the
-	// queue, so a test that owns a town owns both of its write paths.
-	townRoot string
-	logPath  string
-	mu       sync.Mutex
+	logPath string
+	mu      sync.Mutex
 }
 
 // logDir returns the directory for town logs.
@@ -76,21 +72,12 @@ func logPath(townRoot string) string {
 // NewLogger creates a new Logger for the given town root.
 func NewLogger(townRoot string) *Logger {
 	return &Logger{
-		townRoot: townRoot,
-		logPath:  logPath(townRoot),
+		logPath: logPath(townRoot),
 	}
 }
 
 // LogEvent logs a single event to the town log.
 func (l *Logger) LogEvent(event Event) error {
-	// Structural backstop: a unit test must never stamp events into a live
-	// town's log. Checked here because this is the one function every town log
-	// entry passes through. See guardTestTownLog — this route is the one the
-	// gt-vmj count was read out of.
-	if handled, err := guardTestTownLog(l.townRoot, l.logPath); handled {
-		return err
-	}
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
