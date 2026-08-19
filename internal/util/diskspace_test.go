@@ -2,6 +2,7 @@ package util
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -109,6 +110,40 @@ func TestCheckDiskSpace_CurrentDir(t *testing.T) {
 	// In a normal test environment, disk should be OK
 	if level == DiskSpaceCritical {
 		t.Logf("Disk space is critical: %s", msg)
+	}
+}
+
+// TestCheckDiskSpace_MessageNamesPath pins the disambiguation that gt-yb33
+// turned on: a host has several filesystems, and a message that reports only a
+// figure sends the reader to `df /` — which on that host reported 1.3 TB free
+// while the tmpfs the check had actually measured was at 96%, so a full
+// filesystem read as a code regression.
+func TestCheckDiskSpace_MessageNamesPath(t *testing.T) {
+	dir := t.TempDir()
+
+	// Synthetic info, so that the assertion does not depend on how full this
+	// host's filesystems happen to be when the suite runs.
+	full := &DiskSpaceInfo{
+		AvailableBytes: 1288490188,
+		TotalBytes:     32212254720,
+		UsedBytes:      30923764532,
+		UsedPercent:    96.0,
+	}
+	for _, level := range []DiskSpaceLevel{DiskSpaceCritical, DiskSpaceWarning} {
+		msg := diskSpaceMessage(level, full, dir)
+		if !strings.Contains(msg, dir) {
+			t.Errorf("%s message %q does not name the measured path %q", level, msg, dir)
+		}
+	}
+	if msg := diskSpaceMessage(DiskSpaceOK, full, dir); msg != "" {
+		t.Errorf("DiskSpaceOK carries a message: %q", msg)
+	}
+
+	// The path reaches the message through the exported entry point too.
+	if _, msg, err := CheckDiskSpace(dir); err != nil {
+		t.Fatalf("CheckDiskSpace(%q): %v", dir, err)
+	} else if msg != "" && !strings.Contains(msg, dir) {
+		t.Errorf("CheckDiskSpace message %q does not name %q", msg, dir)
 	}
 }
 

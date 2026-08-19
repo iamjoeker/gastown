@@ -25,35 +25,17 @@ import (
 // assert the KEEP branches as hard as the delete branch.
 //
 // See: gt-hkv, gt-32z
-const stalePIDFileSection = "**3. Stale PID/lock files**"
+//
+// The TITLE, without the section number — the number floats as sections are
+// inserted, and pinning it here broke this test for an unrelated change once
+// already (gt-yb33). See patrol_section_test.go.
+const stalePIDFileSection = "Stale PID/lock files"
 
 // extractStalePIDFileScript pulls the shell block that follows the "stale
 // PID/lock files" heading out of the deacon patrol formula.
 func extractStalePIDFileScript(t *testing.T) string {
 	t.Helper()
-
-	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
-	if err != nil {
-		t.Fatalf("reading deacon patrol formula: %v", err)
-	}
-
-	body := string(content)
-	sectionIdx := strings.Index(body, stalePIDFileSection)
-	if sectionIdx < 0 {
-		t.Fatalf("deacon patrol formula: %q section not found", stalePIDFileSection)
-	}
-
-	rest := body[sectionIdx:]
-	open := strings.Index(rest, "```bash\n")
-	if open < 0 {
-		t.Fatal("deacon patrol formula: no bash block after stale PID/lock files section")
-	}
-	rest = rest[open+len("```bash\n"):]
-	closeIdx := strings.Index(rest, "\n```")
-	if closeIdx < 0 {
-		t.Fatal("deacon patrol formula: unterminated bash block in stale PID/lock files section")
-	}
-	return rest[:closeIdx]
+	return patrolSectionScript(t, deaconPatrolFormula, stalePIDFileSection)
 }
 
 // TestStalePIDFileGuardHasNoBareGlobOrExitStatusTest is a cheap regression
