@@ -53,12 +53,10 @@ type Mailbox struct {
 	// existed, gt surfaced that advice while offering no way to act on it: the
 	// suggested remedy was unreachable from the command that suggested it.
 	//
-	// An agent archiving its OWN mail no longer needs this: closeInDir acts under
-	// the mailbox's canonical identity, which is the identity the delivery path
-	// assigned (gt-n3gj). What remains is the case the flag was named for —
-	// deliberately closing a record that belongs to another agent, such as
-	// clearing mail left behind by an agent that no longer exists.
-	// See SetForceClose.
+	// That is reachable in normal operation because agent addressing is not
+	// canonical — mail may be delivered to one form of an agent's address while
+	// the agent acts under another, so an agent can be unable to archive its
+	// own mail. See SetForceClose.
 	forceClose bool
 }
 
@@ -629,16 +627,6 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 	}
 
 	args := []string{"close", id}
-	// Act under this mailbox's canonical identity. bd's ownership guard compares
-	// the acting identity against the bead's assignee, and mail beads are always
-	// assigned the canonical form (AddressToIdentity, e.g. "gastown/toast"). The
-	// ambient BD_ACTOR is the agent's role path ("gastown/polecats/toast"), which
-	// is the right actor for work beads but never matches a mail bead — so
-	// without this every polecat and crew agent was refused when archiving its
-	// own mail, and had to reach for --force. See gt-n3gj.
-	if actor := actorForIdentity(m.identity); actor != "" {
-		args = append(args, "--actor="+actor)
-	}
 	// Pass session ID for work attribution if available
 	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
 		args = append(args, "--session="+sessionID)
@@ -662,26 +650,6 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 	}
 
 	return nil
-}
-
-// actorForIdentity returns the bd actor a mailbox should act under, or "" when
-// the mailbox has no agent identity to act as.
-//
-// The identity is re-normalized because not every Mailbox constructor runs it
-// through AddressToIdentity, and normalization is idempotent. Queue, channel and
-// announce mailboxes are shared destinations rather than agents: their beads are
-// assigned "queue:name" and friends, which is not an actor, so they keep the
-// ambient BD_ACTOR and the real agent stays in the audit trail.
-func actorForIdentity(identity string) string {
-	if identity == "" {
-		return ""
-	}
-	for _, prefix := range []string{"queue:", "channel:", "announce:", "list:", "group:"} {
-		if strings.HasPrefix(identity, prefix) {
-			return ""
-		}
-	}
-	return AddressToIdentity(identity)
 }
 
 func (m *Mailbox) markReadLegacy(id string) error {

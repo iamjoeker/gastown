@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gt:record` marks a bead as a durable archive, not work** (gt-f8td). After
+  seven closed MR wisps were destroyed, the standing defence became writing
+  incident and merge-ledger state onto a *normal* bead rather than a wisp —
+  wisps are what the GC purges. That protection had a side effect: the dispatch
+  path treats any open, non-wisp bead of a work type as implementable work, so
+  the very act of protecting a record made it look like a work item. Two
+  measured cases (`gt-8uc`, a merge ledger; `gt-6dp`, an incident report) each
+  burned a full polecat session that ended in "nothing here to build", and the
+  loop could not self-limit: a ledger is never *done* in the implementer sense,
+  so absent an explicit `bd close` the zombie patrol reopened it and dispatched
+  it again. The record's durability was exactly what made it recur. `bd label
+  add <id> gt:record` (or the synonyms `gt:ledger` / `gt:incident`) now makes
+  `gt sling`, `executeSling` (batch and queue/scheduler dispatch), and `gt
+  ready` all skip the bead, with `--force` as the override and `bd label remove`
+  named in the refusal. Durability is untouched — the bead stays an ordinary row
+  in `issues`, out of reach of every wisp GC path, and the label is deliberately
+  kept out of both `InternalIssueLabel` and `ProtectedIssueLabel` so nothing
+  starts treating a record as runtime state. `gt ready` builds its exclusion set
+  from a separate labelled `bd list` query because `bd ready --json` returns no
+  `labels` field at all, which would have made a label-only filter a silent
+  no-op. New guide at `docs/guides/durable-records.md`.
+
 - **`gt config list` enumerates the whole configuration surface** — every key,
   its compiled-in default, its acting value, and which of the layers supplied it
   (gt-il30). Configuration is spread across compiled-in defaults, town and rig

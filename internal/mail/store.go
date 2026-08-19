@@ -119,10 +119,7 @@ func (m *Mailbox) storeCloseInDir(id string) error {
 	defer cancel()
 
 	sessionID := runtime.SessionIDFromEnv()
-	// Same canonical actor the subprocess path passes as --actor, so the two
-	// close routes attribute the close identically and agree with any ownership
-	// guard the store grows. See closeInDir and gt-n3gj.
-	err := m.store.CloseIssue(ctx, id, "", actorForIdentity(m.identity), sessionID)
+	err := m.store.CloseIssue(ctx, id, "", "", sessionID)
 	telemetry.RecordMailMessage(context.Background(), "read", telemetry.MailMessageInfo{
 		ID: id,
 		To: m.identity,

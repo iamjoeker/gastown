@@ -168,11 +168,7 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["GIT_CEILING_DIRECTORIES"] = cfg.TownRoot
 	}
 
-	// Set BEADS_AGENT_NAME for polecat/crew. This is the canonical mail identity
-	// ("rig/name"), deliberately NOT the BD_ACTOR role path ("rig/polecats/name"):
-	// work beads are assigned the role path, mail beads the canonical form. Code
-	// that must match a mail bead's assignee has to act under the canonical form
-	// (see mail.AddressToIdentity and mail's closeInDir, gt-n3gj).
+	// Set BEADS_AGENT_NAME for polecat/crew (uses same format as BD_ACTOR)
 	if cfg.Role == constants.RolePolecat || cfg.Role == constants.RoleCrew {
 		env["BEADS_AGENT_NAME"] = fmt.Sprintf("%s/%s", cfg.Rig, cfg.AgentName)
 	}
