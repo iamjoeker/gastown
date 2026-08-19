@@ -2619,15 +2619,7 @@ func (t *Tmux) FindSessionByWorkDir(targetDir string, processNames []string) ([]
 	return matches, nil
 }
 
-// CapturePane captures the visible content of a pane, preceded by lines of
-// scrollback history.
-//
-// lines is a START offset, not a length: -S only moves where the capture
-// begins, and the capture always runs to the bottom of the visible pane. So
-// CapturePane(s, 5) returns the whole visible pane plus up to 5 lines of
-// history — never 5 lines. Callers that need a bounded tail must bound it
-// themselves after the fact; three idle checks read this parameter as a tail
-// length and scanned entire agent transcripts for years (gt-qye).
+// CapturePane captures the visible content of a pane.
 func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 	return t.run("capture-pane", "-p", "-t", session, "-S", fmt.Sprintf("-%d", lines))
 }
@@ -2637,8 +2629,7 @@ func (t *Tmux) CapturePaneAll(session string) (string, error) {
 	return t.run("capture-pane", "-p", "-t", session, "-S", "-")
 }
 
-// CapturePaneLines is CapturePane split into lines: the whole visible pane plus
-// up to lines of scrollback, NOT the last N lines. See CapturePane.
+// CapturePaneLines captures the last N lines of a pane as a slice.
 func (t *Tmux) CapturePaneLines(session string, lines int) ([]string, error) {
 	out, err := t.CapturePane(session, lines)
 	if err != nil {
@@ -3424,14 +3415,9 @@ const DefaultReadyPromptPrefix = "❯ "
 //
 // Returns nil if the agent becomes idle within the timeout.
 // Returns an error if the timeout expires while the agent is still busy.
-//
-// Each poll reads only the status region around the composer line
-// (atIdlePromptFromLines). Scanning the whole snapshot instead would let the
-// busy marker quoted anywhere in the agent's transcript hold this in its loop
-// until the timeout expires, on an agent that has been at its prompt the whole
-// time (gt-qye).
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := readyPromptPrefixForSession(t, session)
+	prefix := strings.TrimSpace(promptPrefix)
 
 	// Require 2 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
@@ -3442,7 +3428,7 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		lines, err := t.CapturePaneLines(session, idleCaptureHistoryLines)
+		lines, err := t.CapturePaneLines(session, 5)
 		if err != nil {
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
@@ -3455,11 +3441,38 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 			continue
 		}
 
-		// The composer must be visible and its status region clear of the busy
-		// indicator. Claude Code renders that status bar below the prompt line,
-		// so the prompt is not the last non-empty line and the region reaches
-		// past it in both directions.
-		if atIdlePromptFromLines(lines, promptPrefix) {
+		// Busy indicator check: if "esc to interrupt" is visible anywhere in
+		// the recent pane output, the agent is actively working — NOT idle,
+		// regardless of whether the prompt prefix is also visible.
+		statusBarBusy := false
+		for _, line := range lines {
+			if hasBusyIndicator(line) {
+				statusBarBusy = true
+				break
+			}
+		}
+		if statusBarBusy {
+			consecutiveIdle = 0
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		// Scan all captured lines for the prompt prefix.
+		// Claude Code renders a status bar below the prompt line,
+		// so the prompt may not be the last non-empty line.
+		promptFound := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if matchesPromptPrefix(trimmed, promptPrefix) || (prefix != "" && trimmed == prefix) {
+				promptFound = true
+				break
+			}
+		}
+
+		if promptFound {
 			consecutiveIdle++
 			if consecutiveIdle >= requiredConsecutive {
 				return nil
@@ -3500,81 +3513,35 @@ func (t *Tmux) IsAtPrompt(session string, rc *config.RuntimeConfig) bool {
 // Returns true if idle, false if the agent is busy or the check fails.
 // This is a point-in-time snapshot, not a poll.
 //
-// Detection strategy: locate the composer line and read only the status region
-// around it (see idleFromLines). The busy scan is anchored rather than run over
-// the whole snapshot, because the snapshot is the whole visible pane — see
-// idleCaptureHistoryLines — and the agent's own transcript can carry the busy
-// marker as prose (gt-qye, gt-blj).
+// Detection strategy: check the Claude Code status bar (bottom line of the
+// pane starting with ⏵⏵). When the agent is actively working, the status
+// bar contains "esc to interrupt". When idle, it does not.
 func (t *Tmux) IsIdle(session string) bool {
-	lines, err := t.CapturePaneLines(session, idleCaptureHistoryLines)
+	lines, err := t.CapturePaneLines(session, 5)
 	if err != nil {
 		return false
 	}
-	return idleFromLines(lines, readyPromptPrefixForSession(t, session))
-}
 
-// modeStatusMarker is the permission-mode indicator Claude Code renders in the
-// footer line directly below the composer box. It is on screen whether or not
-// the agent is working, so it anchors the busy scan but is never an idle signal
-// on its own.
-const modeStatusMarker = "⏵⏵"
-
-// idleCaptureHistoryLines is the scrollback depth requested when capturing a
-// pane for idle detection.
-//
-// It is NOT a scan bound, which is the mistake this constant exists to spell
-// out: capture-pane's -S flag sets only where the capture STARTS, and the
-// capture always runs to the bottom of the visible pane. Asking for 5 lines
-// returns the whole visible pane plus up to 5 lines of history: measured on a
-// 24-row pane, -S -5 returned 27 lines against 24 with no -S at all, and on
-// live agent panes both returned 24 because Claude Code's alternate screen
-// accumulates no scrollback (gt-qye). Zero keeps the snapshot to what is on
-// screen; the scan is bounded by the anchor instead.
-const idleCaptureHistoryLines = 0
-
-// idleFromLines reports whether a pane snapshot shows an agent parked at its
-// prompt with no turn in flight.
-//
-// The composer line is the anchor: the busy marker lives in the footer beneath
-// it (or in the spinner just above it), while the transcript further up is
-// where text that merely looks like the marker appears. When the composer is
-// not on screen the mode-status footer line stands in as the anchor, so a pane
-// whose prompt prefix does not match still gets its answer from the same
-// bounded region. Neither anchor present means the pane cannot be read as an
-// agent pane at all, and IsIdle's contract maps that to "not idle" rather than
-// to a guess.
-func idleFromLines(lines []string, promptPrefix string) bool {
-	lines = trimTrailingBlankLines(lines)
-	anchor := findComposerLine(lines, promptPrefix)
-	if anchor < 0 {
-		anchor = findModeStatusLine(lines)
-	}
-	return anchor >= 0 && !busyIndicatorNearAnchor(lines, anchor)
-}
-
-// atIdlePromptFromLines is idleFromLines without the mode-status fallback: the
-// composer itself must be visible. WaitForIdle uses this because its callers
-// are about to type into that composer, so a pane where it cannot be found is
-// not somewhere to send input.
-func atIdlePromptFromLines(lines []string, promptPrefix string) bool {
-	lines = trimTrailingBlankLines(lines)
-	anchor := findComposerLine(lines, promptPrefix)
-	return anchor >= 0 && !busyIndicatorNearAnchor(lines, anchor)
-}
-
-// findModeStatusLine returns the index of the last mode-status footer line, or
-// -1 if none is within the same bounded window used for the composer.
-func findModeStatusLine(lines []string) int {
-	start := len(lines) - turnComposerScanLines
-	if start < 0 {
-		start = 0
-	}
-	for i := len(lines) - 1; i >= start; i-- {
-		if strings.Contains(lines[i], modeStatusMarker) {
-			return i
+	for _, line := range lines {
+		if hasBusyIndicator(line) {
+			return false
 		}
 	}
-	return -1
+
+	promptPrefix := readyPromptPrefixForSession(t, session)
+	for _, line := range lines {
+		if matchesPromptPrefix(line, promptPrefix) {
+			return true
+		}
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "⏵⏵") || strings.Contains(trimmed, "\u23F5\u23F5") {
+			return true
+		}
+	}
+	return false
 }
 
 // IsBusy reports whether a session's pane shows positive evidence that the
