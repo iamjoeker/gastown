@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/testenv"
 )
 
 // TestMain sets up a dedicated tmux server for the package's integration tests.
@@ -12,6 +14,11 @@ import (
 // down after all tests complete. This prevents test sessions from appearing on
 // the user's interactive tmux and avoids socket conflicts with other packages.
 func TestMain(m *testing.M) {
+	// Point this package at a dead Dolt port before anything else runs, so a
+	// test that reaches for Dolt without arranging a server of its own cannot
+	// land on the production one. See testenv.GuardProductionDolt.
+	testenv.GuardProductionDolt()
+
 	socket := fmt.Sprintf("gt-test-%d", os.Getpid())
 
 	// Set defaultSocket so NewTmux() connects to the test server, not the
