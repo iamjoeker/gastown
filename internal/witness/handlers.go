@@ -3189,44 +3189,55 @@ func getAttachedMoleculeID(bd *BdCli, workDir, beadID string) string {
 
 // closeMoleculeWithDescendants closes a molecule and all its descendant step
 // issues using the bd CLI. Returns the total number of issues closed.
+//
+// The root close is withheld until every descendant is confirmed closed. bd
+// refuses to close a parent over open children anyway, so this does not change
+// what lands — it changes what the witness reports: the returned error names the
+// steps that survived instead of bd's refusal to close the root, which says
+// nothing about which steps stranded it. A descendant listing that FAILED counts
+// as unresolved for the same reason (gt-r9x4).
 func closeMoleculeWithDescendants(bd *BdCli, workDir, moleculeID string) (int, error) {
 	// Recursively close descendants first (bottom-up)
 	closed, descErr := closeDescendantsViaCLI(bd, workDir, moleculeID)
+	if descErr != nil {
+		return closed, fmt.Errorf("not closing molecule %s, descendants unresolved: %w", moleculeID, descErr)
+	}
 
 	// Close the molecule itself
 	reason := "Orphaned mol-polecat-work — owning polecat no longer exists (issue #1381)"
 	if err := bd.Run(workDir, "close", moleculeID, "-r", reason); err != nil {
-		closeErr := fmt.Errorf("closing molecule %s: %w", moleculeID, err)
-		if descErr != nil {
-			return closed, fmt.Errorf("%w; also: %v", closeErr, descErr)
-		}
-		return closed, closeErr
+		return closed, fmt.Errorf("closing molecule %s: %w", moleculeID, err)
 	}
 	closed++
 
-	return closed, descErr
+	return closed, nil
 }
 
-// closeDescendantsViaCLI recursively closes descendant issues of a parent
-// using bd CLI commands. Returns count of issues closed and any error.
+// witnessClosePassLimit bounds the repeated close passes in
+// closeChildrenToFixedPoint. A pass that closes nothing ends the loop, so this
+// only guards against a close that reports success without changing the child's
+// status — which would otherwise spin forever. Molecules have far fewer steps.
+const witnessClosePassLimit = 64
+
+// childBead is the subset of a child issue this cleanup path reads.
+type childBead struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+// closeDescendantsViaCLI recursively closes descendant issues of a parent using
+// bd CLI commands. Returns the count of issues confirmed closed, and an error
+// naming any descendant that is still open.
+//
+// The count is derived from re-reading the children, never from the close's exit
+// status: `bd close a b c` exits non-zero only when NOTHING settled as closed
+// (cmd/bd/close.go), so a batch that closed 1 of 5 exits 0 and a caller that
+// trusts the exit status reports 5 (gt-3xmz).
 func closeDescendantsViaCLI(bd *BdCli, workDir, parentID string) (int, error) {
-	// List children of this parent
-	output, err := bd.Exec(workDir, "list", "--parent="+parentID, "--json")
+	children, err := listChildrenViaCLI(bd, workDir, parentID)
 	if err != nil {
-		return 0, fmt.Errorf("listing children of %s: %w", parentID, err)
+		return 0, err
 	}
-	if output == "" {
-		return 0, nil
-	}
-
-	var children []struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal([]byte(output), &children); err != nil {
-		return 0, fmt.Errorf("parsing children of %s: %w", parentID, err)
-	}
-
 	if len(children) == 0 {
 		return 0, nil
 	}
@@ -3235,36 +3246,155 @@ func closeDescendantsViaCLI(bd *BdCli, workDir, parentID string) (int, error) {
 	totalClosed := 0
 	var errs []error
 	for _, child := range children {
-		n, err := closeDescendantsViaCLI(bd, workDir, child.ID)
+		n, childErr := closeDescendantsViaCLI(bd, workDir, child.ID)
 		totalClosed += n
-		if err != nil {
-			errs = append(errs, err)
+		if childErr != nil {
+			errs = append(errs, childErr)
 		}
 	}
 
-	// Close open direct children
-	var idsToClose []string
-	for _, child := range children {
-		if child.Status != "closed" {
-			idsToClose = append(idsToClose, child.ID)
-		}
+	closed, stillOpen, closeErr := closeChildrenToFixedPoint(bd, workDir, parentID)
+	totalClosed += closed
+	if closeErr != nil {
+		errs = append(errs, closeErr)
 	}
-
-	if len(idsToClose) > 0 {
-		reason := "Orphaned mol-polecat-work step — owning polecat no longer exists"
-		args := append([]string{"close"}, idsToClose...)
-		args = append(args, "-r", reason)
-		if err := bd.Run(workDir, args...); err != nil {
-			errs = append(errs, fmt.Errorf("closing children of %s: %w", parentID, err))
-		} else {
-			totalClosed += len(idsToClose)
-		}
+	if len(stillOpen) > 0 {
+		errs = append(errs, fmt.Errorf("%d child issue(s) of %s still open after close passes: %s",
+			len(stillOpen), parentID, strings.Join(stillOpen, " ")))
 	}
 
 	if len(errs) > 0 {
-		return totalClosed, errs[0]
+		return totalClosed, errors.Join(errs...)
 	}
 	return totalClosed, nil
+}
+
+// closeChildrenToFixedPoint closes the open children of parentID, repeating the
+// pass while it makes progress. Returns the number confirmed closed and the IDs
+// that remain open.
+//
+// Molecule steps are siblings chained by `blocks` edges and `bd close` correctly
+// refuses to close a blocked issue, so a single pass in whatever order bd
+// returns children only closes the steps that appear after their blocker — the
+// rest are stranded (gt-g1q1). Retrying an individual step cannot help: a
+// blocked step becomes closeable only when its PREDECESSOR closes, so the
+// dependency is between elements, not in time. One extra pass over the whole set
+// accomplishes what any number of retries of one element cannot.
+//
+// Do NOT reach for --force here. The block predicate is correct and is the only
+// thing keeping steps from closing out of order.
+func closeChildrenToFixedPoint(bd *BdCli, workDir, parentID string) (int, []string, error) {
+	const reason = "Orphaned mol-polecat-work step — owning polecat no longer exists"
+
+	children, err := listChildrenViaCLI(bd, workDir, parentID)
+	if err != nil {
+		return 0, nil, err
+	}
+	open := openChildIDs(children)
+
+	totalClosed := 0
+	var lastCloseErr error
+	for pass := 1; len(open) > 0 && pass <= witnessClosePassLimit; pass++ {
+		// The whole open set goes in one invocation: bd unblocks siblings within
+		// a single close, so a batch settles more of the chain than one id at a
+		// time would. Its error is kept only to explain a stalled pass — a
+		// mid-chain "cannot close blocked issue" is expected, and the next pass
+		// retries it once its blocker is closed.
+		args := append([]string{"close"}, open...)
+		args = append(args, "-r", reason)
+		if runErr := bd.Run(workDir, args...); runErr != nil {
+			lastCloseErr = runErr
+		}
+
+		children, err = listChildrenViaCLI(bd, workDir, parentID)
+		if err != nil {
+			return totalClosed, open, err
+		}
+		remaining := openChildIDs(children)
+		if len(remaining) >= len(open) {
+			// The pass closed nothing. An identical pass cannot do better.
+			return totalClosed, remaining, lastCloseErr
+		}
+		totalClosed += len(open) - len(remaining)
+		open = remaining
+	}
+
+	if len(open) == 0 {
+		return totalClosed, nil, nil
+	}
+	return totalClosed, open, lastCloseErr
+}
+
+// openChildIDs returns the IDs of children that are not closed.
+func openChildIDs(children []childBead) []string {
+	var open []string
+	for _, child := range children {
+		if child.ID != "" && child.Status != "closed" {
+			open = append(open, child.ID)
+		}
+	}
+	return open
+}
+
+// listChildrenViaCLI enumerates the children of parentID across BOTH the durable
+// issues table and the wisps table, at every status and priority.
+//
+// A bare `bd list --parent=<id> --json` saw neither: it never returns wisps, and
+// it inherits bd's status and priority defaults. Molecule step children ARE
+// ephemeral wisps, so that listing came back empty for the exact molecules this
+// path exists to collect — it closed nothing, returned no error, and let the
+// caller close the root over still-open steps (gt-u2u).
+func listChildrenViaCLI(bd *BdCli, workDir, parentID string) ([]childBead, error) {
+	issues, err := listChildBeadsViaCLI(bd, workDir,
+		"list", "--parent="+parentID, "--status=all", "--limit=0", "--json")
+	if err != nil {
+		return nil, fmt.Errorf("listing children of %s: %w", parentID, err)
+	}
+
+	// Wisps are unreachable from `bd list`; they need `bd query ephemeral=true`
+	// (mirrors beads.listEphemeral, which is what listChildrenAcrossTables uses).
+	wisps, err := listChildBeadsViaCLI(bd, workDir,
+		"query", "--json", "ephemeral=true AND parent="+strconv.Quote(parentID), "--all", "--limit=0")
+	if err != nil {
+		return nil, fmt.Errorf("listing wisp children of %s: %w", parentID, err)
+	}
+
+	return mergeChildBeads(issues, wisps), nil
+}
+
+func listChildBeadsViaCLI(bd *BdCli, workDir string, args ...string) ([]childBead, error) {
+	output, err := bd.Exec(workDir, args...)
+	if err != nil {
+		return nil, err
+	}
+	// bd prints plain text ("No issues found.") rather than an empty array when
+	// there are no results.
+	output = strings.TrimSpace(output)
+	if output == "" || (output[0] != '[' && output[0] != '{') {
+		return nil, nil
+	}
+
+	var children []childBead
+	if err := json.Unmarshal([]byte(output), &children); err != nil {
+		return nil, fmt.Errorf("parsing bd output: %w", err)
+	}
+	return children, nil
+}
+
+// mergeChildBeads concatenates two child listings, dropping duplicate IDs.
+func mergeChildBeads(primary, secondary []childBead) []childBead {
+	merged := make([]childBead, 0, len(primary)+len(secondary))
+	seen := make(map[string]bool, len(primary)+len(secondary))
+	for _, group := range [][]childBead{primary, secondary} {
+		for _, child := range group {
+			if child.ID == "" || seen[child.ID] {
+				continue
+			}
+			seen[child.ID] = true
+			merged = append(merged, child)
+		}
+	}
+	return merged
 }
 
 // DoneIntent represents a parsed done-intent label from an agent bead.
