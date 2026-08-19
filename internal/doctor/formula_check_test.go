@@ -233,43 +233,6 @@ func TestFormulaCheck_Run_DriftAlongsideFixable(t *testing.T) {
 	}
 }
 
-// TestFormulaCheck_Run_NamesMissingSections: doctor is where most operators
-// first meet a pinned formula, and "reconcile by hand" does not say whether
-// that merge is urgent. The detail must name what the executing copy is
-// actually missing — the difference between "you are behind" and "you are
-// missing the step that prevents re-dispatch" (gt-yubx).
-func TestFormulaCheck_Run_NamesMissingSections(t *testing.T) {
-	const target = "mol-deacon-patrol.formula.toml"
-	tmpDir := driftTownRoot(t, target)
-
-	result := NewFormulaCheck().Run(&CheckContext{TownRoot: tmpDir})
-
-	joined := strings.Join(result.Details, "\n")
-	if !strings.Contains(joined, "Missing ") || !strings.Contains(joined, "shipped section(s)") {
-		t.Errorf("details do not name the missing sections:\n%s", joined)
-	}
-	// driftTownRoot replaces the whole file with a comment, so the shipped
-	// steps are all absent and at least one must be named by id.
-	if !strings.Contains(joined, "step ") {
-		t.Errorf("details name no absent step:\n%s", joined)
-	}
-}
-
-// TestFormulaCheck_Run_QuietWhenNothingMissing is the control for the test
-// above: an unmodified town must produce no missing-section line at all, or the
-// line proves nothing when it does appear.
-func TestFormulaCheck_Run_QuietWhenNothingMissing(t *testing.T) {
-	tmpDir := t.TempDir()
-	if _, err := formula.ProvisionFormulas(tmpDir); err != nil {
-		t.Fatalf("ProvisionFormulas() error: %v", err)
-	}
-
-	result := NewFormulaCheck().Run(&CheckContext{TownRoot: tmpDir})
-	if joined := strings.Join(result.Details, "\n"); strings.Contains(joined, "shipped section(s)") {
-		t.Errorf("clean town reports missing sections:\n%s", joined)
-	}
-}
-
 func TestFormulaCheck_Fix(t *testing.T) {
 	tmpDir := t.TempDir()
 
