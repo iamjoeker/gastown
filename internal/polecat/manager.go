@@ -1396,7 +1396,12 @@ func (m *Manager) ReclaimBrokenIdlePolecat(name string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	if current.State != StateIdle || current.Issue != "" {
+	// Eligibility, not safety: every blocker below still has to pass. Accepting
+	// StateDone here matters because a broken sandbox that reached StateDone was
+	// previously unreclaimable forever — it failed this check, failed reuse (its
+	// git checks error out), and kept consuming a slot against the per-rig
+	// directory cap. That cap filling is what blocked dispatch in gt-2uqy.
+	if !StateEligibleForPoolReuse(current.State) || current.Issue != "" {
 		return fmt.Errorf("not a clean idle polecat: state=%s issue=%s", current.State, current.Issue)
 	}
 
@@ -1819,6 +1824,20 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 			return nil, err
 		}
 	}
+	// StateDone is NOT a dead prompt, so it does not get the treatment above.
+	// `gt done` writes agent_state=done BEFORE the agent exits, so a live session
+	// in this state may still be finishing its own completion — pushing, submitting
+	// its MR, closing beads. Everything below rewrites that worktree (reset --hard,
+	// clean -f, checkout -b), which would pull the tree out from under a running
+	// agent. Refuse instead; the caller falls back to allocating a fresh polecat,
+	// and this slot rejoins the pool by itself once the session ends. Sling only
+	// began offering StateDone slots for reuse in gt-2uqy, so this path is new.
+	if current.State == StateDone {
+		if running, stale := m.polecatSessionState(name); running && !stale {
+			return nil, fmt.Errorf("%w: session %s is still running", ErrPolecatNeedsRecovery,
+				session.PolecatSessionName(session.PrefixFor(m.rig.Name), name))
+		}
+	}
 	if decision := m.reuseDecisionForPolecat(name, current.State); !decision.Reusable {
 		return nil, fmt.Errorf("%w: %s", ErrPolecatNeedsRecovery, decision.Reason)
 	}
@@ -1979,6 +1998,45 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 		CreatedAt: now,
 		UpdatedAt: now,
 	}, nil
+}
+
+// ReleaseReusedPolecat returns a polecat that a failed sling REUSED (rather than
+// created) to the idle pool, leaving its sandbox intact.
+//
+// Removal is the wrong rollback for a reused slot. The worktree pre-dates the
+// sling that failed, so deleting it churns exactly the worktree the persistent
+// pool exists to keep — the accumulation-and-cap failure of gt-2uqy in reverse —
+// and takes the polecat's directory and name with it. Undo only what the reuse
+// did: clear the hook it attached and put the agent bead back at idle.
+//
+// Best-effort semantics match the rest of rollback. A stale hook left by a failed
+// bead write is something the witness already recovers; a deleted sandbox is not.
+func (m *Manager) ReleaseReusedPolecat(name, reason string) error {
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	if !m.exists(name) {
+		return ErrPolecatNotFound
+	}
+
+	m.unassignWorkBeads(name)
+
+	agentID := m.agentBeadID(name)
+	if err := m.resetAgentBeadForReuse(agentID, reason); err != nil && !errors.Is(err, beads.ErrNotFound) {
+		return fmt.Errorf("clearing agent bead %s: %w", agentID, err)
+	}
+	// resetAgentBeadForReuse parks the bead at agent_state=nuked, which is correct
+	// for removal and wrong here: this polecat still exists and is available again.
+	// Update the existing bead rather than re-creating it — the create path retries
+	// a dead Dolt for ~2 minutes, and a rollback that blocks the dispatch loop that
+	// long is worse than a stale agent_state the witness already reconciles.
+	if err := m.agentBeads().UpdateAgentState(agentID, string(beads.AgentStateIdle)); err != nil && !errors.Is(err, beads.ErrNotFound) {
+		return fmt.Errorf("returning agent bead %s to idle: %w", agentID, err)
+	}
+	return nil
 }
 
 // killExistingPolecatSession clears an existing tmux session before reusing or
@@ -2317,6 +2375,27 @@ func (m *Manager) List() ([]*Polecat, error) {
 	return polecats, nil
 }
 
+// StateEligibleForPoolReuse reports whether a polecat's lifecycle state lets the
+// pool consider it at all — for reuse by sling, or for reclaim of a structurally
+// broken sandbox. It decides eligibility ONLY; reuse SAFETY is DecideWorkstate's
+// job, and every caller still consults that afterwards.
+//
+// StateDone counts alongside StateIdle (gt-2uqy). A polecat that finished its
+// work sits in StateDone until its own idle transition lands, and that window is
+// long — measured 2026-08-18, ALL 26 reusable polecats in gastown were StateDone
+// and ZERO were StateIdle. So a gate written as `state == StateIdle` is not a
+// narrow gate against a real pool, it is dead code: `gt sling <rig>` spawned a
+// fresh worktree every single time, the pool grew to 29 (758M), hit the 30-slot
+// cap, and BLOCKED DISPATCH OF A P0 data-loss bead until 21 polecats were
+// reclaimed by hand.
+//
+// It is a named predicate rather than an inline condition because the whole of
+// gt-2uqy was one state missing from one condition, silently, with no error —
+// the same omission is cheap to repeat and expensive to notice.
+func StateEligibleForPoolReuse(s State) bool {
+	return s == StateIdle || s == StateDone
+}
+
 // FindIdlePolecat returns the first idle polecat in the rig, or nil if none.
 // Idle means no hook, no active session, and no pending completion/MR cleanup state.
 func (m *Manager) FindIdlePolecat() (*Polecat, error) {
@@ -2325,21 +2404,7 @@ func (m *Manager) FindIdlePolecat() (*Polecat, error) {
 		return nil, err
 	}
 	for _, p := range polecats {
-		// StateDone counts as reusable alongside StateIdle (gt-2uqy). A polecat
-		// that finished its work sits in StateDone until its own idle transition
-		// lands, and that window is long — measured 2026-08-18, ALL 26 idle
-		// polecats in gastown were StateDone and ZERO were StateIdle, so this
-		// lookup returned nil on every sling and `gt sling <rig>` spawned a fresh
-		// worktree every single time. The pool grew to 29 (758M) and then hit the
-		// 30-slot cap, which BLOCKED DISPATCH OF A P0 data-loss bead until 21
-		// polecats were reclaimed by hand.
-		//
-		// The Reusable check below is unchanged and still does the real gating —
-		// it is computed by DecideWorkstate, which already treats StateDone as a
-		// normal finished state (see workstate.go: "StateDone ... falls through to
-		// the real predicate checks"). This only stops the state filter from
-		// discarding those candidates before that check ever runs.
-		if (p.State == StateIdle || p.State == StateDone) && m.reuseDecisionForPolecat(p.Name, p.State).Reusable {
+		if StateEligibleForPoolReuse(p.State) && m.reuseDecisionForPolecat(p.Name, p.State).Reusable {
 			return p, nil
 		}
 	}
