@@ -452,15 +452,14 @@ func escapeSQLString(s string) string {
 // For town-level agents (mayor/, deacon/), also includes the variant without
 // trailing slash for backwards compatibility with legacy messages.
 func (m *Mailbox) identityVariants() []string {
-	variants := []string{m.identity}
-
-	// Town-level agents may have legacy messages without trailing slash
-	if m.identity == "mayor/" {
-		variants = append(variants, "mayor")
-	} else if m.identity == "deacon/" {
-		variants = append(variants, "deacon")
+	// Town-level agents may have legacy messages without the trailing slash.
+	// beads.AgentAddressForms is the single place that knows which addresses
+	// have more than one form; keeping a private copy here is how gt hook and
+	// gt mail came to disagree about "deacon" vs "deacon/" in the first place.
+	variants := beads.AgentAddressForms(m.identity)
+	if len(variants) == 0 {
+		return []string{m.identity}
 	}
-
 	return variants
 }
 
