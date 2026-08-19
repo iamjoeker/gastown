@@ -90,6 +90,15 @@ func randomSuffix() string {
 // The nudge will be picked up by the agent's hook at the next turn boundary.
 // Returns an error if the queue is full (MaxQueueDepth reached).
 func Enqueue(townRoot, session string, nudge QueuedNudge) error {
+	// Structural backstop: a unit test must never put a message in front of a
+	// live agent. Checked here, before the directory is created, because this is
+	// the one function every new nudge enters the queue through. See
+	// guardTestEnqueue for why the check does not live at the call sites, and
+	// why guarding the tmux transport alone was not enough.
+	if handled, err := guardTestEnqueue(townRoot, session, nudge.Message); handled {
+		return err
+	}
+
 	dir := queueDir(townRoot, session)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating nudge queue dir: %w", err)
