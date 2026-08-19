@@ -504,6 +504,14 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 
 	fmt.Printf("%s Wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
 
+	// Classify the wisp and its steps for gt compact (gt-fqd5). Unlike the
+	// patrol spawner this path materializes step rows, so the children are
+	// stamped too. Formulas that declare no wisp_type — mol-polecat-work and
+	// every other work formula — are left unclassified on purpose.
+	stampMoleculeWispType(formulaName, townRoot, "", wispRootID, true, func(c *bdCmd) *bdCmd {
+		return c.Dir(formulaWorkDir).WithAutoCommit().WithGTRoot(townRoot)
+	})
+
 	// Step 3: Hook the wisp bead with retry and verification.
 	// See: https://github.com/steveyegge/gastown/issues/148.
 	hookDir := beads.ResolveHookDir(townRoot, wispRootID, "")
