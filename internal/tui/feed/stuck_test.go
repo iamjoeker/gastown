@@ -364,6 +364,74 @@ func TestCheckAll_Zombie(t *testing.T) {
 	}
 }
 
+// TestCheckAll_NukedAgentIsNotAZombie proves a removed polecat does not become a
+// permanent problem-pane entry. Removal closes the agent bead, which drops it
+// from ListAgentBeads — but the close is best-effort, so a bead that survives it
+// still must not read as "dead, may need restart" (gt-qvx7).
+func TestCheckAll_NukedAgentIsNotAZombie(t *testing.T) {
+	mock := newMockHealthSource()
+	mock.agents["gt-gastown-polecat-Gone"] = &beads.Issue{
+		ID:          "gt-gastown-polecat-Gone",
+		Description: "agent\n\nrole_type: polecat\nagent_state: nuked",
+		UpdatedAt:   time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
+	}
+	// Session NOT alive — the worktree and session are gone by design.
+
+	detector := NewStuckDetectorWithSource(mock)
+	agents, err := detector.CheckAll()
+	if err != nil {
+		t.Fatalf("CheckAll: %v", err)
+	}
+
+	if len(agents) != 0 {
+		t.Fatalf("expected nuked agent to be dropped, got %d agent(s) (first state %s)",
+			len(agents), agents[0].State)
+	}
+}
+
+// TestCheckAll_NukedStateFromStructuredColumn covers legacy agent beads that
+// carry agent_state in the structured column instead of the description.
+func TestCheckAll_NukedStateFromStructuredColumn(t *testing.T) {
+	mock := newMockHealthSource()
+	mock.agents["gt-gastown-polecat-Legacy"] = &beads.Issue{
+		ID:         "gt-gastown-polecat-Legacy",
+		AgentState: string(beads.AgentStateNuked),
+		UpdatedAt:  time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
+	}
+
+	detector := NewStuckDetectorWithSource(mock)
+	agents, err := detector.CheckAll()
+	if err != nil {
+		t.Fatalf("CheckAll: %v", err)
+	}
+
+	if len(agents) != 0 {
+		t.Fatalf("expected legacy nuked agent to be dropped, got %d agent(s)", len(agents))
+	}
+}
+
+// TestCheckAll_LiveAgentStillReportsZombie is the control for the two tests
+// above: without the nuked marker, a dead session must still be flagged, so a
+// pass there cannot come from the detector having stopped reporting anything.
+func TestCheckAll_LiveAgentStillReportsZombie(t *testing.T) {
+	mock := newMockHealthSource()
+	mock.agents["gt-gastown-polecat-Crashed"] = &beads.Issue{
+		ID:          "gt-gastown-polecat-Crashed",
+		Description: "agent\n\nrole_type: polecat\nagent_state: working",
+		UpdatedAt:   time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
+	}
+
+	detector := NewStuckDetectorWithSource(mock)
+	agents, err := detector.CheckAll()
+	if err != nil {
+		t.Fatalf("CheckAll: %v", err)
+	}
+
+	if len(agents) != 1 || agents[0].State != StateZombie {
+		t.Fatalf("expected a zombie for a crashed agent, got %d agent(s)", len(agents))
+	}
+}
+
 // TestCheckAll_MultipleAgents tests sorting with multiple agents in different states
 func TestCheckAll_MultipleAgents(t *testing.T) {
 	mock := newMockHealthSource()

@@ -1920,9 +1920,8 @@ func dryRunNukeSummary(total, blocked int) string {
 
 // nukePolecatFull performs the complete cleanup sequence for a single polecat:
 // 1. Kill tmux session
-// 2. Delete worktree (via RemoveWithOptions with nuclear=true)
+// 2. Delete worktree (via RemoveWithOptions with nuclear=true, which also resets and closes the agent bead)
 // 3. Delete git branch
-// 4. Close agent bead
 // This is the canonical cleanup path used by both `polecat nuke` and `polecat stale --cleanup`.
 func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig) error {
 	return nukePolecatFullWithOptions(polecatName, rigName, mgr, r, nukePolecatOptions{PurgeClosedEphemerals: true})
@@ -2049,11 +2048,21 @@ func checkNukeActiveMRSafety(checker activeMRRemovalChecker, polecatName, rigNam
 
 func resetPolecatAgentBeadForReuse(r *rig.Rig, rigName, polecatName string) {
 	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	bd := beads.New(r.Path)
-	if err := bd.ForAgentBead().ResetAgentBeadForReuse(agentBeadID, "nuked"); err != nil {
+	bd := beads.New(r.Path).ForAgentBead()
+	if err := bd.ResetAgentBeadForReuse(agentBeadID, "nuked"); err != nil {
 		fmt.Printf("  %s agent bead not found or already cleaned\n", style.Dim.Render("○"))
+		return
+	}
+	fmt.Printf("  %s reset agent bead %s\n", style.Success.Render("✓"), agentBeadID)
+
+	// The worktree was already gone, so Manager.RemoveWithOptions bailed with
+	// ErrPolecatNotFound and never retired the bead. Close it here or this
+	// polecat stays a permanent "dead" entry in gt feed's problems pane —
+	// exactly the tombstone this path exists to clean up (gt-qvx7).
+	if err := bd.CloseAgentBead(agentBeadID, "polecat nuked"); err != nil {
+		fmt.Printf("  %s agent bead close failed (proceeding): %v\n", style.Dim.Render("○"), err)
 	} else {
-		fmt.Printf("  %s reset agent bead %s\n", style.Success.Render("✓"), agentBeadID)
+		fmt.Printf("  %s closed agent bead %s\n", style.Success.Render("✓"), agentBeadID)
 	}
 }
 
