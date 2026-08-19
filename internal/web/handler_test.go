@@ -31,15 +31,10 @@ type MockConvoyFetcher struct {
 	Queues               []QueueRow
 	Sessions             []SessionRow
 	Hooks                []HookRow
-	// HooksFailedStores names stores whose hooked-bead query failed, so the
-	// handler's partial-union caveat can be driven from a test.
-	HooksFailedStores []string
-	Mayor             *MayorStatus
-	Issues            []IssueRow
-	// IssuesFailedStores is the same lever for the backlog union.
-	IssuesFailedStores []string
-	Activity           []ActivityRow
-	Error              error
+	Mayor                *MayorStatus
+	Issues               []IssueRow
+	Activity             []ActivityRow
+	Error                error
 }
 
 func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
@@ -82,16 +77,16 @@ func (m *MockConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	return m.Sessions, nil
 }
 
-func (m *MockConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
-	return StoreResult[HookRow]{Rows: m.Hooks, FailedStores: m.HooksFailedStores}, nil
+func (m *MockConvoyFetcher) FetchHooks() ([]HookRow, error) {
+	return m.Hooks, nil
 }
 
 func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	return m.Mayor, nil
 }
 
-func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
-	return StoreResult[IssueRow]{Rows: m.Issues, FailedStores: m.IssuesFailedStores}, nil
+func (m *MockConvoyFetcher) FetchIssues() ([]IssueRow, error) {
+	return m.Issues, nil
 }
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
@@ -1211,16 +1206,16 @@ func (m *MockConvoyFetcherWithErrors) FetchSessions() ([]SessionRow, error) {
 	return nil, nil
 }
 
-func (m *MockConvoyFetcherWithErrors) FetchHooks() (StoreResult[HookRow], error) {
-	return StoreResult[HookRow]{}, nil
+func (m *MockConvoyFetcherWithErrors) FetchHooks() ([]HookRow, error) {
+	return nil, nil
 }
 
 func (m *MockConvoyFetcherWithErrors) FetchMayor() (*MayorStatus, error) {
 	return nil, nil
 }
 
-func (m *MockConvoyFetcherWithErrors) FetchIssues() (StoreResult[IssueRow], error) {
-	return StoreResult[IssueRow]{}, nil
+func (m *MockConvoyFetcherWithErrors) FetchIssues() ([]IssueRow, error) {
+	return nil, nil
 }
 
 func (m *MockConvoyFetcherWithErrors) FetchActivity() ([]ActivityRow, error) {
@@ -1421,13 +1416,9 @@ func (m *CountingMockFetcher) FetchEscalations() ([]EscalationRow, error) {
 func (m *CountingMockFetcher) FetchHealth() (*HealthRow, error)     { return m.inner.FetchHealth() }
 func (m *CountingMockFetcher) FetchQueues() ([]QueueRow, error)     { return m.inner.FetchQueues() }
 func (m *CountingMockFetcher) FetchSessions() ([]SessionRow, error) { return m.inner.FetchSessions() }
-func (m *CountingMockFetcher) FetchHooks() (StoreResult[HookRow], error) {
-	return m.inner.FetchHooks()
-}
-func (m *CountingMockFetcher) FetchMayor() (*MayorStatus, error) { return m.inner.FetchMayor() }
-func (m *CountingMockFetcher) FetchIssues() (StoreResult[IssueRow], error) {
-	return m.inner.FetchIssues()
-}
+func (m *CountingMockFetcher) FetchHooks() ([]HookRow, error)       { return m.inner.FetchHooks() }
+func (m *CountingMockFetcher) FetchMayor() (*MayorStatus, error)    { return m.inner.FetchMayor() }
+func (m *CountingMockFetcher) FetchIssues() ([]IssueRow, error)     { return m.inner.FetchIssues() }
 func (m *CountingMockFetcher) FetchActivity() ([]ActivityRow, error) {
 	return m.inner.FetchActivity()
 }
@@ -1527,43 +1518,4 @@ func TestFetchCircuitBreaker(t *testing.T) {
 		t.Errorf("backoff %v exceeds maxBackoff %v", cb.backoff, maxBackoff)
 	}
 	cb.mu.Unlock()
-}
-
-// TestConvoyHandler_PartialStoreNotices asserts the Work and Hooks panels admit
-// an incomplete union instead of rendering a store that could not be read as a
-// store that held nothing (gt-c332).
-func TestConvoyHandler_PartialStoreNotices(t *testing.T) {
-	mock := &MockConvoyFetcher{
-		Convoys:            []ConvoyRow{},
-		Issues:             []IssueRow{{ID: "gt-1", Title: "work", Priority: 2}},
-		IssuesFailedStores: []string{"beads"},
-		Hooks:              []HookRow{{ID: "gt-2", Title: "hooked", Agent: "nux"}},
-		HooksFailedStores:  []string{"duly_noted"},
-	}
-
-	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("NewConvoyHandler() error = %v", err)
-	}
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	body := w.Body.String()
-	for _, want := range []string{
-		"Work backlog partial results (unreadable: beads)",
-		"Hooks partial results (unreadable: duly_noted)",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("Response should name the unreadable store: missing %q", want)
-		}
-	}
-	// Both counts must read as floors, not totals.
-	if !strings.Contains(body, `<span class="count">1+</span>`) {
-		t.Error("Incomplete Work count should render with a '+' suffix")
-	}
-	if !strings.Contains(body, `1+</span>`) {
-		t.Error("Incomplete Hooks count should render with a '+' suffix")
-	}
 }

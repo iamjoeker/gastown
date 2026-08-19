@@ -868,7 +868,7 @@
             <div class="panel" id="work-panel">
                 <div class="panel-header">
                     <h2>📋 Work</h2>
-                    <span class="count">{{len .Issues}}{{if .IssuesWarning}}+{{end}}</span>
+                    <span class="count">{{len .Issues}}</span>
                     <button class="new-issue-btn" onclick="openIssueModal()">+ New</button>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
@@ -879,9 +879,6 @@
                     <button class="tab-btn" data-tab="all" onclick="switchWorkTab('all')">All</button>
                 </div>
                 <div class="panel-body">
-                    {{if .IssuesWarning}}
-                    <p class="truncation-notice">⚠️ Work backlog {{.IssuesWarning}} — count is incomplete</p>
-                    {{end}}
                     <!-- Issues List View -->
                     <div id="issues-list">
                         {{if .Issues}}
@@ -983,16 +980,13 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🪝 Hooks</h2>
-                    <span class="count{{if .Hooks}} {{end}}">{{len .Hooks}}{{if .HooksWarning}}+{{end}}</span>
+                    <span class="count{{if .Hooks}} {{end}}">{{len .Hooks}}</span>
                     <button class="hook-attach-btn" onclick="openHookAttachForm()">+ Attach</button>
                     {{if .Hooks}}<button class="hook-clear-all-btn" onclick="clearAllHooks()">Clear All</button>{{end}}
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .HooksWarning}}
-                    <p class="truncation-notice">⚠️ Hooks {{.HooksWarning}} — count is incomplete</p>
-                    {{end}}
                     <!-- Attach Hook Form (hidden by default) -->
                     <div id="hook-attach-form" class="hook-attach-form" style="display:none;">
                         <div class="hook-attach-form-row">

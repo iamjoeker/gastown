@@ -31,9 +31,9 @@ type ConvoyFetcher interface {
 	FetchHealth() (*HealthRow, error)
 	FetchQueues() ([]QueueRow, error)
 	FetchSessions() ([]SessionRow, error)
-	FetchHooks() (StoreResult[HookRow], error)
+	FetchHooks() ([]HookRow, error)
 	FetchMayor() (*MayorStatus, error)
-	FetchIssues() (StoreResult[IssueRow], error)
+	FetchIssues() ([]IssueRow, error)
 	FetchActivity() ([]ActivityRow, error)
 }
 
@@ -202,9 +202,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		health         *HealthRow
 		queues         []QueueRow
 		sessions       []SessionRow
-		hooks          StoreResult[HookRow]
+		hooks          []HookRow
 		mayor          *MayorStatus
-		issues         StoreResult[IssueRow]
+		issues         []IssueRow
 		activity       []ActivityRow
 		wg             sync.WaitGroup
 	)
@@ -342,7 +342,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}
 
 	// Compute summary from already-fetched data
-	summary := computeSummary(workers, hooks.Rows, issues.Rows, convoys, escalations, escalationsErr, activity)
+	summary := computeSummary(workers, hooks, issues, convoys, escalations, escalationsErr, activity)
 
 	data := ConvoyData{
 		Convoys:              convoys,
@@ -359,11 +359,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		Health:                 health,
 		Queues:                 queues,
 		Sessions:               sessions,
-		Hooks:                  hooks.Rows,
-		HooksWarning:           hooks.Warning(),
+		Hooks:                  hooks,
 		Mayor:                  mayor,
-		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
-		IssuesWarning:          issues.Warning(),
+		Issues:                 enrichIssuesWithAssignees(issues, hooks),
 		Activity:               activity,
 		Summary:                summary,
 		Expand:                 expandPanel,
