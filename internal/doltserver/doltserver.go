@@ -3019,58 +3019,20 @@ type OrphanedDatabase struct {
 // CollectDatabaseOwners so `gt dolt list` / `gt dolt status` annotate them as
 // protected rather than reporting them as orphans.
 //
-// These are the ones gt knows about because they are part of gt. A town's own
-// deliberate unreferenced databases go in settings/config.json instead — see
-// ProtectedDatabases, which merges both.
+// Single source of truth for orphan-detection skipping (FindOrphanedDatabases,
+// RemoveDatabase) and owner-label reporting (CollectDatabaseOwners). Adding a
+// new protected database here automatically picks up all three surfaces.
 func protectedSharedServerDatabases() map[string]string {
 	return map[string]string{
 		"beads_global": "global shared beads database (protected)",
 	}
 }
 
-// ProtectedDatabaseSettingsLabel is the owner label reporting surfaces show for
-// a database the town protected in settings/config.json. It names the file so a
-// reader who did not write the entry can find and change it.
-const ProtectedDatabaseSettingsLabel = "protected by settings/config.json"
-
-// ProtectedDatabases returns every database that must not be deleted despite
-// having no rig metadata, mapped to the label reporting surfaces show for it:
-// gt's own built-in registry, plus whatever the town listed in
-// settings/config.json under protected_dolt_databases.
-//
-// Single source of truth for orphan-detection skipping (FindOrphanedDatabases),
-// the delete-time refusal (RemoveDatabase, which honours it even under --force)
-// and owner-label reporting (CollectDatabaseOwners). A guard installed on only
-// one of those is inert on the others, so all three read this.
-//
-// It returns an error rather than an empty map when the settings file exists
-// but cannot be read or parsed. Every delete path fails closed on that error:
-// a corrupt settings file must not silently mean "nothing is protected", which
-// is the one failure that turns this guard into a deletion. (gt-xhjb)
-func ProtectedDatabases(townRoot string) (map[string]string, error) {
-	protected := make(map[string]string)
-	for name, label := range protectedSharedServerDatabases() {
-		protected[name] = label
-	}
-	if townRoot == "" {
-		return protected, nil
-	}
-
-	settings, err := configpkg.LoadOrCreateTownSettings(configpkg.TownSettingsPath(townRoot))
-	if err != nil {
-		return nil, fmt.Errorf("reading protected databases from %s: %w", configpkg.TownSettingsPath(townRoot), err)
-	}
-	for _, name := range settings.ProtectedDoltDatabases {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		if _, already := protected[name]; already {
-			continue
-		}
-		protected[name] = ProtectedDatabaseSettingsLabel
-	}
-	return protected, nil
+// isProtectedSharedServerDatabase reports databases that are intentionally
+// hosted by the shared Dolt server but are not referenced by rig metadata.
+func isProtectedSharedServerDatabase(dbName string) bool {
+	_, ok := protectedSharedServerDatabases()[dbName]
+	return ok
 }
 
 // ReferencedDatabases returns the set of database names that orphan detection
@@ -3082,7 +3044,7 @@ func ReferencedDatabases(townRoot string) map[string]bool {
 }
 
 // IsOrphanDatabase reports whether dbName is an orphan, given the referenced
-// set from ReferencedDatabases and the protected set from ProtectedDatabases.
+// set from ReferencedDatabases.
 //
 // This is the single orphan predicate. `gt dolt list` and `gt dolt cleanup` are
 // the two surfaces an operator consults before deleting anything, so they must
@@ -3090,13 +3052,8 @@ func ReferencedDatabases(townRoot string) map[string]bool {
 // no metadata.json named it, while cleanup also honoured the rig-prefix safety
 // net in collectReferencedDatabases — which is how a real database ("gt") was
 // shown in a deletion list that cleanup would never have touched. (gt-ti84)
-//
-// Both sets are parameters rather than lookups so that a caller cannot answer
-// this question having loaded only one of them, and so that the error from
-// loading the protected set is handled where it can be reported. (gt-xhjb)
-func IsOrphanDatabase(protected map[string]string, referenced map[string]bool, dbName string) bool {
-	_, isProtected := protected[dbName]
-	return !referenced[dbName] && !isProtected
+func IsOrphanDatabase(referenced map[string]bool, dbName string) bool {
+	return !referenced[dbName] && !isProtectedSharedServerDatabase(dbName)
 }
 
 // IsRigPrefixDatabase reports whether dbName is named after a rig prefix in
@@ -3135,19 +3092,11 @@ func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 	// Collect all referenced database names from metadata.json files
 	referenced := ReferencedDatabases(townRoot)
 
-	// Fail rather than report orphans we cannot rule out: an unreadable
-	// protection list would otherwise flag every database the town deliberately
-	// kept, and the surfaces that print this list are read as deletion lists.
-	protected, err := ProtectedDatabases(townRoot)
-	if err != nil {
-		return nil, err
-	}
-
 	// Find databases that exist on disk but aren't referenced
 	config := DefaultConfig(townRoot)
 	var orphans []OrphanedDatabase
 	for _, dbName := range databases {
-		if !IsOrphanDatabase(protected, referenced, dbName) {
+		if !IsOrphanDatabase(referenced, dbName) {
 			continue
 		}
 		dbPath := filepath.Join(config.DataDir, dbName)
@@ -3353,17 +3302,8 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 	// them as orphans. Only labels protected DBs that actually exist on disk —
 	// otherwise we'd advertise a phantom owner. Never overwrites a rig-derived
 	// label if one is already present.
-	//
-	// On a load error this falls back to gt's built-in registry: labelling is
-	// the one consumer that can degrade safely, because understating protection
-	// only makes a database look more deletable in a report, while every path
-	// that actually deletes reads ProtectedDatabases directly and refuses.
 	config := DefaultConfig(townRoot)
-	protected, err := ProtectedDatabases(townRoot)
-	if err != nil {
-		protected = protectedSharedServerDatabases()
-	}
-	for dbName, label := range protected {
+	for dbName, label := range protectedSharedServerDatabases() {
 		if _, already := owners[dbName]; already {
 			continue
 		}
@@ -3380,15 +3320,8 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 // If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
-	// Deliberately before every other check and not gated on force: this is the
-	// only guard that covers `gt dolt cleanup --force`, `gt doctor --fix` and
-	// AddRig's orphan drop alike, all three of which pass force=true. (gt-xhjb)
-	protected, err := ProtectedDatabases(townRoot)
-	if err != nil {
-		return fmt.Errorf("refusing to remove %q: cannot determine which databases are protected: %w", dbName, err)
-	}
-	if label, ok := protected[dbName]; ok {
-		return fmt.Errorf("database %q is protected (%s) and will not be removed, with or without --force", dbName, label)
+	if isProtectedSharedServerDatabase(dbName) {
+		return fmt.Errorf("database %q is a protected shared-server database", dbName)
 	}
 
 	config := DefaultConfig(townRoot)

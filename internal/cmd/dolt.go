@@ -764,11 +764,9 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\n  %s %d orphaned database(s) (not referenced by any rig):\n",
 				style.Bold.Render("!"), len(orphans))
 			for _, o := range orphans {
-				fmt.Printf("    - %s (%s%s)\n", o.Name, formatBytes(o.SizeBytes), orphanCreatedSuffix(o))
+				fmt.Printf("    - %s (%s)\n", o.Name, formatBytes(o.SizeBytes))
 			}
-			allDBs, _ := doltserver.ListDatabases(townRoot)
-			fmt.Println()
-			fmt.Print(orphanCleanupGuidance(townRoot, orphans, allDBs, "    "))
+			fmt.Printf("  Clean up with: %s\n", style.Dim.Render("gt dolt cleanup"))
 		}
 
 		if len(metrics.Warnings) > 0 {
@@ -1128,7 +1126,12 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 
 		// Report orphans even when workspaces are healthy
 		if orphanErr == nil && len(orphans) > 0 {
-			printOrphanReport(townRoot, orphans, databases)
+			fmt.Printf("\n%s %d orphaned database(s) in .dolt-data/ (not referenced by any rig):\n",
+				style.Bold.Render("!"), len(orphans))
+			for _, o := range orphans {
+				fmt.Printf("  - %s (%s)\n", o.Name, formatBytes(o.SizeBytes))
+			}
+			fmt.Printf("\nClean up with: %s\n", style.Dim.Render("gt dolt cleanup"))
 		}
 
 		return nil
@@ -1166,24 +1169,15 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 
 	// Report orphans after repairs
 	if orphanErr == nil && len(orphans) > 0 {
-		allDBs, _ := doltserver.ListDatabases(townRoot)
-		printOrphanReport(townRoot, orphans, allDBs)
+		fmt.Printf("\n%s %d orphaned database(s) in .dolt-data/ (not referenced by any rig):\n",
+			style.Bold.Render("!"), len(orphans))
+		for _, o := range orphans {
+			fmt.Printf("  - %s (%s)\n", o.Name, formatBytes(o.SizeBytes))
+		}
+		fmt.Printf("\nClean up with: %s\n", style.Dim.Render("gt dolt cleanup"))
 	}
 
 	return nil
-}
-
-// printOrphanReport is the orphan section `gt dolt init` prints, in both the
-// healthy and the post-repair path. One renderer so the two cannot drift into
-// giving different advice about the same databases.
-func printOrphanReport(townRoot string, orphans []doltserver.OrphanedDatabase, allDBs []string) {
-	fmt.Printf("\n%s %d orphaned database(s) in .dolt-data/ (not referenced by any rig):\n",
-		style.Bold.Render("!"), len(orphans))
-	for _, o := range orphans {
-		fmt.Printf("  - %s (%s%s)\n", o.Name, formatBytes(o.SizeBytes), orphanCreatedSuffix(o))
-	}
-	fmt.Println()
-	fmt.Print(orphanCleanupGuidance(townRoot, orphans, allDBs, "  "))
 }
 
 // orphanCleanupGlobs are the directory patterns that match test-pollution
@@ -1299,24 +1293,9 @@ const orphanFixtureBurstWindow = 5 * time.Minute
 // the filesystem instead. (Clown Show #18: 245 orphans at 27s latency)
 const maxSQLCleanup = 50
 
-// cleanupBalkKind names which refusal was raised, so a surface that only needs
-// to say THAT cleanup will refuse does not have to re-derive it from the
-// thresholds and get a different answer than evaluateCleanupBalks did. The
-// order the two balks are evaluated in is part of that answer. (gt-xhjb)
-type cleanupBalkKind int
-
-const (
-	// balkOrphanRatio: too large a share of the town's databases is flagged.
-	balkOrphanRatio cleanupBalkKind = iota + 1
-	// balkTooManyOrphans: more orphans than DROP DATABASE can clear by SQL.
-	balkTooManyOrphans
-)
-
 // cleanupBalk is a refusal `gt dolt cleanup` raises before deleting anything:
-// which refusal it is, the operator-facing explanation, and the error the real
-// run returns.
+// the operator-facing explanation, and the error the real run returns.
 type cleanupBalk struct {
-	Kind    cleanupBalkKind
 	Message string
 	Err     error
 }
@@ -1333,7 +1312,6 @@ func evaluateCleanupBalks(townRoot string, orphans []doltserver.OrphanedDatabase
 	if len(allDBs) > 0 && !force {
 		if msg := orphanRatioBalkMessage(orphans, len(allDBs)); msg != "" {
 			return &cleanupBalk{
-				Kind:    balkOrphanRatio,
 				Message: msg,
 				Err:     fmt.Errorf("refusing to clean %d/%d databases without --force (safety check, gt-xvh)", len(orphans), len(allDBs)),
 			}
@@ -1348,67 +1326,12 @@ func evaluateCleanupBalks(townRoot string, orphans []doltserver.OrphanedDatabase
 		_, pid, _ := doltserver.IsRunning(townRoot)
 		b.WriteString(filesystemCleanupRemedy(townRoot, doltserver.DetectSupervisor(pid)))
 		return &cleanupBalk{
-			Kind:    balkTooManyOrphans,
 			Message: b.String(),
 			Err:     fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans)),
 		}
 	}
 
 	return nil
-}
-
-// orphanCleanupGuidance renders what a REPORTING surface says after it has
-// listed orphaned databases: `gt dolt status`, `gt dolt init`, `gt doctor`.
-// indent is prefixed to every line so each caller keeps its own layout.
-//
-// It names no mutating command, which is the whole point. The line it replaced
-// was an unconditional "Clean up with: gt dolt cleanup", and the chain a reader
-// followed from it was three steps of ordinary-looking tool guidance ending at
-// the highest-blast-radius command in the town: status recommends cleanup ->
-// cleanup refuses at the orphan ratio and offers --force -> --force is under a
-// standing prohibition the reader has no way to know about from here. The
-// recommendation was also loudest exactly when it was most dangerous, because
-// it fired on every detected orphan, and deletion matters most when detection
-// is RIGHT. Correct detection and safe guidance pointed opposite ways. (gt-xhjb)
-//
-// So this reports and the operator decides. It describes what cleanup would do
-// rather than telling anyone to run it, it says up front when cleanup will
-// refuse — a fact that was previously discoverable only by running the deletion
-// command — and every command it does name is read-only.
-func orphanCleanupGuidance(townRoot string, orphans []doltserver.OrphanedDatabase, allDBs []string, indent string) string {
-	var b strings.Builder
-	line := func(format string, args ...any) {
-		fmt.Fprintf(&b, indent+format+"\n", args...)
-	}
-
-	// Ask the deletion path itself rather than re-deriving the thresholds, so
-	// this cannot describe a refusal cleanup would not raise, or miss one it
-	// would. force=false: this describes a plain `gt dolt cleanup`.
-	//
-	// Cleanup is named in prose and never as a bare invocation, so that the only
-	// literal commands anywhere in this text are the two read-only ones below.
-	// A reader — or an agent — scanning the output for something to run finds
-	// nothing here that deletes.
-	switch balk := evaluateCleanupBalks(townRoot, orphans, allDBs, false); {
-	case balk == nil:
-		line("Cleanup would remove these, skipping any that still hold user tables.")
-		line("It has not run.")
-	case balk.Kind == balkTooManyOrphans:
-		line("Cleanup will REFUSE these: %d orphans is past the %d it can drop by SQL", len(orphans), maxSQLCleanup)
-		line("in reasonable time. Its refusal prints a filesystem procedure that")
-		line("deletes database directories by hand.")
-	default:
-		line("Cleanup will REFUSE these: %d of %d databases is above the ratio it", len(orphans), len(allDBs))
-		line("stops at. Its refusal offers --force, which deletes every flagged")
-		line("database without the per-database check for user tables.")
-	}
-
-	line("Read the whole thing without deleting anything: gt dolt cleanup --dry-run")
-	line("See who owns every database, not just these: gt dolt list")
-	line("To keep one of these permanently, add it to protected_dolt_databases in")
-	line("settings/config.json — cleanup then refuses it even under --force.")
-
-	return b.String()
 }
 
 // orphanRatioBalkMessage renders the orphan-ratio refusal, or "" when the ratio
@@ -1588,11 +1511,11 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 // that column is read as a deletion list, and a database claimed by orphan
 // detection through something other than a metadata.json — the rig-prefix
 // safety net — gets a label that says so instead. (gt-ti84)
-func doltDatabaseLabel(townRoot, db string, owners map[string]string, protected map[string]string, referenced map[string]bool) string {
+func doltDatabaseLabel(townRoot, db string, owners map[string]string, referenced map[string]bool) string {
 	if owner, ok := owners[db]; ok {
 		return owner
 	}
-	if !doltserver.IsOrphanDatabase(protected, referenced, db) {
+	if !doltserver.IsOrphanDatabase(referenced, db) {
 		if doltserver.IsRigPrefixDatabase(townRoot, db) {
 			return "rig prefix — no metadata.json owner"
 		}
@@ -1626,16 +1549,10 @@ func runDoltList(cmd *cobra.Command, args []string) error {
 	// a real database claimed by the rig-prefix safety net, in this list under
 	// the same word cleanup uses for what it removes. (gt-ti84)
 	referenced := doltserver.ReferencedDatabases(townRoot)
-	// Fail rather than print a column read as a deletion list while unable to
-	// say which databases the town marked as never-delete. (gt-xhjb)
-	protected, err := doltserver.ProtectedDatabases(townRoot)
-	if err != nil {
-		return err
-	}
 	fmt.Printf("Rig databases in %s:\n\n", config.DataDir)
 	for _, db := range databases {
 		dbDir := doltserver.RigDatabaseDir(townRoot, db)
-		fmt.Printf("  %s (%s)\n    %s\n", style.Bold.Render(db), doltDatabaseLabel(townRoot, db, owners, protected, referenced), style.Dim.Render(dbDir))
+		fmt.Printf("  %s (%s)\n    %s\n", style.Bold.Render(db), doltDatabaseLabel(townRoot, db, owners, referenced), style.Dim.Render(dbDir))
 	}
 
 	return nil

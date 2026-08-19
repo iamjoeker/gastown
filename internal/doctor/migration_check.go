@@ -542,16 +542,11 @@ func (c *DoltOrphanedDatabaseCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 
 	return &CheckResult{
-		Name:    c.Name(),
-		Status:  StatusWarning,
-		Message: fmt.Sprintf("%d orphaned database(s) in .dolt-data/", len(orphans)),
-		Details: details,
-		// A hint, not an instruction: this check reports, the operator decides.
-		// It names only read-only commands, because the deletion command it used
-		// to name refuses above the orphan ratio and its refusal offers --force,
-		// so the hint reliably routed the reader to a bulk delete of the live
-		// data plane without ever saying so. (gt-xhjb)
-		FixHint:  "Inspect with 'gt dolt cleanup --dry-run' (deletes nothing) or 'gt dolt list'; keep one permanently by adding it to protected_dolt_databases in settings/config.json",
+		Name:     c.Name(),
+		Status:   StatusWarning,
+		Message:  fmt.Sprintf("%d orphaned database(s) in .dolt-data/", len(orphans)),
+		Details:  details,
+		FixHint:  "Run 'gt dolt cleanup' to remove orphaned databases",
 		Category: c.CheckCategory,
 	}
 }
