@@ -31,67 +31,6 @@ Then escalate with the evidence path:
 gt escalate -s HIGH "Dolt: <symptom>" -m "Evidence: /tmp/dolt-status-..."
 ```
 
-## Hazard: Dolt May Have a Second Supervisor
-
-A town can run Dolt under a systemd unit (Gas Town rigs commonly use a user unit
-named `gt-dolt.service`). When it does, **gt cannot stop the server**, and the
-distinction changes how you read every symptom below.
-
-`doltserver.Stop` sends SIGTERM to the server's PID. Under `Restart=always` that
-signal is not a stop — it is a restart trigger. systemd brings the server back
-`RestartSec` later with a **new PID**. `gt dolt stop` and `gt down` now say so
-instead of reporting success:
-
-```
-! Signalled Dolt server (PID 3580495) — but it is NOT stopped.
-
-  This server is supervised by systemd unit gt-dolt.service (Restart=always).
-  ...
-  To stop the server for real:
-      systemctl --user stop gt-dolt.service
-```
-
-If you see that notice, the server is coming back and re-running the stop will not
-change it. That retry loop is what produced the gt-09e4 incident: three `gt down`
-runs in six minutes, each reporting Dolt stopped, while the data plane never went
-down at all.
-
-`gt dolt restart` refuses outright under a reviving unit — gt would rebind the
-port before systemd's restart fired, leaving systemd retrying a bind failure on a
-loop. Use `systemctl --user restart gt-dolt.service`.
-
-`systemctl --user stop gt-dolt.service` takes beads, mail, and identity offline
-for every agent in the town. It is not a routine step.
-
-Note the policy dependence: only `Restart=always` and `Restart=on-success` revive
-the server. Dolt handles SIGTERM and exits 0, and systemd counts SIGTERM as a
-clean exit regardless, so `on-failure`, `on-abnormal`, `on-abort` and
-`on-watchdog` all leave a gt-issued stop standing.
-
-### Reading `journalctl --user -u gt-dolt.service`
-
-Two exit signatures, two very different causes:
-
-| Journal lines | Means |
-|---|---|
-| `Stopping...` / `Stopped` | An explicit `systemctl stop`. Only systemctl produces this wording. |
-| `Consumed ... CPU time`, then `Scheduled restart job` ~`RestartSec` later | The process was killed by something **outside** systemd — the `doltserver.Stop` signature (`gt dolt stop`, `gt down`, `gt doctor --fix`). |
-
-A restart counter that resets to 1 means someone ran an explicit `systemctl start`
-in between. Correlate exits against shell history (`~/.local/share/fish/fish_history`
-records an epoch `when:` per command) before blaming gt — in gt-09e4 every exit
-matched an operator command to the second.
-
-### Note on `dolt.auto-start`
-
-`dolt.auto-start=false` / `BEADS_DOLT_AUTO_START=0` only stops a **bd/gt client**
-from spawning its own server on connect. It has no effect on a systemd unit, and
-no gt config can disable one. The bd-emitted message
-`Dolt server auto-start is disabled (dolt.auto-start: false)` is true and
-irrelevant at the same time whenever a unit is managing the server; it has already
-sent two agents down the wrong path. Check `systemctl --user status gt-dolt.service`
-before trusting it.
-
 ## RCA Capture Checklist
 
 Attach this checklist to the escalation body, the follow-up bead, or the war-room

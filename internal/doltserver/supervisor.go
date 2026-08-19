@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -32,30 +31,18 @@ type Supervisor struct {
 }
 
 // AutoRestarts reports whether the supervisor brings the server back up on its
-// own after gt stops the server. When true, `gt dolt stop` does not keep the
+// own after the process exits. When true, `gt dolt stop` does not keep the
 // server down.
-//
-// The answer depends on the signal gt sends, not just on the policy. Stop sends
-// SIGTERM, and systemd counts termination by SIGTERM as a CLEAN exit — it is one
-// of the four signals (SIGHUP, SIGINT, SIGTERM, SIGPIPE) excluded from the
-// "terminated by a signal" clause in systemd.service(5). Dolt also handles the
-// signal itself and exits 0, which is why the unit logs Result=success on every
-// gt-issued stop. Both routes agree: the exit is a success.
-//
-// So only the policies that restart after a SUCCESSFUL exit revive the server.
-// "on-failure", "on-abnormal", "on-abort" and "on-watchdog" all leave it down —
-// a distinction that matters because Restart=on-failure is the leading candidate
-// for this town's unit (gt-09e4), and reporting "the supervisor will restart it"
-// under that policy would be exactly backwards.
-//
-// Caveat: if the server ignores SIGTERM for 5s, Stop escalates to SIGKILL, which
-// IS an unclean exit and does revive a failure-triggered unit. That path is the
-// exception, not the case this predicts.
 func (s *Supervisor) AutoRestarts() bool {
 	if s == nil {
 		return false
 	}
-	return s.Restart == "always" || s.Restart == "on-success"
+	switch s.Restart {
+	case "", "no":
+		return false
+	default:
+		return true
+	}
 }
 
 // StopCommand returns the command that actually stops the server: the
@@ -116,47 +103,12 @@ func DetectSupervisor(pid int) *Supervisor {
 	if unit == "" {
 		return nil
 	}
-	if !unitOwns(unit, userUnit, pid) {
-		return nil
-	}
 	return &Supervisor{
 		Kind:     "systemd",
 		Unit:     unit,
 		UserUnit: userUnit,
 		Restart:  systemctlProperty(unit, userUnit, "Restart"),
 	}
-}
-
-// unitOwns reports whether pid is the unit's MAIN process, i.e. the process the
-// unit's Restart= policy actually applies to.
-//
-// Cgroup membership alone is too weak a signal. Every child inherits its
-// parent's cgroup, so a Dolt server that gt started itself sits in the cgroup of
-// whatever unit gt was running under — a timer-driven unit like
-// gt-snapshot.service, or the town daemon. Without this check, such a server is
-// reported as supervised, and gt tells the operator to stop an unrelated unit to
-// bring Dolt down. That advice does nothing to Dolt and stops something else.
-//
-// Only a positively different MainPID disproves ownership. If systemctl cannot
-// be reached or gives no answer, we cannot disprove it and keep the detection —
-// failing back to cgroup membership rather than to silence.
-func unitOwns(unit string, userUnit bool, pid int) bool {
-	return ownsPID(systemctlProperty(unit, userUnit, "MainPID"), pid)
-}
-
-// ownsPID decides ownership from a unit's raw MainPID property. Split out from
-// unitOwns so the rule is testable without a live systemd.
-//
-// "" (no systemctl, no bus, unknown unit) and "0" (unit not running) are both
-// absent answers, not contradicting ones — they leave the cgroup evidence
-// standing. Only a parsed, non-zero MainPID naming a different process disproves
-// ownership.
-func ownsPID(mainPIDProperty string, pid int) bool {
-	parsed, err := strconv.Atoi(strings.TrimSpace(mainPIDProperty))
-	if err != nil || parsed == 0 {
-		return true
-	}
-	return parsed == pid
 }
 
 // parseSystemdUnit extracts the owning systemd unit from the contents of
