@@ -42,6 +42,10 @@ var ambientEnvPrefixes = []string{"GT_", "BD_", "BEADS_"}
 // t.Setenv and are unaffected. Helpers that set process-wide state for the
 // whole run — EnsureDoltContainerForTestMain — must be called after this.
 //
+// GuardProductionDolt must also be called after this, not before: the GT_ and
+// BEADS_ prefixes stripped here include the port variables the guard writes,
+// so stripping second would undo it and put the 3307 default back in play.
+//
 // It returns the variables it removed, which is useful for a TestMain that
 // wants to log what the host was contributing.
 func UnsetAmbientTownEnv() []string {
