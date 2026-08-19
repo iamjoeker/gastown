@@ -106,15 +106,6 @@ type Message struct {
 	// Wisp messages auto-cleanup on patrol squash.
 	Wisp bool `json:"wisp,omitempty"`
 
-	// Permanent forces durable storage even when the subject matches a
-	// protocol/lifecycle prefix that would otherwise be auto-detected as
-	// ephemeral. Set by the CLI when --permanent is passed. Without it, a
-	// subject like "MERGED crater" was ephemeral with no way to say otherwise
-	// — the flag documented as overriding --wisp never reached the classifier
-	// (gt-rhxb). Permanent wins over Wisp.
-	// In-memory only — not serialized.
-	Permanent bool `json:"-"`
-
 	// CC contains addresses that should receive a copy of this message.
 	// CC'd recipients see the message in their inbox but are not the primary recipient.
 	CC []string `json:"cc,omitempty"`

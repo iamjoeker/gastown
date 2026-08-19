@@ -823,54 +823,33 @@ func (r *Router) queryAgentsFromDir(beadsDir string) ([]*agentBead, error) {
 	return r.queryAgentsInDir(beadsDir, "")
 }
 
-// wispSubjectPrefixes are the protocol/lifecycle subject tokens that mark a
-// message as ephemeral. They are matched case-sensitively against the raw
-// subject: every automated sender writes them in caps (see
-// internal/protocol/messages.go), and gt mail drain's classifier already
-// matches the same tokens case-sensitively. Matching case-insensitively also
-// swallowed ordinary prose — "Merged crater's fix by hand" was silently stored
-// ephemeral (gt-rhxb).
-var wispSubjectPrefixes = []string{
-	"POLECAT_STARTED",
-	"POLECAT_DONE",
-	"WORK_DONE",
-	"START_WORK",
-	"NUDGE",
-	"LIFECYCLE:",
-	"MERGED",
-	"MERGE_READY",
-	"MERGE_FAILED",
-}
-
-// WillBeEphemeral reports whether msg would be stored as an ephemeral wisp
-// (age-GC reclaimable, not synced to git) rather than a durable bead.
-//
-// Precedence, most explicit first:
-//   - Message.Permanent (--permanent) forces durable
-//   - Message.Wisp (--wisp) forces ephemeral
-//   - subject matches a protocol/lifecycle prefix -> ephemeral
-//
-// Exported so senders can report which table a message landed in: "Message
-// sent" reads identically for both, which is what let reaped merge receipts
-// look like delivered ones (gt-rhxb).
-func WillBeEphemeral(msg *Message) bool {
-	if msg.Permanent {
-		return false
-	}
+// shouldBeWisp determines if a message should be stored as a wisp.
+// Returns true if:
+// - Message.Wisp is explicitly set
+// - Subject matches lifecycle message patterns (POLECAT_*, NUDGE, etc.)
+func (r *Router) shouldBeWisp(msg *Message) bool {
 	if msg.Wisp {
 		return true
 	}
-	for _, prefix := range wispSubjectPrefixes {
-		if strings.HasPrefix(msg.Subject, prefix) {
+	// Auto-detect protocol/lifecycle messages by subject prefix
+	subjectLower := strings.ToLower(msg.Subject)
+	wispPrefixes := []string{
+		"polecat_started",
+		"polecat_done",
+		"work_done",
+		"start_work",
+		"nudge",
+		"lifecycle:",
+		"merged",
+		"merge_ready",
+		"merge_failed",
+	}
+	for _, prefix := range wispPrefixes {
+		if strings.HasPrefix(subjectLower, prefix) {
 			return true
 		}
 	}
 	return false
-}
-
-// shouldBeWisp determines if a message should be stored as a wisp.
-func (r *Router) shouldBeWisp(msg *Message) bool {
-	return WillBeEphemeral(msg)
 }
 
 // Send delivers a message via beads message.

@@ -281,11 +281,9 @@ func TestShouldBeWisp(t *testing.T) {
 			want: true,
 		},
 		{
-			// Case-sensitive since gt-rhxb: every automated sender writes the
-			// token in caps, so a lowercase subject is prose, not protocol.
-			name: "polecat_done subject (lowercase) is prose, not protocol",
+			name: "polecat_done subject (lowercase)",
 			msg:  &Message{Subject: "polecat_done: work complete"},
-			want: false,
+			want: true,
 		},
 		{
 			name: "NUDGE subject",
@@ -330,26 +328,6 @@ func TestShouldBeWisp(t *testing.T) {
 		{
 			name: "handoff message (not auto-wisp)",
 			msg:  &Message{Subject: "HANDOFF: context notes"},
-			want: false,
-		},
-		{
-			name: "MERGED subject with --permanent stays durable",
-			msg:  &Message{Subject: "MERGED nux", Permanent: true},
-			want: false,
-		},
-		{
-			name: "explicit wisp loses to explicit permanent",
-			msg:  &Message{Subject: "Regular message", Wisp: true, Permanent: true},
-			want: false,
-		},
-		{
-			name: "prose beginning with a protocol word stays durable",
-			msg:  &Message{Subject: "Merged crater's fix by hand — see notes"},
-			want: false,
-		},
-		{
-			name: "prose beginning with nudge stays durable",
-			msg:  &Message{Subject: "Nudge me when the refinery drains"},
 			want: false,
 		},
 	}

@@ -33,12 +33,17 @@ type ConvoyData struct {
 	Queues                 []QueueRow
 	Sessions               []SessionRow
 	Hooks                  []HookRow
-	Mayor                  *MayorStatus
-	Issues                 []IssueRow
-	Activity               []ActivityRow
-	Summary                *DashboardSummary
-	Expand                 string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken              string // Token for CSRF protection on POST requests
+	// HooksWarning names the stores whose hooked-bead query did not fully
+	// answer. Non-empty means the rendered count is a floor, not a total.
+	HooksWarning string
+	Mayor        *MayorStatus
+	Issues       []IssueRow
+	// IssuesWarning is the same caveat for the backlog union.
+	IssuesWarning string
+	Activity      []ActivityRow
+	Summary       *DashboardSummary
+	Expand        string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken     string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
