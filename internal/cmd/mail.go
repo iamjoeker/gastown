@@ -483,9 +483,10 @@ func init() {
 	// worked. Defaulting mail to wisp meant unread mail was the mail most likely
 	// to be deleted, silently, on the channel agents are told to use when a
 	// message MUST survive a session. Protocol/lifecycle traffic is still stored
-	// ephemerally — Router.shouldBeWisp auto-detects it by subject.
+	// ephemerally — mail.WillBeEphemeral auto-detects it by UPPERCASE subject
+	// prefix, and --permanent overrides that detection (gt-rhxb).
 	mailSendCmd.Flags().BoolVar(&mailWisp, "wisp", false, "Send as wisp (ephemeral, age-GC reclaimable, not synced to git)")
-	mailSendCmd.Flags().BoolVar(&mailPermanent, "permanent", false, "Send as permanent (default; kept for compatibility, overrides --wisp)")
+	mailSendCmd.Flags().BoolVar(&mailPermanent, "permanent", false, "Force durable storage, overriding --wisp and protocol-subject auto-detection (durable is already the default for ordinary subjects)")
 	mailSendCmd.Flags().StringVar(&mailTo, "to", "", "Recipient address (alternative to positional argument)")
 	mailSendCmd.Flags().StringVar(&mailFrom, "from", "", "Override sender address (for relay/bridge use)")
 	mailSendCmd.Flags().BoolVar(&mailSendSelf, "self", false, "Send to self (auto-detect from cwd)")
