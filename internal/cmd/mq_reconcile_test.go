@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -132,6 +136,139 @@ func TestReconcileDoesNotClose(t *testing.T) {
 	}
 	if !strings.Contains(cmd.Long, "reports only") {
 		t.Error("mq reconcile help must state that it reports only")
+	}
+}
+
+// captureReconcileOutput runs print with stdout redirected and returns what it
+// wrote.
+func captureReconcileOutput(t *testing.T, asJSON bool, report reconcileReport) string {
+	t.Helper()
+	oldJSON := mqReconcileJSON
+	mqReconcileJSON = asJSON
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		os.Stdout = oldStdout
+		mqReconcileJSON = oldJSON
+	})
+
+	printErr := printReconcileReport(report)
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stdout = oldStdout
+	mqReconcileJSON = oldJSON
+	if printErr != nil {
+		t.Fatalf("printReconcileReport: %v", printErr)
+	}
+	return buf.String()
+}
+
+func reconcileReportWithSkips(skips ...reconcileSkip) reconcileReport {
+	report := reconcileReport{
+		Rig:          "gastown",
+		Ref:          "origin/main",
+		Fetched:      true,
+		Scanned:      50,
+		SkippedBeads: append([]reconcileSkip{}, skips...),
+		MissedCloses: []reconcileFinding{},
+		InFlight:     []reconcileFinding{},
+	}
+	report.finalize()
+	return report
+}
+
+// A skipped bead that is only counted is indistinguishable from a bead that was
+// searched and found clean — the same reasoning the Unsearchable path already
+// applies. Every exclusion is correct, but a bead wrongly labelled no_merge
+// skips for a wrong reason and is the missed close this command exists to find.
+func TestReconcileNamesSkippedBeadsInHumanOutput(t *testing.T) {
+	output := captureReconcileOutput(t, false, reconcileReportWithSkips(
+		reconcileSkip{IssueID: "gt-mr-1", Reason: "internal-type:merge-request"},
+		reconcileSkip{IssueID: "gt-602", Reason: "no_merge"},
+		reconcileSkip{IssueID: "gt-2uqy", Reason: "no_merge"},
+	))
+
+	if !strings.Contains(output, "3 skipped") {
+		t.Errorf("summary line lost the skipped count:\n%s", output)
+	}
+	for _, want := range []string{"gt-602", "gt-2uqy", "gt-mr-1", "no_merge", "internal-type:merge-request"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("skipped beads output does not name %q:\n%s", want, output)
+		}
+	}
+	// Grouped by reason, so a reason with two beads is stated once.
+	if got := strings.Count(output, "no_merge"); got != 1 {
+		t.Errorf("no_merge appears %d times, want 1 grouped line:\n%s", got, output)
+	}
+	if !strings.Contains(output, "no_merge: gt-2uqy, gt-602") {
+		t.Errorf("skipped beads are not grouped and sorted under their reason:\n%s", output)
+	}
+}
+
+// A clean sweep must not grow a section about beads that do not exist.
+func TestReconcileNoSkipsPrintsNoSkipSection(t *testing.T) {
+	output := captureReconcileOutput(t, false, reconcileReportWithSkips())
+	if strings.Contains(output, "skipped before") {
+		t.Errorf("empty skip list still printed a section:\n%s", output)
+	}
+	if !strings.Contains(output, "0 skipped") {
+		t.Errorf("summary line lost the skipped count:\n%s", output)
+	}
+}
+
+// The patrol reads this command's JSON. skipped_beads carries the attribution
+// the count cannot, and is an empty list rather than null on a clean rig so a
+// consumer can read .skipped_beads[] unconditionally.
+func TestReconcileJSONNamesSkippedBeads(t *testing.T) {
+	output := captureReconcileOutput(t, true, reconcileReportWithSkips(
+		reconcileSkip{IssueID: "gt-602", Reason: "no_merge"},
+	))
+
+	var decoded reconcileReport
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		t.Fatalf("unmarshal %q: %v", output, err)
+	}
+	if len(decoded.SkippedBeads) != 1 {
+		t.Fatalf("skipped_beads = %+v, want the one skipped bead", decoded.SkippedBeads)
+	}
+	if decoded.SkippedBeads[0].IssueID != "gt-602" || decoded.SkippedBeads[0].Reason != "no_merge" {
+		t.Errorf("skipped_beads[0] = %+v, want gt-602/no_merge", decoded.SkippedBeads[0])
+	}
+	if decoded.Skipped != len(decoded.SkippedBeads) {
+		t.Errorf("skipped = %d but skipped_beads has %d entries; the count and the names disagree",
+			decoded.Skipped, len(decoded.SkippedBeads))
+	}
+	if !strings.Contains(output, `"skipped_beads":[]`) {
+		clean := captureReconcileOutput(t, true, reconcileReportWithSkips())
+		if !strings.Contains(clean, `"skipped_beads":[]`) {
+			t.Errorf("clean rig emits null rather than [] for skipped_beads:\n%s", clean)
+		}
+	}
+}
+
+// finalize derives the count from the named list rather than trusting a tally
+// maintained alongside it, and orders the list so two runs of the same sweep
+// produce the same report.
+func TestReconcileFinalizeDerivesSkipCount(t *testing.T) {
+	report := reconcileReport{
+		Skipped: 99,
+		SkippedBeads: []reconcileSkip{
+			{IssueID: "gt-zzz", Reason: "terminal"},
+			{IssueID: "gt-aaa", Reason: "no_merge"},
+		},
+	}
+	report.finalize()
+
+	if report.Skipped != 2 {
+		t.Errorf("Skipped = %d, want 2 derived from the named beads", report.Skipped)
+	}
+	if report.SkippedBeads[0].IssueID != "gt-aaa" {
+		t.Errorf("SkippedBeads not sorted by ID: %+v", report.SkippedBeads)
 	}
 }
 
