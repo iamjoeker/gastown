@@ -119,12 +119,40 @@ var newDoneSessionKiller = func() doneSessionKiller {
 
 var updateAgentStateOnDoneFn = updateAgentStateOnDone
 
-func updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) error {
+func updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, mrID string, pushFailed, mrFailed bool) error {
 	if !shouldUpdateAgentStateOnDone(pushFailed, mrFailed) {
 		style.PrintWarning("skipping agent cleanup because push or MR submission failed")
 		return nil
 	}
-	return updateAgentStateOnDoneFn(cwd, townRoot, exitType, issueID)
+	return updateAgentStateOnDoneFn(cwd, townRoot, exitType, issueID, mrID)
+}
+
+// sourceCloseDeferredToMergeReason reports why gt done must leave the source
+// bead open, or "" when this completion should close it here.
+//
+// gt done used to close the hooked bead on every completion, including the one
+// that had just put the work in the merge queue (gt-429i). That close ran two
+// to three seconds after MR creation and minutes before any merge, which left
+// two live faults:
+//
+//   - The refinery's pre-merge recheck rejects an MR whose source issue is
+//     terminal (refinery.Engineer.recheckMRSourceStillMergeable). Every MR gt
+//     done produced arrived in that state, so the unattended merge path could
+//     only reject it.
+//   - Between submit and merge the bead reads DONE on every listing surface
+//     while its commits sit on a branch outside the target. Seven strandings in
+//     one session all died in that window, and no detector was watching it.
+//
+// The merge is what finishes the work, so the merge is what closes the bead:
+// refinery.Manager.postMergeMR -> closeMergedWorkBead already does exactly that
+// with a "Merged in <MR>" reason. Leaving the bead open until then costs an
+// unmerged MR a bead that stays open — which is the honest state, and is what
+// the witness branch sweep and MR patrol are looking for.
+func sourceCloseDeferredToMergeReason(exitType, mrID string) string {
+	if exitType != ExitCompleted || strings.TrimSpace(mrID) == "" {
+		return ""
+	}
+	return fmt.Sprintf("submitted to the merge queue as %s — the refinery closes it on merge", strings.TrimSpace(mrID))
 }
 
 func resolveDonePolecatWorktree() (donePolecatWorktree, error) {
@@ -2097,7 +2125,7 @@ notifyWitness:
 
 	// Update agent bead state (ZFC: self-report completion). If push/MR failed,
 	// keep the hook intact so Witness can recover the still-open work.
-	if err := updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, pushFailed, mrFailed); err != nil {
+	if err := updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, mrID, pushFailed, mrFailed); err != nil {
 		return err
 	}
 
@@ -2734,6 +2762,10 @@ func closeAttachedWorkMolecule(bd *beads.Beads, hookedBead *beads.Issue) (string
 // Uses issueID directly to find the hooked bead instead of reading the agent bead's
 // hook_bead slot (hq-l6mm5: direct bead tracking).
 //
+// mrID is the merge request this completion submitted, or "" when there is none.
+// A completion that queued an MR does NOT close the bead — see
+// sourceCloseDeferredToMergeReason (gt-429i).
+//
 // Clean completions use "done" to prevent dead completed sessions from
 // re-entering the idle reuse pool before witness/refinery cleanup finishes.
 // Escalated/deferred exits use "stuck" because they need recovery.
@@ -2743,7 +2775,7 @@ func closeAttachedWorkMolecule(bd *beads.Beads, hookedBead *beads.Issue) (string
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID string) error {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -2883,8 +2915,12 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 				goto doneStateUpdate
 			}
 
-			// Acceptance criteria gate: skip close if criteria are unchecked.
-			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
+			// gt-429i: the merge closes the bead, not the submission. This is a
+			// normal completion, not a skipped one — no warning, no witness mail.
+			if deferReason := sourceCloseDeferredToMergeReason(exitType, mrID); deferReason != "" {
+				fmt.Fprintf(os.Stderr, "Note: leaving %s open — %s\n", hookedBeadID, deferReason)
+			} else if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
+				// Acceptance criteria gate: skip close if criteria are unchecked.
 				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
 			} else if err := hookBd.Close(hookedBeadID); err != nil {
