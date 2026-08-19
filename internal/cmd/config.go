@@ -628,8 +628,6 @@ Supported keys:
   lifecycle.reaper.enabled     Enable/disable wisp reaper (true/false)
   lifecycle.reaper.interval    Reaper check interval (default: 30m)
   lifecycle.reaper.delete_age  Delete closed wisps after this duration (default: 168h / 7d)
-  lifecycle.reaper.stale_issue_age Auto-close stale issues after this duration (default: 720h / 30d)
-  lifecycle.reaper.mail_delete_age Delete closed mail after this duration (default: 168h / 7d)
   lifecycle.compactor.enabled  Enable/disable compactor dog (true/false)
   lifecycle.compactor.interval Compactor check interval (default: 24h)
   lifecycle.compactor.threshold Commit count before compaction (default: 500)
@@ -647,7 +645,6 @@ Examples:
   gt config set maintenance.window 03:00
   gt config set maintenance.interval daily
   gt config set lifecycle.reaper.delete_age 336h
-  gt config set lifecycle.reaper.stale_issue_age 1440h
   gt config set lifecycle.compactor.threshold 1000`,
 	Args: cobra.ExactArgs(2),
 	RunE: runConfigSet,
@@ -677,8 +674,6 @@ Supported keys:
   lifecycle.reaper.enabled     Wisp reaper enabled (true/false)
   lifecycle.reaper.interval    Reaper check interval
   lifecycle.reaper.delete_age  Duration before closed wisps are deleted
-  lifecycle.reaper.stale_issue_age Duration before stale issues are auto-closed
-  lifecycle.reaper.mail_delete_age Duration before closed mail is deleted
   lifecycle.compactor.enabled  Compactor dog enabled (true/false)
   lifecycle.compactor.interval Compactor check interval
   lifecycle.compactor.threshold Commit count threshold for compaction
@@ -1046,24 +1041,6 @@ func setLifecycleConfig(townRoot, key, value string) error {
 		}
 		patrolConfig.Patrols.WispReaper.DeleteAgeStr = value
 
-	case "lifecycle.reaper.stale_issue_age":
-		if _, err := time.ParseDuration(value); err != nil {
-			return fmt.Errorf("invalid duration for %s: %w", key, err)
-		}
-		if patrolConfig.Patrols.WispReaper == nil {
-			patrolConfig.Patrols.WispReaper = &daemon.WispReaperConfig{Enabled: true}
-		}
-		patrolConfig.Patrols.WispReaper.StaleIssueAgeStr = value
-
-	case "lifecycle.reaper.mail_delete_age":
-		if _, err := time.ParseDuration(value); err != nil {
-			return fmt.Errorf("invalid duration for %s: %w", key, err)
-		}
-		if patrolConfig.Patrols.WispReaper == nil {
-			patrolConfig.Patrols.WispReaper = &daemon.WispReaperConfig{Enabled: true}
-		}
-		patrolConfig.Patrols.WispReaper.MailDeleteAgeStr = value
-
 	// Compactor
 	case "lifecycle.compactor.enabled":
 		b, err := parseBool(value)
@@ -1143,7 +1120,7 @@ func setLifecycleConfig(townRoot, key, value string) error {
 		patrolConfig.Patrols.DoltBackup.IntervalStr = value
 
 	default:
-		return fmt.Errorf("unknown lifecycle key: %q\n\nSupported lifecycle keys:\n  lifecycle.reaper.enabled\n  lifecycle.reaper.interval\n  lifecycle.reaper.delete_age\n  lifecycle.reaper.stale_issue_age\n  lifecycle.reaper.mail_delete_age\n  lifecycle.compactor.enabled\n  lifecycle.compactor.interval\n  lifecycle.compactor.threshold\n  lifecycle.doctor.enabled\n  lifecycle.doctor.interval\n  lifecycle.backup.enabled\n  lifecycle.backup.interval", key)
+		return fmt.Errorf("unknown lifecycle key: %q\n\nSupported lifecycle keys:\n  lifecycle.reaper.enabled\n  lifecycle.reaper.interval\n  lifecycle.reaper.delete_age\n  lifecycle.compactor.enabled\n  lifecycle.compactor.interval\n  lifecycle.compactor.threshold\n  lifecycle.doctor.enabled\n  lifecycle.doctor.interval\n  lifecycle.backup.enabled\n  lifecycle.backup.interval", key)
 	}
 
 	if err := daemon.SavePatrolConfig(townRoot, patrolConfig); err != nil {
@@ -1178,20 +1155,6 @@ func getLifecycleConfig(townRoot, key string) error {
 	case "lifecycle.reaper.delete_age":
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.DeleteAgeStr != "" {
 			value = patrolConfig.Patrols.WispReaper.DeleteAgeStr
-		} else {
-			value = "168h (default, 7 days)"
-		}
-
-	case "lifecycle.reaper.stale_issue_age":
-		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.StaleIssueAgeStr != "" {
-			value = patrolConfig.Patrols.WispReaper.StaleIssueAgeStr
-		} else {
-			value = "720h (default, 30 days)"
-		}
-
-	case "lifecycle.reaper.mail_delete_age":
-		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.MailDeleteAgeStr != "" {
-			value = patrolConfig.Patrols.WispReaper.MailDeleteAgeStr
 		} else {
 			value = "168h (default, 7 days)"
 		}
@@ -1251,7 +1214,7 @@ func getLifecycleConfig(townRoot, key string) error {
 		}
 
 	default:
-		return fmt.Errorf("unknown lifecycle key: %q\n\nSupported lifecycle keys:\n  lifecycle.reaper.enabled\n  lifecycle.reaper.interval\n  lifecycle.reaper.delete_age\n  lifecycle.reaper.stale_issue_age\n  lifecycle.reaper.mail_delete_age\n  lifecycle.compactor.enabled\n  lifecycle.compactor.interval\n  lifecycle.compactor.threshold\n  lifecycle.doctor.enabled\n  lifecycle.doctor.interval\n  lifecycle.backup.enabled\n  lifecycle.backup.interval", key)
+		return fmt.Errorf("unknown lifecycle key: %q\n\nSupported lifecycle keys:\n  lifecycle.reaper.enabled\n  lifecycle.reaper.interval\n  lifecycle.reaper.delete_age\n  lifecycle.compactor.enabled\n  lifecycle.compactor.interval\n  lifecycle.compactor.threshold\n  lifecycle.doctor.enabled\n  lifecycle.doctor.interval\n  lifecycle.backup.enabled\n  lifecycle.backup.interval", key)
 	}
 
 	fmt.Println(value)
