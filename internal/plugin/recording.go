@@ -57,10 +57,11 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 		title = fmt.Sprintf("Plugin run: %s", record.PluginName)
 	}
 
-	// Build labels
+	// Build labels. The type label is the const the retention queries in
+	// retention.go match on, so the writer and the pruner cannot drift.
 	labels := []string{
-		"type:plugin-run",
-		fmt.Sprintf("plugin:%s", record.PluginName),
+		receiptTypeLabel,
+		pluginLabelPrefix + record.PluginName,
 		fmt.Sprintf("result:%s", record.Result),
 	}
 	if record.RigName != "" {
@@ -83,10 +84,13 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	// receipts at 24h would make the gate read "never ran" for the remaining six
 	// days and dispatch a brew upgrade on every daemon scan.
 	//
-	// These receipts DO accumulate (5683 rows in hq on 2026-08-19) and want a
-	// TTL — but one that outlives the longest cooldown reading them, which no
-	// member of bd's seven-value vocabulary expresses. Filed separately rather
-	// than borrowed from a bucket that means something else.
+	// These receipts DO accumulate (5,779 rows in hq on 2026-08-19) and their
+	// TTL has to outlive the longest cooldown reading them, which no member of
+	// bd's seven-value vocabulary expresses. It is enforced in retention.go
+	// instead (gt-0cja): PruneReceipts deletes them on a window derived from the
+	// gate durations themselves, which is knowledge only this package has. The
+	// empty wisp_type is what keeps gt compact out of the way while that
+	// happens, so it is load-bearing in both directions — do not add one here.
 	args := []string{
 		"create",
 		"--ephemeral",
@@ -163,8 +167,8 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 		// which makes `gt plugin history` report "No execution history" and
 		// leaves every cooldown gate permanently open.
 		"--include-infra",
-		"-l", "type:plugin-run",
-		"-l", fmt.Sprintf("plugin:%s", pluginName),
+		"-l", receiptTypeLabel,
+		"-l", pluginLabelPrefix + pluginName,
 	}
 	if limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", limit))
