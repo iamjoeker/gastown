@@ -83,7 +83,7 @@ rendered as the same empty Escalation panel with no error indicator.
 exists to surface trouble, and bd is most likely to be failing when the town is
 in trouble — so the sicker the town, the calmer the dashboard looked.
 
-Two rules for read paths:
+Four rules for read paths:
 
 4. **Zero must mean zero; unknown must look different from zero.** A failed
    query returns an error, and the display renders an explicit unavailable
@@ -95,6 +95,31 @@ Two rules for read paths:
    `StoreResult.FailedStores` do. A count that is a floor must not be displayed
    as a total.
 
+6. **The discriminator is "did the source answer", not "did the call return an
+   error".** Not every error branch is a swallowed failure. A source that
+   answered "there is nothing" reports a real zero even though the call failed:
+
+   | Situation | Call | Meaning |
+   |---|---|---|
+   | Kennel directory does not exist | `ENOENT` | zero — no dog was ever created |
+   | Kennel exists, cannot be read | `EACCES` | unknown |
+   | `.events.jsonl` does not exist | `ENOENT` | zero — nothing was ever logged |
+   | tmux: `no server running` | exit 1 | zero — nothing is running |
+   | tmux: timeout, or missing from `PATH` | exit ≠ 0 | unknown |
+   | Circuit breaker open | no call made | unknown — the query never ran |
+
+   Getting this backwards costs both ways. A caveat that appears on every quiet
+   or shut-down town trains operators to ignore it, which removes the warning
+   just as effectively as never showing one.
+
+7. **An error with no fact in it cannot be branched on, or read.** Rule 6 needs
+   the error to say WHICH failure it was, and the operator needs the same words.
+   `runCmd`/`runBdCmd` fold the first line of the command's stderr into the
+   error for both reasons: `connection refused` and `unknown label` send someone
+   to different places, and `exit status 1` sends them nowhere. A fix that edits
+   only the `if err != nil` branch is not complete while the error it returns
+   carries nothing to distinguish.
+
 Aggregates inherit the defect: a summary that counts an unreadable panel as 0
 will happily report "✓ All clear". Not being able to see is itself an alert.
 
@@ -103,6 +128,10 @@ will happily report "✓ All clear". Not being able to see is itself an alert.
 - Does any success path return `nil` without having confirmed the effect?
 - On a read path: can a failed query and an empty result return the same value?
   (`return nil, nil` on an error branch is the signature of this bug.)
+- Does the error reach the reader, or only `log.Printf`? A logged error and a
+  discarded one render identically to whoever is looking at the page.
+- Does the error carry the fact the caller has to branch on, and the operator
+  has to read? (`exit status 1` carries neither.)
 - Does any helper that mutates state return no error at all? (`func(x) `, not
   `func(x) error`)
 - Is there an `_ =` or a bare call discarding an error on a mutation path?
