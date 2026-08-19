@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -447,6 +448,87 @@ func TestPurgeOldMailBehaviour(t *testing.T) {
 		if got := f.issueIDs(t, table); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s issue_ids = %v, want %v", table, got, want)
 		}
+	}
+}
+
+// TestPurgeReportsDoltCommitFailureOnBothHalves is the acceptance test for
+// gt-u5c: the mail half of Purge swallowed DOLT_COMMIT failure entirely, so the
+// deletion could go unversioned while `gt reaper purge --json` reported a clean
+// result. The operator check the purge step prescribes — "check for
+// dolt_commit_failed anomalies" — could never fire on that half.
+//
+// Both halves are seeded and asserted together, because the defect was an
+// ASYMMETRY: the wisp half already reported. A test that only injected the fault
+// on the mail path could not tell "the mail path now reports" from "the
+// injection reached the wisp path instead".
+//
+// Control: the same fixture shape without the injected failure must produce no
+// anomalies. Without it, a purge that reported dolt_commit_failed
+// unconditionally would pass.
+func TestPurgeReportsDoltCommitFailureOnBothHalves(t *testing.T) {
+	now := time.Now().UTC()
+	oldClose := now.Add(-30 * 24 * time.Hour)
+
+	seed := func(f *fixture) {
+		f.insertWisps(t, wispRow{id: "w-old", status: "closed", wispType: "step", createdAt: oldClose, closedAt: &oldClose})
+		f.insertIssues(t, issueRow{id: "mail-old", status: "closed", priority: 2,
+			updatedAt: oldClose, closedAt: &oldClose, labels: []string{"gt:message"}})
+	}
+
+	// Control: DOLT_COMMIT succeeds — a clean purge must stay clean.
+	ok := newFixture(t, "purge_commit_ok")
+	seed(ok)
+	okResult, err := Purge(ok.db, ok.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("control Purge: %v", err)
+	}
+	if len(okResult.Anomalies) != 0 {
+		t.Fatalf("control purge reported anomalies: %+v", okResult.Anomalies)
+	}
+	if okResult.WispsPurged != 1 || okResult.MailPurged != 1 {
+		t.Fatalf("control purged wisps=%d mail=%d, want 1 and 1 — the halves must both run",
+			okResult.WispsPurged, okResult.MailPurged)
+	}
+
+	f := newFixture(t, "purge_commit_fail")
+	seed(f)
+	f.failDoltCommits(t)
+
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+
+	// The rows are gone and the SQL commit landed; only the versioning failed.
+	// That is precisely why the anomaly is the sole signal available.
+	if got := f.ids(t, "wisps"); len(got) != 0 {
+		t.Errorf("surviving wisps = %v, want none", got)
+	}
+	if got := f.ids(t, "issues"); len(got) != 0 {
+		t.Errorf("surviving issues = %v, want none", got)
+	}
+	if result.MailPurged != 1 {
+		t.Errorf("MailPurged = %d, want 1", result.MailPurged)
+	}
+
+	var wispReported, mailReported bool
+	for _, a := range result.Anomalies {
+		if a.Type != "dolt_commit_failed" {
+			continue
+		}
+		switch {
+		case strings.Contains(a.Message, "mail"):
+			mailReported = true
+		default:
+			wispReported = true
+		}
+	}
+	if !wispReported {
+		t.Errorf("wisp half reported no dolt_commit_failed anomaly: %+v", result.Anomalies)
+	}
+	if !mailReported {
+		t.Errorf("mail half reported no dolt_commit_failed anomaly — the operator check is inert: %+v",
+			result.Anomalies)
 	}
 }
 
