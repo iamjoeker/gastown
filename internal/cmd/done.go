@@ -2032,13 +2032,6 @@ notifyWitness:
 		}
 	}
 
-	// Write witness notification checkpoint for resume (gt-aufru)
-	if agentBeadID != "" {
-		// Agent bead lives in town DB despite rig prefix — bypass routing.
-		cpBd := beads.New(cwd).ForAgentBead()
-		writeDoneCheckpoint(cpBd, agentBeadID, CheckpointWitnessNotified, "ok")
-	}
-
 	// Log done event (townlog and activity feed)
 	if err := LogDone(townRoot, sender, issueID); err != nil {
 		style.PrintWarning("could not log done event: %v", err)
@@ -2064,8 +2057,21 @@ notifyWitness:
 	if reasons := summarizeDoneErrors(doneErrors); reasons != "" {
 		doneMessage += " errors=" + reasons
 	}
-	nudgeWitness(rigName, doneMessage)
-	fmt.Printf("%s Witness notified of %s (via nudge)\n", style.Bold.Render("✓"), exitType)
+	// gt-lae6: report what actually happened. Both the console line and the
+	// checkpoint below used to be hardcoded, so a polecat whose witness never
+	// heard it left the same trace as one whose witness did.
+	witnessDelivery := nudgeWitness(rigName, doneMessage)
+	symbol, notifyLine := witnessNotifyResult(exitType, witnessDelivery)
+	fmt.Printf("%s %s\n", style.Bold.Render(symbol), notifyLine)
+
+	// Write witness notification checkpoint for resume (gt-aufru), AFTER the
+	// nudge and carrying its real outcome (gt-lae6). Written earlier with a
+	// hardcoded "ok", it recorded success before the attempt it described.
+	if agentBeadID != "" {
+		// Agent bead lives in town DB despite rig prefix — bypass routing.
+		cpBd := beads.New(cwd).ForAgentBead()
+		writeDoneCheckpoint(cpBd, agentBeadID, CheckpointWitnessNotified, witnessCheckpointValue(witnessDelivery))
+	}
 
 	// Clean successful polecats are retired after durable handoff. Preserve the
 	// feature branch and metadata; Witness/refinery cleanup owns the sandbox.
@@ -2240,7 +2246,11 @@ func reportDetachedBranchUnresolvable(cwd, townRoot, rigName, polecatName, sende
 		} else {
 			fmt.Printf("%s Witness notified: POLECAT_DETACHED\n", style.Bold.Render("✓"))
 		}
-		nudgeWitness(rigName, alarm)
+		// The mail above is the durable path; the nudge is the wake-up. Say so
+		// when the wake-up did not land, rather than dropping it (gt-lae6).
+		if d := nudgeWitness(rigName, alarm); !d.Delivered() {
+			style.PrintWarning("could not nudge witness about detached worktree (%s) — mail was still sent", d.Summary())
+		}
 	}
 
 	return fmt.Errorf("cannot submit work: %s\n"+
@@ -2473,6 +2483,35 @@ const (
 	CheckpointMRCreated       DoneCheckpoint = "mr-created"
 	CheckpointWitnessNotified DoneCheckpoint = "witness-notified"
 )
+
+// witnessCheckpointValue maps a nudge outcome to the value stored in the
+// witness-notified checkpoint (gt-lae6). The value must be a single token: the
+// label is done-cp:<stage>:<value>:<ts> and readDoneCheckpoints splits on ':',
+// so anything containing a colon is silently truncated.
+func witnessCheckpointValue(d nudgeDelivery) string {
+	switch {
+	case !d.Delivered():
+		return "failed"
+	case d.Degraded():
+		return "degraded"
+	default:
+		return "ok"
+	}
+}
+
+// witnessNotifyResult renders the console line for a witness nudge (gt-lae6),
+// returning the status symbol and the text. Split from the printing so the
+// three outcomes — delivered, degraded, failed — are testable without tmux.
+func witnessNotifyResult(exitType string, d nudgeDelivery) (symbol, line string) {
+	switch {
+	case !d.Delivered():
+		return "✗", fmt.Sprintf("Witness NOT notified of %s — every delivery path failed (%s)", exitType, d.Summary())
+	case d.Degraded():
+		return "⚠", fmt.Sprintf("Witness notified of %s, degraded (%s)", exitType, d.Summary())
+	default:
+		return "✓", fmt.Sprintf("Witness notified of %s (via nudge)", exitType)
+	}
+}
 
 // writeDoneCheckpoint writes a checkpoint label on the agent bead.
 // Format: done-cp:<stage>:<value>:<unix-ts>
