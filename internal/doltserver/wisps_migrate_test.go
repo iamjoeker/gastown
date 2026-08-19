@@ -49,12 +49,8 @@ func setupBdWorkDir(t *testing.T, port int) string {
 	workDir := t.TempDir()
 	beadsDir := filepath.Join(workDir, ".beads")
 	// 0700, not 0755: bd warns about a group/world-readable .beads on every
-	// invocation, and the warning has no business in this fixture's output.
-	// It used to matter more than that — bdSQLCSV read CombinedOutput, so the
-	// warning landed in the CSV bdSQLCount parses and a healthy server reported
-	// a count of zero (gt-g12p). That is fixed in bdSQLCSV and pinned by
-	// TestBdSQLCSV_StderrStaysOutOfCSV; the mode here is now hygiene, not a
-	// workaround.
+	// invocation, and bdSQLCSV reads CombinedOutput — so the warning lands in
+	// the CSV bdSQLCount parses, and a healthy server reports a count of zero.
 	if err := os.MkdirAll(beadsDir, 0700); err != nil {
 		t.Fatalf("creating .beads dir: %v", err)
 	}
