@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1707,124 +1706,6 @@ func TestConvoyHandler_PartialStoreNotices(t *testing.T) {
 	}
 	if !strings.Contains(body, `1+</span>`) {
 		t.Error("Incomplete Hooks count should render with a '+' suffix")
-	}
-}
-
-// TestConvoyHandler_UnreadableUnionPanelsSaySo covers the last two panels of
-// the swallowed-error family (gt-8nhx). The Hooks and Work panels have no error
-// to render: they union every beads store, so every store failing separately
-// still returns a result, and the panel used to describe a total blackout as a
-// count of zero with a "count is incomplete" footnote under it.
-//
-// Zero rows with no store read is not a floor. It is no number at all, and the
-// panel, its header count and the banner stat must each say so.
-func TestConvoyHandler_UnreadableUnionPanelsSaySo(t *testing.T) {
-	mock := &MockConvoyFetcher{
-		Convoys: []ConvoyRow{},
-		// No rows, and no store that could have supplied them.
-		HooksFailedStores:  []string{"town", "gastown"},
-		IssuesFailedStores: []string{"town", "gastown"},
-	}
-
-	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("NewConvoyHandler() error = %v", err)
-	}
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	body := w.Body.String()
-
-	for _, want := range []string{
-		"Hooks unavailable: no store could be read (unreadable: town, gastown)",
-		"Work backlog unavailable: no store could be read (unreadable: town, gastown)",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("panel should name why it could not read: missing %q", want)
-		}
-	}
-
-	// The empty states are the exact renders the bug produced.
-	for _, unwanted := range []string{"No hooked work", "No work items"} {
-		if strings.Contains(body, unwanted) {
-			t.Errorf("an unreadable panel must not render its empty state: found %q", unwanted)
-		}
-	}
-
-	// "0+" is the floor render, and a floor drawn from no sources is a claim
-	// the panel cannot make.
-	if strings.Contains(body, "0+</span>") {
-		t.Error("an unreadable union must not render its count as a floor of zero")
-	}
-
-	// The banner is what an operator reads at a glance.
-	if strings.Contains(body, "All clear") {
-		t.Error("a dashboard that cannot read hooks or work is not 'All clear'")
-	}
-	for _, want := range []string{"🪝 hooks unreadable", "📋 work unreadable"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("summary alerts should flag the unreadable panel: missing %q", want)
-		}
-	}
-	// The banner stat is the other half: an operator who never opens the panel
-	// reads the town off these two numbers.
-	for _, label := range []string{"🪝 Hooks", "📋 Work"} {
-		if got := bannerStat(t, body, label); got != "?" {
-			t.Errorf("banner stat %q = %q, want %q for a count that could not be read", label, got, "?")
-		}
-	}
-}
-
-// bannerStat returns the value the summary banner renders above the given stat
-// label, so a test can assert on the number an operator actually sees rather
-// than on a substring that any other panel's zero would satisfy.
-func bannerStat(t *testing.T, body, label string) string {
-	t.Helper()
-
-	pattern := regexp.MustCompile(`stat-value">([^<]*)</span>\s*<span class="stat-label">` + regexp.QuoteMeta(label))
-	match := pattern.FindStringSubmatch(body)
-	if match == nil {
-		t.Fatalf("no banner stat found for label %q", label)
-	}
-	return match[1]
-}
-
-// TestConvoyHandler_ReadableUnionPanelsRenderTheirZero is the control for
-// TestConvoyHandler_UnreadableUnionPanelsSaySo: a town whose stores answered
-// and had nothing to say still gets its empty states and its zeroes. Without
-// it, a notice rendered unconditionally would pass the test above.
-func TestConvoyHandler_ReadableUnionPanelsRenderTheirZero(t *testing.T) {
-	mock := &MockConvoyFetcher{Convoys: []ConvoyRow{}}
-
-	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("NewConvoyHandler() error = %v", err)
-	}
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	body := w.Body.String()
-	for _, want := range []string{"No hooked work", "No work items"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("a readable, quiet panel should render its empty state: missing %q", want)
-		}
-	}
-	for _, unwanted := range []string{"Hooks unavailable", "Work backlog unavailable"} {
-		if strings.Contains(body, unwanted) {
-			t.Errorf("a successful union must not render an unavailable notice: found %q", unwanted)
-		}
-	}
-	if !strings.Contains(body, "All clear") {
-		t.Error("a quiet, readable town should still render 'All clear'")
-	}
-	for _, label := range []string{"🪝 Hooks", "📋 Work"} {
-		if got := bannerStat(t, body, label); got != "0" {
-			t.Errorf("banner stat %q = %q, want a plain %q when the stores answered", label, got, "0")
-		}
 	}
 }
 

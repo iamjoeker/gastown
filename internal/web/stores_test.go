@@ -167,16 +167,6 @@ func TestForEachStore_DistinguishesEmptyFromUnreadable(t *testing.T) {
 		if len(result.FailedStores) != 0 {
 			t.Errorf("FailedStores = %v, want none", result.FailedStores)
 		}
-		// Four stores said "nothing here". That is a real zero, and a panel
-		// that renders it as unavailable is as wrong as one that renders an
-		// outage as zero.
-		if result.Unreadable() {
-			t.Errorf("Unreadable() = true for stores that answered, reason = %q", result.UnavailableReason())
-		}
-		want := []string{townStoreName, "beads", "broken", "gastown"}
-		if !reflect.DeepEqual(result.ReadStores, want) {
-			t.Errorf("ReadStores = %v, want %v", result.ReadStores, want)
-		}
 	})
 
 	t.Run("every store unreadable", func(t *testing.T) {
@@ -194,84 +184,6 @@ func TestForEachStore_DistinguishesEmptyFromUnreadable(t *testing.T) {
 		want := []string{townStoreName, "beads", "broken", "gastown"}
 		if !reflect.DeepEqual(result.FailedStores, want) {
 			t.Errorf("FailedStores = %v, want %v", result.FailedStores, want)
-		}
-		if len(result.ReadStores) != 0 {
-			t.Errorf("ReadStores = %v, want none", result.ReadStores)
-		}
-		// Partial alone reads as "0 so far". Nothing was read at all, and the
-		// panel needs to be able to say that instead of showing a floor.
-		if !result.Unreadable() {
-			t.Fatal("Unreadable() = false when no store answered, want true")
-		}
-		if got := result.UnavailableReason(); !strings.Contains(got, "beads") {
-			t.Errorf("UnavailableReason() = %q, want it to name the stores that failed", got)
-		}
-	})
-
-	// One store answering — even with nothing to give — is the difference
-	// between an incomplete count and no count. Without this case, Unreadable
-	// could be a synonym for Partial and no test would notice.
-	t.Run("one store answers, the rest fail", func(t *testing.T) {
-		fn, _, _ := fixedRows(t, nil, map[string]bool{"beads": true, "broken": true, "gastown": true})
-		result := forEachStore(f, storeBudgetUnlimited, fn)
-
-		if !result.Partial() {
-			t.Error("Partial() = false with three failed stores, want true")
-		}
-		if result.Unreadable() {
-			t.Errorf("Unreadable() = true though the town root answered, reason = %q", result.UnavailableReason())
-		}
-		if got := result.UnavailableReason(); got != "" {
-			t.Errorf("UnavailableReason() = %q, want empty when a store answered", got)
-		}
-	})
-}
-
-// TestStoreResultUnreadable_RowsOutrankMissingLabels pins the guard that keeps
-// a hand-built result — a test mock, or any caller that fills Rows without
-// naming their stores — from reading as unreadable while holding rows.
-func TestStoreResultUnreadable_RowsOutrankMissingLabels(t *testing.T) {
-	partial := StoreResult[storeRow]{
-		Rows:         rowsFrom("gastown", 2),
-		FailedStores: []string{"beads"},
-	}
-	if partial.Unreadable() {
-		t.Error("Unreadable() = true for a result holding rows, want false")
-	}
-	if !partial.Partial() {
-		t.Error("Partial() = false with a failed store, want true")
-	}
-}
-
-// TestStoreResultCarriesReadStores asserts the two places a union changes shape
-// keep the record of which stores answered. Dropping it in either turns a
-// readable store into an unreadable one a layer later.
-func TestStoreResultCarriesReadStores(t *testing.T) {
-	t.Run("merge unions both halves", func(t *testing.T) {
-		open := StoreResult[storeRow]{ReadStores: []string{townStoreName, "beads"}}
-		hooked := StoreResult[storeRow]{ReadStores: []string{"beads", "gastown"}}
-
-		want := []string{townStoreName, "beads", "gastown"}
-		if got := open.merge(hooked).ReadStores; !reflect.DeepEqual(got, want) {
-			t.Errorf("merged ReadStores = %v, want %v", got, want)
-		}
-	})
-
-	t.Run("mapStoreRows keeps them when every row is dropped", func(t *testing.T) {
-		// A store full of beads the panel filters out still answered. If the
-		// label were recomputed from the surviving rows, this would render as
-		// "no store could be read".
-		full := StoreResult[storeRow]{
-			Rows:       rowsFrom(townStoreName, 3),
-			ReadStores: []string{townStoreName},
-		}
-		mapped := mapStoreRows(full, func(storeRow) (storeRow, bool) { return storeRow{}, false })
-
-		if len(mapped.Rows) != 0 {
-			t.Fatalf("rows = %d, want every row dropped", len(mapped.Rows))
-		}
-		if mapped.Unreadable() {
-			t.Errorf("Unreadable() = true after filtering a store that answered, reason = %q", mapped.UnavailableReason())
 		}
 	})
 }

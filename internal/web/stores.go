@@ -75,13 +75,6 @@ type StoreResult[T any] struct {
 	// UnreadStores names stores that were never queried because the row budget
 	// was already spent when their turn came.
 	UnreadStores []string
-
-	// ReadStores names stores that answered, whether or not they had rows to
-	// give. It is what separates "every store said there is nothing" from "no
-	// store said anything": both leave Rows empty, and only the first is a
-	// zero. Without it a panel can report an incomplete count but never report
-	// no count at all.
-	ReadStores []string
 }
 
 // Partial reports whether Rows is known to be incomplete. An empty Rows with
@@ -89,24 +82,6 @@ type StoreResult[T any] struct {
 // the dashboard could not find out.
 func (r StoreResult[T]) Partial() bool {
 	return len(r.FailedStores) > 0 || len(r.TruncatedStores) > 0 || len(r.UnreadStores) > 0
-}
-
-// Unreadable reports that no store answered at all, so Rows is empty because
-// nothing could be read rather than because there is nothing there.
-//
-// Partial and Unreadable are degrees of the same failure and a panel needs
-// both: Partial means the count is a floor, Unreadable means there is no count.
-// A panel that renders only the floor tells an operator "0 so far" on a page
-// where every source is down.
-//
-// Rows short-circuits the answer so a result assembled by hand — a test mock,
-// or any caller that fills Rows without naming the stores they came from —
-// cannot be read as unreadable while it is visibly holding rows.
-func (r StoreResult[T]) Unreadable() bool {
-	if len(r.Rows) > 0 || len(r.ReadStores) > 0 {
-		return false
-	}
-	return len(r.FailedStores) > 0 || len(r.UnreadStores) > 0
 }
 
 // merge folds a second union of the same row type into this one.
@@ -121,7 +96,6 @@ func (r StoreResult[T]) merge(other StoreResult[T]) StoreResult[T] {
 		FailedStores:    appendUnique(r.FailedStores, other.FailedStores),
 		TruncatedStores: appendUnique(r.TruncatedStores, other.TruncatedStores),
 		UnreadStores:    appendUnique(r.UnreadStores, other.UnreadStores),
-		ReadStores:      appendUnique(r.ReadStores, other.ReadStores),
 	}
 }
 
@@ -145,10 +119,6 @@ func mapStoreRows[A, B any](r StoreResult[A], convert func(A) (B, bool)) StoreRe
 		FailedStores:    r.FailedStores,
 		TruncatedStores: r.TruncatedStores,
 		UnreadStores:    r.UnreadStores,
-		// Carried, not recomputed: a store whose every row the panel just
-		// filtered out still answered, and forgetting that turns a store full
-		// of beads the panel hides into a store that could not be read.
-		ReadStores: r.ReadStores,
 	}
 }
 
@@ -179,26 +149,6 @@ func (r StoreResult[T]) Warning() string {
 		return ""
 	}
 	return "partial results (" + strings.Join(parts, "; ") + ")"
-}
-
-// UnavailableReason renders why the union has no answer at all, or "" when at
-// least one store answered.
-//
-// It names the stores for the same reason Warning does: the operator's next
-// move differs by which source is down, and "unavailable" alone sends them
-// looking at the dashboard instead of at bd.
-func (r StoreResult[T]) UnavailableReason() string {
-	if !r.Unreadable() {
-		return ""
-	}
-	var parts []string
-	if len(r.FailedStores) > 0 {
-		parts = append(parts, "unreadable: "+strings.Join(r.FailedStores, ", "))
-	}
-	if len(r.UnreadStores) > 0 {
-		parts = append(parts, "not queried: "+strings.Join(r.UnreadStores, ", "))
-	}
-	return "no store could be read (" + strings.Join(parts, "; ") + ")"
 }
 
 // storeSources returns every store to union: the town root first, then each
@@ -325,9 +275,6 @@ func forEachStoreLimited[T any](f *LiveConvoyFetcher, limiter storeLimiter, fn f
 			rows = rows[:limit]
 		}
 
-		// Recorded even when rows is empty: an empty answer is still an answer,
-		// and it is the only thing that makes a union's zero a real zero.
-		result.ReadStores = append(result.ReadStores, src.Name)
 		result.Rows = append(result.Rows, rows...)
 	}
 
