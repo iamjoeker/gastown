@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -358,5 +359,157 @@ func TestFetchHooks_EmptyEverywhereIsNotPartial(t *testing.T) {
 	}
 	if got := result.Warning(); got != "" {
 		t.Errorf("Warning() = %q, want empty", got)
+	}
+}
+
+// The Polecats panel was filed as safe because FetchWorkers loads the rigs
+// config — but it loads it to filter tmux session names, and its bead lookup
+// asked the town root for status=in_progress. Measured against a live town, not
+// one assigned bead in any store was at in_progress while eleven sat at hooked,
+// all of them in rig stores. So the lookup returned nothing, every worker got an
+// empty IssueID, and calculateWorkerWorkStatus reports empty as "idle": ten
+// working polecats rendered idle. These tests pin both halves — the store and
+// the status — because fixing either alone still returns an empty map.
+
+// assignedBeads builds n beads assigned to distinct workers of a rig.
+func assignedBeads(rig string, n int) []map[string]any {
+	beads := make([]map[string]any, 0, n)
+	for i := 0; i < n; i++ {
+		beads = append(beads, map[string]any{
+			"id":       fmt.Sprintf("%s-work-%d", rig, i),
+			"title":    fmt.Sprintf("assigned item %d in %s", i, rig),
+			"assignee": fmt.Sprintf("%s/polecats/worker%d", rig, i),
+		})
+	}
+	return beads
+}
+
+// TestGetAssignedIssuesMap_UnionsEveryStore pins the store half. The town root
+// is deliberately empty of assigned work, as the live town's was: a fixture that
+// puts rows in the town root passes against the town-root-only code it replaced.
+func TestGetAssignedIssuesMap_UnionsEveryStore(t *testing.T) {
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {},
+		"beads":       {"hooked": assignedBeads("beads", 2)},
+		"gastown":     {"hooked": assignedBeads("gastown", 3)},
+	})
+
+	result := f.getAssignedIssuesMap()
+	if result.Partial() {
+		t.Fatalf("Partial() = true for a complete union, warning = %q", result.Warning())
+	}
+
+	got := assignedIssuesByAssignee(result.Rows)
+	if len(got) != 5 {
+		t.Errorf("assignees = %d, want 5 (2 in beads + 3 in gastown)", len(got))
+	}
+	// Naming an assignee from each rig is what catches a union that returns the
+	// right total from the wrong stores.
+	for _, assignee := range []string{"beads/polecats/worker1", "gastown/polecats/worker2"} {
+		if _, ok := got[assignee]; !ok {
+			t.Errorf("assignee %q missing from the union: %v", assignee, got)
+		}
+	}
+}
+
+// TestGetAssignedIssuesMap_FindsHookedWork pins the status half. The old query
+// asked only for in_progress, which no bead in the measured town held.
+func TestGetAssignedIssuesMap_FindsHookedWork(t *testing.T) {
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {},
+		"gastown":     {"hooked": assignedBeads("gastown", 2)},
+	})
+
+	got := assignedIssuesByAssignee(f.getAssignedIssuesMap().Rows)
+	if len(got) != 2 {
+		t.Fatalf("assignees = %d, want 2 — hooked work must be found, not just in_progress", len(got))
+	}
+	if issue := got["gastown/polecats/worker0"]; issue.ID != "gastown-work-0" {
+		t.Errorf("issue for worker0 = %+v, want ID gastown-work-0", issue)
+	}
+}
+
+// TestGetAssignedIssuesMap_FindsInProgressWork is the other side of that pair:
+// the older assignment path still writes in_progress, so widening the query must
+// not have narrowed it.
+func TestGetAssignedIssuesMap_FindsInProgressWork(t *testing.T) {
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {},
+		"gastown":     {"in_progress": assignedBeads("gastown", 2)},
+	})
+
+	if got := assignedIssuesByAssignee(f.getAssignedIssuesMap().Rows); len(got) != 2 {
+		t.Fatalf("assignees = %d, want 2 — in_progress work must still be found", len(got))
+	}
+}
+
+// TestGetAssignedIssuesMap_NamesStoreThatCouldNotAnswer covers the swallowed
+// error. This is the failure that matters most here: an unreadable rig store
+// drops its workers' issues, and a worker with no issue is rendered idle. The
+// panel must say it could not look rather than call them idle.
+func TestGetAssignedIssuesMap_NamesStoreThatCouldNotAnswer(t *testing.T) {
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {},
+		"gastown":     {"hooked": assignedBeads("gastown", 2)},
+	}, "broken")
+
+	result := f.getAssignedIssuesMap()
+	if want := []string{"broken"}; !reflect.DeepEqual(result.FailedStores, want) {
+		t.Errorf("FailedStores = %v, want %v", result.FailedStores, want)
+	}
+	// Named once, though the store is asked for two statuses.
+	if !result.Partial() {
+		t.Error("Partial() = false with an unreadable store, want true")
+	}
+	if len(result.Rows) != 2 {
+		t.Errorf("rows = %d, want 2 (the readable store still answers)", len(result.Rows))
+	}
+}
+
+// TestGetAssignedIssuesMap_EmptyEverywhereIsNotPartial is the control: a town
+// where nobody is assigned anything must not raise the caveat, or the caveat
+// stops meaning anything.
+func TestGetAssignedIssuesMap_EmptyEverywhereIsNotPartial(t *testing.T) {
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {},
+		"beads":       {},
+		"gastown":     {},
+	})
+
+	result := f.getAssignedIssuesMap()
+	if len(result.Rows) != 0 {
+		t.Fatalf("rows = %d, want 0", len(result.Rows))
+	}
+	if result.Partial() {
+		t.Errorf("Partial() = true for an empty but fully readable town, warning = %q", result.Warning())
+	}
+}
+
+// TestFetchWorkers_CarriesAssignmentCaveat checks the caveat survives the trip
+// out of FetchWorkers, which is where the panel reads it. Without this the
+// resolver can name a failed store into a value nobody carries.
+func TestFetchWorkers_CarriesAssignmentCaveat(t *testing.T) {
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {},
+		"gastown":     {"hooked": assignedBeads("gastown", 1)},
+	}, "broken")
+
+	// tmux answering with no sessions keeps this test on the bead lookup: the
+	// worker rows come from tmux, but the caveat comes from the stores.
+	original := fetcherRunCmd
+	t.Cleanup(func() { fetcherRunCmd = original })
+	fetcherRunCmd = func(_ time.Duration, _ string, _ ...string) (*bytes.Buffer, error) {
+		return bytes.NewBufferString(""), nil
+	}
+
+	result, err := f.FetchWorkers()
+	if err != nil {
+		t.Fatalf("FetchWorkers() error = %v", err)
+	}
+	if want := []string{"broken"}; !reflect.DeepEqual(result.FailedStores, want) {
+		t.Errorf("FailedStores = %v, want %v", result.FailedStores, want)
+	}
+	if got := result.Warning(); got == "" {
+		t.Error("Warning() = \"\" with an unreadable store — the panel would show workers idle with no caveat")
 	}
 }
