@@ -80,11 +80,11 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	// Apply additional filters and calculate scores
 	now := time.Now()
 	type scoredIssue struct {
-		issue           *beads.Issue
-		fields          *beads.MRFields
-		score           float64
-		branchMissing   bool // true if branch doesn't exist in git (when --verify is set)
-		branchVerifyErr bool // true if git check errored (corrupt repo, permission, etc.)
+		issue        *beads.Issue
+		fields       *beads.MRFields
+		score        float64
+		branchState  mrBranchState // git verification result (when --verify is set)
+		commitsAhead int           // commits the branch carries over its target (valid for OK/EMPTY)
 	}
 	var scored []scoredIssue
 
@@ -137,12 +137,13 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Check branch existence if --verify is set (local + remote-tracking refs)
-		branchMissing, branchVerifyErr := verifyBranch(mqListVerify, gitClient, fields)
+		// Check the branch if --verify is set: does it exist (local + remote-tracking
+		// refs), and does it actually carry commits over its target?
+		branchState, commitsAhead := verifyBranch(mqListVerify, gitClient, fields)
 
 		// Calculate priority score
 		score := calculateMRScore(issue, fields, now)
-		scored = append(scored, scoredIssue{issue: issue, fields: fields, score: score, branchMissing: branchMissing, branchVerifyErr: branchVerifyErr})
+		scored = append(scored, scoredIssue{issue: issue, fields: fields, score: score, branchState: branchState, commitsAhead: commitsAhead})
 	}
 
 	// Sort by score descending (highest priority first)
@@ -162,18 +163,30 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			// Extend JSON with verification results
 			type verifiedIssue struct {
 				*beads.Issue
-				BranchExists *bool `json:"branch_exists,omitempty"`
-				VerifyError  bool  `json:"verify_error,omitempty"`
+				BranchExists *bool  `json:"branch_exists,omitempty"`
+				BranchEmpty  *bool  `json:"branch_empty,omitempty"`
+				CommitsAhead *int   `json:"commits_ahead,omitempty"`
+				GitState     string `json:"git_state,omitempty"`
+				VerifyError  bool   `json:"verify_error,omitempty"`
 			}
 			var verified []verifiedIssue
 			for _, s := range scored {
 				vi := verifiedIssue{Issue: s.issue}
 				if s.fields != nil && s.fields.Branch != "" {
-					if s.branchVerifyErr {
+					vi.GitState = string(s.branchState)
+					switch s.branchState {
+					case mrBranchStateErr:
 						vi.VerifyError = true
-					} else {
-						exists := !s.branchMissing
+					case mrBranchStateMissing:
+						exists := false
 						vi.BranchExists = &exists
+					case mrBranchStateEmpty, mrBranchStateOK:
+						exists := true
+						empty := s.branchState == mrBranchStateEmpty
+						ahead := s.commitsAhead
+						vi.BranchExists = &exists
+						vi.BranchEmpty = &empty
+						vi.CommitsAhead = &ahead
 					}
 				}
 				verified = append(verified, vi)
@@ -272,11 +285,17 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		// Format branch status when --verify is set
 		gitStatus := ""
 		if mqListVerify {
-			if item.branchVerifyErr {
+			switch item.branchState {
+			case mrBranchStateErr:
 				gitStatus = style.Warning.Render("ERR")
-			} else if item.branchMissing {
+			case mrBranchStateMissing:
 				gitStatus = style.Error.Render("MISSING")
-			} else {
+			case mrBranchStateEmpty:
+				// The branch exists but carries no commits over its target:
+				// merging it is a no-op. Distinct from OK because the correct
+				// disposition is rejection, not merge (gt-d5u).
+				gitStatus = style.Error.Render("EMPTY")
+			case mrBranchStateOK:
 				gitStatus = style.Success.Render("OK")
 			}
 		}
@@ -300,18 +319,28 @@ func runMQList(cmd *cobra.Command, args []string) error {
 
 	fmt.Print(table.Render())
 
-	// Show summary of missing branches when --verify is set
+	// Show summary of missing/empty branches when --verify is set
 	if mqListVerify {
 		missingCount := 0
+		emptyCount := 0
 		for _, item := range scored {
-			if item.branchMissing {
+			switch item.branchState {
+			case mrBranchStateMissing:
 				missingCount++
+			case mrBranchStateEmpty:
+				emptyCount++
 			}
 		}
 		if missingCount > 0 {
 			fmt.Printf("\n  %s %d MR(s) with missing branches\n",
 				style.Error.Render("⚠"),
 				missingCount)
+		}
+		if emptyCount > 0 {
+			fmt.Printf("\n  %s %d MR(s) whose branch carries no commits over its target\n",
+				style.Error.Render("⚠"),
+				emptyCount)
+			fmt.Printf("  %s\n", style.Dim.Render("Merging one is a no-op that still closes the source issue — reject instead: gt mq reject <rig> <mr-id> --reason \"empty branch\" --notify"))
 		}
 	}
 
@@ -448,32 +477,100 @@ func calculateMRScore(issue *beads.Issue, fields *beads.MRFields, now time.Time)
 	return refinery.ScoreMRWithDefaults(input)
 }
 
-// branchVerifier abstracts git branch existence checks for testability.
+// mrBranchState is the result of verifying an MR's branch in git.
+//
+// EXISTS and HAS-WORK are separate questions: a branch that was never committed
+// to still resolves to its base, so existence alone cannot distinguish "mergeable
+// work is waiting" from "merging this changes nothing" (gt-d5u). The states are
+// kept distinct because their dispositions differ — an EMPTY MR is rejected, not
+// merged and not retried.
+type mrBranchState string
+
+const (
+	// mrBranchStateSkipped means no verification ran (--verify off, no client,
+	// or the MR records no branch).
+	mrBranchStateSkipped mrBranchState = ""
+	// mrBranchStateOK means the branch exists and carries at least one commit
+	// over its target branch.
+	mrBranchStateOK mrBranchState = "OK"
+	// mrBranchStateMissing means neither a local nor a remote-tracking ref exists.
+	mrBranchStateMissing mrBranchState = "MISSING"
+	// mrBranchStateEmpty means the branch exists but is not ahead of its target:
+	// merging it is a no-op.
+	mrBranchStateEmpty mrBranchState = "EMPTY"
+	// mrBranchStateErr means git could not answer (corrupt repo, permissions,
+	// unresolvable target ref).
+	mrBranchStateErr mrBranchState = "ERR"
+)
+
+// branchVerifier abstracts the git checks --verify performs, for testability.
 type branchVerifier interface {
 	BranchExists(branch string) (bool, error)
 	RemoteTrackingBranchExists(remote, branch string) (bool, error)
+	CommitsAhead(base, branch string) (int, error)
 }
 
-// verifyBranch checks if a branch exists locally or as a remote-tracking ref.
-// Returns (missing, verifyErr).
-func verifyBranch(verify bool, client branchVerifier, fields *beads.MRFields) (bool, bool) {
+// defaultMRTargetBranch is the target assumed when an MR records none.
+const defaultMRTargetBranch = "main"
+
+// verifyBranch checks that an MR's branch both exists and contains work.
+// Returns the resulting state and, when it is OK or EMPTY, the number of commits
+// the branch carries over its target.
+func verifyBranch(verify bool, client branchVerifier, fields *beads.MRFields) (mrBranchState, int) {
 	if !verify || client == nil || fields == nil || fields.Branch == "" {
-		return false, false
+		return mrBranchStateSkipped, 0
 	}
-	localExists, err := client.BranchExists(fields.Branch)
+
+	branchRef, found, err := resolveVerifyRef(client, fields.Branch)
 	if err != nil {
-		return false, true
+		return mrBranchStateErr, 0
+	}
+	if !found {
+		return mrBranchStateMissing, 0
+	}
+
+	// Content check: does the branch carry anything the target does not already
+	// have? A branch pointing at its own base answers "yes" to existence and
+	// "no" here.
+	target := strings.TrimSpace(fields.Target)
+	if target == "" {
+		target = defaultMRTargetBranch
+	}
+	targetRef, targetFound, err := resolveVerifyRef(client, target)
+	if err != nil || !targetFound {
+		// Existence held but the target could not be resolved, so "does this
+		// contain work" is unanswered. Report that rather than implying OK.
+		return mrBranchStateErr, 0
+	}
+
+	ahead, err := client.CommitsAhead(targetRef, branchRef)
+	if err != nil {
+		return mrBranchStateErr, 0
+	}
+	if ahead == 0 {
+		return mrBranchStateEmpty, 0
+	}
+	return mrBranchStateOK, ahead
+}
+
+// resolveVerifyRef finds a usable ref for a branch name, preferring the
+// remote-tracking ref because MRs are submitted by pushing to origin — a stale
+// local ref would answer for a different commit than the queue will merge.
+// Returns (ref, found, err).
+func resolveVerifyRef(client branchVerifier, branch string) (string, bool, error) {
+	remoteExists, err := client.RemoteTrackingBranchExists("origin", branch)
+	if err != nil {
+		return "", false, err
+	}
+	if remoteExists {
+		return "origin/" + branch, true, nil
+	}
+	localExists, err := client.BranchExists(branch)
+	if err != nil {
+		return "", false, err
 	}
 	if localExists {
-		return false, false
+		return branch, true, nil
 	}
-	// Also check remote-tracking ref (polecats often only have origin refs)
-	remoteExists, rerr := client.RemoteTrackingBranchExists("origin", fields.Branch)
-	if rerr != nil {
-		return false, true
-	}
-	if !remoteExists {
-		return true, false
-	}
-	return false, false
+	return "", false, nil
 }
