@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -367,6 +368,13 @@ squashed_at: %s
 	return nil
 }
 
+// closeDescendantsPassLimit bounds the repeated close passes
+// closeChildrenToFixedPoint makes over one parent's direct children. A pass that
+// closes nothing already ends the loop, so this only guards against a close that
+// reports progress without ever draining the set. Molecules have far fewer steps
+// than this. Mirrors dogClosePassLimit in internal/daemon/dog_molecule.go.
+const closeDescendantsPassLimit = 64
+
 // closeDescendants recursively closes all descendant issues of a parent.
 // Returns the count of issues closed. Logs warnings on errors but doesn't fail.
 func closeDescendants(b *beads.Beads, parentID string) int {
@@ -402,7 +410,9 @@ func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, err
 		return 0, nil
 	}
 
-	// First, recursively close grandchildren
+	// First, recursively close grandchildren. bd refuses to close an issue that
+	// still has open children, so every subtree has to reach its own fixed point
+	// before this level starts closing.
 	totalClosed := 0
 	var errs []error
 	for _, child := range children {
@@ -413,30 +423,98 @@ func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, err
 		}
 	}
 
-	// Then close direct children
-	var idsToClose []string
-	for _, child := range children {
-		if child.Status != "closed" {
-			idsToClose = append(idsToClose, child.ID)
-		}
-	}
-
-	if len(idsToClose) > 0 {
-		var closeErr error
-		if force {
-			closeErr = b.ForceCloseWithReason("burned: force-close descendants", idsToClose...)
-		} else {
-			closeErr = b.Close(idsToClose...)
-		}
-		if closeErr != nil {
-			errs = append(errs, fmt.Errorf("closing children of %s: %w", parentID, closeErr))
-		} else {
-			totalClosed += len(idsToClose)
-		}
+	// Then close direct children, repeating while the passes make progress.
+	closed, stillOpen, closeErr := closeChildrenToFixedPoint(b, parentID, children, force)
+	totalClosed += closed
+	if closeErr != nil {
+		errs = append(errs, closeErr)
+	} else if len(stillOpen) > 0 {
+		// Not an error bd reported — the passes simply stopped making progress.
+		// Say so anyway: the caller is about to close the root, and this is the
+		// only signal that it would be closing over still-open children.
+		errs = append(errs, fmt.Errorf("%d child issue(s) of %s still open after close passes: %s",
+			len(stillOpen), parentID, strings.Join(stillOpen, " ")))
 	}
 
 	if len(errs) > 0 {
 		return totalClosed, errors.Join(errs...)
 	}
 	return totalClosed, nil
+}
+
+// closeChildrenToFixedPoint closes the direct children of parentID, repeating
+// the close pass while it makes progress. Returns how many children went from
+// open to closed, which ones are still open when the passes stop, and any close
+// error that ended them.
+//
+// Molecule steps are SIBLINGS under one root, chained to each other by `blocks`
+// edges, and bd correctly refuses to close a blocked issue. `bd close a b c`
+// closes what it can and skips the rest, so one pass over the children in
+// whatever order the listing returns closes only those whose blockers happen to
+// already be closed — the rest are stranded. Recursing down parent-child does
+// nothing for that: the ordering constraint runs sideways between siblings, not
+// down the tree. This is the same arithmetic gt-g1q1 fixed in the daemon's dog
+// molecule path; gt-3xmz is this second site, and it is the worse of the two
+// because the daemon's root close is refused over open children (a loud stuck
+// root) while gt done's succeeds (a silent orphan).
+//
+// So the pass repeats: each one closes at least the chain's current head, which
+// unblocks the next link, and a pass that closes nothing means nothing closable
+// is left. This needs no knowledge of the dependency graph and is bounded by the
+// number of children.
+//
+// Progress is measured by re-reading the children, NOT by the close's exit
+// status: `bd close` given several IDs exits 0 when ANY of them settled as
+// closed. Trusting it is the second half of this bug — the old single pass
+// counted len(idsToClose) as closed whenever the batch exited 0, so a partially
+// refused close was reported as a complete one.
+//
+// Force is deliberately not used to push past the block guard when the caller
+// did not ask for it. The guard is the only thing keeping steps from closing out
+// of order; force-closing them destroys the ordering information and converts a
+// visible stuck molecule into silent damage (the argument recorded on gt-g1q1
+// and hq-vfr42).
+func closeChildrenToFixedPoint(b *beads.Beads, parentID string, children []*beads.Issue, force bool) (closed int, stillOpen []string, err error) {
+	open := openChildIDs(children)
+	initialOpen := len(open)
+
+	for pass := 0; pass < closeDescendantsPassLimit && len(open) > 0; pass++ {
+		var closeErr error
+		if force {
+			closeErr = b.ForceCloseWithReason("burned: force-close descendants", open...)
+		} else {
+			closeErr = b.Close(open...)
+		}
+
+		remaining, listErr := listChildrenAcrossTables(b, parentID)
+		if listErr != nil {
+			return initialOpen - len(open), open, fmt.Errorf("re-listing children of %s: %w", parentID, listErr)
+		}
+		remainingOpen := openChildIDs(remaining)
+		madeProgress := len(remainingOpen) < len(open)
+		open = remainingOpen
+		if !madeProgress {
+			// An identical next pass cannot help: whatever is left is blocked by
+			// something outside this set, or the close is failing outright. A
+			// close refused mid-chain is expected on earlier passes and is not
+			// reported — only the one that ended the passes is.
+			if closeErr != nil {
+				err = fmt.Errorf("closing children of %s: %w", parentID, closeErr)
+			}
+			break
+		}
+	}
+
+	return initialOpen - len(open), open, err
+}
+
+// openChildIDs returns the IDs of the children that still need closing.
+func openChildIDs(children []*beads.Issue) []string {
+	var open []string
+	for _, child := range children {
+		if child.Status != "closed" {
+			open = append(open, child.ID)
+		}
+	}
+	return open
 }
