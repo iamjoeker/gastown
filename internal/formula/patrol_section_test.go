@@ -27,6 +27,11 @@ var patrolSectionHeading = regexp.MustCompile(`(?m)^\*\*\d+\. .*\*\*\r?$`)
 
 const deaconPatrolFormula = "formulas/mol-deacon-patrol.formula.toml"
 
+// orphanedGoWorkDirSection is the section gt-yb33 added. Nothing extracts its
+// script yet; it is named here so a rename is caught by
+// TestPatrolSectionScriptFindsRealDeaconSections rather than by a silent skip.
+const orphanedGoWorkDirSection = "Orphaned Go build work directories"
+
 // findPatrolSectionScript returns the first bash block inside the section of
 // body titled title. Errors name the way the lookup failed, so a renamed
 // section, a duplicated one and a section with no script are distinguishable.
@@ -154,8 +159,9 @@ func TestFindPatrolSectionScriptDoesNotBorrowTheNextSectionsScript(t *testing.T)
 // This one fails if a heading is renamed or its script removed.
 func TestPatrolSectionScriptFindsRealDeaconSections(t *testing.T) {
 	for _, title := range []string{
-		tmpSweepSection,
+		staleTempDirSection,
 		stalePIDFileSection,
+		orphanedGoWorkDirSection,
 	} {
 		if script := patrolSectionScript(t, deaconPatrolFormula, title); strings.TrimSpace(script) == "" {
 			t.Errorf("section %q resolved to an empty script", title)

@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 19
+version = 18
 
 [vars]
 [vars.wisp_type]
@@ -322,7 +322,7 @@ needs = ["inbox-check"]
 description = """
 Detect and clean runtime pollution left by tests and dead processes.
 
-This step cleans up four categories of pollution, plus one report-only survey. **Only clean items where the
+This step cleans up five categories of pollution, plus one report-only survey. **Only clean items where the
 owning process is confirmed dead** — never kill or remove resources owned by
 live processes.
 
@@ -337,45 +337,62 @@ is an "imposter" — a leaked server from another workspace. Kill and log.
 gt dolt kill-imposters 2>/dev/null || true
 ```
 
-**2. Stranded build and test scratch dirs**
+**2. Stale test temp dirs**
 
-Reclaim orphaned scratch directories from TMPDIR: Go toolchain work directories
-(`go-build<n>`, `go-link-<n>`) and beads test fixtures (`beads-test-dolt-*`,
-`beads-bd-tests-*`). Both are created per invocation and removed on normal
-exit; a KILLED run — OOM killer, test timeout, polecat recycle — strands them,
-at 100-300MB a time for the Go ones.
-
-Where TMPDIR is a RAM-backed tmpfs this exhausts the filesystem: 34 stranded
-work directories held 5.35GB of a 31GB tmpfs on 2026-08-19, and gastown's own
-disk-space guard began refusing polecat creation with `insufficient disk space`
-while `df /` still reported 1.3TB free, because /tmp is a different filesystem
-(gt-yb33). The error names disk space rather than the test, so it reads as a
-code regression to whichever agent hits it next.
+Find `beads-test-dolt-*` and `beads-bd-tests-*` directories in TMPDIR and remove
+only the ones PROVEN to be idle. This is an `rm -rf` path; it fails closed. Every
+check that cannot produce a positive "nothing is open here" answer REFUSES.
 
 ```bash
-gt deacon sweep-tmp --json
+TMPDIR="${TMPDIR:-/tmp}"
+STALE_DIRS=0
+
+if ! command -v lsof >/dev/null 2>&1; then
+  # No lsof means no evidence. Missing evidence is not permission to delete.
+  echo "REFUSING all stale test dir cleanup: lsof not installed"
+else
+  while IFS= read -r dir; do
+    [ -d "$dir" ] || continue
+
+    # (a) Can WE walk the whole tree? If find cannot descend, lsof could not
+    #     either, and its silence means "I could not look", not "nothing open".
+    walk_err=$(find "$dir" -print 2>&1 >/dev/null)
+    if [ -n "$walk_err" ]; then
+      echo "REFUSING (cannot fully inspect): $dir"
+      continue
+    fi
+
+    # (b) lsof's STDOUT is the evidence. Its EXIT STATUS is not: on hosts with
+    #     docker nsfs/overlay mounts, `lsof +D` prints a can't-stat() warning and
+    #     exits non-zero on every run — including runs where it DID list live
+    #     handles. Testing the status deletes live data (gt-32z).
+    open_files=$(lsof +D "$dir" 2>/dev/null)
+    lsof_rc=$?
+    if [ -n "$open_files" ]; then
+      echo "REFUSING (live file handles): $dir"
+      continue
+    fi
+    # Empty output is only meaningful alongside lsof's "searched, found nothing"
+    # status (1). Anything else — 0 with no output, 127, a signal — is a broken
+    # check, not a clean bill of health.
+    if [ "$lsof_rc" -ne 1 ]; then
+      echo "REFUSING (lsof rc=$lsof_rc with no output, inconclusive): $dir"
+      continue
+    fi
+
+    chmod -R u+w "$dir" 2>/dev/null
+    rm -rf "$dir" && { echo "Cleaned stale test dir: $(basename "$dir")"; STALE_DIRS=$((STALE_DIRS + 1)); }
+  done <<EOF
+$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'beads-test-dolt-*' 2>/dev/null
+  find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'beads-bd-tests-*' 2>/dev/null)
+EOF
+fi
+echo "stale_dirs=$STALE_DIRS"
 ```
 
-The command owns the safety rules. It removes only directories whose name is
-exactly a member of a known family, that are real directories owned by this
-user, whose whole tree is readable and has been untouched for `--min-age`
-(default 1h), and that no running process is using — by naming the path in its
-argv, by having it as its working directory, or by holding an open file
-descriptor inside it. If the process table cannot be read it removes NOTHING,
-however old the directories look. It never touches agent scratchpads, PID
-files, or anything it did not positively identify.
-
-Read `removed` and `removed_bytes` from the JSON for the digest. A true
-`inconclusive` means the sweep refused for lack of evidence — report it, do not
-work around it. A non-zero `opaque_processes` is a named gap in coverage, not a
-failure: some processes will not publish their working directory or open files
-even to their owner, so only their command lines were searched.
-
-**DO NOT REIMPLEMENT THIS IN SHELL (gt-1gdh, gt-32z, gt-hkv).** This step used
-to be two inline blocks, and the beads-fixture half was an `rm -rf` guarded by
-`lsof`. It failed OPEN for months. The form was
-`if ! lsof +D "$dir" >/dev/null 2>&1; then rm -rf "$dir"; fi`, i.e. "delete when
-lsof exits non-zero". Measured on a host with docker mounts:
+**WHY THIS GUARD IS SHAPED THIS WAY (gt-32z) — DO NOT SIMPLIFY IT.** The previous
+version was `if ! lsof +D "$dir" >/dev/null 2>&1; then rm -rf "$dir"; fi`, i.e.
+"delete when lsof exits non-zero". Measured on a host with docker mounts:
 
 ```
 lsof +D <dir with 23 live handles on a running dolt server>   -> exit 1, correct STDOUT
@@ -384,29 +401,54 @@ lsof +D <directory we cannot read>                            -> exit 1, empty S
 lsof not installed                                            -> exit 127
 ```
 
-Every failure mode exits non-zero, so the test read every one of them as
-permission to `chmod -R u+w` and `rm -rf`. It would have destroyed a live Dolt
-server's `.dolt/` — the exact unrecoverable corruption the town CLAUDE.md
-forbids — plus 1.6GB of a named polecat's in-flight P0 test fixtures. It never
-fired only because of a SECOND, unrelated bug: `for dir in A* B*` under zsh
-aborts the whole statement when `A*` matches nothing, so the loop ran zero
-iterations. Repairing the glob alone — the natural, obviously-correct-looking
-fix — would have armed the destruction on its first run.
+Every failure mode exits non-zero, so the old test read every one of them as
+permission to `chmod -R u+w` and `rm -rf`. It failed OPEN into `rm -rf`, and it
+would have destroyed a live Dolt server's `.dolt/` — the exact unrecoverable
+corruption the town CLAUDE.md forbids — plus 1.6GB of a named polecat's in-flight
+P0 test fixtures.
 
-The repaired shell version worked by carefully NOT trusting lsof's exit status.
-`gt deacon sweep-tmp` reads /proc instead, where there is no status to misread,
-and where the same walk answers cwd and open descriptors as well as argv. The
-logic is Go with real unit tests against real fixtures (TestSweepRejectsDangerousRoots,
-TestScanRefusesSymlink, TestSweepSkipsWorkDirOfARunningBuild,
-TestSweepRefusesADirWithAnOpenFileDescriptor and its control) instead of prose
-in a TOML file that no test can reach.
+It never fired only because of a SECOND, unrelated bug: `for dir in A* B*` under
+zsh aborts the whole statement when `A*` matches nothing, so the loop ran zero
+iterations. Repairing the glob alone — the natural, obviously-correct-looking fix —
+would have armed the destruction on its first run. The `find` form above removes
+that dependency on shell glob semantics, which is why the guard had to be fixed in
+the same change. **Never restore an exit-status test here, and never re-add a bare
+glob `for` loop over these patterns.**
 
-**This is a symptom, not the disease.** Something is killing builds and suites
-often enough to strand dozens of directories in three days. If `removed` is
-routinely high, that is worth an investigation of its own (OOM killer, test
-timeouts, mid-build recycles), not a bigger sweep.
+**3. Orphaned Go build work directories**
 
-**3. Agent scratchpad directories**
+The Go toolchain creates a work directory under TMPDIR for every build, test and
+vet run, and removes it on normal exit. A KILLED build — OOM killer, test
+timeout, polecat recycle — strands it, at 100-300MB a time. Where TMPDIR is a
+RAM-backed tmpfs this exhausts the filesystem: 34 stranded directories held
+5.35GB of a 31GB tmpfs on 2026-08-19, and gastown's own disk-space guard began
+refusing polecat creation with `insufficient disk space` while `df /` still
+reported 1.3TB free, because /tmp is a different filesystem (gt-yb33). The error
+names disk space rather than the test, so it reads as a code regression to
+whichever agent hits it next.
+
+```bash
+gt deacon sweep-tmp --json
+```
+
+The command owns the safety rules; do not reimplement them in shell. It removes
+only directories whose name is exactly a Go work directory, that are real
+directories owned by this user, whose whole tree is readable and has been
+untouched for `--min-age` (default 1h), and which no running process names in
+its argv. If the process table cannot be read it removes NOTHING, however old
+the directories look. It never touches agent scratchpads, test fixtures, or
+anything it did not positively identify.
+
+Read `removed` and `removed_bytes` from the JSON for the digest. A non-zero
+`inconclusive` means the sweep refused for lack of evidence — report it, do not
+work around it.
+
+**This is a symptom, not the disease.** Something is killing builds often enough
+to strand dozens of work directories in three days. If `removed` is routinely
+high, that is worth an investigation of its own (OOM killer, test timeouts,
+mid-build recycles), not a bigger sweep.
+
+**4. Agent scratchpad directories**
 
 The other half of the same tmpfs. Every Claude Code session gets a private
 working directory under `$TMPDIR/claude-<uid>/`, and nothing removes it when the
@@ -433,7 +475,7 @@ proves death by conjunction (birth time versus live process start times, working
 directories, transcript activity, a forensic floor) and keeps anything it cannot
 prove dead. See `docs/scratchpad-retention.md`.
 
-**4. Stale PID/lock files**
+**5. Stale PID/lock files**
 
 Remove test-server PID files whose process is PROVEN dead. Same discipline as
 sub-section 2, one blast radius smaller: alive beats every probe, and a probe
@@ -516,7 +558,7 @@ kill -0 999999 (unallocated)   -> rc=1, "No such process"           dead
 **Never restore an exit-status-only `kill -0` test here, and never re-add a bare
 glob `for` loop over these patterns.**
 
-**5. Dead dog worktrees**
+**6. Dead dog worktrees**
 
 If a dog's tmux session is dead but worktree dirs remain, prune them.
 
@@ -561,21 +603,21 @@ only counts. **If you restore deletion here, you re-arm exactly that hazard** �
 a worktree is frequently the only thing holding a commit reachable. Prefer a tag
 (`preserve/*`) plus an explicit human decision over any automated prune.
 
-**6. Report**
+**7. Report**
 
 Log counts of cleaned items. If any items were cleaned, include counts in a
 brief summary for the patrol digest:
 
 ```
-Test pollution cleanup: rogue_dolt=N tmp_dirs=N scratchpads=N stale_pids=N dead_worktrees=N
+Test pollution cleanup: rogue_dolt=N stale_dirs=N go_build_dirs=N scratchpads=N stale_pids=N dead_worktrees=N
 ```
 
 If all counts are 0, log "Test pollution cleanup: clean" and move on.
 
 **Safety:**
 - NEVER kill this workspace's own legitimate dolt server (checked via data-dir)
-- NEVER remove a temp directory some process is using — and decide that from
-  /proc via `gt deacon sweep-tmp`, never from lsof's exit status (gt-32z)
+- NEVER remove dirs where lsof shows active file handles — and read lsof's
+  STDOUT, never its exit status, to decide that (gt-32z)
 - NEVER treat a check that could not run — missing tool, unreadable directory,
   non-zero status from a tool that also warns about unrelated filesystems — as
   permission to delete. Absence of a signal is not a clean bill of health.
