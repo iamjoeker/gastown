@@ -465,6 +465,13 @@ func doneSourceCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue *be
 	if skipReason != "" {
 		return skipReason, fatal
 	}
+	// A protected bead is real work that must not be auto-closed, so skipping
+	// the close is the whole remedy — failing here instead left the polecat no
+	// exit (gt-zu5n). Sources that are not work at all (wisps, formulas,
+	// internal types) stay fatal.
+	if reason := beads.ProtectedLabelRejectReason(issue); reason != "" {
+		return fmt.Sprintf("issue %s is protected (%s) — leaving it open instead of closing", issueID, reason), false
+	}
 	if err := validateConcreteSourceIssue(issueID, issue); err != nil {
 		return err.Error(), true
 	}
@@ -1056,7 +1063,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		isNoMergeTask := false
 		reviewOnlySource := false
 		if issueID != "" {
-			sourceInfo, sourceErr := resolveSubmitSourceIssue(cwd, issueID)
+			// Resolution only — concreteness is enforced below, once we know an
+			// MR is actually needed (gt-zu5n). Checking it here gated the no-MR
+			// path too, so a gt:keep bead had no exit at all.
+			sourceInfo, sourceErr := lookupSubmitSourceIssue(cwd, issueID)
 			if sourceErr != nil {
 				return fmt.Errorf("source issue validation failed: %w", sourceErr)
 			}
@@ -1193,6 +1203,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			// Skip straight to witness notification (no MR needed)
 			goto notifyWitness
+		}
+
+		// From here the branch carries commits, so a merge request (or a direct
+		// push) is coming and the source must be a concrete work issue — the
+		// refinery rejects an MR whose source is not. Deliberately after the
+		// no-MR return above: validate the source only once you know you need
+		// one (gt-zu5n).
+		if issueID != "" {
+			if err := validateConcreteSourceIssue(issueID, sourceIssueForNoMerge); err != nil {
+				return fmt.Errorf("source issue validation failed: %w", err)
+			}
 		}
 
 		if reviewOnlySource {
