@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/wisp"
 )
@@ -36,8 +37,14 @@ var defaultTTLs = map[string]time.Duration{
 
 // compactResult tracks what happened to each wisp during compaction.
 type compactResult struct {
-	Promoted         []compactAction `json:"promoted"`
-	Deleted          []compactAction `json:"deleted"`
+	Promoted []compactAction `json:"promoted"`
+	Deleted  []compactAction `json:"deleted"`
+	// Protected lists wisps past TTL that compaction declined to delete because
+	// they carry a reaper.ProtectedWispLabels label. Reported as its own list
+	// rather than folded into Skipped so a run that declines to delete SAYS so:
+	// gt-6dp's recurring shape is a count that cannot distinguish "protected N"
+	// from "there was less to do".
+	Protected        []compactAction `json:"protected,omitempty"`
 	Skipped          int             `json:"skipped"`            // wisps still within TTL
 	OrphanedWispDeps int             `json:"orphaned_wisp_deps"` // stale wisp_dependencies removed
 	Errors           []string        `json:"errors,omitempty"`
@@ -57,8 +64,10 @@ var compactCmd = &cobra.Command{
 	Long: `Apply TTL-based compaction policy to ephemeral wisps.
 
 For non-closed wisps past TTL: promotes to permanent beads (something is stuck).
-For closed wisps past TTL: deletes them (Dolt AS OF preserves history).
+For closed wisps past TTL: deletes them PERMANENTLY. Wisp tables are dolt-ignored,
+so there is no history to read AS OF and no backup to restore from.
 Wisps with comments or keep labels are always promoted.
+Wisps carrying a protected label (merge-request records) are never deleted.
 
 TTLs by wisp type:
   heartbeat, ping:              6h
@@ -378,6 +387,27 @@ func promoteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compac
 
 // deleteWisp removes a closed wisp that has expired past its TTL.
 func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compactResult) {
+	// The guard lives in the callee, not at the three call sites, deliberately.
+	// gt-6dp's post-mortem names reading the callee instead of the caller as
+	// "the whole lesson": the unbounded `bd purge --force` survived review
+	// because each caller looked reasonable in isolation. A call site added
+	// later inherits this check for free; it would not inherit a copy of the
+	// check written above each existing call.
+	if label := protectedWispLabel(w); label != "" {
+		protected := compactAction{
+			ID:       w.ID,
+			Title:    w.Title,
+			Reason:   fmt.Sprintf("protected label %s (would have been: %s)", label, reason),
+			WispType: w.WispType,
+		}
+		result.Protected = append(result.Protected, protected)
+		if compactVerbose && !compactJSON {
+			fmt.Printf("  %s %s %s (%s)\n",
+				style.Dim.Render("protect"), w.ID, compactTruncate(w.Title, 40), protected.Reason)
+		}
+		return
+	}
+
 	action := compactAction{ID: w.ID, Title: w.Title, Reason: reason, WispType: w.WispType}
 
 	if compactDryRun {
@@ -389,7 +419,11 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 		return
 	}
 
-	// bd delete --force (safe: Dolt AS OF preserves history)
+	// bd delete --force. NOT recoverable for wisps: wisp tables are dolt-ignored
+	// (hq-del4), so there is no history to read AS OF and no backup to restore
+	// from. --force is also the documented deliberate override that BYPASSES the
+	// gc.protected_labels skip `bd purge` applies, which is why this path needs
+	// protectedWispLabel above rather than inheriting bd's protection.
 	_, err := bd.Run("delete", w.ID, "--force")
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", w.ID, err))
@@ -407,7 +441,8 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 func printCompactSummary(result *compactResult) {
 	promoted := len(result.Promoted)
 	deleted := len(result.Deleted)
-	total := promoted + deleted + result.Skipped
+	protected := len(result.Protected)
+	total := promoted + deleted + protected + result.Skipped
 
 	if compactDryRun {
 		fmt.Printf("\n%s Dry run complete: %d wisps scanned\n",
@@ -419,6 +454,9 @@ func printCompactSummary(result *compactResult) {
 	fmt.Printf("  Promoted: %d\n", promoted)
 	fmt.Printf("  Deleted:  %d\n", deleted)
 	fmt.Printf("  Skipped:  %d (within TTL)\n", result.Skipped)
+	if protected > 0 {
+		fmt.Printf("  Protected: %d (past TTL, held by label)\n", protected)
+	}
 	if result.OrphanedWispDeps > 0 {
 		fmt.Printf("  Cleaned:  %d orphaned wisp dependency ref(s)\n", result.OrphanedWispDeps)
 	}
@@ -460,6 +498,32 @@ func hasComments(w *compactIssue) bool {
 // isReferenced checks dependency counts.
 func isReferenced(w *compactIssue) bool {
 	return w.DependentCount > 0 || w.DependencyCount > 0
+}
+
+// protectedWispLabel returns the label that forbids deleting w, or "" if none.
+//
+// The list is reaper.ProtectedWispLabels — the same variable the reaper's native
+// SQL delete consults — so the two paths cannot disagree about what is
+// undeletable. A private copy here would be a second list to keep in sync, and
+// gt-6dp is a record of what happens when one deleter is protected and another
+// is not.
+//
+// LIMIT, stated because an unstated one is how gt-6dp's near-miss happened:
+// this sees only labels. It does NOT see the `pinned` column, the other guard
+// `bd purge` and the reaper both honour, because `bd list --json` does not
+// return it. A responder who pins a record by hand is protected on those two
+// paths and NOT on this one. Type protection is the guard that needs nobody to
+// have anticipated the specific record, so it is the load-bearing half here,
+// but this is a partial guard and should not be cited as a complete one.
+func protectedWispLabel(w *compactIssue) string {
+	for _, label := range w.Labels {
+		for _, protected := range reaper.ProtectedWispLabels {
+			if label == protected {
+				return protected
+			}
+		}
+	}
+	return ""
 }
 
 // hasKeepLabel checks for keep labels.

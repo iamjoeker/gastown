@@ -153,8 +153,7 @@ func runMailClaim(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Preview: %s\n", style.Dim.Render(preview))
 	}
 	fmt.Printf("  From: %s\n", claimed.From)
-	// Zone label: local here, UTC in bd — see readMessage's Date line.
-	fmt.Printf("  Created: %s\n", claimed.Created.Local().Format("2006-01-02 15:04 MST"))
+	fmt.Printf("  Created: %s\n", claimed.Created.Local().Format("2006-01-02 15:04"))
 
 	return nil
 }

@@ -120,10 +120,8 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 				style.Dim.Render(msg.ID),
 				msg.From)
 		}
-		// Zone label: see the Date line in readMessage. The list is the surface
-		// most often read before a bead is opened, so it needs the label too.
 		fmt.Printf("      %s\n",
-			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04 MST")))
+			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04")))
 	}
 
 	return nil
