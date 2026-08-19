@@ -42,6 +42,15 @@ Drift kinds:
 A local edit whose shipped default has NOT moved since is not drift and is not
 listed — nothing is being missed there.
 
+What a pinned copy is missing:
+
+Being "behind" is not a finding — it is an unknown. So drift also names the
+sections (steps, and headings inside step descriptions) that the shipped
+default has and the executing copy does not. A missing '**Step 4: Reconcile
+the ledger**' is a step that is not running; that line is what a hand diff was
+being run to find (gt-yubx). A renamed heading also reads as missing, so treat
+the list as where to look, not as proof.
+
 Reconciling a pinned formula:
 
   # 1. See what the shipped default says
@@ -79,6 +88,11 @@ func init() {
 	formulaCmd.AddCommand(formulaDriftCmd)
 }
 
+// driftListSectionLimit bounds how many missing sections the fleet list names
+// per formula. One line per formula keeps the list scannable; the detail view
+// prints them all.
+const driftListSectionLimit = 2
+
 // formulaDriftJSONEntry is the machine-readable shape of one drifted formula.
 type formulaDriftJSONEntry struct {
 	Name          string `json:"name"`
@@ -89,6 +103,10 @@ type formulaDriftJSONEntry struct {
 	CurrentHash   string `json:"current_hash"`
 	InstalledHash string `json:"installed_hash"`
 	EmbeddedHash  string `json:"embedded_hash"`
+	// MissingSections is null when the two texts were not comparable (the
+	// executing copy IS the embedded default, or this build ships no default
+	// under that name) and [] when they were compared and nothing is absent.
+	MissingSections []formula.Section `json:"missing_sections"`
 }
 
 func runFormulaDrift(cmd *cobra.Command, args []string) error {
@@ -154,22 +172,58 @@ func formulaDriftOne(name, townRoot, rigName string) error {
 	}
 	if !resolved.ShadowsNewerDefault() {
 		reason := "matches the default shipped in this build"
+		prefix := style.SuccessPrefix
 		switch resolved.Drift {
 		case formula.DriftCustomized:
 			reason = "locally customized, but no newer default has shipped since — nothing is being missed"
+			// A hand merge declared complete with --mark-reconciled lands
+			// here, and an INCOMPLETE one lands here too: the hash baseline
+			// says "reconciled" because a human said so, not because the
+			// sections arrived. Compare the texts before repeating the claim.
+			if len(resolved.MissingSections()) > 0 {
+				reason = "locally customized, and no newer default has shipped since — but sections of the current default are absent:"
+				prefix = style.WarningPrefix
+			}
 		case formula.DriftNone:
 			if resolved.EmbeddedHash == "" {
 				reason = "this build ships no default under that name (purely local formula)"
 			}
 		}
-		fmt.Printf("  %s %s\n", style.SuccessPrefix, reason)
+		fmt.Printf("  %s %s\n", prefix, reason)
+		formulaDriftPrintMissing(resolved)
 		return nil
 	}
 
 	fmt.Printf("  drift:          %s\n", resolved.Drift)
 	fmt.Println()
 	fmt.Print(resolved.DriftNotice())
+	formulaDriftPrintMissing(resolved)
 	return nil
+}
+
+// formulaDriftPrintMissing lists, in full, the sections the shipped default has
+// and the executing copy does not.
+//
+// The empty case is printed too, and is not filler: "compared both texts, every
+// shipped section is present" bounds a pinned formula's risk to wording inside
+// sections it already has. Silence there would be indistinguishable from not
+// having looked.
+func formulaDriftPrintMissing(r *formula.Resolved) {
+	missing := r.MissingSections()
+	if missing == nil {
+		return
+	}
+	fmt.Println()
+	if len(missing) == 0 {
+		fmt.Printf("%s Every section of the shipped default is present in this copy;\n", style.SuccessPrefix)
+		fmt.Printf("  %s\n", style.Dim.Render("whatever it is behind by is wording inside sections it already has."))
+		return
+	}
+	fmt.Printf("%s Shipped sections absent from this copy (%d):\n", style.WarningPrefix, len(missing))
+	for _, s := range missing {
+		fmt.Printf("    %s\n", s)
+	}
+	fmt.Printf("  %s\n", style.Dim.Render("A renamed heading reads as missing — these are where to look, not proof."))
 }
 
 func formulaDriftAll(townRoot, rigName string) error {
@@ -197,6 +251,9 @@ func formulaDriftAll(townRoot, rigName string) error {
 		}
 		fmt.Printf("  %-38s %-9s %s\n", r.Name, r.Drift, r.Tier)
 		fmt.Printf("  %s\n", style.Dim.Render(r.Path))
+		if line := formula.SummarizeMissingSections(r.MissingSections(), driftListSectionLimit); line != "" {
+			fmt.Printf("  %s\n", line)
+		}
 		fmt.Printf("  %s\n\n", style.Dim.Render("→ "+fix))
 	}
 	fmt.Printf("%s\n", style.Dim.Render("Detail for one: gt formula drift <name>"))
@@ -207,14 +264,15 @@ func formulaDriftPrintJSON(list []*formula.Resolved) error {
 	entries := make([]formulaDriftJSONEntry, 0, len(list))
 	for _, r := range list {
 		entries = append(entries, formulaDriftJSONEntry{
-			Name:          r.Name,
-			Tier:          string(r.Tier),
-			Path:          r.Path,
-			Drift:         string(r.Drift),
-			AutoFixable:   r.AutoFixable(),
-			CurrentHash:   r.CurrentHash,
-			InstalledHash: r.InstalledHash,
-			EmbeddedHash:  r.EmbeddedHash,
+			Name:            r.Name,
+			Tier:            string(r.Tier),
+			Path:            r.Path,
+			Drift:           string(r.Drift),
+			AutoFixable:     r.AutoFixable(),
+			CurrentHash:     r.CurrentHash,
+			InstalledHash:   r.InstalledHash,
+			EmbeddedHash:    r.EmbeddedHash,
+			MissingSections: r.MissingSections(),
 		})
 	}
 	out, err := json.MarshalIndent(entries, "", "  ")
