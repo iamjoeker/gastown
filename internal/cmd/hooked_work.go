@@ -38,9 +38,55 @@ func listBeadsAcrossTables(b *beads.Beads, opts beads.ListOptions) ([]*beads.Iss
 	return merged, nil
 }
 
+// beadLister runs one bead query. It exists so the assignee-form fan-out below
+// is testable without a database.
+type beadLister func(beads.ListOptions) ([]*beads.Issue, error)
+
+// listAcrossAssigneeForms runs list once per address form the assignee's beads
+// may carry, and merges the results.
+//
+// Writers have not all converged on the canonical form: gt patrol report wrote
+// the next patrol wisp as assignee "deacon" while gt hook queried "deacon/". A
+// reader that matches only one form reports "Nothing on hook" for work that is
+// genuinely hooked, and the agent idles while it waits. See
+// beads.AgentAddressForms.
+func listAcrossAssigneeForms(list beadLister, opts beads.ListOptions) ([]*beads.Issue, error) {
+	forms := beads.AgentAddressForms(opts.Assignee)
+	if len(forms) <= 1 {
+		return list(opts)
+	}
+
+	limit := opts.Limit
+	var found []*beads.Issue
+	for _, form := range forms {
+		formOpts := opts
+		formOpts.Assignee = form
+		formOpts.Limit = 0
+		matched, err := list(formOpts)
+		if err != nil {
+			return nil, err
+		}
+		found = append(found, matched...)
+	}
+
+	merged := mergeBeadLists(found, nil)
+	if limit > 0 && len(merged) > limit {
+		return merged[:limit], nil
+	}
+	return merged, nil
+}
+
+// listBeadsAcrossAssigneeForms merges listBeadsAcrossTables results over every
+// address form for the assignee.
+func listBeadsAcrossAssigneeForms(b *beads.Beads, opts beads.ListOptions) ([]*beads.Issue, error) {
+	return listAcrossAssigneeForms(func(o beads.ListOptions) ([]*beads.Issue, error) {
+		return listBeadsAcrossTables(b, o)
+	}, opts)
+}
+
 func listAssignedActiveWork(b *beads.Beads, assignee string) ([]*beads.Issue, error) {
 	for _, status := range activeWorkStatuses() {
-		beadsForStatus, err := listBeadsAcrossTables(b, beads.ListOptions{
+		beadsForStatus, err := listBeadsAcrossAssigneeForms(b, beads.ListOptions{
 			Status:   status,
 			Assignee: assignee,
 			Priority: -1,
@@ -58,7 +104,7 @@ func listAssignedActiveWork(b *beads.Beads, assignee string) ([]*beads.Issue, er
 func listAssignedActiveWorkAcrossStatuses(b *beads.Beads, assignee string) ([]*beads.Issue, error) {
 	var assigned []*beads.Issue
 	for _, status := range activeWorkStatuses() {
-		beadsForStatus, err := listBeadsAcrossTables(b, beads.ListOptions{
+		beadsForStatus, err := listBeadsAcrossAssigneeForms(b, beads.ListOptions{
 			Status:   status,
 			Assignee: assignee,
 			Priority: -1,

@@ -1253,7 +1253,7 @@ func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []
 	agentBeadID := "gt-" + agent.Name
 	if agent.Address != "" && agent.Address != agent.Name {
 		// Use address for full path agents like gastown/crew/joe → gt-gastown-crew-joe
-		addr := strings.TrimSuffix(agent.Address, "/") // Remove trailing slash for global agents
+		addr := beads.BareAgentAddress(agent.Address) // Remove trailing slash for global agents
 		parts := strings.Split(addr, "/")
 		if len(parts) == 1 {
 			// Global agent: mayor/, deacon/ → hq-mayor, hq-deacon

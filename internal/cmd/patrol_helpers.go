@@ -333,6 +333,11 @@ func renderPatrolWispDescription(cfg PatrolConfig) (string, error) {
 }
 
 func patrolRigName(cfg PatrolConfig) string {
+	// Town-level roles are canonically addressed with a trailing slash
+	// ("deacon/"), which splits into a first segment that is a role, not a rig.
+	if beads.IsTownLevelSlashRole(cfg.Assignee) {
+		return ""
+	}
 	rigName, _, ok := strings.Cut(cfg.Assignee, "/")
 	if !ok {
 		return ""
