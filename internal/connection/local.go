@@ -167,8 +167,12 @@ func (c *LocalConnection) TmuxKillSession(name string) error {
 }
 
 // TmuxSendKeys sends keys to a tmux session.
+//
+// The Connection abstraction addresses sessions agents are running in, so this
+// is an agent-facing send and uses the guarded wrapper. A test holding a
+// Connection would otherwise have an unguarded route into a live pane (gt-7s8).
 func (c *LocalConnection) TmuxSendKeys(session, keys string) error {
-	return c.tmux.SendKeys(session, keys)
+	return c.tmux.SendKeysToAgent(session, keys)
 }
 
 // TmuxCapturePane captures the last N lines from a tmux pane.
