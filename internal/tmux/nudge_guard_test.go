@@ -53,8 +53,8 @@ func TestGuardTestNudge_AuthorizationIsScopedToItsSocket(t *testing.T) {
 	for _, socket := range []string{"", owned} {
 		handled, err := NewTmuxWithSocket(socket).guardTestNudge("hq-mayor", "msg")
 		if !handled || !errors.Is(err, ErrTestNudgeRefused) {
-			t.Errorf("guardTestNudge() with %s=1 on socket %s = (%v, %v), want (true, ErrTestNudgeRefused)",
-				AllowTestNudgeEnv, describeSocket(socket), handled, err)
+			t.Errorf("guardTestNudge() with %s=1 on socket %q = (%v, %v), want (true, ErrTestNudgeRefused)",
+				AllowTestNudgeEnv, socket, handled, err)
 		}
 	}
 
