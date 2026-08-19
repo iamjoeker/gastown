@@ -132,25 +132,11 @@ gt reaper purge --db=<name> \\
 
 **2. Inspect results for anomalies:**
 - Check for `dolt_commit_failed` anomalies — purged data may not be persisted
-- Check for `wisp_archive_failed` / `wisp_archive_stalled` anomalies — protected
-  wisps were NOT released and are still accumulating
 - Verify purge counts are reasonable (not suspiciously high or low)
-
-**Reading the three counts:** `wisps_purged`, `wisps_archived` and
-`wisps_protected` partition the closed-past-purge_age window, so they always add
-up and none can absorb another.
-- `wisps_purged` — ordinary wisps, deleted outright
-- `wisps_archived` — merge-request and escalation wisps, written to the durable
-  archive first and then deleted. Read them back with `gt reaper archive`.
-- `wisps_protected` — still held back: pinned rows, or anything the archive
-  refused. A number that climbs run after run means the archive is unavailable.
 
 **Safety:** Only deletes wisps that are already closed AND past the purge
 retention window. Active wisps are never touched. Reverse dependency
-references are cleaned up to prevent dangling parent refs. Wisps whose type
-must never be lost are exported and fsynced BEFORE their rows are deleted, so a
-failure anywhere leaves rows in the database rather than a record nowhere.
-Pinned wisps are never archived or deleted.
+references are cleaned up to prevent dangling parent refs.
 
 **Exit criteria:** Old closed wisps and mail purged."""
 
@@ -220,8 +206,6 @@ Generate summary and signal completion.
 **Databases scanned**: (count)
 **Wisps reaped**: (total closed stale open wisps)
 **Wisps purged**: (total deleted old closed wisps)
-**Wisps archived**: (protected wisps exported to the archive, then released)
-**Wisps protected**: (still held back — pinned, or archive unavailable)
 **Mail purged**: (total deleted old closed mail)
 **Issues auto-closed**: (stale > stale_issue_age, excl. epics/convoys/P0-P1/deps)
 **Convoys closed**: (all tracked beads closed, via gt convoy check)
