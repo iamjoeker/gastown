@@ -187,7 +187,15 @@ var mqRejectCmd = &cobra.Command{
 	Long: `Manually reject a merge request.
 
 This closes the MR with a 'rejected' status without merging.
-The source issue is NOT closed (work is not done).
+
+A rejection means the work is not done, so the source issue must be able to be
+re-slung. Reject never closes it, and if it is already CLOSED — a polecat that
+closed its own bead before submitting, or any other route — reject REOPENS it.
+Leaving it closed strands the branch on origin with nothing able to re-dispatch
+the work (gt-a46b). The Issue: line reports the issue's actual status.
+
+Tombstoned issues and non-work beads (wisps, agent beads) are reported, never
+rewritten.
 
 Examples:
   gt mq reject greenplace polecat/Nux/gp-xyz --reason "Does not meet requirements"
@@ -544,19 +552,77 @@ func runMQReject(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("rejecting MR: %w", err)
 	}
 
-	fmt.Printf("%s Rejected: %s\n", style.Bold.Render("✗"), result.Branch)
-	fmt.Printf("  Worker: %s\n", result.Worker)
+	fmt.Printf("%s Rejected: %s\n", style.Bold.Render("✗"), result.MR.Branch)
+	fmt.Printf("  Worker: %s\n", result.MR.Worker)
 	fmt.Printf("  Reason: %s\n", mqRejectReason)
-
-	if result.IssueID != "" {
-		fmt.Printf("  Issue:  %s %s\n", result.IssueID, style.Dim.Render("(not closed - work not done)"))
-	}
+	printRejectedIssueLine(result)
 
 	if mqRejectNotify {
 		fmt.Printf("  %s\n", style.Dim.Render("Worker notified via mail"))
 	}
 
 	return nil
+}
+
+// rejectedIssueReport is the source-issue outcome of a rejection, as plain text.
+type rejectedIssueReport struct {
+	// Note follows the issue ID on the Issue: line.
+	Note string
+	// Action is an operator instruction, empty when nothing needs doing by hand.
+	Action string
+}
+
+// rejectedIssueReportFor describes the source issue's ACTUAL state after a
+// rejection.
+//
+// The old wording ("not closed - work not done") described reject's own
+// behaviour but read as an assertion that the bead was open, so a bead that was
+// already closed looked available for re-dispatch when nothing could re-sling
+// it (gt-a46b).
+func rejectedIssueReportFor(result *refinery.RejectResult) rejectedIssueReport {
+	id := result.SourceIssueID
+	switch {
+	case result.SourceIssueErr != nil:
+		return rejectedIssueReport{
+			Note: fmt.Sprintf("(status unknown: %v)", result.SourceIssueErr),
+			Action: fmt.Sprintf(
+				"Check it by hand: bd show %s - if closed, run: bd reopen %s", id, id),
+		}
+	case result.SourceIssueReopened:
+		return rejectedIssueReport{
+			Note: "(was closed - reopened: rejection means the work is not done)",
+		}
+	case result.SourceIssueSkipReason != "":
+		return rejectedIssueReport{
+			Note: fmt.Sprintf("(status: %s - not reopened: %s)",
+				issueStatusLabel(result.SourceIssueStatus), result.SourceIssueSkipReason),
+			Action: fmt.Sprintf(
+				"This issue cannot be re-slung as-is. Resolve by hand: bd show %s", id),
+		}
+	default:
+		return rejectedIssueReport{
+			Note: fmt.Sprintf("(status: %s - reject did not close it)",
+				issueStatusLabel(result.SourceIssueStatus)),
+		}
+	}
+}
+
+func printRejectedIssueLine(result *refinery.RejectResult) {
+	if result.SourceIssueID == "" {
+		return
+	}
+	report := rejectedIssueReportFor(result)
+	fmt.Printf("  Issue:  %s %s\n", result.SourceIssueID, style.Dim.Render(report.Note))
+	if report.Action != "" {
+		fmt.Printf("  %s\n", style.Warning.Render(report.Action))
+	}
+}
+
+func issueStatusLabel(status string) string {
+	if strings.TrimSpace(status) == "" {
+		return "unknown"
+	}
+	return status
 }
 
 func runMQPostMerge(_ *cobra.Command, args []string) error {
