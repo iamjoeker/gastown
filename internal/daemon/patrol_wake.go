@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/awaitprobe"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -41,7 +40,7 @@ import (
 // itself: see [tmux.TurnState].
 //
 // The PRESENCE of an await is a different signal from its absence, and that one
-// is used: see [awaitprobe.Probe]. An ended turn is read here as "nothing is pending",
+// is used: see [awaitProbe]. An ended turn is read here as "nothing is pending",
 // which is false for an agent whose await was backgrounded — the await outlives
 // the turn that started it, and the wake lands on a healthy wait. Two such wakes
 // were measured on gastown/witness seven minutes apart with the await pid alive
@@ -137,7 +136,7 @@ func (d *Daemon) wakeStoppedTargets(targets []patrolWakeTarget) {
 
 	// One snapshot of the process table for the whole sweep, taken after the
 	// confirm delay so it is as close in time to the wake decision as possible.
-	probe := &awaitprobe.Probe{}
+	probe := &awaitProbe{}
 
 	for _, tgt := range candidates {
 		if state := d.tmux.TurnState(tgt.session); state != tmux.TurnEnded {
@@ -147,10 +146,10 @@ func (d *Daemon) wakeStoppedTargets(targets []patrolWakeTarget) {
 		// An ended turn does not mean nothing is pending: an await that was
 		// backgrounded outlives the turn that launched it, and waking then
 		// interrupts a healthy wait. Only a confirmed live await suppresses the
-		// wake — an unreadable process table leaves the pre-check behavior
-		// intact, because a wake that was not needed costs one cycle whereas a
-		// wake that was needed and withheld costs the loop.
-		if state := probe.State(tgt.bead); state == awaitprobe.StatePending {
+		// wake — awaitUnknown leaves the pre-check behavior intact, because a
+		// wake that was not needed costs one cycle whereas a wake that was
+		// needed and withheld costs the loop.
+		if state := probe.state(tgt.bead); state == awaitPending {
 			d.logger.Printf("patrol-wake: %s has a live await (%s), not waking", tgt.label(), tgt.bead)
 			continue
 		}
