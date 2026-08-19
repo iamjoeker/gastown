@@ -5,10 +5,16 @@ import (
 	"os"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/testenv"
 	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 func TestMain(m *testing.M) {
+	// Point this package at a dead Dolt port before anything else runs, so a
+	// test that reaches for Dolt without arranging a server of its own cannot
+	// land on the production one. See testenv.GuardProductionDolt.
+	testenv.GuardProductionDolt()
+
 	// Start an ephemeral Dolt container for this package's tests.
 	// setupTestStore sets BEADS_TEST_MODE=1, which causes the beads SDK
 	// to create testdb_<hash> databases. By routing those to an isolated

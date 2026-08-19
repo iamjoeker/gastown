@@ -288,21 +288,12 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		if err != nil {
 			return snapshot, fmt.Errorf("listing active polecat work for %s capacity: %w", rigName, err)
 		}
-		// Capacity counts a polecat holding an open MR as pending-MR rather than
-		// reusable, so it needs the same branch-level queue view the inventory
-		// surface uses (gt-46rk). A failed index degrades to the previous
-		// bead-only counting instead of failing the whole snapshot.
-		mrIndex, mrIndexErr := newPolecatBranchMRIndex(rigBeads)
-		if mrIndexErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to index merge requests for %s capacity: %v\n", rigName, mrIndexErr)
-			mrIndex = nil
-		}
 		prefix := beads.GetPrefixForRig(townRoot, rigName)
 		for _, name := range polecatNames {
 			agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, name)
 			issue := agents[agentID]
 			fields := parsePolecatAgentFields(issue)
-			applyAgentFieldsToCapacitySnapshot(&snapshot, rigName, name, fields, activeWork[name], sessions, mrIndex)
+			applyAgentFieldsToCapacitySnapshot(&snapshot, rigName, name, fields, activeWork[name], sessions)
 		}
 	}
 
@@ -338,8 +329,8 @@ func listPolecatDirectoryNames(rigPath string) ([]string, error) {
 	return names, nil
 }
 
-func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet, mrIndex *polecatBranchMRIndex) {
-	item := buildPolecatInventoryItem(rigName, polecatName, fields, activeWork, sessions, mrIndex)
+func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) {
+	item := buildPolecatInventoryItem(rigName, polecatName, fields, activeWork, sessions)
 	applyWorkstateDispositionToCapacitySnapshot(snapshot, item.State, item.Disposition)
 }
 

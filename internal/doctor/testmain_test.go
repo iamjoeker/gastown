@@ -21,5 +21,11 @@ import (
 // need a value still set it with t.Setenv.
 func TestMain(m *testing.M) {
 	testenv.UnsetAmbientTownEnv()
+
+	// After the strip, not before: UnsetAmbientTownEnv removes GT_* and
+	// BEADS_* wholesale, which would take the guarded port with it and leave
+	// resolution falling through to the 3307 default again.
+	testenv.GuardProductionDolt()
+
 	os.Exit(m.Run())
 }

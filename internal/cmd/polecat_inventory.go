@@ -73,68 +73,11 @@ func polecatSessionKey(rigName, polecatName string) string {
 	return rigName + polecatSessionKeySep + polecatName
 }
 
-// polecatBranchMRIndex answers "has this branch ever been submitted, and is an
-// MR for it open right now" from a single merge-queue listing, so the inventory
-// surface can consult the queue for a whole rig without one lookup per polecat.
-//
-// It exists because the agent bead's active_mr field is written by gt done and
-// by nothing else. When someone rescues a stranded branch with `gt mq submit`,
-// the owning polecat's field stays empty and the polecat keeps reporting
-// SAFE_TO_NUKE with an open MR against a branch that recycling would delete
-// (gt-46rk). The branch is the durable join key; the stored field is not.
-type polecatBranchMRIndex struct {
-	openMR    map[string]string // branch -> ID of an open MR for that branch
-	submitted map[string]bool   // branch -> an MR exists, open or closed
+func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) polecatInventoryItem {
+	return buildPolecatInventoryItemFromEvidence(rigName, polecatName, fields, assessPolecatAssignedIssueWork(activeWork), sessions)
 }
 
-// newPolecatBranchMRIndex builds the index from one ListMergeRequests call.
-// A nil index is valid and means "the queue was not consulted" — callers must
-// treat that as unknown, never as proof that no MR exists.
-func newPolecatBranchMRIndex(bd *beads.Beads) (*polecatBranchMRIndex, error) {
-	issues, err := bd.ListMergeRequests(beads.ListOptions{Status: "all", Label: "gt:merge-request"})
-	if err != nil {
-		return nil, err
-	}
-	index := &polecatBranchMRIndex{
-		openMR:    make(map[string]string),
-		submitted: make(map[string]bool),
-	}
-	for _, issue := range issues {
-		mrFields := beads.ParseMRFields(issue)
-		if mrFields == nil {
-			continue
-		}
-		branch := strings.TrimSpace(mrFields.Branch)
-		if branch == "" {
-			continue
-		}
-		index.submitted[branch] = true
-		if issue.Status != "closed" && index.openMR[branch] == "" {
-			index.openMR[branch] = issue.ID
-		}
-	}
-	return index, nil
-}
-
-func (i *polecatBranchMRIndex) hasMR(branch string) bool {
-	if i == nil || branch == "" {
-		return false
-	}
-	return i.submitted[branch]
-}
-
-func (i *polecatBranchMRIndex) openMRFor(branch string) string {
-	if i == nil || branch == "" {
-		return ""
-	}
-	return i.openMR[branch]
-}
-
-func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet, mrIndex *polecatBranchMRIndex) polecatInventoryItem {
-	return buildPolecatInventoryItemFromEvidence(rigName, polecatName, fields, assessPolecatAssignedIssueWork(activeWork), sessions, mrIndex)
-}
-
-func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *beads.AgentFields, activeWorkEvidence polecatActiveWorkEvidence, sessions polecatSessionSet, mrIndex *polecatBranchMRIndex) polecatInventoryItem {
+func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *beads.AgentFields, activeWorkEvidence polecatActiveWorkEvidence, sessions polecatSessionSet) polecatInventoryItem {
 	sessionName, running := sessions.lookup(rigName, polecatName)
 	item := polecatInventoryItem{
 		Rig:            rigName,
@@ -156,18 +99,9 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		input.CleanupStatus = polecat.CleanupStatus(item.CleanupStatus)
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
-		input.MRRefused = fields.MRRefused
 		input.Branch = item.Branch
 		input.ActiveMR = item.ActiveMR
 	}
-
-	// This surface reads beads only — it never runs git, so it cannot know
-	// whether unmerged commits remain and deliberately leaves MQCheckRequired
-	// false rather than letting DecideWorkstate conclude "not_required" from
-	// facts nobody gathered. MRSubmitted is the one merge-queue fact available
-	// cheaply, and it is only ever used to CLEAR a recorded refusal, never to
-	// assert that submission happened.
-	input.MRSubmitted = mrIndex.hasMR(item.Branch)
 
 	if !activeWorkEvidence.BlocksCleanup && fields != nil {
 		activeWorkEvidence = assessPolecatAgentStateWork(beads.AgentState(strings.TrimSpace(fields.AgentState)))
@@ -197,14 +131,6 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 	}
 	if item.ActiveMR != "" {
 		input.ActiveMRBlocker = "active_mr=" + item.ActiveMR + " status=unknown"
-	} else if openMR := mrIndex.openMRFor(item.Branch); openMR != "" {
-		// An open MR nobody recorded on this agent bead — the rescue-submit case
-		// (gt-46rk). The branch it points at is the only copy of that work, and
-		// the polecat would otherwise read SAFE_TO_NUKE right up until recycling
-		// force-deleted the branch out from under the queue.
-		item.ActiveMR = openMR
-		input.ActiveMR = openMR
-		input.ActiveMRBlocker = "active_mr=" + openMR + " status=open source=branch-index"
 	}
 
 	input.State = item.State

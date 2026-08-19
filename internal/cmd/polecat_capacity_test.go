@@ -423,7 +423,7 @@ func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			snapshot := polecatCapacitySnapshot{}
-			applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", "synth", tt.fields, tt.activeWork, nil, nil)
+			applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", "synth", tt.fields, tt.activeWork, nil)
 			if snapshot.Working != tt.want.Working || snapshot.RecoveryBlocked != tt.want.RecoveryBlocked || snapshot.ReusableIdle != tt.want.ReusableIdle || snapshot.PendingMR != tt.want.PendingMR || snapshot.capacityUsed != tt.want.capacityUsed {
 				t.Fatalf("snapshot = %+v, want %+v", snapshot, tt.want)
 			}

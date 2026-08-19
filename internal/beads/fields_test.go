@@ -588,41 +588,6 @@ func TestAgentFieldsMRFailedTrue(t *testing.T) {
 	}
 }
 
-// TestAgentFieldsMRRefusedTrue pins the field that makes gt done's MR refusal
-// legible on the agent bead. Before it existed, a refusal and an ordinary
-// completion with nothing to enqueue produced byte-identical completion
-// metadata — mr_failed absent, mr_id absent — so every polecat surface reported
-// the refused polecat as finished and safe while its pushed branch sat outside
-// the merge queue (gt-46rk).
-func TestAgentFieldsMRRefusedTrue(t *testing.T) {
-	fields := &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "beads",
-		AgentState: "done",
-		ExitType:   "COMPLETED",
-		Branch:     "polecat/dag/bd-uh0",
-		MRRefused:  true,
-	}
-
-	formatted := FormatAgentDescription("Polecat dag", fields)
-	if !strings.Contains(formatted, "mr_refused: true") {
-		t.Errorf("missing mr_refused: true in formatted output:\n%s", formatted)
-	}
-	// A refusal is not a failure: gt-7qm deliberately leaves mr_failed false so
-	// the hook clears and the session retires rather than looping.
-	if strings.Contains(formatted, "mr_failed") {
-		t.Errorf("refusal must not be written as a failure:\n%s", formatted)
-	}
-
-	parsed := ParseAgentFields(formatted)
-	if !parsed.MRRefused {
-		t.Errorf("MRRefused: got false, want true")
-	}
-	if parsed.MRFailed {
-		t.Errorf("MRFailed: got true, want false")
-	}
-}
-
 func TestAgentFieldsCompletionOmittedWhenEmpty(t *testing.T) {
 	fields := &AgentFields{
 		RoleType:   "polecat",
@@ -632,7 +597,7 @@ func TestAgentFieldsCompletionOmittedWhenEmpty(t *testing.T) {
 	}
 
 	formatted := FormatAgentDescription("Polecat nux", fields)
-	for _, keyword := range []string{"exit_type:", "mr_id:", "branch:", "last_source_issue:", "mr_failed:", "mr_refused:", "completion_time:"} {
+	for _, keyword := range []string{"exit_type:", "mr_id:", "branch:", "last_source_issue:", "mr_failed:", "completion_time:"} {
 		if strings.Contains(formatted, keyword) {
 			t.Errorf("empty completion field %q should not appear in output:\n%s", keyword, formatted)
 		}
