@@ -613,14 +613,10 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Check if bead is already assigned (guard against accidental re-sling).
 	// This must happen before resolveTarget(), since rig targets can spawn/hook a new polecat as a side-effect.
-	// Resolving the owner here also settles which store a moved bead really lives
-	// in (gt-ad32), before the cross-rig guard and any bd write runs.
-	owner, err := resolveBeadOwner(townRoot, beadID)
+	info, err := getBeadInfo(beadID)
 	if err != nil {
 		return fmt.Errorf("checking bead status: %w", err)
 	}
-	reportMovedBead(beadID, owner)
-	info := owner.Info
 
 	// Guard against slinging beads with flag-like titles (gt-e0kx5).
 	// These are garbage beads created by flag-parsing bugs. Slinging them
@@ -632,7 +628,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Guard against dispatching closed/tombstone beads (defense-in-depth).
 	// Not bypassed by --force — if you need to re-dispatch, reopen the bead first.
 	if info.Status == "closed" || info.Status == "tombstone" {
-		return closedBeadError(beadID, owner)
+		return fmt.Errorf("bead %s is %s (work already completed)", beadID, info.Status)
 	}
 
 	// Guard against slinging deferred beads (gt-1326mw).
@@ -1171,14 +1167,9 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	return nil
 }
 
-// checkCrossRigGuard validates that a bead belongs to the target rig.
+// checkCrossRigGuard validates that a bead's prefix matches the target rig.
 // Polecats work in their rig's worktree and cannot fix code owned by another rig.
 // Returns an error if the bead belongs to a different rig than the target polecat.
-//
-// Ownership comes from beads.RigNameForBead, which prefers a store override
-// registered by resolveBeadOwner over the rig the id prefix names. A bead moved
-// across rigs keeps its original prefix, so the prefix alone would send it back
-// to the rig that closed it (gt-ad32).
 //
 // When the prefix maps to town root, the guard warns rather than errors: this
 // ambiguous case arises when a crew member's redirect chain is broken and their
@@ -1198,8 +1189,7 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 		return nil
 	}
 
-	beadRig := beads.RigNameForBead(townRoot, beadID)
-	_, ownedByOverride := beads.LookupBeadStore(beadID)
+	beadRig := beads.GetRigNameForPrefix(townRoot, beadPrefix)
 
 	if beadRig != targetRig {
 		if beadRig == "" {
@@ -1208,9 +1198,7 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 			//   (b) prefix is not in routes.jsonl at all (unknown prefix)
 			// GetRigPathForPrefix distinguishes them: it returns townRoot for (a),
 			// empty string for (b).
-			// An override means the live row was read from the town-level store,
-			// which settles the question without consulting the prefix at all.
-			if !ownedByOverride && beads.GetRigPathForPrefix(townRoot, beadPrefix) == "" {
+			if beads.GetRigPathForPrefix(townRoot, beadPrefix) == "" {
 				// Unknown prefix — no route exists, can't resolve rig.
 				return fmt.Errorf("bead %s (prefix %q) is not in rig %q — prefix not in routes\n"+
 					"Create the task from the rig directory: cd %s && bd create --title=...\n"+
@@ -1225,17 +1213,9 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 				style.Warning.Render("⚠"), beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig)
 			return nil
 		}
-		// Say which store answered. The same id can be open in one rig and closed
-		// in another, and a mismatch that names only the prefix reads as operator
-		// error rather than as a moved bead (gt-ad32).
-		ownership := fmt.Sprintf("prefix %q", strings.TrimSuffix(beadPrefix, "-"))
-		if ownedByOverride {
-			ownership = fmt.Sprintf("live row, prefix %q notwithstanding", strings.TrimSuffix(beadPrefix, "-"))
-		}
-		return fmt.Errorf("cross-rig mismatch: bead %s belongs to rig %q by %s, but target is rig %q\n"+
-			"Sling it to its owning rig: gt sling %s %s\n"+
-			"Or create the task from the target rig: cd %s && bd create --title=...\n"+
-			"Use --force to override", beadID, beadRig, ownership, targetRig, beadID, beadRig, targetRig)
+		return fmt.Errorf("cross-rig mismatch: bead %s (prefix %q) belongs to rig %q, but target is rig %q\n"+
+			"Create the task from the target rig: cd %s && bd create --title=...\n"+
+			"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), beadRig, targetRig, targetRig)
 	}
 
 	return nil
