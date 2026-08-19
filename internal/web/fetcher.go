@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -27,24 +28,47 @@ import (
 
 // runCmd executes a command with a timeout and returns stdout.
 // Returns empty buffer on timeout or error.
-// Security: errors from this function are logged server-side only (via log.Printf
-// in callers) and never included in HTTP responses. The handler renders templates
-// with whatever data was successfully fetched; fetch failures result in empty panels.
+//
+// stderr is captured into the error rather than discarded: a command's exit
+// status says only that it failed, and the panels need to tell one failure from
+// another — "no server running" is an empty town, anything else is a town the
+// dashboard could not read. See tmuxServerAbsent.
 func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("%s timed out after %v", name, timeout)
 		}
+		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			return nil, fmt.Errorf("%s: %w: %s", name, err, detail)
+		}
 		return nil, err
 	}
 	return &stdout, nil
+}
+
+// tmuxServerAbsent reports whether a tmux command failed because there is no
+// tmux server at all.
+//
+// That is a town with nothing running — genuinely zero sessions — and it must
+// stay distinguishable from a tmux the dashboard could not ask. tmux exits
+// non-zero for both, so the discrimination is on the message: without it, the
+// "unreadable" caveat would appear on every town whose server is simply down
+// and stop carrying information.
+func tmuxServerAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no server running") ||
+		strings.Contains(msg, "error connecting to")
 }
 
 // runTmuxCmd runs a tmux command using the per-town socket.
@@ -125,6 +149,25 @@ func (cb *fetchCircuitBreaker) allow() bool {
 	}
 	cb.inFlight = true
 	return true
+}
+
+// unavailableReason explains why allow() refused, so the caller can report
+// that it has no data instead of returning an empty result.
+//
+// A backed-off fetch knows nothing about the town: the breaker exists to stop
+// process storms, not to make an unreadable panel look like a quiet one.
+func (cb *fetchCircuitBreaker) unavailableReason() error {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures == 0 {
+		return errors.New("a query is already in flight")
+	}
+	retryIn := cb.backoff - time.Since(cb.lastAttempt)
+	if retryIn < 0 {
+		retryIn = 0
+	}
+	return fmt.Errorf("backing off after %d consecutive failures, retrying in %v",
+		cb.failures, retryIn.Round(time.Second))
 }
 
 // recordFailure increments the failure count and sets exponential backoff.
@@ -236,7 +279,10 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 // persistently (e.g., "invalid issue type: convoy" schema mismatch).
 func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	if !f.convoyBreaker.allow() {
-		return nil, nil // Backed off — return empty result silently
+		// Backed off, so this call read nothing. Reporting that is the whole
+		// point: the panel that renders a silent backoff as an empty list is
+		// claiming there are no convoys on the evidence of a query never run.
+		return nil, fmt.Errorf("listing convoys: %w", f.convoyBreaker.unavailableReason())
 	}
 
 	// List all open issues and filter locally so legacy type=convoy beads remain visible.
@@ -992,8 +1038,11 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	// Query all tmux sessions with window_activity for more accurate timing
 	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
-		// tmux not running or no sessions
-		return nil, nil
+		if tmuxServerAbsent(err) {
+			return nil, nil // No tmux server: there really are no workers.
+		}
+		// Any other tmux failure means the worker list is unknown, not empty.
+		return nil, fmt.Errorf("listing worker sessions: %w", err)
 	}
 
 	// Pre-fetch merge queue count to determine refinery idle status
@@ -1173,21 +1222,30 @@ func (f *LiveConvoyFetcher) getWorkerStatusHint(sessionName string) string {
 	return ""
 }
 
-// getMergeQueueCount returns the total number of open PRs across all repos.
+// mergeQueueCountUnknown marks a queue that could not be read. It is distinct
+// from zero because the refinery's hint reads zero as "idle", which is a claim
+// about the refinery made on the strength of a query that never answered.
+const mergeQueueCountUnknown = -1
+
+// getMergeQueueCount returns the total number of open PRs across all repos, or
+// mergeQueueCountUnknown when the queue could not be read.
 func (f *LiveConvoyFetcher) getMergeQueueCount() int {
 	mergeQueue, err := f.FetchMergeQueue()
 	if err != nil {
-		return 0
+		log.Printf("dashboard: merge queue count unavailable: %v", err)
+		return mergeQueueCountUnknown
 	}
 	return len(mergeQueue.Rows)
 }
 
 // getRefineryStatusHint returns appropriate status for refinery based on merge queue.
 func (f *LiveConvoyFetcher) getRefineryStatusHint(mergeQueueCount int) string {
-	if mergeQueueCount == 0 {
+	switch {
+	case mergeQueueCount == mergeQueueCountUnknown:
+		return "Merge queue unreadable"
+	case mergeQueueCount == 0:
 		return "Idle - Waiting for PRs"
-	}
-	if mergeQueueCount == 1 {
+	case mergeQueueCount == 1:
 		return "Processing 1 PR"
 	}
 	return fmt.Sprintf("Processing %d PRs", mergeQueueCount)
@@ -1564,11 +1622,15 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 }
 
 // FetchQueues returns work queues and their status.
+//
+// A bd failure is an error, not an empty queue list: "bd not available" and "no
+// queues" are different facts, and only one of them means the panel can be
+// trusted.
 func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 	// List queue beads
 	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:queue", "--json")
 	if err != nil {
-		return nil, nil // No queues or bd not available
+		return nil, fmt.Errorf("listing queues: %w", err)
 	}
 
 	var queues []struct {
@@ -1621,7 +1683,11 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
 	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
-		return nil, nil // tmux not running or no sessions
+		if tmuxServerAbsent(err) {
+			return nil, nil // No tmux server: there really are no sessions.
+		}
+		// Any other tmux failure means the session list is unknown, not empty.
+		return nil, fmt.Errorf("listing tmux sessions: %w", err)
 	}
 
 	var rows []SessionRow
@@ -1747,6 +1813,11 @@ func (f *LiveConvoyFetcher) listHookRows(storeDir string) ([]HookRow, error) {
 }
 
 // FetchMayor returns the Mayor's current status.
+//
+// This is the sharpest case of the swallowed-error family: a tmux the
+// dashboard could not ask used to be rendered as the specific, confident claim
+// that the Mayor is detached. Only an absent tmux server supports that claim —
+// every other failure leaves the Mayor's state unknown.
 func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	status := &MayorStatus{
 		IsAttached: false,
@@ -1758,8 +1829,10 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	// Check if mayor tmux session exists
 	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
-		// tmux not running or no sessions
-		return status, nil
+		if tmuxServerAbsent(err) {
+			return status, nil // No tmux server: the Mayor really is detached.
+		}
+		return nil, fmt.Errorf("checking mayor session: %w", err)
 	}
 
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
@@ -2003,13 +2076,19 @@ func (f *LiveConvoyFetcher) listIssueBeads(storeDir, status string, limit int) (
 }
 
 // FetchActivity returns recent activity from the event log.
+//
+// A missing log is a town that has not logged anything yet; an unreadable one
+// is a town whose history the dashboard cannot see. The split follows FetchDogs.
 func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 	eventsPath := filepath.Join(f.townRoot, ".events.jsonl")
 
 	// Read events file
 	data, err := os.ReadFile(eventsPath)
 	if err != nil {
-		return nil, nil // No events file
+		if os.IsNotExist(err) {
+			return nil, nil // No events file yet — nothing has happened.
+		}
+		return nil, fmt.Errorf("reading event log: %w", err)
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")

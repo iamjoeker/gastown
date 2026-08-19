@@ -22,24 +22,33 @@ type MockConvoyFetcher struct {
 	MergeQueue           []MergeQueueRow
 	MergeQueueFailedRigs []string
 	Workers              []WorkerRow
-	Mail                 []MailRow
-	Rigs                 []RigRow
-	Dogs                 []DogRow
-	Escalations          []EscalationRow
-	EscalationsError     error
-	Health               *HealthRow
-	Queues               []QueueRow
-	Sessions             []SessionRow
-	Hooks                []HookRow
+	// WorkersError and the other per-panel errors are the levers for the
+	// "could not read" render path. Each panel needs its own: a single shared
+	// error cannot show that one panel failing leaves the others intact.
+	WorkersError     error
+	Mail             []MailRow
+	Rigs             []RigRow
+	Dogs             []DogRow
+	Escalations      []EscalationRow
+	EscalationsError error
+	Health           *HealthRow
+	Queues           []QueueRow
+	QueuesError      error
+	Sessions         []SessionRow
+	SessionsError    error
+	Hooks            []HookRow
 	// HooksFailedStores names stores whose hooked-bead query failed, so the
 	// handler's partial-union caveat can be driven from a test.
 	HooksFailedStores []string
 	Mayor             *MayorStatus
+	MayorError        error
 	Issues            []IssueRow
 	// IssuesFailedStores is the same lever for the backlog union.
 	IssuesFailedStores []string
 	Activity           []ActivityRow
-	Error              error
+	ActivityError      error
+	// Error is the convoy fetch's error.
+	Error error
 }
 
 func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
@@ -51,7 +60,7 @@ func (m *MockConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 }
 
 func (m *MockConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
-	return m.Workers, nil
+	return m.Workers, m.WorkersError
 }
 
 func (m *MockConvoyFetcher) FetchMail() ([]MailRow, error) {
@@ -75,11 +84,11 @@ func (m *MockConvoyFetcher) FetchHealth() (*HealthRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchQueues() ([]QueueRow, error) {
-	return m.Queues, nil
+	return m.Queues, m.QueuesError
 }
 
 func (m *MockConvoyFetcher) FetchSessions() ([]SessionRow, error) {
-	return m.Sessions, nil
+	return m.Sessions, m.SessionsError
 }
 
 func (m *MockConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
@@ -87,7 +96,7 @@ func (m *MockConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
 }
 
 func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
-	return m.Mayor, nil
+	return m.Mayor, m.MayorError
 }
 
 func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
@@ -95,7 +104,7 @@ func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 }
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
-	return m.Activity, nil
+	return m.Activity, m.ActivityError
 }
 
 func TestConvoyHandler_RendersTemplate(t *testing.T) {
@@ -257,8 +266,9 @@ func TestConvoyHandler_MultipleConvoys(t *testing.T) {
 }
 
 // Integration tests for error handling
-// Note: The refactored dashboard handler treats fetch errors as non-fatal,
-// rendering an empty section instead of returning an error.
+// Note: The dashboard handler treats fetch errors as non-fatal — the page still
+// renders — but a panel whose fetch failed says so rather than rendering the
+// empty state it would show for a genuinely quiet town (gt-egq9).
 
 func TestConvoyHandler_FetchConvoysError(t *testing.T) {
 	mock := &MockConvoyFetcher{
@@ -275,15 +285,20 @@ func TestConvoyHandler_FetchConvoysError(t *testing.T) {
 
 	handler.ServeHTTP(w, req)
 
-	// Fetch errors are now non-fatal - the dashboard still renders
+	// Fetch errors are non-fatal - the dashboard still renders
 	if w.Code != http.StatusOK {
 		t.Errorf("Status = %d, want %d (fetch errors are non-fatal)", w.Code, http.StatusOK)
 	}
 
 	body := w.Body.String()
-	// Should show the empty state for convoys section
-	if !strings.Contains(body, "No active convoys") {
-		t.Error("Response should show empty state when fetch fails")
+	if !strings.Contains(body, "Convoys unavailable") {
+		t.Error("Panel should say convoys are unavailable when the fetch failed")
+	}
+	if !strings.Contains(body, errFetchFailed.Error()) {
+		t.Error("Notice should name the reason the query failed")
+	}
+	if strings.Contains(body, "No active convoys") {
+		t.Error("A failed fetch must not render the empty state — that is the bug")
 	}
 }
 
@@ -457,6 +472,117 @@ func TestConvoyHandler_NoEscalationsRendersEmptyState(t *testing.T) {
 	}
 	if !strings.Contains(body, "All clear") {
 		t.Error("A quiet, readable town should still render 'All clear'")
+	}
+}
+
+// TestConvoyHandler_UnreadablePanelsSaySo covers the six panels that used to
+// answer a failed fetch with (nil, nil): each must name the reason it has no
+// rows instead of rendering the empty state a quiet town produces (gt-egq9).
+func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
+	// A distinct reason per panel: one shared message could not show that each
+	// panel reports its OWN failure rather than a page-wide banner.
+	mock := &MockConvoyFetcher{
+		Error:         errors.New("listing convoys: backing off after 3 consecutive failures"),
+		WorkersError:  errors.New("listing worker sessions: tmux timed out after 2s"),
+		QueuesError:   errors.New("listing queues: connection refused"),
+		SessionsError: errors.New("listing tmux sessions: tmux timed out after 2s"),
+		MayorError:    errors.New("checking mayor session: tmux timed out after 2s"),
+		ActivityError: errors.New("reading event log: permission denied"),
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+
+	for _, want := range []string{
+		"Convoys unavailable: listing convoys: backing off after 3 consecutive failures",
+		"Polecats unavailable: listing worker sessions: tmux timed out after 2s",
+		"Queues unavailable: listing queues: connection refused",
+		"Sessions unavailable: listing tmux sessions: tmux timed out after 2s",
+		"Mayor status unavailable: checking mayor session: tmux timed out after 2s",
+		"Activity unavailable: reading event log: permission denied",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("panel should name why it could not read: missing %q", want)
+		}
+	}
+
+	// The empty states are the exact renders the bug produced. None may appear.
+	for _, unwanted := range []string{
+		"No active convoys",
+		"<p>No polecats</p>",
+		"No active sessions",
+		"No recent activity",
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("an unreadable panel must not render its empty state: found %q", unwanted)
+		}
+	}
+
+	// "Detached" is a claim about tmux, and tmux could not be reached.
+	if strings.Contains(body, "badge-muted\">Detached") {
+		t.Error("the Mayor banner must not claim 'Detached' when tmux could not be asked")
+	}
+
+	// The banner is what an operator reads at a glance.
+	if strings.Contains(body, "All clear") {
+		t.Error("a dashboard that cannot see six panels is not 'All clear'")
+	}
+	for _, want := range []string{"polecats unreadable", "convoys unreadable"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("summary alerts should flag the unreadable panel: missing %q", want)
+		}
+	}
+}
+
+// TestConvoyHandler_QuietTownRendersEmptyStates is the control for
+// TestConvoyHandler_UnreadablePanelsSaySo. Without it, a caveat rendered on
+// every load would pass the test above and carry no information at all.
+func TestConvoyHandler_QuietTownRendersEmptyStates(t *testing.T) {
+	mock := &MockConvoyFetcher{Convoys: []ConvoyRow{}}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+
+	for _, want := range []string{
+		"No active convoys",
+		"<p>No polecats</p>",
+		"No active sessions",
+		"No recent activity",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("a readable, quiet panel should render its empty state: missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"Convoys unavailable",
+		"Polecats unavailable",
+		"Queues unavailable",
+		"Sessions unavailable",
+		"Mayor status unavailable",
+		"Activity unavailable",
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("a successful query must not render an unavailable notice: found %q", unwanted)
+		}
+	}
+	if !strings.Contains(body, "All clear") {
+		t.Error("a quiet, readable town should still render 'All clear'")
 	}
 }
 
