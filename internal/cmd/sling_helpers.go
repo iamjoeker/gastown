@@ -924,72 +924,10 @@ func wakeRigAgents(rigName string) {
 	}
 }
 
-// nudgeDelivery records the outcome of every path attempted when waking an
-// agent (gt-lae6). A nudge has two independent delivery paths — a file event
-// and a tmux nudge — and either one reaching the agent is enough. A caller that
-// only knows "the function returned" cannot tell "both paths delivered" from
-// "both paths failed", so it must be handed the per-path outcome instead.
-type nudgeDelivery struct {
-	// TestHook is true when the test hook short-circuited both real paths.
-	// It counts as delivered: under test there is no agent to reach, and a
-	// caller under test must not report a delivery failure that never happened.
-	TestHook bool
-	// EventEmitted is true when the file event was written.
-	EventEmitted bool
-	// EventErr is set when the event path was attempted and failed, or was
-	// skipped because no town root could be resolved.
-	EventErr error
-	// SessionNudged is true when the tmux session accepted the message.
-	SessionNudged bool
-	// SessionErr is set when the tmux nudge was attempted and failed.
-	SessionErr error
-}
-
-// Delivered reports whether at least one path reached the agent.
-func (d nudgeDelivery) Delivered() bool {
-	return d.TestHook || d.EventEmitted || d.SessionNudged
-}
-
-// Degraded reports whether the agent was reached but a path failed getting
-// there. Degraded delivery is still delivery, and it is worth reporting: it is
-// the only warning that the redundancy is gone.
-func (d nudgeDelivery) Degraded() bool {
-	return d.Delivered() && (d.EventErr != nil || d.SessionErr != nil)
-}
-
-// Summary describes each path's outcome, e.g. "event emitted, tmux nudge
-// failed: ...". Single-line: it is printed as part of one console line.
-func (d nudgeDelivery) Summary() string {
-	if d.TestHook {
-		return "test hook: no delivery attempted"
-	}
-	parts := make([]string, 0, 2)
-	switch {
-	case d.EventEmitted:
-		parts = append(parts, "event emitted")
-	case d.EventErr != nil:
-		parts = append(parts, "event emit failed: "+strings.Join(strings.Fields(d.EventErr.Error()), " "))
-	default:
-		parts = append(parts, "event not attempted")
-	}
-	switch {
-	case d.SessionNudged:
-		parts = append(parts, "tmux nudge delivered")
-	case d.SessionErr != nil:
-		parts = append(parts, "tmux nudge failed: "+strings.Join(strings.Fields(d.SessionErr.Error()), " "))
-	default:
-		parts = append(parts, "tmux nudge not attempted")
-	}
-	return strings.Join(parts, ", ")
-}
-
 // nudgeWitness wakes the witness after polecat completion (gt-a6gp).
 // Replaces POLECAT_DONE mail — nudges are free (no Dolt commit).
 // Uses immediate delivery: sends directly to the tmux pane.
-// Returns which paths delivered (gt-lae6) — callers must not report success
-// unconditionally, because a witness that never heard the polecat produced an
-// identical transcript to one that did.
-func nudgeWitness(rigName, message string) nudgeDelivery {
+func nudgeWitness(rigName, message string) {
 	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 
 	// Test hook: log nudge for test observability. Returns before both the
@@ -997,35 +935,23 @@ func nudgeWitness(rigName, message string) nudgeDelivery {
 	// event or poke a live session.
 	if logPath, inTest := testNudgeHook(); inTest {
 		writeTestNudgeLog(logPath, fmt.Sprintf("nudge:%s:%s\n", witnessSession, message))
-		return nudgeDelivery{TestHook: true}
+		return
 	}
-
-	var d nudgeDelivery
 
 	// Emit a file event so the witness's await-event unblocks instantly.
 	townRoot, _ := workspace.FindFromCwd()
-	if townRoot == "" {
-		d.EventErr = fmt.Errorf("no town root found from cwd")
-	} else if _, err := channelevents.EmitToRig(townRoot, rigName, "witness", "POLECAT_DONE", []string{
-		"source=polecat",
-		"rig=" + rigName,
-		"message=" + message,
-	}); err != nil {
-		d.EventErr = err
-		fmt.Fprintf(os.Stderr, "Warning: failed to emit POLECAT_DONE event to rig %s: %v\n", rigName, err)
-	} else {
-		d.EventEmitted = true
+	if townRoot != "" {
+		_, _ = channelevents.EmitToRig(townRoot, rigName, "witness", "POLECAT_DONE", []string{
+			"source=polecat",
+			"rig=" + rigName,
+			"message=" + message,
+		})
 	}
 
 	t := tmux.NewTmux()
 	if err := t.NudgeSession(witnessSession, message); err != nil {
-		d.SessionErr = err
 		fmt.Fprintf(os.Stderr, "Warning: failed to nudge witness %s: %v\n", witnessSession, err)
-	} else {
-		d.SessionNudged = true
 	}
-
-	return d
 }
 
 // nudgeRefinery wakes the refinery after an MR is created.

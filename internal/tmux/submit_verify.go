@@ -10,13 +10,7 @@ import (
 
 // ErrSubmitNotVerified reports that a nudge payload was typed, but the
 // transport could not prove it left the target composer.
-//
-// The text is deliberately branch-neutral (gt-lae6): it used to claim "message
-// stranded in composer", which is only one of the states that reach here. The
-// dirty-composer branch means the target held OTHER text, and readers of that
-// error — agents and humans alike — diagnosed the wrong failure from the
-// shared wording. Each wrap below supplies the state it actually observed.
-var ErrSubmitNotVerified = errors.New("submit not verified")
+var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
 type submitProbe int
 
@@ -301,7 +295,7 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeUnknown:
 		return enterErr
 	case probeComposerDirty:
-		return fmt.Errorf("%w (composer held other text after Enter; our message was never seen stranded)", ErrSubmitNotVerified)
+		return fmt.Errorf("%w (composer contains other text after Enter)", ErrSubmitNotVerified)
 	case probeStranded:
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
@@ -311,7 +305,7 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 
 func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix string) error {
 	if _, err := t.run("send-keys", "-t", target, "C-j"); err != nil {
-		return fmt.Errorf("%w (message stranded in composer; C-j reset failed: %v)", ErrSubmitNotVerified, err)
+		return fmt.Errorf("%w (C-j reset failed: %v)", ErrSubmitNotVerified, err)
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -320,18 +314,18 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		return nil
 	case probeComposerCleared:
 		if err := t.sendMessageToTarget(target, message); err != nil {
-			return fmt.Errorf("%w (message stranded in composer; retype failed: %v)", ErrSubmitNotVerified, err)
+			return fmt.Errorf("%w (retype failed: %v)", ErrSubmitNotVerified, err)
 		}
 		time.Sleep(adaptiveTextDelay(len(message)))
 		_ = t.sendEnterVerified(target)
 	case probeStranded, probeComposerDirty, probeUnknown:
-		return fmt.Errorf("%w (message stranded in composer; composer state after C-j: %s)", ErrSubmitNotVerified, probe)
+		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
 	}
 
 	switch probe := t.pollSubmission(target, needle, promptPrefix, submitProbeAttempts); probe {
 	case probeTurnStarted, probeComposerCleared:
 		return nil
 	default:
-		return fmt.Errorf("nudge submit to %q: %w (message stranded in composer; final state: %s)", target, ErrSubmitNotVerified, probe)
+		return fmt.Errorf("nudge submit to %q: %w (final state: %s)", target, ErrSubmitNotVerified, probe)
 	}
 }
