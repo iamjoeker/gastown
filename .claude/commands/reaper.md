@@ -73,8 +73,17 @@ For each database with reap candidates:
 gt reaper reap --db=<name> --port=3307 --max-age=24h [--dry-run] --json
 ```
 
-**IMPORTANT**: Scan/reap count mismatch is NORMAL (witness closes wisps concurrently).
-Do NOT escalate scan > reap mismatches. Only escalate actual errors.
+**IMPORTANT**: Scan/reap count mismatch is NORMAL in BOTH directions. Do not
+escalate either one — only escalate actual errors.
+
+- `scan > reap`: the witness closes wisps concurrently.
+- `reap > scan`: one reap call runs to a fixed point (gt-r1b). Closing a molecule
+  wisp releases its step-wisps, which the same call then closes; scan and
+  `--dry-run` count only what is closable right now and cannot see that cascade,
+  so they are a LOWER BOUND, not a prediction.
+
+One invocation per database is enough — `passes` in the JSON reports how many
+rounds it took, and the last round is always the one that closed nothing.
 
 ### Step 5: Purge old closed wisps and mail
 
