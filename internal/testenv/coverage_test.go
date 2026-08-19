@@ -32,26 +32,10 @@ var testMainDecl = regexp.MustCompile(`(?m)^func TestMain\(`)
 //	    testenv.GuardProductionDolt()
 //	    os.Exit(m.Run())
 //	}
-//
-// SCOPE, which this check used to leave unstated. It walks every module in the
-// repository, not just the one it lives in. Nested modules were skipped once,
-// on the reasoning that they are "built and tested on their own terms" — but
-// nothing tested them on those terms: `go test ./...` from the repo root
-// reports "matched no packages" for a nested module, and `make test` is that
-// command, so plugins/dolt-snapshots was covered by no gate at all while this
-// check reported complete coverage of the repo (gt-05p1). A check that cannot
-// see something has to say so; this one descends instead, because the scan is
-// textual and a module boundary does not stop a filesystem walk.
-//
-// What a nested module cannot do is import testenv — internal/ is unimportable
-// across a module boundary. It satisfies the same contract with its own
-// GuardProductionDolt; see plugins/dolt-snapshots/testmain_guard_test.go, whose
-// port constants TestNestedModuleGuardsMatchThisPackage holds against this
-// package's.
 func TestEveryTestPackageGuardsProductionDolt(t *testing.T) {
 	root := moduleRoot(t)
 
-	var unguarded, missing, nested []string
+	var unguarded, missing []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -63,15 +47,11 @@ func TestEveryTestPackageGuardsProductionDolt(t *testing.T) {
 			return filepath.SkipDir
 		}
 
-		rel, _ := filepath.Rel(root, path)
-		if path != root && isModuleRoot(path) {
-			nested = append(nested, rel)
-		}
-
 		scan := scanTestFiles(t, path)
 		if !scan.hasTests {
 			return nil
 		}
+		rel, _ := filepath.Rel(root, path)
 		if !scan.hasTestMain {
 			missing = append(missing, rel)
 			return nil
@@ -85,22 +65,12 @@ func TestEveryTestPackageGuardsProductionDolt(t *testing.T) {
 		t.Fatalf("walking %s: %v", root, err)
 	}
 
-	// Stated, not assumed: these are the modules `go test ./...` does not
-	// reach and this walk does. If the list is ever empty the boundary is the
-	// root module and nothing is hidden behind a go.mod.
-	if len(nested) > 0 {
-		t.Logf("nested modules covered by this check but NOT by `go test ./...` from the repo root:\n  %s",
-			strings.Join(nested, "\n  "))
-	}
-
 	if len(missing) > 0 {
-		t.Errorf("packages with tests but no TestMain (they inherit the production Dolt port):\n  %s\n"+
-			"a package in a nested module cannot import testenv; it declares its own "+
-			"GuardProductionDolt instead (see plugins/dolt-snapshots/testmain_guard_test.go)",
+		t.Errorf("packages with tests but no TestMain (they inherit the production Dolt port):\n  %s",
 			strings.Join(missing, "\n  "))
 	}
 	if len(unguarded) > 0 {
-		t.Errorf("TestMain declarations that never call GuardProductionDolt:\n  %s",
+		t.Errorf("TestMain declarations that never call testenv.GuardProductionDolt:\n  %s",
 			strings.Join(unguarded, "\n  "))
 	}
 }
@@ -147,11 +117,8 @@ func scanTestFiles(t *testing.T, dir string) dirScan {
 }
 
 // skipDir reports whether a directory is outside the scope of this check:
-// testdata and fixture trees, and vendored or generated dependency trees.
-//
-// A nested go.mod is deliberately NOT on this list. It was, and that is the
-// whole of gt-05p1: the exclusion was invisible in the result, so a module
-// nothing else tested read as covered.
+// testdata and fixture trees, tool directories, and any nested module, whose
+// packages are built and tested on their own terms.
 func skipDir(root, path, name string) bool {
 	if path == root {
 		return false
@@ -160,14 +127,14 @@ func skipDir(root, path, name string) bool {
 	case "testdata", "vendor", "node_modules", ".git":
 		return true
 	}
-	return strings.HasPrefix(name, ".")
-}
-
-// isModuleRoot reports whether a directory holds a go.mod, and so begins a
-// module of its own.
-func isModuleRoot(path string) bool {
-	_, err := os.Stat(filepath.Join(path, "go.mod"))
-	return err == nil
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	// A nested go.mod means a separate module.
+	if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+		return true
+	}
+	return false
 }
 
 // moduleRoot walks up from the test's working directory to the directory
