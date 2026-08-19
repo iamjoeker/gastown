@@ -67,7 +67,15 @@
         {{if .Summary}}
         <div class="summary-banner">
             <div class="summary-stats">
-                {{if .Health}}
+                {{if .HealthUnavailable}}
+                <!-- The stat renders only when health is known, so a failed read
+                     used to remove the liveness indicator instead of showing a
+                     bad one — and a missing warning light reads as a good one. -->
+                <div class="stat health-stat unhealthy" title="{{.HealthUnavailable}}">
+                    <span class="stat-value">?</span>
+                    <span class="stat-label">💓 heartbeat unreadable</span>
+                </div>
+                {{else if .Health}}
                 <div class="stat health-stat {{if .Health.HeartbeatFresh}}healthy{{else}}unhealthy{{end}}">
                     <span class="stat-value">{{if .Health.HeartbeatFresh}}✓{{else}}⚠{{end}}</span>
                     <span class="stat-label">💓 {{.Health.DeaconHeartbeat}}</span>
@@ -111,6 +119,18 @@
                 {{end}}
                 {{if .Summary.IssuesUnavailable}}
                 <span class="alert-item alert-red">📋 work unreadable</span>
+                {{end}}
+                {{if .Summary.MergeQueueUnavailable}}
+                <span class="alert-item alert-red">🔀 merge queue unreadable</span>
+                {{end}}
+                {{if .Summary.MailUnavailable}}
+                <span class="alert-item alert-red">✉️ mail unreadable</span>
+                {{end}}
+                {{if .Summary.RigsUnavailable}}
+                <span class="alert-item alert-red">🏗️ rigs unreadable</span>
+                {{end}}
+                {{if .Summary.HealthUnavailable}}
+                <span class="alert-item alert-red">💓 health unreadable</span>
                 {{end}}
                 {{if .Summary.StuckPolecats}}
                 <span class="alert-item alert-red">💀 {{.Summary.StuckPolecats}} stuck</span>
@@ -523,7 +543,7 @@
             <div class="panel" id="mail-panel">
                 <div class="panel-header">
                     <h2>✉️ Mail</h2>
-                    <span class="count" id="mail-count">{{len .Mail}}</span>
+                    <span class="count" id="mail-count">{{if .MailUnavailable}}?{{else}}{{len .Mail}}{{end}}</span>
                     <div class="mail-tabs">
                         <button class="mail-tab active" data-tab="inbox">Inbox</button>
                         <button class="mail-tab" data-tab="all">All Traffic</button>
@@ -543,7 +563,15 @@
                     </div>
                     <!-- All Mail view (all traffic from beads) -->
                     <div id="mail-all" style="display: none;">
-                        {{if .Mail}}
+                        {{if .MailUnavailable}}
+                        <!-- Unreadable, not silent: the mail query failed, so
+                             this panel knows of no traffic rather than there
+                             having been none. -->
+                        <div class="empty-state">
+                            <p class="truncation-notice">⚠️ Mail unavailable: {{.MailUnavailable}}</p>
+                            <p>This is NOT "no mail" — the dashboard could not read it.</p>
+                        </div>
+                        {{else if .Mail}}
                         <table class="mail-all-table">
                             <thead>
                                 <tr>
@@ -622,7 +650,7 @@
             <div class="panel" id="merge-queue-panel">
                 <div class="panel-header">
                     <h2>🔀 Merge Queue</h2>
-                    <span class="count">{{len .MergeQueue}}{{if .MergeQueueFailedRigs}}+{{end}}</span>
+                    <span class="count">{{if .MergeQueueUnavailable}}?{{else}}{{len .MergeQueue}}{{if .MergeQueueFailedRigs}}+{{end}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
@@ -632,7 +660,15 @@
                     {{end}}
                     <!-- MR List View -->
                     <div id="pr-list">
-                        {{if .MergeQueue}}
+                        {{if .MergeQueueUnavailable}}
+                        <!-- No rig was asked at all, so the queue is unknown.
+                             "Merge queue empty" here would be the dashboard
+                             telling an operator that work has stopped arriving. -->
+                        <div class="empty-state">
+                            <p class="truncation-notice">⚠️ Merge queue unavailable: {{.MergeQueueUnavailable}}</p>
+                            <p>This is NOT "merge queue empty" — the dashboard could not read it.</p>
+                        </div>
+                        {{else if .MergeQueue}}
                         <table>
                             <thead>
                                 <tr>
@@ -786,12 +822,20 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🏗️ Rigs</h2>
-                    <span class="count">{{len .Rigs}}</span>
+                    <span class="count">{{if .RigsUnavailable}}?{{else}}{{len .Rigs}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Rigs}}
+                    {{if .RigsUnavailable}}
+                    <!-- The rig list is the town's roster. Rendering "No rigs
+                         configured" from a config that could not be read claims
+                         the town is empty. -->
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ Rigs unavailable: {{.RigsUnavailable}}</p>
+                        <p>This is NOT "no rigs" — the dashboard could not read the rig list.</p>
+                    </div>
+                    {{else if .Rigs}}
                     <table>
                         <thead>
                             <tr>
