@@ -25,16 +25,7 @@ func sourceRouteContext(currentBeadsDir, routedBeadsDir string) string {
 	return fmt.Sprintf("current_db=%s routed_db=%s", currentBeadsDir, routedBeadsDir)
 }
 
-// lookupSubmitSourceIssue resolves issueID to its routed bead without judging
-// whether that bead is a usable merge-request source.
-//
-// gt-zu5n: concreteness is a precondition of *creating an MR*, not of reading
-// the source issue. Validating it at resolution time made every completion path
-// pay the check, including the ones that submit nothing — so hardening a bead
-// with gt:keep (the sanctioned reaper exemption) turned the polecat working it
-// into a zombie with no exit. Callers that will submit must follow this with
-// validateConcreteSourceIssue once they know an MR is needed.
-func lookupSubmitSourceIssue(cwd, issueID string) (*submitSourceIssue, error) {
+func resolveSubmitSourceIssue(cwd, issueID string) (*submitSourceIssue, error) {
 	issueID = strings.TrimSpace(issueID)
 	if issueID == "" {
 		return nil, fmt.Errorf("source_issue is required")
@@ -45,6 +36,9 @@ func lookupSubmitSourceIssue(cwd, issueID string) (*submitSourceIssue, error) {
 	if err != nil {
 		return nil, fmt.Errorf("source_issue %s could not be resolved (%s): %w", issueID, sourceRouteContext(currentBeadsDir, routedBeadsDir), err)
 	}
+	if err := validateConcreteSourceIssue(issueID, issue); err != nil {
+		return nil, err
+	}
 	return &submitSourceIssue{
 		ID:              issueID,
 		Issue:           issue,
@@ -52,20 +46,6 @@ func lookupSubmitSourceIssue(cwd, issueID string) (*submitSourceIssue, error) {
 		CurrentBeadsDir: currentBeadsDir,
 		RoutedBeadsDir:  routedBeadsDir,
 	}, nil
-}
-
-// resolveSubmitSourceIssue is lookupSubmitSourceIssue for callers that are
-// definitely creating a merge request, and so must reject a non-concrete source
-// up front.
-func resolveSubmitSourceIssue(cwd, issueID string) (*submitSourceIssue, error) {
-	source, err := lookupSubmitSourceIssue(cwd, issueID)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateConcreteSourceIssue(source.ID, source.Issue); err != nil {
-		return nil, err
-	}
-	return source, nil
 }
 
 func validateConcreteSourceIssue(issueID string, issue *beads.Issue) error {

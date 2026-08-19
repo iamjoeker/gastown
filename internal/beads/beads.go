@@ -263,22 +263,6 @@ func ConcreteWorkIssueRejectReason(issue *Issue) string {
 		if InternalIssueLabel(label) {
 			return "internal-label:" + strings.ToLower(strings.TrimSpace(label))
 		}
-	}
-	return ProtectedLabelRejectReason(issue)
-}
-
-// ProtectedLabelRejectReason returns why issue is rejected on account of a
-// protected label alone, or "" when no label protects it.
-//
-// This is the recoverable half of ConcreteWorkIssueRejectReason. A wisp, a
-// formula or an internal type is not work at all, but a protected bead is
-// ordinary work that merely must not be auto-closed — completion paths that
-// close nothing can carry on past it (gt-zu5n).
-func ProtectedLabelRejectReason(issue *Issue) string {
-	if issue == nil {
-		return ""
-	}
-	for _, label := range issue.Labels {
 		if ProtectedIssueLabel(label) {
 			return "protected-label:" + strings.ToLower(strings.TrimSpace(label))
 		}
@@ -539,6 +523,14 @@ type CreateOptions struct {
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
 	Rig         string // Target rig database (e.g., "gantry"). When set, binds create to the rig's .beads directory.
+
+	// WispType classifies an ephemeral issue for gt compact's TTL policy
+	// (heartbeat, ping, patrol, gc_report, recovery, error, escalation — see
+	// wisp_type.go). Ignored unless Ephemeral is set: the column only exists on
+	// the wisps table. Leave empty when no vocabulary value fits; the wisp then
+	// falls to compaction's "default" TTL, which is what every wisp got before
+	// gt-fqd5.
+	WispType string
 }
 
 // UpdateOptions specifies options for updating an issue.
@@ -1859,6 +1851,9 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	if IsFlagLikeTitle(opts.Title) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
 	}
+	if err := opts.validateWispType(); err != nil {
+		return nil, err
+	}
 
 	targetDir, err := b.targetBeadsDirForCreate(opts)
 	if err != nil {
@@ -1902,6 +1897,9 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	}
 	if opts.Ephemeral {
 		args = append(args, "--ephemeral")
+		if opts.WispType != "" {
+			args = append(args, "--wisp-type="+opts.WispType)
+		}
 	}
 	// Default Actor from BD_ACTOR env var if not specified
 	// Uses getActor() to respect isolated mode (tests)
