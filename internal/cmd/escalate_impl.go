@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -84,16 +83,6 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("  Actions: %s\n", strings.Join(actions, ", "))
 		fmt.Printf("  Mail targets: %s\n", strings.Join(targets, ", "))
-		// Whether anything outlives the ephemeral record is the question a dry
-		// run should answer, and the one nobody could ask before gt-3i4e.
-		if slices.Contains(actions, escalationBeadAction) {
-			fmt.Printf("  Durable bead: yes\n")
-		} else {
-			fmt.Printf("  Durable bead: no — only the ephemeral record, which is GC'd unread\n")
-		}
-		if len(actions) == 0 {
-			style.PrintWarning("severity %q routes to nothing: this escalation would be recorded but undelivered, and would exit non-zero", severity)
-		}
 		return nil
 	}
 
@@ -144,12 +133,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Send mail to each target (actions with "mail:" prefix)
 	router := mail.NewRouter(townRoot)
 	defer router.WaitPendingNotifications()
-	// Statuses start EMPTY. A status is appended only once its channel has been
-	// attempted, and its success flags are set only from a real result. Seeding
-	// this slice with a hardcoded {Channel: "bead", Created: true} was the whole
-	// of the "bead" action's implementation (gt-3i4e): a claim that could never
-	// report failure, printed on every escalation at every severity.
-	var statuses []deliveryStatus
+	statuses := []deliveryStatus{{Channel: "bead", Created: true, Severity: severity}}
 	for _, target := range targets {
 		status := deliveryStatus{Target: target, Channel: "mail", Severity: severity, NotificationRoute: "mail+nudge"}
 		msg := &mail.Message{
@@ -190,7 +174,6 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 			style.PrintWarning("failed to annotate escalation mail for %s: %v", target, err)
 			continue
 		}
-		status.BeadID = mailIssue.ID
 
 		addLabels := []string{
 			fmt.Sprintf("severity:%s", severity),
@@ -203,18 +186,6 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 			status.Annotated = true
 		}
 		statuses = append(statuses, status)
-	}
-
-	// Execute the "bead" routing action. It runs after the mail loop on purpose:
-	// a successfully annotated mail copy already IS the durable delivery bead, so
-	// this only creates one when nothing else has (see deliverEscalationBead).
-	beadStatus := deliverEscalationBead(bd, actions, statuses, issue.ID, severity,
-		fmt.Sprintf("[%s] %s", strings.ToUpper(severity), description),
-		formatEscalationDeliveryBody(issue.ID, description, fields))
-	if beadStatus != nil {
-		// Prepend: "bead" is listed first in every configured route, and the
-		// durable record reads before the notifications about it.
-		statuses = append([]deliveryStatus{*beadStatus}, statuses...)
 	}
 
 	// Process external notification actions (email:, sms:, slack, log)
@@ -230,7 +201,6 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	_ = events.LogFeed(events.TypeEscalationSent, agentID, payload)
 
 	// Output
-	delivered := escalationWasDelivered(statuses)
 	if escalateJSON {
 		hasFailure := false
 		for _, status := range statuses {
@@ -240,13 +210,12 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 			}
 		}
 		result := map[string]interface{}{
-			"id":        issue.ID,
-			"severity":  severity,
-			"actions":   actions,
-			"targets":   targets,
-			"delivery":  statuses,
-			"status":    escalationDeliveryStatus(delivered, hasFailure),
-			"delivered": delivered,
+			"id":       issue.ID,
+			"severity": severity,
+			"actions":  actions,
+			"targets":  targets,
+			"delivery": statuses,
+			"status":   map[bool]string{true: "partial_failure", false: "ok"}[hasFailure],
 		}
 		if escalateSource != "" {
 			result["source"] = escalateSource
@@ -266,18 +235,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if fingerprintLabel != "" {
 			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		if beadStatus != nil && beadStatus.BeadID != "" {
-			// The record itself is an ephemeral wisp; this is the bead that
-			// outlives it and that `gt escalate list` renders.
-			fmt.Printf("  Recorded as: %s\n", beadStatus.BeadID)
-		}
-		if len(targets) > 0 {
-			fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
-		} else {
-			// An empty "Routed to:" is how this bug hid for so long — it reads
-			// as a rendering glitch rather than as "nobody was told".
-			fmt.Printf("  Routed to: no mail targets (%s route: %s)\n", severity, strings.Join(actions, ", "))
-		}
+		fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
 		for _, status := range statuses {
 			if status.Error != "" {
 				fmt.Printf("  Delivery issue [%s:%s]: %s\n", status.Channel, status.Target, status.Error)
@@ -285,117 +243,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// A routing no-op must never print a success banner and exit 0. The record
-	// exists, but it is an ephemeral wisp with nothing durable referencing it, so
-	// it will be garbage-collected unread — which is exactly how the dn-qpk
-	// disposition was lost for 16 days (gt-3i4e).
-	if !delivered {
-		return fmt.Errorf("escalation %s was recorded but NOT delivered: the %q route (%s) produced no delivery, "+
-			"and the record is an ephemeral wisp that will be garbage-collected with no trace. "+
-			"Fix the route in %s, or re-file at a higher severity",
-			issue.ID, severity, strings.Join(actions, ", "), config.EscalationConfigPath(townRoot))
-	}
-
 	return nil
-}
-
-// escalationBeadAction is the routing action that records an escalation as a
-// durable bead.
-const escalationBeadAction = "bead"
-
-// escalationBeadCreator is the slice of *beads.Beads deliverEscalationBead needs,
-// so the routing decision can be tested without a bd subprocess.
-type escalationBeadCreator interface {
-	CreateEscalationDeliveryBead(title, body, recordID, severity string) (*beads.Issue, error)
-}
-
-// deliverEscalationBead executes the "bead" routing action and returns its
-// delivery status, or nil when the route does not contain the action.
-//
-// Nothing used to dispatch on "bead" at all: it was configured on all four
-// routes, reported as created on every escalation, and implemented nowhere
-// (gt-3i4e). The durable artifact it names existed only as a side effect of the
-// "mail:" actions, so severity "low" — whose default route is exactly ["bead"] —
-// produced no durable bead, showed up on no surface, and was silently destroyed
-// when its wisp aged out. Severity was the revealer, not the cause.
-//
-// When the mail path already produced a linked durable copy, the action is
-// satisfied by it: creating a second bead would double every critical, high and
-// medium escalation in `gt escalate list` and in the Mayor's queue. mailStatuses
-// must therefore be the statuses collected from the mail loop.
-func deliverEscalationBead(bd escalationBeadCreator, actions []string, mailStatuses []deliveryStatus, recordID, severity, title, body string) *deliveryStatus {
-	if !slices.Contains(actions, escalationBeadAction) {
-		return nil
-	}
-
-	status := &deliveryStatus{Channel: escalationBeadAction, Severity: severity}
-	for _, mailStatus := range mailStatuses {
-		// Annotated, not merely persisted: an un-annotated copy is missing the
-		// "escalation:<record-id>" label, so nothing can find it from the record.
-		if mailStatus.Annotated && mailStatus.BeadID != "" {
-			status.Created = true
-			status.BeadID = mailStatus.BeadID
-			status.Detail = "durable copy created by mail delivery to " + mailStatus.Target
-			return status
-		}
-	}
-
-	delivered, err := bd.CreateEscalationDeliveryBead(title, body, recordID, severity)
-	if err != nil {
-		status.Error = err.Error()
-		style.PrintWarning("failed to create durable escalation bead: %v", err)
-		return status
-	}
-	status.Created = true
-	status.BeadID = delivered.ID
-	return status
-}
-
-// formatEscalationDeliveryBody is the description of the durable delivery bead.
-//
-// It carries the record's own structured fields rather than the mail body, so
-// severity, reason, source and provenance survive the record wisp being
-// garbage-collected — that loss is the damage gt-3i4e is about. The trailing
-// block names the record, since ack and close are documented against its ID.
-func formatEscalationDeliveryBody(recordID, description string, fields *beads.EscalationFields) string {
-	return strings.Join([]string{
-		beads.FormatEscalationDescription(description, fields),
-		"",
-		"---",
-		fmt.Sprintf("Escalation record: %s (ephemeral — this bead is the durable copy)", recordID),
-		"To acknowledge: gt escalate ack " + recordID,
-		"To close: gt escalate close " + recordID + " --reason \"resolution\"",
-	}, "\n")
-}
-
-// escalationWasDelivered reports whether any channel actually delivered
-// something. Warnings do not count (a skipped email is not a delivery) and
-// neither does the escalation record itself, which is created regardless of
-// routing and is ephemeral.
-func escalationWasDelivered(statuses []deliveryStatus) bool {
-	for _, status := range statuses {
-		if status.Error != "" {
-			continue
-		}
-		if status.Created || status.Persisted || status.RuntimeNotified {
-			return true
-		}
-	}
-	return false
-}
-
-// escalationDeliveryStatus renders the JSON "status" field. "ok" used to be
-// unconditional for want of any failing channel — the seeded bead status could
-// not fail, so every escalation ever emitted reported ok (gt-3i4e).
-func escalationDeliveryStatus(delivered, hasFailure bool) string {
-	switch {
-	case !delivered:
-		return "undelivered"
-	case hasFailure:
-		return "partial_failure"
-	default:
-		return "ok"
-	}
 }
 
 func escalationFingerprintLabel(raw string) string {
@@ -410,8 +258,6 @@ func escalationFingerprintLabel(raw string) string {
 type deliveryStatus struct {
 	Target            string `json:"target,omitempty"`
 	Channel           string `json:"channel"`
-	BeadID            string `json:"bead_id,omitempty"` // durable bead this delivery produced
-	Detail            string `json:"detail,omitempty"`  // how the channel was satisfied
 	Created           bool   `json:"created,omitempty"`
 	Persisted         bool   `json:"persisted,omitempty"`
 	RuntimeNotified   bool   `json:"runtime_notified,omitempty"`
