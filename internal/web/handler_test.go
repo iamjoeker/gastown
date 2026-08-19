@@ -22,7 +22,11 @@ type MockConvoyFetcher struct {
 	Convoys              []ConvoyRow
 	MergeQueue           []MergeQueueRow
 	MergeQueueFailedRigs []string
-	Workers              []WorkerRow
+	// MergeQueueError is the whole-queue failure, distinct from
+	// MergeQueueFailedRigs: one rig short is a partial count, no rig list at all
+	// is no count.
+	MergeQueueError error
+	Workers         []WorkerRow
 	// WorkersError and the other per-panel errors are the levers for the
 	// "could not read" render path. Each panel needs its own: a single shared
 	// error cannot show that one panel failing leaves the others intact.
@@ -32,12 +36,15 @@ type MockConvoyFetcher struct {
 	// Separate from WorkersError because the two caveats are separate facts.
 	WorkersFailedStores []string
 	Mail                []MailRow
+	MailError           error
 	Rigs                []RigRow
+	RigsError           error
 	Dogs                []DogRow
 	DogsError           error
 	Escalations         []EscalationRow
 	EscalationsError    error
 	Health              *HealthRow
+	HealthError         error
 	Queues              []QueueRow
 	QueuesError         error
 	Sessions            []SessionRow
@@ -46,9 +53,13 @@ type MockConvoyFetcher struct {
 	// HooksFailedStores names stores whose hooked-bead query failed, so the
 	// handler's partial-union caveat can be driven from a test.
 	HooksFailedStores []string
-	Mayor             *MayorStatus
-	MayorError        error
-	Issues            []IssueRow
+	// HooksError and IssuesError are the whole-query failure of a union panel,
+	// which leaves no StoreResult to name failed stores with.
+	HooksError  error
+	IssuesError error
+	Mayor       *MayorStatus
+	MayorError  error
+	Issues      []IssueRow
 	// IssuesFailedStores is the same lever for the backlog union.
 	IssuesFailedStores []string
 	Activity           []ActivityRow
@@ -62,7 +73,7 @@ func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
-	return MergeQueueResult{Rows: m.MergeQueue, FailedRigs: m.MergeQueueFailedRigs}, nil
+	return MergeQueueResult{Rows: m.MergeQueue, FailedRigs: m.MergeQueueFailedRigs}, m.MergeQueueError
 }
 
 func (m *MockConvoyFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
@@ -70,11 +81,11 @@ func (m *MockConvoyFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
 }
 
 func (m *MockConvoyFetcher) FetchMail() ([]MailRow, error) {
-	return m.Mail, nil
+	return m.Mail, m.MailError
 }
 
 func (m *MockConvoyFetcher) FetchRigs() ([]RigRow, error) {
-	return m.Rigs, nil
+	return m.Rigs, m.RigsError
 }
 
 func (m *MockConvoyFetcher) FetchDogs() ([]DogRow, error) {
@@ -86,7 +97,7 @@ func (m *MockConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchHealth() (*HealthRow, error) {
-	return m.Health, nil
+	return m.Health, m.HealthError
 }
 
 func (m *MockConvoyFetcher) FetchQueues() ([]QueueRow, error) {
@@ -98,7 +109,7 @@ func (m *MockConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
-	return StoreResult[HookRow]{Rows: m.Hooks, FailedStores: m.HooksFailedStores}, nil
+	return StoreResult[HookRow]{Rows: m.Hooks, FailedStores: m.HooksFailedStores}, m.HooksError
 }
 
 func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
@@ -106,7 +117,7 @@ func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 }
 
 func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
-	return StoreResult[IssueRow]{Rows: m.Issues, FailedStores: m.IssuesFailedStores}, nil
+	return StoreResult[IssueRow]{Rows: m.Issues, FailedStores: m.IssuesFailedStores}, m.IssuesError
 }
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
@@ -498,6 +509,13 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 		// dropped it here, so it was the last of the nine sites still rendering
 		// a failure as an empty kennel (gt-1jrl).
 		DogsError: errors.New("reading kennel: permission denied"),
+		// These four outlived that fix: their fetchers returned an error, and the
+		// handler logged it and rendered the panel from the zero value anyway, so
+		// the same lie survived one layer up (gt-xw1t).
+		MailError:       errors.New("listing mail: bd timed out after 30s"),
+		RigsError:       errors.New("loading rigs config: parsing config: unexpected end of JSON input"),
+		HealthError:     errors.New("reading deacon heartbeat: permission denied"),
+		MergeQueueError: errors.New("loading rigs config: parsing config: unexpected end of JSON input"),
 	}
 
 	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
@@ -519,6 +537,10 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 		"Mayor status unavailable: checking mayor session: tmux timed out after 2s",
 		"Activity unavailable: reading event log: permission denied",
 		"Dogs unavailable: reading kennel: permission denied",
+		"Mail unavailable: listing mail: bd timed out after 30s",
+		"Rigs unavailable: loading rigs config: parsing config: unexpected end of JSON input",
+		"Merge queue unavailable: loading rigs config: parsing config: unexpected end of JSON input",
+		"heartbeat unreadable",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("panel should name why it could not read: missing %q", want)
@@ -532,6 +554,9 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 		"No active sessions",
 		"No recent activity",
 		"No dogs in kennel",
+		"No mail traffic",
+		"No rigs configured",
+		"Merge queue empty",
 	} {
 		if strings.Contains(body, unwanted) {
 			t.Errorf("an unreadable panel must not render its empty state: found %q", unwanted)
@@ -545,9 +570,16 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 
 	// The banner is what an operator reads at a glance.
 	if strings.Contains(body, "All clear") {
-		t.Error("a dashboard that cannot see six panels is not 'All clear'")
+		t.Error("a dashboard that cannot see ten panels is not 'All clear'")
 	}
-	for _, want := range []string{"polecats unreadable", "convoys unreadable"} {
+	for _, want := range []string{
+		"polecats unreadable",
+		"convoys unreadable",
+		"mail unreadable",
+		"rigs unreadable",
+		"health unreadable",
+		"merge queue unreadable",
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("summary alerts should flag the unreadable panel: missing %q", want)
 		}
@@ -558,7 +590,13 @@ func TestConvoyHandler_UnreadablePanelsSaySo(t *testing.T) {
 // TestConvoyHandler_UnreadablePanelsSaySo. Without it, a caveat rendered on
 // every load would pass the test above and carry no information at all.
 func TestConvoyHandler_QuietTownRendersEmptyStates(t *testing.T) {
-	mock := &MockConvoyFetcher{Convoys: []ConvoyRow{}}
+	mock := &MockConvoyFetcher{
+		Convoys: []ConvoyRow{},
+		// A town that answers about its health is the control for the banner's
+		// "?" stat: without a readable heartbeat here, an indicator that never
+		// renders would pass the failure test above.
+		Health: &HealthRow{DeaconHeartbeat: "Jan 2, 3:04 PM", HeartbeatFresh: true},
+	}
 
 	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
@@ -577,6 +615,10 @@ func TestConvoyHandler_QuietTownRendersEmptyStates(t *testing.T) {
 		"No active sessions",
 		"No recent activity",
 		"No dogs in kennel",
+		"No mail traffic",
+		"No rigs configured",
+		"Merge queue empty",
+		"💓 Jan 2, 3:04 PM",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("a readable, quiet panel should render its empty state: missing %q", want)
@@ -590,6 +632,10 @@ func TestConvoyHandler_QuietTownRendersEmptyStates(t *testing.T) {
 		"Mayor status unavailable",
 		"Activity unavailable",
 		"Dogs unavailable",
+		"Mail unavailable",
+		"Rigs unavailable",
+		"Merge queue unavailable",
+		"heartbeat unreadable",
 	} {
 		if strings.Contains(body, unwanted) {
 			t.Errorf("a successful query must not render an unavailable notice: found %q", unwanted)
@@ -1774,6 +1820,52 @@ func TestConvoyHandler_UnreadableUnionPanelsSaySo(t *testing.T) {
 		if got := bannerStat(t, body, label); got != "?" {
 			t.Errorf("banner stat %q = %q, want %q for a count that could not be read", label, got, "?")
 		}
+	}
+}
+
+// TestConvoyHandler_UnionQueryFailureSaysSo covers the union panels' OTHER
+// failure channel: the query failing outright, before any StoreResult exists.
+// There are no failed stores to name in that case, so a panel that reads only
+// the StoreResult finds "" — indistinguishable from every store answering — and
+// renders "No hooked work" for a query that never ran (gt-xw1t).
+func TestConvoyHandler_UnionQueryFailureSaysSo(t *testing.T) {
+	mock := &MockConvoyFetcher{
+		Convoys:     []ConvoyRow{},
+		HooksError:  errors.New("resolving stores: reading rigs config: permission denied"),
+		IssuesError: errors.New("resolving stores: reading rigs config: permission denied"),
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+
+	for _, want := range []string{
+		"Hooks unavailable: resolving stores: reading rigs config: permission denied",
+		"Work backlog unavailable: resolving stores: reading rigs config: permission denied",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("panel should name why it could not read: missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"No hooked work", "No work items"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("a failed union query must not render its empty state: found %q", unwanted)
+		}
+	}
+	for _, label := range []string{"🪝 Hooks", "📋 Work"} {
+		if got := bannerStat(t, body, label); got != "?" {
+			t.Errorf("banner stat %q = %q, want %q for a query that never ran", label, got, "?")
+		}
+	}
+	if strings.Contains(body, "All clear") {
+		t.Error("a dashboard whose hook and work queries failed is not 'All clear'")
 	}
 }
 

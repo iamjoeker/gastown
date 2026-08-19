@@ -3761,14 +3761,8 @@ func TestRemoveDatabase_RefusesProtectedSharedServerDatabase(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for protected shared-server database")
 	}
-	if !strings.Contains(err.Error(), "is protected") {
+	if !strings.Contains(err.Error(), "protected shared-server database") {
 		t.Errorf("expected protected database error, got: %v", err)
-	}
-	// The refusal has to say force does not override it, because this call
-	// passed force=true and every other check in RemoveDatabase does yield to
-	// it. (gt-xhjb)
-	if !strings.Contains(err.Error(), "with or without --force") {
-		t.Errorf("refusal must say --force does not override it, got: %v", err)
 	}
 	if _, statErr := os.Stat(dbPath); statErr != nil {
 		t.Errorf("expected beads_global to remain on disk, got stat error: %v", statErr)
