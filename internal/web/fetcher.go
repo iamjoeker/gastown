@@ -1675,39 +1675,12 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	return rows, nil
 }
 
-// FetchHooks returns all hooked beads (work pinned to agents), from every store.
-//
-// Hooks are per-rig data: a polecat's hook bead lives in its own rig's store,
-// not in the town root. Measured against this town, the town root held 0 hooked
-// beads while the gastown rig held 5 — so the town-root-only query this
-// replaced rendered "no work is hooked anywhere" on a town with five hooked
-// beads. Every hooked bead in every store is the panel's actual subject.
-func (f *LiveConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
-	result := forEachStore(f, storeBudgetUnlimited, func(src storeSource, _ int) ([]HookRow, error) {
-		return f.listHookRows(src.Dir)
-	})
-
-	// Sort by stale first (stuck work), then by age
-	sort.Slice(result.Rows, func(i, j int) bool {
-		if result.Rows[i].IsStale != result.Rows[j].IsStale {
-			return result.Rows[i].IsStale // Stale items first
-		}
-		return result.Rows[i].Age > result.Rows[j].Age
-	})
-
-	return result, nil
-}
-
-// listHookRows reads the hooked beads of one store.
-//
-// Unlike the query it replaced, a bd failure here is an error rather than an
-// empty slice: the resolver names the store that could not answer, and a store
-// that returned nothing because it broke must not read as a store that returned
-// nothing because it was empty.
-func (f *LiveConvoyFetcher) listHookRows(storeDir string) ([]HookRow, error) {
-	stdout, err := f.runBdCmd(storeDir, "list", "--status=hooked", "--json", "--limit=0")
+// FetchHooks returns all hooked beads (work pinned to agents).
+func (f *LiveConvoyFetcher) FetchHooks() ([]HookRow, error) {
+	// Query all beads with status=hooked
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--status=hooked", "--json", "--limit=0")
 	if err != nil {
-		return nil, fmt.Errorf("listing hooked beads: %w", err)
+		return nil, nil // No hooked beads or bd not available
 	}
 
 	var beads []struct {
@@ -1720,7 +1693,7 @@ func (f *LiveConvoyFetcher) listHookRows(storeDir string) ([]HookRow, error) {
 		return nil, fmt.Errorf("parsing hooked beads: %w", err)
 	}
 
-	rows := make([]HookRow, 0, len(beads))
+	var rows []HookRow
 	for _, bead := range beads {
 		row := HookRow{
 			ID:       bead.ID,
@@ -1742,6 +1715,14 @@ func (f *LiveConvoyFetcher) listHookRows(storeDir string) ([]HookRow, error) {
 
 		rows = append(rows, row)
 	}
+
+	// Sort by stale first (stuck work), then by age
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].IsStale != rows[j].IsStale {
+			return rows[i].IsStale // Stale items first
+		}
+		return rows[i].Age > rows[j].Age
+	})
 
 	return rows, nil
 }
@@ -1863,49 +1844,106 @@ func stripModelSuffix(model string) string {
 	return model
 }
 
-// issuesPerStoreLimit caps how many raw beads each store contributes to the
-// Work panel, per status listed.
-//
-// The town-root-only query this replaced asked for 50. Keeping 50 PER STORE
-// rather than 50 shared is deliberate: the stores are wildly uneven (521 open
-// beads in the town root against 65 in the gastown rig when measured), so a
-// shared budget would be spent by the town root before a single rig was read
-// and the panel would stay blind. See perStoreLimit.
-const issuesPerStoreLimit = 50
+// FetchIssues returns open issues (the backlog).
+func (f *LiveConvoyFetcher) FetchIssues() ([]IssueRow, error) {
+	// Query both open AND hooked issues for the Work panel
+	// Open = ready to assign, Hooked = in progress
+	var allBeads []struct {
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		Type      string   `json:"type"`
+		Priority  int      `json:"priority"`
+		Labels    []string `json:"labels"`
+		CreatedAt string   `json:"created_at"`
+	}
 
-// FetchIssues returns open issues (the backlog) from every store.
-//
-// Issues are per-rig data: measured against this town, the town root held 521
-// open beads while the rigs held 65, 7 and 2 that this panel never showed.
-func (f *LiveConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
-	// Query both open AND hooked issues for the Work panel.
-	// Open = ready to assign, Hooked = in progress.
-	//
-	// One union per status, joined after: a single pass returning both would
-	// make the per-store row limit a limit on the two statuses combined, so a
-	// store with 50 open beads would report its hooked beads as truncated away.
-	open := forEachStorePerStore(f, issuesPerStoreLimit, func(src storeSource, limit int) ([]issueBead, error) {
-		return f.listIssueBeads(src.Dir, "open", limit)
-	})
-	hooked := forEachStorePerStore(f, issuesPerStoreLimit, func(src storeSource, limit int) ([]issueBead, error) {
-		return f.listIssueBeads(src.Dir, "hooked", limit)
-	})
-
-	// Internal beads are dropped here rather than in the fetch so the resolver
-	// counts what bd actually returned when it decides a store was truncated.
-	// The town root is mostly gt:message rows, so a store can fill its whole
-	// allowance and still show almost nothing — that is a truncated store, and
-	// filtering first would have hidden it.
-	result := mapStoreRows(open.merge(hooked), func(b issueBead) (IssueRow, bool) {
-		if b.isInternal() {
-			return IssueRow{}, false
+	// Fetch open issues
+	if stdout, err := f.runBdCmd(f.townRoot, "list", "--status=open", "--json", "--limit=50"); err == nil {
+		var openBeads []struct {
+			ID        string   `json:"id"`
+			Title     string   `json:"title"`
+			Type      string   `json:"type"`
+			Priority  int      `json:"priority"`
+			Labels    []string `json:"labels"`
+			CreatedAt string   `json:"created_at"`
 		}
-		return b.row(), true
-	})
+		if err := json.Unmarshal(stdout.Bytes(), &openBeads); err == nil {
+			allBeads = append(allBeads, openBeads...)
+		}
+	}
+
+	// Fetch hooked issues (in progress)
+	if stdout, err := f.runBdCmd(f.townRoot, "list", "--status=hooked", "--json", "--limit=50"); err == nil {
+		var hookedBeads []struct {
+			ID        string   `json:"id"`
+			Title     string   `json:"title"`
+			Type      string   `json:"type"`
+			Priority  int      `json:"priority"`
+			Labels    []string `json:"labels"`
+			CreatedAt string   `json:"created_at"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &hookedBeads); err == nil {
+			allBeads = append(allBeads, hookedBeads...)
+		}
+	}
+
+	beads := allBeads
+
+	var rows []IssueRow
+	for _, bead := range beads {
+		// Skip internal types (messages, convoys, queues, merge-requests, wisps)
+		// Check both legacy type field and gt: labels
+		isInternal := false
+		switch bead.Type {
+		case "message", "convoy", "queue", "merge-request", "wisp", "agent":
+			isInternal = true
+		}
+		for _, l := range bead.Labels {
+			switch l {
+			case "gt:message", "gt:convoy", "gt:queue", "gt:merge-request", "gt:wisp", "gt:agent":
+				isInternal = true
+			}
+		}
+		if isInternal {
+			continue
+		}
+
+		row := IssueRow{
+			ID:       bead.ID,
+			Title:    bead.Title,
+			Type:     bead.Type,
+			Priority: bead.Priority,
+		}
+
+		// Keep full title - CSS handles overflow
+
+		// Format labels (skip internal labels)
+		var displayLabels []string
+		for _, label := range bead.Labels {
+			if !strings.HasPrefix(label, "gt:") && !strings.HasPrefix(label, "internal:") {
+				displayLabels = append(displayLabels, label)
+			}
+		}
+		if len(displayLabels) > 0 {
+			row.Labels = strings.Join(displayLabels, ", ")
+			if len(row.Labels) > 25 {
+				row.Labels = row.Labels[:22] + "..."
+			}
+		}
+
+		// Calculate age
+		if bead.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, bead.CreatedAt); err == nil {
+				row.Age = formatTimestamp(t)
+			}
+		}
+
+		rows = append(rows, row)
+	}
 
 	// Sort by priority (1=critical first), then by age
-	sort.Slice(result.Rows, func(i, j int) bool {
-		pi, pj := result.Rows[i].Priority, result.Rows[j].Priority
+	sort.Slice(rows, func(i, j int) bool {
+		pi, pj := rows[i].Priority, rows[j].Priority
 		if pi == 0 {
 			pi = 5 // Treat unset priority as low
 		}
@@ -1915,91 +1953,10 @@ func (f *LiveConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 		if pi != pj {
 			return pi < pj
 		}
-		return result.Rows[i].Age > result.Rows[j].Age // Older first for same priority
+		return rows[i].Age > rows[j].Age // Older first for same priority
 	})
 
-	return result, nil
-}
-
-// issueBead is one bead as the backlog panel reads it from bd, before the
-// panel decides whether to display it.
-type issueBead struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	Type      string   `json:"type"`
-	Priority  int      `json:"priority"`
-	Labels    []string `json:"labels"`
-	CreatedAt string   `json:"created_at"`
-}
-
-// isInternal reports whether the bead is Gas Town plumbing — messages,
-// convoys, queues, merge requests, wisps, agent identities — rather than work
-// someone filed. Both the legacy type field and the gt: labels are checked.
-func (b issueBead) isInternal() bool {
-	switch b.Type {
-	case "message", "convoy", "queue", "merge-request", "wisp", "agent":
-		return true
-	}
-	for _, l := range b.Labels {
-		switch l {
-		case "gt:message", "gt:convoy", "gt:queue", "gt:merge-request", "gt:wisp", "gt:agent":
-			return true
-		}
-	}
-	return false
-}
-
-// row renders the bead as a backlog row.
-func (b issueBead) row() IssueRow {
-	row := IssueRow{
-		ID:       b.ID,
-		Title:    b.Title,
-		Type:     b.Type,
-		Priority: b.Priority,
-	}
-
-	// Keep full title - CSS handles overflow
-
-	// Format labels (skip internal labels)
-	var displayLabels []string
-	for _, label := range b.Labels {
-		if !strings.HasPrefix(label, "gt:") && !strings.HasPrefix(label, "internal:") {
-			displayLabels = append(displayLabels, label)
-		}
-	}
-	if len(displayLabels) > 0 {
-		row.Labels = strings.Join(displayLabels, ", ")
-		if len(row.Labels) > 25 {
-			row.Labels = row.Labels[:22] + "..."
-		}
-	}
-
-	// Calculate age
-	if b.CreatedAt != "" {
-		if t, err := time.Parse(time.RFC3339, b.CreatedAt); err == nil {
-			row.Age = formatTimestamp(t)
-		}
-	}
-
-	return row
-}
-
-// listIssueBeads reads one status from one store, unfiltered.
-//
-// Unlike the query it replaced, a bd failure is an error rather than a silently
-// skipped list: the resolver names the store that could not answer, so a store
-// that broke stops looking like a store that was empty.
-func (f *LiveConvoyFetcher) listIssueBeads(storeDir, status string, limit int) ([]issueBead, error) {
-	stdout, err := f.runBdCmd(storeDir, "list", "--status="+status, "--json", fmt.Sprintf("--limit=%d", limit))
-	if err != nil {
-		return nil, fmt.Errorf("listing %s beads: %w", status, err)
-	}
-
-	var beads []issueBead
-	if err := json.Unmarshal(stdout.Bytes(), &beads); err != nil {
-		return nil, fmt.Errorf("parsing %s beads: %w", status, err)
-	}
-	return beads, nil
+	return rows, nil
 }
 
 // FetchActivity returns recent activity from the event log.

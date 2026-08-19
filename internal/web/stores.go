@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 
@@ -34,11 +33,6 @@ const rigsConfigStoreName = "mayor/rigs.json"
 
 // storeBudgetUnlimited disables the total row budget on a union query.
 const storeBudgetUnlimited = 0
-
-// storeStarved is the allowance for a store the budget can no longer pay for.
-// It is distinct from storeBudgetUnlimited because zero already means "no
-// limit": a starved store must be recorded as unread, not queried without a cap.
-const storeStarved = -1
 
 // storeSource is one beads store the dashboard can read.
 type storeSource struct {
@@ -82,54 +76,6 @@ type StoreResult[T any] struct {
 // the dashboard could not find out.
 func (r StoreResult[T]) Partial() bool {
 	return len(r.FailedStores) > 0 || len(r.TruncatedStores) > 0 || len(r.UnreadStores) > 0
-}
-
-// merge folds a second union of the same row type into this one.
-//
-// A panel that asks each store more than one question — the Work panel lists
-// open beads and hooked beads — runs one union per question and joins them
-// here, so a store that failed either question is named once rather than twice
-// or, worse, only in the half the caller happened to keep.
-func (r StoreResult[T]) merge(other StoreResult[T]) StoreResult[T] {
-	return StoreResult[T]{
-		Rows:            append(r.Rows, other.Rows...),
-		FailedStores:    appendUnique(r.FailedStores, other.FailedStores),
-		TruncatedStores: appendUnique(r.TruncatedStores, other.TruncatedStores),
-		UnreadStores:    appendUnique(r.UnreadStores, other.UnreadStores),
-	}
-}
-
-// mapStoreRows converts a union's rows, keeping the failure labels intact.
-// convert returns false for a row to drop.
-//
-// Panels that discard rows after fetching must do it here rather than inside
-// the fetch, because the resolver decides truncation from the number of rows a
-// store returned. A store that fills its whole allowance with rows the panel
-// then hides is still a truncated store, and dropping them before the resolver
-// counts them is how that becomes invisible.
-func mapStoreRows[A, B any](r StoreResult[A], convert func(A) (B, bool)) StoreResult[B] {
-	rows := make([]B, 0, len(r.Rows))
-	for _, row := range r.Rows {
-		if converted, keep := convert(row); keep {
-			rows = append(rows, converted)
-		}
-	}
-	return StoreResult[B]{
-		Rows:            rows,
-		FailedStores:    r.FailedStores,
-		TruncatedStores: r.TruncatedStores,
-		UnreadStores:    r.UnreadStores,
-	}
-}
-
-// appendUnique appends the names not already present, preserving store order.
-func appendUnique(dst, src []string) []string {
-	for _, name := range src {
-		if !slices.Contains(dst, name) {
-			dst = append(dst, name)
-		}
-	}
-	return dst
 }
 
 // Warning renders the incompleteness as a single display line, or "" when the
@@ -180,68 +126,20 @@ func (f *LiveConvoyFetcher) storeSources() ([]storeSource, error) {
 	return sources, nil
 }
 
-// storeLimiter decides the row allowance for the next store, given how many
-// rows the union already holds. It returns storeBudgetUnlimited for "no limit"
-// and storeStarved for "the budget cannot pay for this store at all".
-type storeLimiter func(rowsSoFar int) int
-
-// sharedBudget spends one total allowance across the stores in order. It is
-// what stops four stores at --limit=50 from quietly returning 200 rows under a
-// cap of 50.
-func sharedBudget(budget int) storeLimiter {
-	return func(rowsSoFar int) int {
-		if budget <= storeBudgetUnlimited {
-			return storeBudgetUnlimited
-		}
-		if remaining := budget - rowsSoFar; remaining > 0 {
-			return remaining
-		}
-		return storeStarved
-	}
-}
-
-// perStoreLimit gives every store the same allowance instead of making them
-// compete for one.
-//
-// This is the right policy for a panel whose defect is blindness rather than
-// size. The stores are wildly uneven — the town root holds 521 open beads to
-// gastown's 65 — so under a shared budget the town root spends the whole
-// allowance before any rig is read, and the rig rows land in UnreadStores
-// instead of on screen: the panel stays exactly as blind as it was, now with a
-// caption. A per-store limit keeps each store's contribution the size it was
-// before the union and bounds the page at limit x stores.
-func perStoreLimit(limit int) storeLimiter {
-	return func(int) int {
-		if limit <= storeBudgetUnlimited {
-			return storeBudgetUnlimited
-		}
-		return limit
-	}
-}
-
-// forEachStore runs fn against every store and unions the rows, spending one
-// row budget across them. See forEachStorePerStore for the per-store policy.
-func forEachStore[T any](f *LiveConvoyFetcher, budget int, fn func(src storeSource, limit int) ([]T, error)) StoreResult[T] {
-	return forEachStoreLimited(f, sharedBudget(budget), fn)
-}
-
-// forEachStorePerStore runs fn against every store and unions the rows, giving
-// each store the same row limit.
-func forEachStorePerStore[T any](f *LiveConvoyFetcher, limit int, fn func(src storeSource, limit int) ([]T, error)) StoreResult[T] {
-	return forEachStoreLimited(f, perStoreLimit(limit), fn)
-}
-
-// forEachStoreLimited is the shared union loop.
+// forEachStore runs fn against every store and unions the rows.
 //
 // fn receives the store — so rows can be stamped with where they came from —
-// and the number of rows it is allowed to return, which the limiter decides.
+// and the number of rows it is still allowed to return. A budget of
+// storeBudgetUnlimited passes 0 through, meaning "no limit"; otherwise the
+// limit shrinks as earlier stores fill it, which is what stops four stores at
+// --limit=50 from quietly returning 200 rows under a cap of 50.
 //
 // A store whose query errors is recorded in FailedStores and does not abort the
 // others: partial results are acceptable, silent partial results are not.
 //
 // It is a free function rather than a method because Go methods cannot carry
 // type parameters; the fetcher is therefore the first argument.
-func forEachStoreLimited[T any](f *LiveConvoyFetcher, limiter storeLimiter, fn func(src storeSource, limit int) ([]T, error)) StoreResult[T] {
+func forEachStore[T any](f *LiveConvoyFetcher, budget int, fn func(src storeSource, limit int) ([]T, error)) StoreResult[T] {
 	var result StoreResult[T]
 
 	sources, err := f.storeSources()
@@ -253,10 +151,13 @@ func forEachStoreLimited[T any](f *LiveConvoyFetcher, limiter storeLimiter, fn f
 	}
 
 	for _, src := range sources {
-		limit := limiter(len(result.Rows))
-		if limit == storeStarved {
-			result.UnreadStores = append(result.UnreadStores, src.Name)
-			continue
+		limit := storeBudgetUnlimited
+		if budget > storeBudgetUnlimited {
+			limit = budget - len(result.Rows)
+			if limit <= 0 {
+				result.UnreadStores = append(result.UnreadStores, src.Name)
+				continue
+			}
 		}
 
 		rows, err := fn(src, limit)
