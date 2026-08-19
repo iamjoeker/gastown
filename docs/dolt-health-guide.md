@@ -82,6 +82,35 @@ in between. Correlate exits against shell history (`~/.local/share/fish/fish_his
 records an epoch `when:` per command) before blaming gt — in gt-09e4 every exit
 matched an operator command to the second.
 
+### "Connection refused, then a new PID, and nobody restarted it"
+
+This is a restart, not a mystery. `gt dolt status` prints a **Restart History**
+block whenever the unit has restarted the server or cannot detect a crash loop:
+
+```
+  Supervisor: systemd unit gt-dolt.service (Restart=on-failure)
+
+  Restart History:
+    ! Restarted 2 time(s) by systemd unit gt-dolt.service since it was last started by hand.
+      ...
+    ! Crash-loop detection is OFF for this unit (StartLimitIntervalSec=0 or
+      StartLimitBurst=0). ...
+```
+
+Read the count as a **lower bound**: systemd resets `NRestarts` on every manual
+`systemctl start`/`restart`, so it counts restarts within the current manual
+start, not since boot. A count above zero means the previous process died — the
+uptime beside it belongs to the replacement, not to that process.
+
+The second notice is the reason a repeatedly dying server can look healthy
+everywhere. With `StartLimitIntervalSec=0` the unit never enters `failed`, so
+`systemctl status` stays green, `journalctl -p err` shows nothing, and the only
+journal trace of the exit is a bare `Consumed ... CPU time` line — no
+`Main process exited`, no `Failed with result`. On 2026-08-18 two agents
+independently escalated two such exits in 75s and neither could attribute them
+(hq-njloj, hq-69g3w, gt-qiok). Arm a start limit on the unit if you want a real
+crash loop to surface as a failed unit.
+
 ### Note on `dolt.auto-start`
 
 `dolt.auto-start=false` / `BEADS_DOLT_AUTO_START=0` only stops a **bd/gt client**

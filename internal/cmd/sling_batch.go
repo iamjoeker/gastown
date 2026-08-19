@@ -238,17 +238,9 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	return nil
 }
 
-// cleanupSpawnedPolecat undoes the polecat side of a sling whose session/hook failed.
-//
-// What "undo" means depends on where the polecat came from. A polecat this sling
-// CREATED is removed outright — worktree, agent bead, git branch — so orphans do
-// not accumulate. A polecat this sling REUSED from the idle pool is released back
-// to it with its sandbox intact: that worktree pre-dates the failed sling, and
-// deleting it would churn the pool the reuse path exists to preserve, one failure
-// at a time. Sling only started reusing pool polecats in gt-2uqy, so before that
-// fix every caller here was, correctly, a fresh spawn.
-//
-// The auto-convoy belongs to the sling attempt either way, so it is closed in both.
+// cleanupSpawnedPolecat removes a polecat that was spawned but whose session/hook failed,
+// preventing orphaned polecats from accumulating. Cleans up worktree, agent bead, git branch,
+// and optionally the associated auto-convoy.
 func cleanupSpawnedPolecat(spawnInfo *SpawnedPolecatInfo, rigName, convoyID string) {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -268,22 +260,6 @@ func cleanupSpawnedPolecat(spawnInfo *SpawnedPolecatInfo, rigName, convoyID stri
 	polecatGit := git.NewGit(r.Path)
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
-	if spawnInfo.Reused {
-		if err := polecatMgr.ReleaseReusedPolecat(spawnInfo.PolecatName, "sling rollback"); err != nil {
-			fmt.Printf("  %s Could not release reused polecat %s back to the pool: %v\n",
-				style.Dim.Render("Warning:"), spawnInfo.PolecatName, err)
-		} else {
-			fmt.Printf("  %s Released reused polecat %s back to the pool (sandbox kept)\n",
-				style.Dim.Render("○"), spawnInfo.PolecatName)
-		}
-		// The branch is deliberately left alone: the reused worktree is still
-		// checked out on it, so deleting it is both impossible and pointless — the
-		// next reuse checks out a fresh branch over it.
-		if convoyID != "" {
-			closeConvoy(convoyID, "Sling rollback - hook failed")
-		}
-		return
-	}
 	if err := polecatMgr.Remove(spawnInfo.PolecatName, true); err != nil {
 		fmt.Printf("  %s Could not clean up orphaned polecat %s: %v\n",
 			style.Dim.Render("Warning:"), spawnInfo.PolecatName, err)
