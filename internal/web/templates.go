@@ -68,7 +68,12 @@ type ConvoyData struct {
 	// HooksWarning names the stores whose hooked-bead query did not fully
 	// answer. Non-empty means the rendered count is a floor, not a total.
 	HooksWarning string
-	Mayor        *MayorStatus
+	// HooksUnavailable holds the reason NO store could be read, or "" when at
+	// least one answered. It is the end of the same scale HooksWarning starts:
+	// a floor of zero drawn from no sources at all is not a floor, and the
+	// panel must say so instead of rendering "No hooked work".
+	HooksUnavailable string
+	Mayor            *MayorStatus
 	// MayorUnavailable holds the reason the Mayor lookup failed, or "" when it
 	// succeeded. A nil Mayor with no reason is the banner's "Unknown" state; a
 	// reason turns that into a stated one, so the banner never claims "Detached"
@@ -77,7 +82,10 @@ type ConvoyData struct {
 	Issues           []IssueRow
 	// IssuesWarning is the same caveat for the backlog union.
 	IssuesWarning string
-	Activity      []ActivityRow
+	// IssuesUnavailable is the same "no source answered" reason for the backlog
+	// union.
+	IssuesUnavailable string
+	Activity          []ActivityRow
 	// ActivityUnavailable holds the reason the event log could not be read, or
 	// "" when it was read (including when it does not exist yet).
 	ActivityUnavailable string
@@ -208,6 +216,13 @@ type DashboardSummary struct {
 	// forms their impression of the town at a glance.
 	PolecatsUnavailable bool
 	ConvoysUnavailable  bool
+
+	// HooksUnavailable and IssuesUnavailable say it about the two union-backed
+	// stats. These panels read every store, so their stat reaches zero the
+	// moment the last store fails — the failure mode is a banner that prints a
+	// calm "0 Hooks / 0 Work" for a town whose beads are simply unreachable.
+	HooksUnavailable  bool
+	IssuesUnavailable bool
 
 	// Alerts (things needing attention)
 	StuckPolecats      int // No activity > 5 min

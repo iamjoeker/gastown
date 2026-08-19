@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -167,6 +168,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if isDeferredBead(info) && !explicitForce {
 		result.ErrMsg = "deferred"
 		return result, fmt.Errorf("bead %s is deferred (use --force to override)", params.BeadID)
+	}
+
+	// Guard against dispatching durable archival records (gt-f8td).
+	// Uses explicitForce for the same reason as the deferred gate: dead-agent
+	// auto-force must not turn a record into work.
+	if refusal := beads.RecordDispatchRefusal(params.BeadID, info.Labels); refusal != "" && !explicitForce {
+		result.ErrMsg = "record bead"
+		return result, errors.New(refusal)
 	}
 
 	if params.RigName != "" {
