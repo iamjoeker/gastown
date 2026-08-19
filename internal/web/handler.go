@@ -196,15 +196,29 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		convoys    []ConvoyRow
 		convoysErr error
 		mergeQueue MergeQueueResult
-		workers    StoreResult[WorkerRow]
+		// mergeQueueErr and mergeQueue.FailedRigs are the two scales of the same
+		// fact: the error means no rig was ever asked (the rig list itself could
+		// not be read), the failed rigs mean some answered and some did not.
+		// Without the error the panel rendered "Merge queue empty" for a town
+		// whose queue it had never looked at.
+		mergeQueueErr error
+		workers       StoreResult[WorkerRow]
 		// workersErr and workers.Warning() are not two spellings of one fact:
 		// the error means tmux could not be asked, so there is no worker list;
 		// the warning means the list exists but a rig store could not say what
 		// its workers are carrying. Both are rendered.
 		workersErr error
 		mail       []MailRow
-		rigs       []RigRow
-		dogs       []DogRow
+		// mailErr is rendered: a bd that could not list mail is not a town that
+		// sent none, and "No mail traffic" is the one render an operator reads as
+		// proof that nothing was sent.
+		mailErr error
+		rigs    []RigRow
+		// rigsErr is rendered for the same reason. An unreadable rigs.json is not
+		// a town with no rigs — and it is the same failure that empties the merge
+		// queue panel, so the two must not disagree about whether anything is wrong.
+		rigsErr error
+		dogs    []DogRow
 		// FetchDogs already tells a kennel that has never held a dog from one it
 		// could not read. That distinction died here, one layer above it: the
 		// error was logged and the template got an empty slice either way, so an
@@ -215,17 +229,28 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		// panel must not look like an empty one (gt-edty).
 		escalationsErr error
 		health         *HealthRow
-		queues         []QueueRow
-		queuesErr      error
-		sessions       []SessionRow
-		sessionsErr    error
-		hooks          StoreResult[HookRow]
-		mayor          *MayorStatus
-		mayorErr       error
-		issues         StoreResult[IssueRow]
-		activity       []ActivityRow
-		activityErr    error
-		wg             sync.WaitGroup
+		// healthErr matters more than most: the heartbeat stat renders only when
+		// health is non-nil, so a failed read did not render a wrong value — it
+		// removed the town's liveness indicator from the banner entirely, leaving
+		// nothing to notice.
+		healthErr   error
+		queues      []QueueRow
+		queuesErr   error
+		sessions    []SessionRow
+		sessionsErr error
+		hooks       StoreResult[HookRow]
+		// hooksErr and issuesErr are the union panels' whole-query failure, one
+		// level above the per-store failures StoreResult carries: with no result
+		// at all there are no failed stores to name, so the reason has to come
+		// from the error or the panel falls back to "No hooked work".
+		hooksErr    error
+		mayor       *MayorStatus
+		mayorErr    error
+		issues      StoreResult[IssueRow]
+		issuesErr   error
+		activity    []ActivityRow
+		activityErr error
+		wg          sync.WaitGroup
 	)
 
 	// Run all fetches in parallel with error logging
@@ -240,10 +265,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		mergeQueue, err = h.fetcher.FetchMergeQueue()
-		if err != nil {
-			log.Printf("dashboard: FetchMergeQueue failed: %v", err)
+		mergeQueue, mergeQueueErr = h.fetcher.FetchMergeQueue()
+		if mergeQueueErr != nil {
+			log.Printf("dashboard: FetchMergeQueue failed: %v", mergeQueueErr)
 		}
 	}()
 	go func() {
@@ -255,18 +279,16 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		mail, err = h.fetcher.FetchMail()
-		if err != nil {
-			log.Printf("dashboard: FetchMail failed: %v", err)
+		mail, mailErr = h.fetcher.FetchMail()
+		if mailErr != nil {
+			log.Printf("dashboard: FetchMail failed: %v", mailErr)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		rigs, err = h.fetcher.FetchRigs()
-		if err != nil {
-			log.Printf("dashboard: FetchRigs failed: %v", err)
+		rigs, rigsErr = h.fetcher.FetchRigs()
+		if rigsErr != nil {
+			log.Printf("dashboard: FetchRigs failed: %v", rigsErr)
 		}
 	}()
 	go func() {
@@ -285,10 +307,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		health, err = h.fetcher.FetchHealth()
-		if err != nil {
-			log.Printf("dashboard: FetchHealth failed: %v", err)
+		health, healthErr = h.fetcher.FetchHealth()
+		if healthErr != nil {
+			log.Printf("dashboard: FetchHealth failed: %v", healthErr)
 		}
 	}()
 	go func() {
@@ -307,10 +328,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		hooks, err = h.fetcher.FetchHooks()
-		if err != nil {
-			log.Printf("dashboard: FetchHooks failed: %v", err)
+		hooks, hooksErr = h.fetcher.FetchHooks()
+		if hooksErr != nil {
+			log.Printf("dashboard: FetchHooks failed: %v", hooksErr)
 		}
 	}()
 	go func() {
@@ -322,10 +342,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		issues, err = h.fetcher.FetchIssues()
-		if err != nil {
-			log.Printf("dashboard: FetchIssues failed: %v", err)
+		issues, issuesErr = h.fetcher.FetchIssues()
+		if issuesErr != nil {
+			log.Printf("dashboard: FetchIssues failed: %v", issuesErr)
 		}
 	}()
 	go func() {
@@ -361,14 +380,18 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		// The union panels have no error to carry — every store failing
 		// separately still returns a result — so the banner is told whether the
 		// rows it is counting came from any store at all.
-		hooksUnreadable:  hooks.Unreadable(),
+		hooksUnreadable:  hooks.Unreadable() || hooksErr != nil,
 		issues:           issues.Rows,
-		issuesUnreadable: issues.Unreadable(),
+		issuesUnreadable: issues.Unreadable() || issuesErr != nil,
 		convoys:          convoys,
 		convoysErr:       convoysErr,
 		escalations:      escalations,
 		escalationsErr:   escalationsErr,
 		activity:         activity,
+		mailErr:          mailErr,
+		rigsErr:          rigsErr,
+		healthErr:        healthErr,
+		mergeQueueErr:    mergeQueueErr,
 	})
 
 	data := ConvoyData{
@@ -378,28 +401,32 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		ConvoysUnavailable:     unavailableMessage(convoysErr),
 		MergeQueue:             mergeQueue.Rows,
 		MergeQueueFailedRigs:   mergeQueue.FailedRigs,
+		MergeQueueUnavailable:  unavailableMessage(mergeQueueErr),
 		Workers:                workers.Rows,
 		WorkersUnavailable:     unavailableMessage(workersErr),
 		WorkersWarning:         workers.Warning(),
 		Mail:                   mail,
+		MailUnavailable:        unavailableMessage(mailErr),
 		Rigs:                   rigs,
+		RigsUnavailable:        unavailableMessage(rigsErr),
 		Dogs:                   dogs,
 		DogsUnavailable:        unavailableMessage(dogsErr),
 		Escalations:            escalations,
 		EscalationsUnavailable: unavailableMessage(escalationsErr),
 		Health:                 health,
+		HealthUnavailable:      unavailableMessage(healthErr),
 		Queues:                 queues,
 		QueuesUnavailable:      unavailableMessage(queuesErr),
 		Sessions:               sessions,
 		SessionsUnavailable:    unavailableMessage(sessionsErr),
 		Hooks:                  hooks.Rows,
 		HooksWarning:           hooks.Warning(),
-		HooksUnavailable:       hooks.UnavailableReason(),
+		HooksUnavailable:       unionUnavailable(hooksErr, hooks.UnavailableReason()),
 		Mayor:                  mayor,
 		MayorUnavailable:       unavailableMessage(mayorErr),
 		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
 		IssuesWarning:          issues.Warning(),
-		IssuesUnavailable:      issues.UnavailableReason(),
+		IssuesUnavailable:      unionUnavailable(issuesErr, issues.UnavailableReason()),
 		Activity:               activity,
 		ActivityUnavailable:    unavailableMessage(activityErr),
 		Summary:                summary,
@@ -435,6 +462,13 @@ type summaryInput struct {
 	escalations      []EscalationRow
 	escalationsErr   error
 	activity         []ActivityRow
+	// These four have no count in the banner, only an alert: the operator's
+	// glance must still show that the page is missing a panel, or "✓ All clear"
+	// gets said about a dashboard that cannot see (gt-xw1t).
+	mailErr       error
+	rigsErr       error
+	healthErr     error
+	mergeQueueErr error
 }
 
 // computeSummary calculates dashboard stats and alerts from fetched data.
@@ -450,6 +484,10 @@ func computeSummary(in summaryInput) *DashboardSummary {
 		ConvoysUnavailable:     in.convoysErr != nil,
 		HooksUnavailable:       in.hooksUnreadable,
 		IssuesUnavailable:      in.issuesUnreadable,
+		MailUnavailable:        in.mailErr != nil,
+		RigsUnavailable:        in.rigsErr != nil,
+		HealthUnavailable:      in.healthErr != nil,
+		MergeQueueUnavailable:  in.mergeQueueErr != nil,
 	}
 
 	workers, hooks, issues, escalations, activity :=
@@ -498,6 +536,10 @@ func computeSummary(in summaryInput) *DashboardSummary {
 		summary.ConvoysUnavailable ||
 		summary.HooksUnavailable ||
 		summary.IssuesUnavailable ||
+		summary.MailUnavailable ||
+		summary.RigsUnavailable ||
+		summary.HealthUnavailable ||
+		summary.MergeQueueUnavailable ||
 		summary.StuckPolecats > 0 ||
 		summary.StaleHooks > 0 ||
 		summary.UnackedEscalations > 0 ||
@@ -516,6 +558,17 @@ func unavailableMessage(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// unionUnavailable renders why a union panel has no answer, from whichever of
+// its two failure channels fired. The query failing outright wins: it means the
+// StoreResult was never built, so its own reason would be an empty string that
+// reads as "every store answered".
+func unionUnavailable(err error, storeReason string) string {
+	if err != nil {
+		return err.Error()
+	}
+	return storeReason
 }
 
 // enrichIssuesWithAssignees adds Assignee info to issues by cross-referencing hooks.
