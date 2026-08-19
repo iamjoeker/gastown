@@ -37,7 +37,7 @@ type tmuxOps interface {
 	AcceptStartupDialogs(session string) error
 	AcceptWorkspaceTrustDialog(session string) error
 	AcceptBypassPermissionsWarning(session string) error
-	InterruptAgent(session, key string) error
+	SendKeysRaw(session, keys string) error
 	GetSessionInfo(name string) (*tmux.SessionInfo, error)
 }
 
@@ -227,7 +227,7 @@ func (m *Manager) Stop() error {
 	m.stopNudgePoller(sessionID)
 
 	// Try graceful shutdown first (best-effort interrupt)
-	_ = t.InterruptAgent(sessionID, tmux.KeyCtrlC)
+	_ = t.SendKeysRaw(sessionID, "C-c")
 	time.Sleep(100 * time.Millisecond)
 
 	// Kill the session.

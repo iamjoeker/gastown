@@ -2833,9 +2833,6 @@ func (t *Tmux) DisplayMessageDefault(session, message string) error {
 // SendNotificationBanner sends a visible notification banner to a tmux session.
 // This interrupts the terminal to ensure the notification is seen.
 // Uses echo to print a boxed banner with the notification details.
-//
-// Delivery goes through SendKeysToAgent: the recipient is a live agent, so the
-// banner carries the same test guard a nudge does (gt-7s8).
 func (t *Tmux) SendNotificationBanner(session, from, subject string) error {
 	// Sanitize inputs to prevent output manipulation
 	from = strings.ReplaceAll(from, "\n", " ")
@@ -2852,7 +2849,7 @@ Run: gt mail inbox
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 '`, from, subject)
 
-	return t.SendKeysToAgent(session, banner)
+	return t.SendKeys(session, banner)
 }
 
 // IsAgentRunning checks if an agent appears to be running in the session.

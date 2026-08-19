@@ -683,7 +683,7 @@ func stopSession(t *tmux.Tmux, sessionName string) (bool, error) {
 
 	// Try graceful shutdown first (Ctrl-C, best-effort interrupt)
 	if !downForce {
-		_ = t.InterruptAgent(sessionName, tmux.KeyCtrlC)
+		_ = t.SendKeysRaw(sessionName, "C-c")
 		if session.WaitForSessionExit(t, sessionName, constants.GracefulShutdownTimeout) {
 			return true, nil // Process exited gracefully
 		}

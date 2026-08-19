@@ -56,7 +56,7 @@ func StopTownSessionWithCache(t *tmux.Tmux, ts TownSession, force bool, cache *t
 func stopTownSessionInternal(t *tmux.Tmux, ts TownSession, force bool) (bool, error) {
 	// Try graceful shutdown first (unless forced)
 	if !force {
-		_ = t.InterruptAgent(ts.SessionID, tmux.KeyCtrlC)
+		_ = t.SendKeysRaw(ts.SessionID, "C-c")
 		WaitForSessionExit(t, ts.SessionID, constants.GracefulShutdownTimeout)
 	}
 

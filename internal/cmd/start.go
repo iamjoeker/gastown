@@ -610,10 +610,7 @@ func runGracefulShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) err
 	fmt.Printf("Phase 1: Sending ESC to %d agent(s)...\n", len(gtSessions))
 	for _, sess := range gtSessions {
 		fmt.Printf("  %s Interrupting %s\n", style.Bold.Render("→"), sess)
-		// InterruptAgent rather than SendKeysRaw: gtSessions is every gt session
-		// on the socket, so a test binary reaching this loop would cancel the
-		// turn of every live agent in the town. Still best-effort in production.
-		_ = t.InterruptAgent(sess, tmux.KeyEscape)
+		_ = t.SendKeysRaw(sess, "Escape") // best-effort interrupt
 	}
 
 	// Phase 2: Send shutdown message asking agents to handoff
@@ -622,18 +619,7 @@ func runGracefulShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) err
 	for _, sess := range gtSessions {
 		// Small delay then send the message
 		time.Sleep(constants.ShutdownNotifyDelay)
-		// Delivered as a nudge, not raw send-keys. This is a message to a
-		// running agent in everything but name, so it should inherit what the
-		// nudge path already provides: the test-mode guard that keeps a unit
-		// test from broadcasting [SHUTDOWN] to the whole town (gt-7s8),
-		// per-session serialization against a concurrent nudge, and the
-		// composer verification that turns "typed into a busy pane and
-		// stranded" into a reported failure. The error is surfaced rather than
-		// discarded — an agent that never saw the request is the one case
-		// Phase 3's wait cannot help with.
-		if err := t.NudgeSession(sess, shutdownMsg); err != nil {
-			fmt.Printf("  %s %s: %v\n", style.Dim.Render("⚠"), sess, err)
-		}
+		_ = t.SendKeys(sess, shutdownMsg) // best-effort notification
 	}
 
 	// Phase 3: Wait for agents to complete handoff
