@@ -349,13 +349,15 @@ case "$cmd" in
 		shift || true
 		case "$sub" in
 		  wisp)
-			echo 'legacy mol wisp should not be called' >&2
-			exit 1
+			echo '{"new_epic_id":"gt-wisp-xyz","id_mapping":{"mol-polecat-work":"gt-wisp-xyz"}}'
 			;;
 		  bond)
-			echo '{"result_id":"gt-abc123","id_mapping":{"mol-polecat-work":"gt-wisp-xyz"}}'
+			echo '{"result_id":"gt-abc123","id_mapping":{"mol-review":"gt-wisp-xyz"}}'
 			;;
 		esac
+    ;;
+  dep)
+    exit 0
     ;;
   update)
     exit 0
@@ -387,14 +389,15 @@ if "%cmd%"=="formula" (
 if "%cmd%"=="cook" exit /b 0
 if "%cmd%"=="mol" (
   if "%sub%"=="wisp" (
-    echo legacy mol wisp should not be called 1>&2
-    exit /b 1
+    echo {"new_epic_id":"gt-wisp-xyz","id_mapping":{"mol-polecat-work":"gt-wisp-xyz"}}
+    exit /b 0
   )
   if "%sub%"=="bond" (
-    echo {"result_id":"gt-abc123","id_mapping":{"mol-polecat-work":"gt-wisp-xyz"}}
+    echo {"result_id":"gt-abc123","id_mapping":{"mol-review":"gt-wisp-xyz"}}
     exit /b 0
   )
 )
+if "%cmd%"=="dep" exit /b 0
 exit /b 0
 `
 	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
@@ -507,6 +510,8 @@ exit /b 0
 	gotPolecatCook := false
 	gotReviewCook := false
 	gotBondCount := 0
+	gotRootOnlyCount := 0
+	gotDepCount := 0
 	gotCreate := false
 	gotTargetDBCheck := false
 	gotFormulaShow := false
@@ -556,6 +561,16 @@ exit /b 0
 		args := parts[7]
 
 		switch {
+		case strings.Contains(args, "mol wisp create "):
+			// pour = false formulas are instantiated root-only (gt-pzx). This
+			// call and the dep add that follows it mutate the target rig's
+			// database, so they answer to the same routing assertions bond did.
+			// Matched before the bare "create " case, which it also contains.
+			gotRootOnlyCount++
+			if !strings.Contains(args, "--root-only") {
+				t.Fatalf("bd mol wisp create args = %q, want --root-only", args)
+			}
+			assertTargetRig("mol wisp create", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
 		case strings.Contains(args, "create "):
 			gotCreate = true
 			assertTargetRig("create", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
@@ -592,6 +607,9 @@ exit /b 0
 				t.Fatalf("bd mol bond args = %q, want --ephemeral", args)
 			}
 			assertTargetRig("mol bond", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
+		case strings.Contains(args, "dep add "):
+			gotDepCount++
+			assertTargetRig("dep add", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--status=hooked"):
 			gotHook = true
 			lastHookIndex = i
@@ -615,9 +633,12 @@ exit /b 0
 		}
 	}
 
-	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotReviewCook || gotBondCount < 2 || !gotHook || !gotMetadata || !gotReviewOnlyMetadata || !gotPriorWorkLookup {
-		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v formulaShow=%v polecatCook=%v reviewCook=%v bondCount=%d hook=%v metadata=%v reviewOnlyMetadata=%v priorWorkLookup=%v (log: %q)",
-			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotReviewCook, gotBondCount, gotHook, gotMetadata, gotReviewOnlyMetadata, gotPriorWorkLookup, string(logBytes))
+	// mol-polecat-work declares no pour, so its dispatch takes the root-only
+	// path and is followed by a dep add; mol-review resolves to no formula file
+	// in this town, so it falls back to bond.
+	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotReviewCook || gotBondCount < 1 || gotRootOnlyCount < 1 || gotDepCount < 1 || !gotHook || !gotMetadata || !gotReviewOnlyMetadata || !gotPriorWorkLookup {
+		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v formulaShow=%v polecatCook=%v reviewCook=%v bondCount=%d rootOnlyCount=%d depCount=%d hook=%v metadata=%v reviewOnlyMetadata=%v priorWorkLookup=%v (log: %q)",
+			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotReviewCook, gotBondCount, gotRootOnlyCount, gotDepCount, gotHook, gotMetadata, gotReviewOnlyMetadata, gotPriorWorkLookup, string(logBytes))
 	}
 	if firstReviewOnlyMetadataIndex == -1 || lastHookIndex == -1 || firstReviewOnlyMetadataIndex > lastHookIndex {
 		t.Fatalf("review-only metadata must be stored before raw hook assignment: metadataIndex=%d hookIndex=%d log: %q", firstReviewOnlyMetadataIndex, lastHookIndex, string(logBytes))
@@ -2956,13 +2977,16 @@ case "$cmd" in
     shift || true
     case "$sub" in
       wisp)
-        echo 'legacy mol wisp should not be called' >&2
-        exit 1
+        echo '{"new_epic_id":"gt-wisp-xyz","id_mapping":{"mol-polecat-work":"gt-wisp-xyz"}}'
         ;;
       bond)
-        echo '{"result_id":"gt-abc123","id_mapping":{"mol-polecat-work":"gt-wisp-xyz"}}'
+        echo 'mol bond should not be called for a pour = false formula' >&2
+        exit 1
         ;;
     esac
+    ;;
+  dep)
+    exit 0
     ;;
   update)
     # Just succeed
@@ -2987,14 +3011,15 @@ if "%cmd%"=="formula" (
 if "%cmd%"=="cook" exit /b 0
 if "%cmd%"=="mol" (
   if "%sub%"=="wisp" (
-    echo legacy mol wisp should not be called 1>&2
-    exit /b 1
-  )
-  if "%sub%"=="bond" (
-    echo {^"result_id^":^"gt-abc123^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-xyz^"}}
+    echo {^"new_epic_id^":^"gt-wisp-xyz^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-xyz^"}}
     exit /b 0
   )
+  if "%sub%"=="bond" (
+    echo mol bond should not be called for a pour = false formula 1>&2
+    exit /b 1
+  )
 )
+if "%cmd%"=="dep" exit /b 0
 if "%cmd%"=="update" exit /b 0
 exit /b 0
 `
@@ -3048,15 +3073,16 @@ exit /b 0
 		t.Fatalf("read bd log: %v", err)
 	}
 
-	// After bonding (mol bond), there should be an update call that includes
+	// After the formula is instantiated (root-only here, since mol-polecat-work
+	// declares no pour), there should be an update call that includes
 	// --description with attached_molecule field. This is what gt hook looks for.
 	logLines := strings.Split(string(logBytes), "\n")
 
-	// Find all update commands after the bond
+	// Find all update commands after the instantiation
 	sawBond := false
 	foundAttachedMolecule := false
 	for _, line := range logLines {
-		if strings.Contains(line, "mol bond") {
+		if strings.Contains(line, "mol wisp create") {
 			sawBond = true
 			continue
 		}
@@ -3070,7 +3096,7 @@ exit /b 0
 	}
 
 	if !sawBond {
-		t.Fatalf("mol bond command not found in log:\n%s", string(logBytes))
+		t.Fatalf("mol wisp create command not found in log:\n%s", string(logBytes))
 	}
 
 	if !foundAttachedMolecule {
@@ -3086,7 +3112,7 @@ exit /b 0
 		if descBytes, err := os.ReadFile(attachedLogPath); err == nil {
 			attachedLog = string(descBytes)
 		}
-		t.Errorf("after mol bond, expected update with attached_molecule in description\n"+
+		t.Errorf("after formula instantiation, expected update with attached_molecule in description\n"+
 			"This is required for gt hook to recognize the molecule attachment.\n"+
 			"Log output:\n%s\nAttached log:\n%s", string(logBytes), attachedLog)
 	}

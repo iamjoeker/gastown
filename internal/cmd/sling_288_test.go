@@ -8,8 +8,39 @@ import (
 	"testing"
 )
 
+// installPouringFormula writes a pour = true formula into the town formula tier
+// so a test exercises the bond path.
+//
+// Formula resolution is rig > town > embedded, and every embedded formula
+// except beads-release declares no `pour` — so a test town with no formula
+// files on disk resolves mol-polecat-work to pour = false and takes the
+// root-only path (gt-pzx). Tests about bond mechanics install this instead of
+// changing the formula name, which would also change the required-var set that
+// ensureFormulaRequiredVars applies to mol-polecat-work.
+func installPouringFormula(t *testing.T, townRoot, formulaName string) {
+	t.Helper()
+	dir := filepath.Join(townRoot, ".beads", "formulas")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir formulas: %v", err)
+	}
+	content := "formula = \"" + formulaName + "\"\n" +
+		"description = \"Pouring test formula.\"\n" +
+		"pour = true\n\n" +
+		"[[steps]]\n" +
+		"id = \"work\"\n" +
+		"title = \"Do the work\"\n" +
+		"description = \"Test step.\"\n"
+	path := filepath.Join(dir, formulaName+".formula.toml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // TestInstantiateFormulaOnBead verifies the helper function works correctly.
 // This tests the formula-on-bead pattern used by issue #288.
+//
+// mol-polecat-work declares no `pour`, so the instantiation is root-only: one
+// wisp root, no step children, and a dependency edge back to the bead (gt-pzx).
 func TestInstantiateFormulaOnBead(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -60,13 +91,15 @@ case "$cmd" in
     shift || true
     case "$sub" in
       wisp)
-        echo 'legacy mol wisp should not be called' >&2
-        exit 1
+        echo '{"new_epic_id":"gt-wisp-288","id_mapping":{"mol-polecat-work":"gt-wisp-288"}}'
         ;;
       bond)
-        echo '{"result_id":"gt-abc123","id_mapping":{"mol-polecat-work":"gt-wisp-288"}}'
+        echo 'mol bond should not be called for a pour = false formula' >&2
+        exit 1
         ;;
     esac
+    ;;
+  dep)
     ;;
   update)
     ;;
@@ -89,14 +122,15 @@ if "%cmd%"=="formula" (
 if "%cmd%"=="cook" exit /b 0
 if "%cmd%"=="mol" (
   if "%sub%"=="wisp" (
-    echo legacy mol wisp should not be called 1>&2
-    exit /b 1
-  )
-  if "%sub%"=="bond" (
-    echo {^"result_id^":^"gt-abc123^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-288^"}}
+    echo {^"new_epic_id^":^"gt-wisp-288^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-288^"}}
     exit /b 0
   )
+  if "%sub%"=="bond" (
+    echo mol bond should not be called for a pour = false formula 1>&2
+    exit /b 1
+  )
 )
+if "%cmd%"=="dep" exit /b 0
 if "%cmd%"=="update" exit /b 0
 exit /b 0
 `
@@ -138,14 +172,17 @@ exit /b 0
 	if !strings.Contains(logContent, "cook mol-polecat-work") {
 		t.Errorf("cook command not found in log:\n%s", logContent)
 	}
-	if strings.Contains(logContent, "mol wisp") {
-		t.Errorf("legacy mol wisp command should not be called:\n%s", logContent)
+	if strings.Contains(logContent, "mol bond") {
+		t.Errorf("mol bond pours every step; a pour = false formula must not use it:\n%s", logContent)
 	}
 	if !strings.Contains(logContent, "--var branch=polecat/furiosa/gt-abc123") {
-		t.Errorf("extra vars not passed to bond command:\n%s", logContent)
+		t.Errorf("extra vars not passed to spawn command:\n%s", logContent)
 	}
-	if !strings.Contains(logContent, "mol bond mol-polecat-work gt-abc123 --json --ephemeral") {
-		t.Errorf("direct mol bond command not found in log:\n%s", logContent)
+	if !strings.Contains(logContent, "mol wisp create mol-polecat-work --root-only --json") {
+		t.Errorf("root-only spawn command not found in log:\n%s", logContent)
+	}
+	if !strings.Contains(logContent, "dep add gt-wisp-288 gt-abc123") {
+		t.Errorf("wisp is not linked back to the bead:\n%s", logContent)
 	}
 }
 
@@ -180,8 +217,8 @@ case "$cmd" in
   mol)
     sub="$1"; shift || true
     case "$sub" in
-      wisp) echo 'legacy mol wisp should not be called' >&2; exit 1;;
-      bond) echo '{"result_id":"gt-test","id_mapping":{"mol-polecat-work":"gt-wisp-skip"}}';;
+      wisp) echo '{"new_epic_id":"gt-wisp-skip","id_mapping":{"mol-polecat-work":"gt-wisp-skip"}}';;
+      bond) echo 'mol bond should not be called for a pour = false formula' >&2; exit 1;;
     esac;;
 esac
 exit 0
@@ -193,12 +230,12 @@ set "cmd=%1"
 set "sub=%2"
 if "%cmd%"=="mol" (
   if "%sub%"=="wisp" (
-    echo legacy mol wisp should not be called 1>&2
-    exit /b 1
+    echo {^"new_epic_id^":^"gt-wisp-skip^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-skip^"}}
+    exit /b 0
   )
   if "%sub%"=="bond" (
-    echo {^"result_id^":^"gt-test^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-skip^"}}
-    exit /b 0
+    echo mol bond should not be called for a pour = false formula 1>&2
+    exit /b 1
   )
 )
 exit /b 0
@@ -226,12 +263,12 @@ exit /b 0
 		t.Errorf("cook should be skipped when skipCook=true, but was called:\n%s", logContent)
 	}
 
-	// Verify direct bond was still called without the legacy wisp path.
-	if strings.Contains(logContent, "mol wisp") {
-		t.Errorf("mol wisp should not be called")
+	// Verify the root-only spawn still ran, cook or no cook.
+	if strings.Contains(logContent, "mol bond") {
+		t.Errorf("mol bond should not be called for a pour = false formula:\n%s", logContent)
 	}
-	if !strings.Contains(logContent, "mol bond mol-polecat-work gt-test --json --ephemeral") {
-		t.Errorf("mol bond should still be called")
+	if !strings.Contains(logContent, "mol wisp create mol-polecat-work --root-only --json") {
+		t.Errorf("root-only spawn should still be called:\n%s", logContent)
 	}
 }
 
@@ -372,8 +409,8 @@ case "$cmd" in
   mol)
     sub="$1"; shift || true
     case "$sub" in
-      wisp) echo 'legacy mol wisp should not be called' >&2; exit 1;;
-      bond) echo '{"result_id":"gt-abc123","id_mapping":{"mol-polecat-work":"gt-wisp-var"}}';;
+      wisp) echo '{"new_epic_id":"gt-wisp-var","id_mapping":{"mol-polecat-work":"gt-wisp-var"}}';;
+      bond) echo 'mol bond should not be called for a pour = false formula' >&2; exit 1;;
     esac;;
 esac
 exit 0
@@ -386,12 +423,12 @@ set "sub=%2"
 if "%cmd%"=="cook" exit /b 0
 if "%cmd%"=="mol" (
   if "%sub%"=="wisp" (
-    echo legacy mol wisp should not be called 1>&2
-    exit /b 1
+    echo {^"new_epic_id^":^"gt-wisp-var^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-var^"}}
+    exit /b 0
   )
   if "%sub%"=="bond" (
-    echo {^"result_id^":^"gt-abc123^",^"id_mapping^":{^"mol-polecat-work^":^"gt-wisp-var^"}}
-    exit /b 0
+    echo mol bond should not be called for a pour = false formula 1>&2
+    exit /b 1
   )
 )
 exit /b 0
@@ -413,25 +450,25 @@ exit /b 0
 	logBytes, _ := os.ReadFile(logPath)
 	logContent := string(logBytes)
 
-	// Find direct mol bond line
-	var bondLine string
+	// Find the root-only spawn line — the same vars must reach it.
+	var spawnLine string
 	for _, line := range strings.Split(logContent, "\n") {
-		if strings.Contains(line, "mol bond") {
-			bondLine = line
+		if strings.Contains(line, "mol wisp create") {
+			spawnLine = line
 			break
 		}
 	}
 
-	if bondLine == "" {
-		t.Fatalf("mol bond command not found:\n%s", logContent)
+	if spawnLine == "" {
+		t.Fatalf("mol wisp create command not found:\n%s", logContent)
 	}
 
-	if !strings.Contains(bondLine, "feature=My Cool Feature") {
-		t.Errorf("mol bond missing feature variable:\n%s", bondLine)
+	if !strings.Contains(spawnLine, "feature=My Cool Feature") {
+		t.Errorf("spawn missing feature variable:\n%s", spawnLine)
 	}
 
-	if !strings.Contains(bondLine, "issue=gt-abc123") {
-		t.Errorf("mol bond missing issue variable:\n%s", bondLine)
+	if !strings.Contains(spawnLine, "issue=gt-abc123") {
+		t.Errorf("spawn missing issue variable:\n%s", spawnLine)
 	}
 }
 
@@ -448,6 +485,11 @@ func TestInstantiateFormulaOnBead_DirectBondParsesIDMapping(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"gt-","path":"."}`), 0644); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
+
+	// This test is about bond mechanics, so give the town a pour = true
+	// mol-polecat-work — the embedded one declares no pour and would take the
+	// root-only path instead (gt-pzx).
+	installPouringFormula(t, townRoot, "mol-polecat-work")
 
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
@@ -711,6 +753,11 @@ func TestInstantiateFormulaOnBead_DirectBondHandlesNonGTIDs(t *testing.T) {
 		t.Fatalf("write routes: %v", err)
 	}
 
+	// This test is about bond mechanics, so give the town a pour = true
+	// mol-polecat-work — the embedded one declares no pour and would take the
+	// root-only path instead (gt-pzx).
+	installPouringFormula(t, townRoot, "mol-polecat-work")
+
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir binDir: %v", err)
@@ -818,6 +865,11 @@ func TestInstantiateFormulaOnBead_DirectBondCreatesNoOrphanCleanup(t *testing.T)
 		t.Fatalf("write routes: %v", err)
 	}
 
+	// This test is about bond mechanics, so give the town a pour = true
+	// mol-polecat-work — the embedded one declares no pour and would take the
+	// root-only path instead (gt-pzx).
+	installPouringFormula(t, townRoot, "mol-polecat-work")
+
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir binDir: %v", err)
@@ -921,6 +973,11 @@ func TestInstantiateFormulaOnBead_DirectBondParseFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"gt-","path":"."}`), 0644); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
+
+	// This test is about bond mechanics, so give the town a pour = true
+	// mol-polecat-work — the embedded one declares no pour and would take the
+	// root-only path instead (gt-pzx).
+	installPouringFormula(t, townRoot, "mol-polecat-work")
 
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
