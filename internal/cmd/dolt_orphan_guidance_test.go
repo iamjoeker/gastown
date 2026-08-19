@@ -57,7 +57,7 @@ func TestOrphanCleanupGuidanceNamesNoMutatingCommand(t *testing.T) {
 		// The case that used to look harmless — and is the one where the
 		// recommendation actually would have deleted something.
 		{"cleanup would proceed", 2, 11},
-		{"cleanup would refuse on volume", maxSQLCleanup + 1, 200},
+		{"cleanup would refuse on volume", doltserver.MaxSQLCleanup + 1, 200},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,7 +119,7 @@ func TestOrphanCleanupGuidanceDistinguishesTheTwoRefusals(t *testing.T) {
 	townRoot := t.TempDir()
 
 	// Volume, not ratio: 51 of 200 is well under the ratio threshold.
-	volume := orphanCleanupGuidance(townRoot, fixtureOrphans(maxSQLCleanup+1, true), make([]string, 200), "  ")
+	volume := orphanCleanupGuidance(townRoot, fixtureOrphans(doltserver.MaxSQLCleanup+1, true), make([]string, 200), "  ")
 	if !strings.Contains(volume, "it can drop by SQL") {
 		t.Errorf("past the SQL ceiling the report must give that reason:\n%s", volume)
 	}
@@ -129,7 +129,7 @@ func TestOrphanCleanupGuidanceDistinguishesTheTwoRefusals(t *testing.T) {
 
 	// Both trip: evaluateCleanupBalks returns the ratio balk first, because that
 	// is the one the real run raises. The report must match the real run.
-	both := orphanCleanupGuidance(townRoot, fixtureOrphans(maxSQLCleanup+1, true), make([]string, maxSQLCleanup+1), "  ")
+	both := orphanCleanupGuidance(townRoot, fixtureOrphans(doltserver.MaxSQLCleanup+1, true), make([]string, doltserver.MaxSQLCleanup+1), "  ")
 	if !strings.Contains(both, "above the ratio") {
 		t.Errorf("when both balks trip, the report must name the one the real run raises first:\n%s", both)
 	}
@@ -137,14 +137,14 @@ func TestOrphanCleanupGuidanceDistinguishesTheTwoRefusals(t *testing.T) {
 
 // TestOrphanCleanupGuidanceTracksTheDeletionPath is the anti-drift control. The
 // report must not carry its own copy of the thresholds: if it did, a change to
-// orphanRatioBalkFraction or maxSQLCleanup would make status confidently
-// describe a refusal that does not happen, or miss one that does.
+// doltserver's OrphanRatioBalkFraction or MaxSQLCleanup would make status
+// confidently describe a refusal that does not happen, or miss one that does.
 func TestOrphanCleanupGuidanceTracksTheDeletionPath(t *testing.T) {
 	townRoot := t.TempDir()
 
 	cases := []struct{ orphans, total int }{
 		{1, 11}, {2, 11}, {3, 11}, {4, 11}, {6, 11}, {5, 10}, {6, 10},
-		{3, 5}, {4, 5}, {maxSQLCleanup, 200}, {maxSQLCleanup + 1, 200},
+		{3, 5}, {4, 5}, {doltserver.MaxSQLCleanup, 200}, {doltserver.MaxSQLCleanup + 1, 200},
 	}
 	sawBoth := map[bool]bool{}
 	for _, tc := range cases {
