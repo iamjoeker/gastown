@@ -35,30 +35,6 @@ func NewFormulaCheck() *FormulaCheck {
 	}
 }
 
-// doctorMissingSectionLimit bounds how many absent sections one doctor detail
-// line names. Doctor prints every check; the full list is one command away.
-const doctorMissingSectionLimit = 2
-
-// missingSectionDetail renders the "what is this copy actually missing" line
-// for a pinned formula, or "" when there is nothing to say — either the two
-// texts share every section, or they could not be compared.
-//
-// The empty case is deliberately silent HERE, unlike in `gt formula drift`: a
-// doctor run prints every check, and a per-formula "nothing missing" line on a
-// warning that is still a warning would be noise. An operator who wants the
-// bounded answer runs the command the line above already names.
-func missingSectionDetail(townRoot, name string) string {
-	r, err := formula.ResolveFormula(name, townRoot, "")
-	if err != nil {
-		return ""
-	}
-	summary := formula.SummarizeMissingSections(r.MissingSections(), doctorMissingSectionLimit)
-	if summary == "" {
-		return ""
-	}
-	return "    " + summary
-}
-
 // Run checks if formulas need updating.
 func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 	report, err := formula.CheckFormulaHealth(ctx.TownRoot)
@@ -95,12 +71,6 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 			if f.EmbeddedChanged {
 				name := strings.TrimSuffix(f.Name, ".formula.toml")
 				details = append(details, fmt.Sprintf("  %s: locally modified AND the shipped default has changed since install — reconcile by hand (gt will keep skipping it): gt formula drift %s", f.Name, name))
-				// Doctor is where most operators meet a pinned formula, and
-				// "reconcile by hand" alone does not say whether that hand
-				// merge is urgent. Name what is absent (gt-yubx).
-				if line := missingSectionDetail(ctx.TownRoot, name); line != "" {
-					details = append(details, line)
-				}
 			} else {
 				details = append(details, fmt.Sprintf("  %s: locally modified (skipping)", f.Name))
 			}

@@ -39,7 +39,8 @@ func sweepFixture() *witness.BranchSweepResult {
 				Branch: "polecat/refinery/gt-aqk+ddd", CommitSHA: "sha4",
 				IssueID: "gt-aqk", IssueStatus: "closed",
 				Class: witness.BranchSweepLanded, Evidence: "cherry",
-				Note: "content is in origin/main (same patches, squashed or cherry-picked)",
+				ContainedIn: "origin/main", HygieneUnreachable: true,
+				Note: "content is in origin/main (same patches, squashed or cherry-picked); NOT an ancestor of origin/main — branch hygiene cannot delete it",
 			},
 		},
 	}
@@ -441,4 +442,264 @@ type cobraCommandShim struct {
 	Use   string
 	Short string
 	Long  string
+}
+
+// landedAncestorFinding is a branch whose commit is in the target's history:
+// the half of "landed" that branch hygiene collects on its own.
+func landedAncestorFinding() witness.BranchSweepFinding {
+	return witness.BranchSweepFinding{
+		Branch: "polecat/chrome/gt-yb33+eee", CommitSHA: "sha5",
+		IssueID: "gt-yb33", IssueStatus: "closed",
+		Class: witness.BranchSweepLanded, Evidence: "ancestor",
+		ContainedIn: "origin/main", HygieneUnreachable: false,
+		Note: "content is in origin/main (ancestor)",
+	}
+}
+
+// The default view hides landed rows entirely, which is exactly why the notice
+// belongs there: without it a reader who never passes --all never learns these
+// branches exist, and nothing else will ever remove them (gt-l65a).
+func TestPatrolBranchesHumanRaisesHygieneUnreachableInTheDefaultView(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", sweepFixture(), false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "NOT ancestors of origin/main") {
+		t.Errorf("default view does not raise the uncollectable landed branch:\n%s", out)
+	}
+	if !strings.Contains(out, "--deletable") {
+		t.Errorf("default view does not route the reader anywhere:\n%s", out)
+	}
+	// The routing claim is the finding. Saying only "landed" is what left these
+	// rows in every future sweep.
+	if !strings.Contains(out, "branch hygiene deletes by ancestry") {
+		t.Errorf("default view does not say why nothing collects them:\n%s", out)
+	}
+}
+
+// A rig whose landed branches are all ancestors has nothing to route, and must
+// not be told to go look at an empty list.
+func TestPatrolBranchesHumanOmitsTheNoticeWhenEveryLandedBranchIsAnAncestor(t *testing.T) {
+	result := sweepFixture()
+	result.Findings[3] = landedAncestorFinding()
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "--deletable") {
+		t.Errorf("notice printed with nothing to route:\n%s", out)
+	}
+	if !strings.Contains(out, "1 landed (1 ancestor, 0 not an ancestor)") {
+		t.Errorf("summary does not split the landed tally:\n%s", out)
+	}
+}
+
+// One number for "landed" hides the half that accumulates, so the tally splits.
+func TestPatrolBranchesHumanSplitsTheLandedTally(t *testing.T) {
+	result := sweepFixture()
+	result.Findings = append(result.Findings, landedAncestorFinding())
+	result.Scanned = 5
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), "2 landed (1 ancestor, 1 not an ancestor)") {
+		t.Errorf("summary does not split the landed tally:\n%s", buf.String())
+	}
+}
+
+// In --all the rows are on screen, so the discriminator must be on the row.
+func TestPatrolBranchesHumanMarksTheUncollectableRow(t *testing.T) {
+	result := sweepFixture()
+	result.Findings = append(result.Findings, landedAncestorFinding())
+	result.Scanned = 5
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, true); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "landed*") {
+		t.Errorf("--all does not mark the uncollectable landed row:\n%s", out)
+	}
+	if !strings.Contains(out, "Marked landed* in the table above") {
+		t.Errorf("--all does not explain the mark:\n%s", out)
+	}
+	// The ancestor row must not wear the mark: it is collected already.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "polecat/chrome/gt-yb33+eee") && strings.Contains(line, "landed*") {
+			t.Errorf("ancestor row marked uncollectable: %q", strings.TrimSpace(line))
+		}
+	}
+}
+
+// --deletable is the short list an operator can act on: exactly the landed rows
+// hygiene cannot reach, and nothing else.
+func TestPatrolBranchesDeletableListsOnlyTheUncollectableRows(t *testing.T) {
+	result := sweepFixture()
+	result.Findings = append(result.Findings, landedAncestorFinding())
+	result.Scanned = 5
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesDeletable(&buf, "gastown", result); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "polecat/refinery/gt-aqk+ddd") {
+		t.Errorf("--deletable omits the uncollectable branch:\n%s", out)
+	}
+	for _, hidden := range []string{
+		"polecat/dust/gt-k3v+aaa",      // check: unmerged, must never be offered for deletion
+		"polecat/foundation/gt-q+bbb",  // queued
+		"polecat/mirelurk/gt-live+ccc", // active
+		"polecat/chrome/gt-yb33+eee",   // landed, and hygiene already has it
+	} {
+		if strings.Contains(out, hidden) {
+			t.Errorf("--deletable includes %s, which is not deletable by this route:\n%s", hidden, out)
+		}
+	}
+}
+
+// It must print the verification before the deletion, and it must perform
+// neither: these are shared remote refs.
+func TestPatrolBranchesDeletableGivesCommandsAndPerformsNothing(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesDeletable(&buf, "gastown", sweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	verify := strings.Index(out, "git cherry origin/main origin/polecat/refinery/gt-aqk+ddd")
+	del := strings.Index(out, "git push origin --delete polecat/refinery/gt-aqk+ddd")
+	if verify < 0 {
+		t.Errorf("no verification command:\n%s", out)
+	}
+	if del < 0 {
+		t.Errorf("no deletion command:\n%s", out)
+	}
+	if verify >= 0 && del >= 0 && verify > del {
+		t.Errorf("deletion is printed before its verification:\n%s", out)
+	}
+	if !strings.Contains(out, "deletes nothing") {
+		t.Errorf("--deletable does not state that it performed nothing:\n%s", out)
+	}
+	if !strings.Contains(strings.ToLower(out), "stop and check") {
+		t.Errorf("--deletable does not say how to read the verification:\n%s", out)
+	}
+}
+
+// A verification must be run against the ref that actually contains the branch.
+// On a fork-backed rig that is not always the primary target.
+func TestPatrolBranchesDeletableVerifiesAgainstTheContainingRef(t *testing.T) {
+	result := sweepFixture()
+	result.Targets = []string{"origin/main", "upstream/main"}
+	result.Findings[3].ContainedIn = "upstream/main"
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesDeletable(&buf, "gastown", result); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), "git cherry upstream/main origin/polecat/refinery/gt-aqk+ddd") {
+		t.Errorf("verification does not use the ref that contains the branch:\n%s", buf.String())
+	}
+}
+
+// An empty --deletable must say what it measured. "Nothing to delete" and "no
+// landed branches at all" are different facts about the rig.
+func TestPatrolBranchesDeletableEmptySaysWhatItMeasured(t *testing.T) {
+	result := sweepFixture()
+	result.Findings[3] = landedAncestorFinding()
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesDeletable(&buf, "gastown", result); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "4 scanned") || !strings.Contains(out, "1 landed") {
+		t.Errorf("empty --deletable does not report what it measured:\n%s", out)
+	}
+	if !strings.Contains(out, "every one is an ancestor of origin/main") {
+		t.Errorf("empty --deletable does not say why the list is empty:\n%s", out)
+	}
+}
+
+// A rig with no polecat branches at all must say so rather than render an empty
+// deletable list, which reads as "measured, and clean".
+func TestPatrolBranchesDeletableDistinguishesAnUnscannedRig(t *testing.T) {
+	var buf bytes.Buffer
+	empty := &witness.BranchSweepResult{Remote: "origin", Target: "origin/main", MRsMeasured: true}
+	if err := writePatrolBranchesDeletable(&buf, "gastown", empty); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), "no polecat branches") {
+		t.Errorf("an empty listing does not say so:\n%s", buf.String())
+	}
+}
+
+// The JSON carries the routing fact per row and as a total, so a consumer never
+// has to re-derive it from the evidence string or re-run with a flag.
+func TestPatrolBranchesJSONCarriesHygieneReachability(t *testing.T) {
+	result := sweepFixture()
+	result.Findings = append(result.Findings, landedAncestorFinding())
+	result.Scanned = 5
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesJSON(&buf, "gastown", result); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	var out struct {
+		Attention          int `json:"attention"`
+		HygieneUnreachable int `json:"hygiene_unreachable"`
+		Findings           []struct {
+			Branch             string `json:"branch"`
+			Class              string `json:"class"`
+			Evidence           string `json:"evidence"`
+			HygieneUnreachable *bool  `json:"hygiene_unreachable"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, buf.String())
+	}
+	if out.HygieneUnreachable != 1 {
+		t.Fatalf("hygiene_unreachable total = %d, want 1", out.HygieneUnreachable)
+	}
+	if out.Attention != 1 {
+		t.Fatalf("attention = %d, want 1 — the two totals are separate", out.Attention)
+	}
+	if len(out.Findings) != 5 {
+		t.Fatalf("findings = %d, want all 5 — JSON is never filtered", len(out.Findings))
+	}
+	for _, f := range out.Findings {
+		// A false must serialise, not vanish: an absent key would read the same
+		// as a row from a build that never looked.
+		if f.HygieneUnreachable == nil {
+			t.Fatalf("%s omits hygiene_unreachable", f.Branch)
+		}
+		want := f.Class == "landed" && f.Evidence != "ancestor"
+		if *f.HygieneUnreachable != want {
+			t.Errorf("%s hygiene_unreachable = %v, want %v (class %q, evidence %q)",
+				f.Branch, *f.HygieneUnreachable, want, f.Class, f.Evidence)
+		}
+	}
+}
+
+func TestPatrolBranchesDeletableFlagIsRegistered(t *testing.T) {
+	flag := patrolBranchesCmd.Flags().Lookup("deletable")
+	if flag == nil {
+		t.Fatalf("flag --deletable is missing")
+	}
+	// The flag lists; it must not read as one that deletes.
+	if !strings.Contains(flag.Usage, "deletes nothing") {
+		t.Errorf("--deletable help does not disclaim acting:\n%s", flag.Usage)
+	}
+	if !strings.Contains(patrolBranchesCmd.Long, "--deletable") {
+		t.Errorf("help text does not document --deletable:\n%s", patrolBranchesCmd.Long)
+	}
 }
