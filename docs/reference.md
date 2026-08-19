@@ -43,6 +43,12 @@ writes (`create`, `update`, `close`, `mail send`), real-`cd` into the owning
 root instead of passing `-C`, then confirm the row landed where you expected. A
 `bd create` success banner is not evidence of which database took the row.
 
+`gt close -C <dir>` is the exception: `gt` strips the flag before calling `bd`
+and actually runs `bd` in `<dir>`, so both inputs come from the directory you
+named. It errors if `<dir>` does not exist rather than falling back to prefix
+routing. An explicit `-C` there overrides the directory the bead's prefix would
+otherwise select, and applies to every bd call in a `--cascade`.
+
 **How it works**: Routes are defined in `~/gt/.beads/routes.jsonl`. Each rig's
 prefix maps to its beads location (the mayor's clone in that rig).
 
