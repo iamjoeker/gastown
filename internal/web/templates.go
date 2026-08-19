@@ -25,16 +25,20 @@ type ConvoyData struct {
 	Rigs                 []RigRow
 	Dogs                 []DogRow
 	Escalations          []EscalationRow
-	Health               *HealthRow
-	Queues               []QueueRow
-	Sessions             []SessionRow
-	Hooks                []HookRow
-	Mayor                *MayorStatus
-	Issues               []IssueRow
-	Activity             []ActivityRow
-	Summary              *DashboardSummary
-	Expand               string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken            string // Token for CSRF protection on POST requests
+	// EscalationsUnavailable holds the reason the escalation query failed, or
+	// "" when it succeeded. Non-empty means the escalation count is unknown —
+	// which the panel must render differently from a count of zero.
+	EscalationsUnavailable string
+	Health                 *HealthRow
+	Queues                 []QueueRow
+	Sessions               []SessionRow
+	Hooks                  []HookRow
+	Mayor                  *MayorStatus
+	Issues                 []IssueRow
+	Activity               []ActivityRow
+	Summary                *DashboardSummary
+	Expand                 string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken              string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
@@ -147,6 +151,11 @@ type DashboardSummary struct {
 	IssueCount      int
 	ConvoyCount     int
 	EscalationCount int
+
+	// EscalationsUnavailable is true when the escalation query failed, making
+	// EscalationCount and UnackedEscalations meaningless zeroes. It is itself an
+	// alert: a dashboard that cannot see escalations is not "all clear".
+	EscalationsUnavailable bool
 
 	// Alerts (things needing attention)
 	StuckPolecats      int // No activity > 5 min
