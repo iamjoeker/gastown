@@ -224,18 +224,6 @@ Write the decision here rather than relying on operators remembering it.
 | `gt issue clear` | Clears issue from tmux status line |
 | `gt doctor --fix` | Auto-fixes: orphan sessions, wisp GC, stale redirects, worktree validity |
 
-## Temp / Scratchpad Cleanup
-
-| Command | What it does |
-|---------|-------------|
-| `gt deacon sweep-scratchpads` | Reports which agent scratchpads under `$TMPDIR/claude-<uid>` are provably dead and how much a sweep would reclaim (dry run) |
-| `gt deacon sweep-scratchpads --apply` | Deletes them, oldest first, only while the filesystem is above the high-water mark |
-| `gt deacon sweep-scratchpads --all --apply` | Deletes every dead scratchpad regardless of filesystem pressure |
-
-A session scratchpad is only ever deleted when no live process can own it — see
-[Scratchpad Retention](scratchpad-retention.md) for the liveness proof and why
-an age-only sweep is both unsafe and ineffective here.
-
 ## System-Level Cleanup
 
 | Command | What it does |
@@ -269,11 +257,11 @@ an age-only sweep is both unsafe and ineffective here.
 
 | Layer | Scope | Key Commands |
 |-------|-------|-------------|
-| **L0** | Ephemeral data | `gt compact`, `gt krc prune` (TTL-based lifecycle), `gt deacon sweep-scratchpads` |
+| **L0** | Ephemeral data | `gt compact`, `gt krc prune` (TTL-based lifecycle) |
 | **L1** | Processes | `gt cleanup`, `gt orphans procs kill`, `gt deacon cleanup-orphans` |
 | **L2** | Git artifacts | `gt prune-branches`, `gt polecat gc`, `gt orphans kill` |
 | **L3** | Agents/sessions | `gt polecat nuke`, `gt done`, `gt shutdown`, `gt down` |
 | **L4** | Workspace | `gt rig reset`, `gt doctor --fix`, `gt dolt cleanup` |
 | **L5** | System | `gt uninstall`, `gt disable --clean` |
 
-**Total: ~63 commands/functions** across the cleanup ecosystem.
+**Total: ~62 commands/functions** across the cleanup ecosystem.

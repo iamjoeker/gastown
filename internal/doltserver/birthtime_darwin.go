@@ -1,15 +1,15 @@
 //go:build darwin
 
-package util
+package doltserver
 
 import (
 	"syscall"
 	"time"
 )
 
-// DirBirthTime returns the filesystem birth (creation) time of path.
+// dirBirthTime returns the filesystem birth (creation) time of path.
 // See the linux implementation for why birth time and not mtime.
-func DirBirthTime(path string) (time.Time, bool) {
+func dirBirthTime(path string) (time.Time, bool) {
 	var st syscall.Stat_t
 	if err := syscall.Stat(path, &st); err != nil {
 		return time.Time{}, false

@@ -3,9 +3,7 @@ package doctor
 import (
 	"fmt"
 	"os"
-	"time"
 
-	"github.com/steveyegge/gastown/internal/scratchpad"
 	"github.com/steveyegge/gastown/internal/tmpgc"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -87,19 +85,6 @@ func (c *TmpSpaceCheck) Run(ctx *CheckContext) *CheckResult {
 		default:
 			details = append(details,
 				"No orphaned Go build directories: the space is held by something else (agent scratchpads, test fixtures)")
-		}
-	}
-
-	// The other half of a full TMPDIR is dead agents' scratchpads, and on the
-	// host that motivated this it was the larger half by a factor of two. Only
-	// reported, never fixed here: proving a session dead is what
-	// sweep-scratchpads does, and deleting another agent's working files is an
-	// explicit call, not a side effect of `gt doctor --fix` (gt-h0jb).
-	if survey, err := scratchpad.Take(scratchpad.DefaultRoot(), os.Getenv("HOME"), scratchpad.DefaultPolicy(), time.Now()); err == nil {
-		if count, bytes := survey.Dead(); count > 0 {
-			details = append(details, fmt.Sprintf(
-				"%s is scratchpad space held by %d dead agent sessions — run 'gt deacon sweep-scratchpads' to review, then --apply",
-				util.FormatBytesHuman(uint64(bytes)), count))
 		}
 	}
 
