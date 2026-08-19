@@ -219,12 +219,17 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			}
 		}
 		if opts.DryRun {
-			fmt.Printf("Would spawn fresh polecat in rig '%s'\n", rigName)
+			fmt.Printf("Would dispatch to a polecat in rig '%s' (reusing an idle one if available)\n", rigName)
 			result.Agent = fmt.Sprintf("%s/polecats/<new>", rigName)
 			result.Pane = "<new-pane>"
 			return result, nil
 		}
-		fmt.Printf("Target is rig '%s', spawning fresh polecat...\n", rigName)
+		// Do not announce a fresh spawn here: SpawnPolecatForSling decides between
+		// reuse and creation, and prints which it did. Claiming "spawning fresh
+		// polecat" up front is how the pool grew unbounded in plain sight for a
+		// month — the line was in the operator's terminal every single time, so it
+		// read as normal rather than as the defect it was reporting (gt-2uqy).
+		fmt.Printf("Target is rig '%s', dispatching to a polecat...\n", rigName)
 		spawnOpts := SlingSpawnOptions{
 			TownRoot:      opts.TownRoot,
 			Force:         opts.Force,
@@ -266,7 +271,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 					return nil, err
 				}
 			}
-			fmt.Printf("Target polecat has no active session, spawning fresh polecat in rig '%s'...\n", rigName)
+			fmt.Printf("Target polecat has no active session, dispatching to a polecat in rig '%s'...\n", rigName)
 			spawnOpts := SlingSpawnOptions{
 				TownRoot:      opts.TownRoot,
 				Force:         opts.Force,
