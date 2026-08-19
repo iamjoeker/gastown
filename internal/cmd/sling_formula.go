@@ -283,6 +283,26 @@ func verifyFormulaExists(formulaName, workDir, townRoot string) error {
 	return fmt.Errorf("formula '%s' not found (check 'bd formula list')", formulaName)
 }
 
+// formulaWispArgs builds the bd command that instantiates a standalone formula
+// as a wisp.
+//
+// The wisp is created root-only unless the formula declares pour = true
+// (gt-pzx). Patrol formulas declare no `pour`, so slinging one used to
+// materialize 26 step wisps that nothing reads or closes, while autoSpawnPatrol
+// created the same formula root-only — the two instantiation paths disagreed
+// for every formula in the corpus but beads-release. gt prime renders the
+// checklist inline from attached_formula either way.
+func formulaWispArgs(formulaName, townRoot, rigName string, vars []string) []string {
+	args := []string{"mol", "wisp", formulaName}
+	if !formulaPoursSteps(formulaName, townRoot, rigName) {
+		args = append(args, "--root-only")
+	}
+	for _, v := range vars {
+		args = append(args, "--var", v)
+	}
+	return append(args, "--json")
+}
+
 // runSlingFormula handles standalone formula slinging.
 // Flow: cook → wisp → attach to hook → nudge
 func runSlingFormula(ctx context.Context, args []string) (err error) {
@@ -472,11 +492,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 
 	// Step 2: Create wisp instance (ephemeral)
 	fmt.Printf("  Creating wisp...\n")
-	wispArgs := []string{"mol", "wisp", formulaName}
-	for _, v := range slingVars {
-		wispArgs = append(wispArgs, "--var", v)
-	}
-	wispArgs = append(wispArgs, "--json")
+	wispArgs := formulaWispArgs(formulaName, townRoot, slingTargetRigName(targetAgent), slingVars)
 
 	wispOut, err := BdCmd(wispArgs...).
 		Dir(formulaWorkDir).
