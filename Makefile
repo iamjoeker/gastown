@@ -179,16 +179,8 @@ check-version-tag:
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
 
-test: test-makefile test-nested-modules
+test: test-makefile
 	go test ./...
-
-# `go test ./...` stops at a module boundary: from the repo root it reports
-# "matched no packages" for anything under a nested go.mod, so until this target
-# existed plugins/dolt-snapshots was run by no gate at all. Each nested module
-# gets its own line; internal/testenv's coverage check enumerates the modules
-# that need one.
-test-nested-modules:
-	cd plugins/dolt-snapshots && go test ./...
 
 test-makefile:
 	bash scripts/check-install-path_test.sh

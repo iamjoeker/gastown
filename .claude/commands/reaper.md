@@ -17,9 +17,9 @@ If `--dry-run` is passed, report counts without making changes.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | max_age | 24h | Wisps older than this are reaped (closed) |
-| purge_age | 72h | Closed wisps older than this are purged (deleted) |
+| purge_age | 168h | Closed wisps older than this are purged — deleted permanently (7d) |
 | stale_issue_age | 720h | Issues stale longer than this are auto-closed (30d) |
-| mail_delete_age | 72h | Closed mail older than this is purged |
+| mail_delete_age | 168h | Closed mail older than this is purged (7d) |
 | alert_threshold | 3000 | Open wisp count that triggers escalation |
 | dolt_port | 3307 | Dolt server port |
 
@@ -27,9 +27,21 @@ If `--dry-run` is passed, report counts without making changes.
 is the value every other surface publishes: the `mol-dog-reaper` formula var, the
 `gt reaper auto-close --help` default, and the daemon constant. This file said 168h
 (7d) until gt-zjb — running it closed live issues 4.3x sooner than the town's
-documented policy, silently. If that number ever needs to change, change it in
-`internal/cmd/reaper.go` (the `--stale-age` flag default) and here in the same
-commit; `TestReaperSkillStaleAgeMatchesCLIDefault` fails if they drift apart.
+documented policy, silently.
+
+`purge_age` and `mail_delete_age` are 168h (7d) because purge **deletes
+permanently**: wisps are unversioned and unbacked (hq-del4), which is what made
+gt-5y7 — a purge that destroyed a closed-but-unmerged refinery rejection ~11
+minutes old — unrecoverable. 7d is what every other destructive path uses: the
+`--purge-age` / `--mail-age` flag defaults, the `mol-dog-reaper` formula vars,
+`donePurgeMinAge` in `internal/cmd/done.go`, and `purgeMinAge` in
+`internal/doltserver/sync.go`. This file said 72h until gt-tu67 — a manual
+/reaper run deleted closed wisps and closed mail 2.3x sooner than the town's own
+policy.
+
+If any of these numbers ever needs to change, change it in
+`internal/cmd/reaper.go` (the flag defaults) and here in the same commit; the
+guards in `internal/cmd/reaper_skill_ages_test.go` fail if they drift apart.
 
 ## Execution Steps
 
@@ -59,8 +71,8 @@ For each database returned in Step 2:
 
 ```bash
 gt reaper scan --db=<name> --port=3307 \
-  --max-age=24h --purge-age=72h \
-  --mail-age=72h --stale-age=720h \
+  --max-age=24h --purge-age=168h \
+  --mail-age=168h --stale-age=720h \
   --json
 ```
 
@@ -99,7 +111,7 @@ For each database with purge candidates:
 
 ```bash
 gt reaper purge --db=<name> --port=3307 \
-  --purge-age=72h --mail-age=72h [--dry-run] --json
+  --purge-age=168h --mail-age=168h [--dry-run] --json
 ```
 
 Watch for `dolt_commit_failed` anomalies — purged data may not persist.
