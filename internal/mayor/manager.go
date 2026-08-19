@@ -340,7 +340,7 @@ func (m *Manager) Stop() error {
 	}
 
 	// Try graceful shutdown first (best-effort interrupt)
-	_ = t.SendKeysRaw(sessionID, "C-c")
+	_ = t.InterruptAgent(sessionID, tmux.KeyCtrlC)
 	time.Sleep(100 * time.Millisecond)
 
 	// Kill the session and all its processes

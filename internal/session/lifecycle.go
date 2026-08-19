@@ -362,7 +362,7 @@ func StopSession(t *tmux.Tmux, sessionID string, graceful bool) error {
 	}
 
 	if graceful {
-		_ = t.SendKeysRaw(sessionID, "C-c")
+		_ = t.InterruptAgent(sessionID, tmux.KeyCtrlC)
 		WaitForSessionExit(t, sessionID, constants.GracefulShutdownTimeout)
 	}
 
