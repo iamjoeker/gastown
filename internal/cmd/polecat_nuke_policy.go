@@ -106,6 +106,13 @@ func witnessActionFor(verdict string) string {
 		return "escalate"
 	case "PENDING_MR":
 		return "leave-alone"
+	case "UNVERIFIED":
+		// UNVERIFIED means the caller gathered no git or merge-queue facts, so
+		// it has ruled nothing out — including work at risk. Restart is the
+		// default arm below and is not destructive to the worktree, but it is
+		// still an action taken on no evidence; the honest answer is to go
+		// measure with `gt polecat check-recovery` first (gt-49dp).
+		return "leave-alone"
 	case "WORKING":
 		// Restart is non-destructive to the worktree but destroys the agent's
 		// context, and WORKING means the agent is generating right now — often

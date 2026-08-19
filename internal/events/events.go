@@ -46,6 +46,12 @@ const (
 	TypeBoot    = "boot"
 	TypeHalt    = "halt"
 
+	// TypePoolReuseRefused records that `gt sling` considered the idle polecat
+	// pool and reused nothing, with the per-candidate reasons. The success path
+	// has always logged TypeSpawn; the refusal logged nothing at all, so the
+	// cost of a fresh worktree was measurable while its cause was not (gt-49dp).
+	TypePoolReuseRefused = "pool_reuse_refused"
+
 	// Session events (for seance discovery)
 	TypeSessionStart = "session_start"
 	TypeSessionEnd   = "session_end"
@@ -205,6 +211,22 @@ func SpawnPayload(rig, polecat string) map[string]interface{} {
 		"rig":     rig,
 		"polecat": polecat,
 	}
+}
+
+// PoolReuseRefusedPayload creates a payload for pool reuse refusal events.
+// rejections are "<polecat>=<reason>" pairs, one per candidate the reuse gate
+// turned down; lookupErr is the FindIdlePolecat error, if any, which the caller
+// used to discard unexamined.
+func PoolReuseRefusedPayload(rig string, considered int, rejections []string, lookupErr string) map[string]interface{} {
+	p := map[string]interface{}{
+		"rig":        rig,
+		"considered": considered,
+		"rejected":   rejections,
+	}
+	if lookupErr != "" {
+		p["lookup_error"] = lookupErr
+	}
+	return p
 }
 
 // BootPayload creates a payload for rig boot events.

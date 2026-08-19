@@ -24,6 +24,64 @@ import (
 
 const minPolecatDirsPerRig = 30
 
+// poolReuseRejections renders one "<polecat>=<reason> state=<state>" line per
+// candidate the reuse gate turned down, dropping the one it accepted.
+//
+// An empty Reason becomes "unknown" rather than an empty field: a rejection with
+// no reason attached is still a rejection worth counting, and silently emitting
+// "name= state=done" would reproduce the problem this whole path exists to fix.
+func poolReuseRejections(candidates []polecat.PoolReuseCandidate) []string {
+	rejections := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if c.Reusable {
+			continue
+		}
+		reason := c.Reason
+		if reason == "" {
+			reason = "unknown"
+		}
+		rejections = append(rejections, fmt.Sprintf("%s=%s state=%s", c.Name, reason, c.State))
+	}
+	return rejections
+}
+
+// logPoolReuseRefusals records which idle polecats the reuse gate turned down
+// and why, before the caller falls through to allocating a fresh worktree.
+//
+// There used to be no else on the `findErr == nil && idlePolecat != nil` branch
+// below. When the gate rejected every candidate, control fell straight through
+// to fresh allocation emitting nothing — no stdout, no event, and findErr
+// discarded unexamined, so even a real lookup error was silent. The success path
+// logged TypeSpawn all along. That asymmetry is why the pool's growth could be
+// measured while the condition causing it could not be named: the reuse gate
+// runs eleven predicates and every one of its refusals was unrecorded (gt-49dp).
+//
+// Emitted as one aggregate event rather than one per candidate: a rig can hold
+// thirty polecats, and thirty feed lines per sling would bury the fact they are
+// meant to surface. LogFeed rather than fmt.Printf because scheduler-driven
+// dispatch discards this process's stdout, which is exactly when nobody is
+// watching.
+func logPoolReuseRefusals(rigName string, reused *polecat.Polecat, candidates []polecat.PoolReuseCandidate, findErr error) {
+	lookupErr := ""
+	if findErr != nil {
+		lookupErr = findErr.Error()
+		style.PrintWarning("could not evaluate idle polecats for reuse: %v; allocating fresh...", findErr)
+	}
+	rejections := poolReuseRejections(candidates)
+	if len(rejections) == 0 && lookupErr == "" {
+		// Either the pool was empty or the first candidate was reusable. Neither
+		// is a refusal, and the reuse itself is already logged as TypeSpawn.
+		return
+	}
+	_ = events.LogFeed(events.TypePoolReuseRefused, "gt", events.PoolReuseRefusedPayload(rigName, len(candidates), rejections, lookupErr))
+	if reused != nil || len(rejections) == 0 {
+		// Reuse still succeeded (or only the lookup failed): the rejections are
+		// recorded for the feed but are not what the operator is waiting on.
+		return
+	}
+	fmt.Printf("  No idle polecat reusable (%d considered): %s\n", len(candidates), strings.Join(rejections, "; "))
+}
+
 // SpawnedPolecatInfo contains info about a spawned polecat session.
 type SpawnedPolecatInfo struct {
 	RigName     string // Rig name (e.g., "gastown")
@@ -190,7 +248,8 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
-	idlePolecat, findErr := polecatMgr.FindIdlePolecat()
+	idlePolecat, reuseCandidates, findErr := polecatMgr.FindIdlePolecatWithCandidates()
+	logPoolReuseRefusals(rigName, idlePolecat, reuseCandidates, findErr)
 	if findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
 		fmt.Printf("Reusing idle polecat: %s\n", polecatName)
@@ -239,6 +298,12 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 			} else {
 				fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v; allocating new...\n", polecatName, err)
 			}
+			// A candidate the gate CLEARED and reuse then rejected. Printed
+			// above for a human at a terminal, and logged here for everyone
+			// else: under scheduler-driven dispatch that stdout goes nowhere,
+			// which made this refusal unrecoverable after the fact (gt-49dp).
+			_ = events.LogFeed(events.TypePoolReuseRefused, "gt", events.PoolReuseRefusedPayload(
+				rigName, 1, []string{fmt.Sprintf("%s=reuse-failed state=%s", polecatName, idlePolecat.State)}, err.Error()))
 		} else {
 			reuseOK = true
 		}
