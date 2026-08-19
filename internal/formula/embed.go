@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // Formulas live in internal/formula/formulas/ (source of truth).
@@ -332,23 +333,51 @@ func CheckFormulaHealth(beadsPath string) (*HealthReport, error) {
 	return report, nil
 }
 
+// UpdateReport describes what UpdateFormulas did — and, just as importantly,
+// what it deliberately refused to do. Refusing to overwrite a locally modified
+// formula is correct behaviour, but a refusal nobody is told about is
+// indistinguishable from an update that worked (gt-bxu).
+type UpdateReport struct {
+	Updated     int
+	Reinstalled int
+	// Skipped names the locally modified formulas left untouched, sorted.
+	Skipped []string
+	// Drifted is the subset of Skipped whose embedded copy has ALSO moved
+	// since install: the town is pinned to its local edit while the shipped
+	// default has changed underneath it. No amount of re-running --fix will
+	// clear these; only a hand reconcile will.
+	Drifted []string
+}
+
 // UpdateFormulas updates formulas that are safe to update (outdated, missing, or untracked).
 // Skips user-modified formulas (tracked files that user changed).
 // Returns counts of updated, skipped (modified), and reinstalled (missing).
+//
+// Callers that need to tell the operator WHICH formulas were skipped, or which
+// of them are drifted, should use UpdateFormulasDetailed instead.
 func UpdateFormulas(beadsPath string) (updated, skipped, reinstalled int, err error) {
+	report, err := UpdateFormulasDetailed(beadsPath)
+	return report.Updated, len(report.Skipped), report.Reinstalled, err
+}
+
+// UpdateFormulasDetailed is UpdateFormulas with a report that names the
+// formulas it skipped and flags the drifted subset.
+func UpdateFormulasDetailed(beadsPath string) (*UpdateReport, error) {
+	result := &UpdateReport{}
+
 	embedded, err := getEmbeddedFormulas()
 	if err != nil {
-		return 0, 0, 0, err
+		return result, err
 	}
 
 	formulasDir := filepath.Join(beadsPath, ".beads", "formulas")
 	if err := os.MkdirAll(formulasDir, 0755); err != nil {
-		return 0, 0, 0, fmt.Errorf("creating formulas directory: %w", err)
+		return result, fmt.Errorf("creating formulas directory: %w", err)
 	}
 
 	installed, err := loadInstalledRecord(formulasDir)
 	if err != nil {
-		return 0, 0, 0, err
+		return result, err
 	}
 
 	for filename, embeddedHash := range embedded {
@@ -384,35 +413,44 @@ func UpdateFormulas(beadsPath string) (updated, skipped, reinstalled int, err er
 		}
 
 		if isModified {
-			skipped++
+			result.Skipped = append(result.Skipped, filename)
+			if installedHash != embeddedHash {
+				// Local edit AND the shipped default moved: this skip is
+				// permanent until someone reconciles the two by hand.
+				result.Drifted = append(result.Drifted, filename)
+			}
 			continue
 		}
 
 		if shouldInstall {
 			content, err := formulasFS.ReadFile("formulas/" + filename)
 			if err != nil {
-				return updated, skipped, reinstalled, fmt.Errorf("reading %s: %w", filename, err)
+				return result, fmt.Errorf("reading %s: %w", filename, err)
 			}
 
 			if err := os.WriteFile(destPath, content, 0644); err != nil {
-				return updated, skipped, reinstalled, fmt.Errorf("writing %s: %w", filename, err)
+				return result, fmt.Errorf("writing %s: %w", filename, err)
 			}
 
 			// Update installed record
 			installed.Formulas[filename] = embeddedHash
 
 			if isMissing {
-				reinstalled++
+				result.Reinstalled++
 			} else {
-				updated++
+				result.Updated++
 			}
 		}
 	}
 
+	// Embedded formulas come out of a map, so fix an order the caller can print.
+	sort.Strings(result.Skipped)
+	sort.Strings(result.Drifted)
+
 	// Save updated installed record
 	if err := saveInstalledRecord(formulasDir, installed); err != nil {
-		return updated, skipped, reinstalled, fmt.Errorf("saving installed record: %w", err)
+		return result, fmt.Errorf("saving installed record: %w", err)
 	}
 
-	return updated, skipped, reinstalled, nil
+	return result, nil
 }

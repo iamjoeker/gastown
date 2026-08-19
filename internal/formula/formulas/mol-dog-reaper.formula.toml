@@ -19,10 +19,10 @@ This is infrastructure cleanup work:
 
 | Variable | Source | Description |
 |----------|--------|-------------|
-| max_age | config | Max wisp age before reaping (default 24h, daemon.json `max_age`) |
-| purge_age | config | Max closed wisp age before purging (default 7d, `lifecycle.reaper.delete_age`) |
-| stale_issue_age | config | Max issue staleness before auto-close (default 30d, `lifecycle.reaper.stale_issue_age`) |
-| mail_delete_age | config | Max closed mail age before purging (default 7d, `lifecycle.reaper.mail_delete_age`) |
+| max_age | config | Max wisp age before reaping (default 24h) |
+| purge_age | config | Max closed wisp age before purging (default 7d) |
+| stale_issue_age | config | Max issue staleness before auto-close (default 30d) |
+| mail_delete_age | config | Max closed mail age before purging (default 7d) |
 | alert_threshold | config | Open wisp count that triggers escalation (default 3000) |
 | dry_run | config | If "true", report without acting |
 | databases | config | Comma-separated DB list (default: auto-discover) |

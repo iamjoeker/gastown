@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -401,8 +402,19 @@ func upgradeFormulas(townRoot string) upgradeResult {
 			return result
 		}
 
+		// A town where every drifted formula is the ONLY thing wrong has nothing
+		// upgrade would change — which is not the same as being up-to-date, and
+		// printing a success tick here is how that distinction was lost.
 		needsUpdate := report.Outdated + report.Missing + report.New + report.Untracked
 		if needsUpdate == 0 {
+			if report.ModifiedDrift > 0 {
+				fmt.Printf("     %s %d formulas %s\n", style.WarningPrefix, report.OK,
+					style.Dim.Render("up-to-date, but upgrade cannot reach every formula"))
+				printFormulaDriftWarning(driftedNames(report))
+				result.skipped = report.Modified
+				result.details = append(result.details, fmt.Sprintf("%d shadowing a newer shipped default", report.ModifiedDrift))
+				return result
+			}
 			fmt.Printf("     %s %d formulas %s\n", style.SuccessPrefix, report.OK, style.Dim.Render("up-to-date"))
 			return result
 		}
@@ -423,18 +435,21 @@ func upgradeFormulas(townRoot string) upgradeResult {
 		}
 
 		fmt.Printf("     %s formulas: %s\n", style.WarningPrefix, style.Dim.Render(strings.Join(result.details, ", ")))
+		if report.ModifiedDrift > 0 {
+			printFormulaDriftWarning(driftedNames(report))
+		}
 		return result
 	}
 
-	updated, skipped, reinstalled, err := formula.UpdateFormulas(townRoot)
+	update, err := formula.UpdateFormulasDetailed(townRoot)
 	if err != nil {
 		result.details = append(result.details, fmt.Sprintf("update error: %v", err))
 		fmt.Printf("     %s Could not update formulas: %v\n", style.ErrorPrefix, err)
 		return result
 	}
 
-	result.changed = updated + reinstalled
-	result.skipped = skipped
+	result.changed = update.Updated + update.Reinstalled
+	result.skipped = len(update.Skipped)
 
 	if result.changed == 0 && result.skipped == 0 {
 		// Check total count for display
@@ -448,19 +463,53 @@ func upgradeFormulas(townRoot string) upgradeResult {
 	}
 
 	var parts []string
-	if updated > 0 {
-		parts = append(parts, fmt.Sprintf("%d updated", updated))
+	if update.Updated > 0 {
+		parts = append(parts, fmt.Sprintf("%d updated", update.Updated))
 	}
-	if reinstalled > 0 {
-		parts = append(parts, fmt.Sprintf("%d reinstalled", reinstalled))
+	if update.Reinstalled > 0 {
+		parts = append(parts, fmt.Sprintf("%d reinstalled", update.Reinstalled))
 	}
-	if skipped > 0 {
-		parts = append(parts, fmt.Sprintf("%d skipped (modified)", skipped))
+	if len(update.Skipped) > 0 {
+		parts = append(parts, fmt.Sprintf("%d skipped (modified)", len(update.Skipped)))
 	}
 
 	fmt.Printf("     %s formulas: %s\n", style.SuccessPrefix, style.Dim.Render(strings.Join(parts, ", ")))
 
+	// "skipped (modified)" reads like a no-op on an unchanged file. For the
+	// drifted subset it is not: the shipped default moved and this town will
+	// not receive it from any future upgrade either. Say so, by name.
+	if len(update.Drifted) > 0 {
+		printFormulaDriftWarning(update.Drifted)
+		result.details = append(result.details, fmt.Sprintf("%d shadowing a newer shipped default", len(update.Drifted)))
+	}
+
 	return result
+}
+
+// driftedNames lists the formulas in a health report that are locally modified
+// AND have a newer shipped default.
+func driftedNames(report *formula.HealthReport) []string {
+	var names []string
+	for _, f := range report.Formulas {
+		if f.Status == "modified" && f.EmbeddedChanged {
+			names = append(names, f.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// printFormulaDriftWarning reports formulas that upgrade correctly refused to
+// overwrite but which are now pinned behind a newer shipped default. Skipping
+// them is right; leaving the operator unaware of the drift is not (gt-bxu).
+func printFormulaDriftWarning(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	fmt.Printf("     %s %s\n", style.WarningPrefix,
+		fmt.Sprintf("%d locally modified formula(s) shadow a newer shipped default: %s",
+			len(names), strings.Join(names, ", ")))
+	fmt.Printf("       %s\n", style.Dim.Render("upgrade will keep skipping these — diff each against the shipped default and merge by hand"))
 }
 
 // printUpgradeSummary prints a final summary of what changed.

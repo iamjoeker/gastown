@@ -29,19 +29,17 @@ var setterKeyTargets = map[string][]string{
 	"maintenance.threshold":       {"patrols.scheduled_maintenance.threshold"},
 	// dolt.port writes daemon.json's env map, which the listing carries whole
 	// and the env layer reports again as GT_DOLT_PORT when exported.
-	"dolt.port":                        {"env"},
-	"lifecycle.reaper.enabled":         {"patrols.wisp_reaper.enabled"},
-	"lifecycle.reaper.interval":        {"patrols.wisp_reaper.interval"},
-	"lifecycle.reaper.delete_age":      {"patrols.wisp_reaper.delete_age"},
-	"lifecycle.reaper.stale_issue_age": {"patrols.wisp_reaper.stale_issue_age"},
-	"lifecycle.reaper.mail_delete_age": {"patrols.wisp_reaper.mail_delete_age"},
-	"lifecycle.compactor.enabled":      {"patrols.compactor_dog.enabled"},
-	"lifecycle.compactor.interval":     {"patrols.compactor_dog.interval"},
-	"lifecycle.compactor.threshold":    {"patrols.compactor_dog.threshold"},
-	"lifecycle.doctor.enabled":         {"patrols.doctor_dog.enabled"},
-	"lifecycle.doctor.interval":        {"patrols.doctor_dog.interval"},
-	"lifecycle.backup.enabled":         {"patrols.jsonl_git_backup.enabled", "patrols.dolt_backup.enabled"},
-	"lifecycle.backup.interval":        {"patrols.jsonl_git_backup.interval", "patrols.dolt_backup.interval"},
+	"dolt.port":                     {"env"},
+	"lifecycle.reaper.enabled":      {"patrols.wisp_reaper.enabled"},
+	"lifecycle.reaper.interval":     {"patrols.wisp_reaper.interval"},
+	"lifecycle.reaper.delete_age":   {"patrols.wisp_reaper.delete_age"},
+	"lifecycle.compactor.enabled":   {"patrols.compactor_dog.enabled"},
+	"lifecycle.compactor.interval":  {"patrols.compactor_dog.interval"},
+	"lifecycle.compactor.threshold": {"patrols.compactor_dog.threshold"},
+	"lifecycle.doctor.enabled":      {"patrols.doctor_dog.enabled"},
+	"lifecycle.doctor.interval":     {"patrols.doctor_dog.interval"},
+	"lifecycle.backup.enabled":      {"patrols.jsonl_git_backup.enabled", "patrols.dolt_backup.enabled"},
+	"lifecycle.backup.interval":     {"patrols.jsonl_git_backup.interval", "patrols.dolt_backup.interval"},
 }
 
 func collectTestTown(t *testing.T) *configreg.Report {

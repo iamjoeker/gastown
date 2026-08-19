@@ -12,6 +12,14 @@ import (
 // and modified formulas (user customized). Can auto-fix outdated and missing.
 type FormulaCheck struct {
 	FixableCheck
+
+	// lastFix records what the most recent Fix() actually did. The doctor
+	// framework re-runs Run() after a successful Fix() and shows only that
+	// second result, so this is the only channel a fix has for reporting the
+	// files it deliberately declined to touch. Throwing these counts away is
+	// what made a correct refusal indistinguishable from a completed update
+	// (gt-bxu). Checks run sequentially, so a plain field is enough.
+	lastFix *formula.UpdateReport
 }
 
 // NewFormulaCheck creates a new formula check.
@@ -74,6 +82,10 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
+	// If a --fix just ran, say what it declined to do. Without this the only
+	// visible outcome of the fix is the unchanged warning it could not clear.
+	details = append(details, c.fixDetails()...)
+
 	// Determine status. Drifted local modifications are not auto-fixable —
 	// overwriting would discard the customization — but they must still warn:
 	// a formula fix shipped in the binary never reaches a town that customized
@@ -114,7 +126,13 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 		Details: details,
 	}
 
+	// A drifted formula must never be sent to the generic update hint on its
+	// own account: --fix provably cannot move it, so the operator would run the
+	// fix and meet the identical warning. When both kinds are present the hint
+	// has to carry both halves, or the drift disappears behind the fixable part.
 	switch {
+	case needsFix && report.ModifiedDrift > 0:
+		result.FixHint = "Run 'gt doctor --fix' for the updatable formulas; the drifted ones above stay put — diff them against the shipped defaults and merge by hand"
 	case needsFix:
 		result.FixHint = "Run 'gt doctor --fix' to update formulas"
 	case report.ModifiedDrift > 0:
@@ -124,21 +142,31 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 	return result
 }
 
+// fixDetails renders what the most recent Fix() refused to do, for the re-run
+// that follows it. Empty before any fix, or when the fix touched everything.
+func (c *FormulaCheck) fixDetails() []string {
+	if c.lastFix == nil || len(c.lastFix.Skipped) == 0 {
+		return nil
+	}
+
+	var out []string
+	out = append(out, fmt.Sprintf("  --fix left %d locally modified formula(s) untouched: %s",
+		len(c.lastFix.Skipped), strings.Join(c.lastFix.Skipped, ", ")))
+	if len(c.lastFix.Drifted) > 0 {
+		out = append(out, fmt.Sprintf("  of those, %s also have a newer shipped default — re-running --fix will never update them",
+			strings.Join(c.lastFix.Drifted, ", ")))
+	}
+	return out
+}
+
 // Fix updates outdated and missing formulas.
+//
+// Formulas the user has customized are skipped, which is correct — overwriting
+// would discard the customization. The skip is recorded rather than discarded so
+// the re-run that follows can report it: a refusal nobody hears about reads as a
+// fix that worked, and the drift it leaves behind is never mentioned again.
 func (c *FormulaCheck) Fix(ctx *CheckContext) error {
-	updated, skipped, reinstalled, err := formula.UpdateFormulas(ctx.TownRoot)
-	if err != nil {
-		return err
-	}
-
-	// Log what was done (caller will re-run check to show new status)
-	if updated > 0 || reinstalled > 0 || skipped > 0 {
-		// The doctor framework will re-run the check after fix
-		// so we don't need to log here
-		_ = updated
-		_ = reinstalled
-		_ = skipped
-	}
-
-	return nil
+	report, err := formula.UpdateFormulasDetailed(ctx.TownRoot)
+	c.lastFix = report
+	return err
 }

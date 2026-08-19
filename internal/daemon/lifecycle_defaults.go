@@ -4,8 +4,7 @@ package daemon
 // for the six-stage Dolt lifecycle (CREATE → LIVE → CLOSE → DECAY → COMPACT → FLATTEN).
 //
 // All patrols are enabled with conservative intervals:
-//   - Wisp Reaper (DECAY): every 30m, delete closed wisps after 7d,
-//     auto-close stale issues after 30d
+//   - Wisp Reaper (DECAY): every 30m, delete closed wisps after 7d
 //   - Compactor Dog (COMPACT): every 24h, threshold 2000 commits
 //   - Checkpoint Dog: every 10m, auto-commit dirty polecat worktrees
 //   - Doctor Dog (health): every 5m
@@ -21,12 +20,10 @@ func DefaultLifecycleConfig() *DaemonPatrolConfig {
 		Version: 1,
 		Patrols: &PatrolsConfig{
 			WispReaper: &WispReaperConfig{
-				Enabled:          true,
-				IntervalStr:      "30m",
-				MaxAgeStr:        "24h",
-				DeleteAgeStr:     "168h", // 7 days
-				StaleIssueAgeStr: "720h", // 30 days — auto-close acts on live issues
-				MailDeleteAgeStr: "168h", // 7 days
+				Enabled:      true,
+				IntervalStr:  "30m",
+				MaxAgeStr:    "24h",
+				DeleteAgeStr: "168h", // 7 days
 			},
 			CompactorDog: &CompactorDogConfig{
 				Enabled:     true,
