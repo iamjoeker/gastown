@@ -9,29 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`gt config list` enumerates the whole configuration surface** — every key,
-  its compiled-in default, its acting value, and which of the layers supplied it
-  (gt-il30). Configuration is spread across compiled-in defaults, town and rig
-  settings, `mayor/daemon.json`, per-namespace `.beads/config.yaml`, the Dolt
-  `config` table, `git config beads.*`, formula vars, and the environment, and
-  nothing enumerated them. An unset key that changes the town's operating mode
-  was therefore indistinguishable from a key that does not exist: with
-  `scheduler.max_polecats` at its default of `-1` the scheduler runs in direct
-  dispatch and never pulls from the ready queue, so a town with 56 ready beads
-  reported `Scheduled: 0 total, 0 ready` and looked broken when it was merely
-  unconfigured. The key list is derived rather than curated — struct-backed
-  layers are reflected over their `json` tags and file/table layers are read
-  key-by-key — so a newly added setting appears without anyone editing a list,
-  and defaults are read by calling the same accessor production code calls.
-  Keys set in more than one layer are marked with the shadowed copies, which is
-  the failure that cost hours: `bd config unset routing.mode` reported
-  "Unset routing.mode (in config.yaml)" and changed nothing, because the Dolt
-  row was the acting value. Every layer is reported with its read status, and a
-  layer that cannot be read is named and exits non-zero, so an empty listing is
-  never mistaken for "nothing is set". `--json` for diffing between towns,
-  `--all`, `--scope`, `--key`, and `--no-dolt` for offline listing. New guide at
-  `docs/configuration.md`.
-
 - **Dogs now have a durable session log** at
   `<townRoot>/deacon/dogs/<name>/session.log`, readable with **`gt dog logs
   [name]`** (gt-wlco). A dog's stdout and stderr went nowhere that outlived the

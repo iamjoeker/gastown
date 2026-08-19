@@ -317,7 +317,11 @@ func runConfigAgentList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show default
-	fmt.Printf("\nDefault: %s\n", style.Bold.Render(townSettings.DefaultAgentV()))
+	defaultAgent := townSettings.DefaultAgent
+	if defaultAgent == "" {
+		defaultAgent = "claude"
+	}
+	fmt.Printf("\nDefault: %s\n", style.Bold.Render(defaultAgent))
 
 	return nil
 }
@@ -517,7 +521,11 @@ func runConfigDefaultAgent(cmd *cobra.Command, args []string) error {
 
 	if len(args) == 0 {
 		// Show current default
-		fmt.Printf("Default agent: %s\n", style.Bold.Render(townSettings.DefaultAgentV()))
+		defaultAgent := townSettings.DefaultAgent
+		if defaultAgent == "" {
+			defaultAgent = "claude"
+		}
+		fmt.Printf("Default agent: %s\n", style.Bold.Render(defaultAgent))
 		return nil
 	}
 
@@ -570,7 +578,10 @@ func runConfigAgentEmailDomain(cmd *cobra.Command, args []string) error {
 
 	if len(args) == 0 {
 		// Show current domain
-		domain := townSettings.AgentEmailDomainV()
+		domain := townSettings.AgentEmailDomain
+		if domain == "" {
+			domain = DefaultAgentEmailDomain
+		}
 		fmt.Printf("Agent email domain: %s\n", style.Bold.Render(domain))
 		fmt.Printf("\nExample: gastown/crew/jack → gastown.crew.jack@%s\n", domain)
 		return nil
@@ -836,10 +847,16 @@ func runConfigGet(cmd *cobra.Command, args []string) error {
 		}
 
 	case "cli_theme":
-		value = townSettings.CLIThemeV()
+		value = townSettings.CLITheme
+		if value == "" {
+			value = "auto"
+		}
 
 	case "default_agent":
-		value = townSettings.DefaultAgentV()
+		value = townSettings.DefaultAgent
+		if value == "" {
+			value = "claude"
+		}
 
 	case "scheduler.max_polecats":
 		scfg := townSettings.Scheduler

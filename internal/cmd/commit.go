@@ -11,9 +11,7 @@ import (
 )
 
 // DefaultAgentEmailDomain is the default domain for agent git emails.
-// Aliased rather than redeclared so `gt config list` reports the value the
-// code actually uses.
-const DefaultAgentEmailDomain = config.DefaultAgentEmailDomain
+const DefaultAgentEmailDomain = "gastown.local"
 
 var commitCmd = &cobra.Command{
 	Use:   "commit [flags] [-- git-commit-args...]",

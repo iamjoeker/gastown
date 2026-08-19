@@ -60,20 +60,6 @@ town-level Gas Town beads, and `cd ~/gt` before writing them.
 
 ## Configuration
 
-Configuration is spread across compiled-in defaults, town and rig settings,
-`mayor/daemon.json`, per-namespace `.beads/config.yaml`, the Dolt `config` table,
-`git config beads.*`, formula vars, and the environment. To see the whole
-surface — every key, its default, its acting value, and which layer supplied it:
-
-```bash
-gt config list --all
-gt config list --json    # diffable between towns
-```
-
-The tables below document selected fields; `gt config list` is the complete and
-always-current answer. See [Configuration Layers](configuration.md) for the
-precedence model and how shadowed keys are reported.
-
 ### Rig Config (`config.json`)
 
 ```json
