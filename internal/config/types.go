@@ -37,6 +37,45 @@ type MayorConfig struct {
 // CurrentTownSettingsVersion is the current schema version for TownSettings.
 const CurrentTownSettingsVersion = 1
 
+// Compiled-in defaults for town settings whose fallback is not expressed by
+// NewTownSettings. Read them through the accessors below rather than repeating
+// the literal at each call site: `gt config list` reports defaults by calling
+// the same accessors the code uses, so a second copy of the value shows up as
+// a wrong default rather than staying invisible.
+const (
+	// DefaultCLITheme lets the terminal background choose the color scheme.
+	DefaultCLITheme = "auto"
+	// DefaultAgentName is the agent preset used when none is configured.
+	DefaultAgentName = "claude"
+	// DefaultAgentEmailDomain is the domain for agent git commit identities.
+	DefaultAgentEmailDomain = "gastown.local"
+)
+
+// CLIThemeV returns the configured CLI theme or the default. Nil-safe.
+func (s *TownSettings) CLIThemeV() string {
+	if s != nil && s.CLITheme != "" {
+		return s.CLITheme
+	}
+	return DefaultCLITheme
+}
+
+// DefaultAgentV returns the configured default agent or the default. Nil-safe.
+func (s *TownSettings) DefaultAgentV() string {
+	if s != nil && s.DefaultAgent != "" {
+		return s.DefaultAgent
+	}
+	return DefaultAgentName
+}
+
+// AgentEmailDomainV returns the configured agent email domain or the default.
+// Nil-safe.
+func (s *TownSettings) AgentEmailDomainV() string {
+	if s != nil && s.AgentEmailDomain != "" {
+		return s.AgentEmailDomain
+	}
+	return DefaultAgentEmailDomain
+}
+
 // TownSettings represents town-level behavioral configuration (settings/config.json).
 // This contains agent configuration that applies to all rigs unless overridden.
 type TownSettings struct {
