@@ -215,6 +215,79 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 	return &issue, nil
 }
 
+// CreateEscalationDeliveryBead creates the durable delivery bead for an
+// escalation's "bead" routing action.
+//
+// The escalation RECORD created by CreateEscalationBead is an ephemeral wisp:
+// unversioned, unbacked, dolt_ignore'd and age-GC'd with no restore path. The
+// half of an escalation that survives is the delivered copy — and until gt-3i4e
+// that copy only ever existed as a side effect of a "mail:" action. A route with
+// no mail target (the default "low" route is just ["bead"]) therefore produced
+// nothing durable, appeared on no surface anyone reads, and was destroyed when
+// the wisp aged out, while the command still reported the bead as created.
+//
+// The bead written here is the same artifact the mail path produces: labelled
+// "gt:escalation", "severity:<sev>" and "escalation:<record-id>", which is what
+// ListEscalations, openEscalationCopies, AckEscalation and CloseEscalation all
+// key off.
+func (b *Beads) CreateEscalationDeliveryBead(title, body, recordID, severity string) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(title) {
+		return nil, fmt.Errorf("refusing to create escalation delivery bead: %w (got %q)", ErrFlagTitle, title)
+	}
+	if recordID == "" {
+		return nil, errors.New("refusing to create escalation delivery bead: no escalation record ID to link it to")
+	}
+
+	// Description goes over stdin for the same reason CreateEscalationBead does:
+	// bd 1.0.3+ rejects newlines inside a --description flag value (dc-1bxe).
+	args := []string{"create", "--json",
+		"--title=" + title,
+		"--body-file=-",
+		"--type=task",
+		"--labels=gt:escalation",
+		"--labels=" + EscalationLinkLabelPrefix + recordID,
+	}
+	if severity != "" {
+		args = append(args, "--labels=severity:"+severity)
+	}
+	if priority, ok := escalationPriority(severity); ok {
+		args = append(args, fmt.Sprintf("--priority=%d", priority))
+	}
+	if actor := b.getActor(); actor != "" {
+		args = append(args, "--actor="+actor)
+	}
+
+	out, err := b.runWithStdin([]byte(body), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	var issue Issue
+	if err := json.Unmarshal(out, &issue); err != nil {
+		return nil, fmt.Errorf("parsing bd create output: %w", err)
+	}
+	return &issue, nil
+}
+
+// escalationPriority maps an escalation severity onto the bead priority the
+// `gt escalate` help text documents (critical P0 … low P3). Returns false for an
+// unrecognised severity so the bead keeps bd's default rather than silently
+// landing at P0.
+func escalationPriority(severity string) (int, bool) {
+	switch severity {
+	case "critical":
+		return 0, true
+	case "high":
+		return 1, true
+	case "medium":
+		return 2, true
+	case "low":
+		return 3, true
+	}
+	return 0, false
+}
+
 // EscalationLinkLabelPrefix marks a delivered escalation copy with the ID of the
 // escalation record it belongs to.
 //
