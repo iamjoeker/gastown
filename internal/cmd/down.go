@@ -280,17 +280,31 @@ func runDown(cmd *cobra.Command, args []string) error {
 	doltCfg := doltserver.DefaultConfig(townRoot)
 	if _, statErr := os.Stat(doltCfg.DataDir); statErr == nil {
 		doltRunning, doltPid, doltErr := doltserver.IsRunning(townRoot)
+		// Probe before the signal: /proc/<pid>/cgroup dies with the process.
+		doltSup := doltserver.DetectSupervisor(doltPid)
 		if doltErr != nil {
 			printDownStatus("Dolt", false, fmt.Sprintf("status check failed: %v", doltErr))
 			allOK = false
 		} else if downDryRun {
-			if doltRunning {
+			if doltRunning && doltSup.AutoRestarts() {
+				printDownStatus("Dolt", true, fmt.Sprintf("would signal PID %d — %s would restart it", doltPid, doltSup.Describe()))
+			} else if doltRunning {
 				printDownStatus("Dolt", true, fmt.Sprintf("would stop (PID %d)", doltPid))
 			}
 		} else {
 			if doltRunning {
 				if err := doltserver.Stop(townRoot); err != nil {
 					printDownStatus("Dolt", false, err.Error())
+					allOK = false
+				} else if doltSup.AutoRestarts() {
+					// The town is NOT down. Reporting "stopped" here is what sent
+					// an operator through three redundant `gt down` runs while the
+					// data plane stayed up the whole time (gt-09e4). gt down is a
+					// pause, so it does not stop the unit on the operator's behalf
+					// — but it must not claim a stop it did not achieve.
+					printDownStatus("Dolt", false, fmt.Sprintf("signalled PID %d — %s restarts it in seconds, still up",
+						doltPid, doltSup.Describe()))
+					fmt.Printf("       to stop the data plane: %s\n", doltSup.StopCommand())
 					allOK = false
 				} else {
 					printDownStatus("Dolt", true, fmt.Sprintf("stopped (was PID %d)", doltPid))
