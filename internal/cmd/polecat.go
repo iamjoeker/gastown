@@ -70,6 +70,14 @@ all polecats with their states:
   - done: Completed work, waiting for cleanup
   - stuck: Needs assistance
 
+This surface reads beads only — it never runs git or consults the merge queue.
+A polecat that nothing blocks therefore reports verdict UNVERIFIED and
+reuse_status idle-unverified: nothing is known to be wrong with it, and nothing
+was checked. Use 'gt polecat check-recovery <rig>/<name>' for a measured verdict
+before acting. (Until gt-49dp this surface printed the same 'idle-preserved'
+string the reuse gate prints for polecats it has cleared, including for polecats
+'gt sling' went on to refuse.)
+
 Examples:
   gt polecat list greenplace
   gt polecat list --all
@@ -1109,6 +1117,10 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		SessionBusy:   mgr.SessionBusy(polecatName),
 		CleanupStatus: polecat.CleanupUnknown,
 		Branch:        p.Branch,
+		// This command exists to gather the git and merge-queue facts (see
+		// loadGitState and applyMQFactsToWorkstateInput below), so its verdict
+		// is a measured one (gt-49dp).
+		ReuseFactsMeasured: true,
 	}
 	var gitState *GitState
 	var gitErr error
@@ -1292,6 +1304,16 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
 		}
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
+	case "UNVERIFIED":
+		// Unreachable from this command — it measures, so its input carries
+		// ReuseFactsMeasured. Listed anyway because the default arm below prints
+		// SAFE_TO_NUKE, and "no facts were gathered" is the last verdict that
+		// should render as permission to destroy anything (gt-49dp).
+		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("UNVERIFIED"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
+		fmt.Println()
+		fmt.Println("  No git or merge-queue facts were gathered for this polecat, so nothing")
+		fmt.Println("  has been ruled out. Treat it as unknown, not as safe.")
 	default:
 		// Deliberately NOT success-styled (gt-y20). This verdict says "no work
 		// is at risk", not "you may destroy this polecat" — and the Witness is

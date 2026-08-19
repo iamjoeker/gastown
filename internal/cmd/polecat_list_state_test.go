@@ -226,10 +226,20 @@ func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
 	}{
 		{
 			name:         "reusable idle",
-			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean},
+			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean, ReuseFactsMeasured: true},
 			wantReusable: true,
 			wantSafe:     true,
 			wantCapacity: polecatCapacitySnapshot{ReusableIdle: 1},
+		},
+		{
+			// The same polecat as above, seen by the bead-only inventory
+			// constructor: nothing blocks and nothing was checked. It must not
+			// project as reusable capacity the reuse gate will then refuse, and
+			// it must not vanish from the accounting either — hence its own
+			// bucket rather than a fall-through (gt-49dp).
+			name:         "unverified idle is counted separately from reusable",
+			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean},
+			wantCapacity: polecatCapacitySnapshot{UnverifiedIdle: 1},
 		},
 		{
 			name:         "recovery blocked idle",
@@ -239,7 +249,7 @@ func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
 		},
 		{
 			name:         "stale stash cleanup ignored is reusable capacity",
-			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupStash, IgnoreCleanupStatus: true},
+			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupStash, IgnoreCleanupStatus: true, ReuseFactsMeasured: true},
 			wantReusable: true,
 			wantSafe:     true,
 			wantCapacity: polecatCapacitySnapshot{ReusableIdle: 1},
@@ -293,7 +303,7 @@ func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
 			}
 			snapshot := polecatCapacitySnapshot{}
 			applyWorkstateDispositionToCapacitySnapshot(&snapshot, tt.in.State, disposition)
-			if snapshot.Working != tt.wantCapacity.Working || snapshot.RecoveryBlocked != tt.wantCapacity.RecoveryBlocked || snapshot.ReusableIdle != tt.wantCapacity.ReusableIdle || snapshot.PendingMR != tt.wantCapacity.PendingMR {
+			if snapshot.Working != tt.wantCapacity.Working || snapshot.RecoveryBlocked != tt.wantCapacity.RecoveryBlocked || snapshot.ReusableIdle != tt.wantCapacity.ReusableIdle || snapshot.UnverifiedIdle != tt.wantCapacity.UnverifiedIdle || snapshot.PendingMR != tt.wantCapacity.PendingMR {
 				t.Fatalf("capacity projection = %+v, want %+v", snapshot, tt.wantCapacity)
 			}
 		})
@@ -329,11 +339,14 @@ func TestPolecatReuseStatus(t *testing.T) {
 			want:          "idle-recovery-needed",
 		},
 		{
-			name:             "idle stale dirty cleanup can be clean",
+			// Cleared of the stale cleanup blocker, but this helper passes no
+			// git or merge-queue facts, so the tail refuses to answer rather
+			// than reporting "idle-clean" on nothing (gt-49dp).
+			name:             "idle stale dirty cleanup is unverified without git facts",
 			state:            polecat.StateIdle,
 			cleanupStatus:    string(polecat.CleanupUnpushed),
 			staleCleanupSafe: true,
-			want:             "idle-clean",
+			want:             "idle-unverified",
 		},
 		{
 			name:           "idle open MR is pr open",
@@ -344,18 +357,24 @@ func TestPolecatReuseStatus(t *testing.T) {
 			want:           "idle-pr-open",
 		},
 		{
-			name:          "idle clean old branch is preserved",
+			// This is the reported bug, at the surface that reported it: a
+			// preserved branch with a clean cleanup_status and no git or
+			// merge-queue check behind it used to read "idle-preserved" —
+			// the same string the reuse gate prints for a polecat it has
+			// actually cleared, and printed for polecats the gate went on to
+			// refuse for mq-not-submitted (gt-49dp).
+			name:          "idle clean old branch is unverified without git facts",
 			state:         polecat.StateIdle,
 			cleanupStatus: string(polecat.CleanupClean),
 			branch:        "polecat/chrome/old-work",
-			want:          "idle-preserved",
+			want:          "idle-unverified",
 		},
 		{
-			name:          "idle clean main is clean",
+			name:          "idle clean main is unverified without git facts",
 			state:         polecat.StateIdle,
 			cleanupStatus: string(polecat.CleanupClean),
 			branch:        "main",
-			want:          "idle-clean",
+			want:          "idle-unverified",
 		},
 	}
 
