@@ -402,9 +402,15 @@ func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 			want:   polecatCapacitySnapshot{RecoveryBlocked: 1, capacityUsed: 1},
 		},
 		{
-			name:   "clean idle is reusable",
+			// This snapshot is built from the bead-only inventory constructor,
+			// which runs no git and no merge-queue lookup. "clean" is a
+			// cleanup_status the polecat wrote about itself, not a check this
+			// process performed, so the slot is unverified rather than reusable
+			// — it used to project as pool depth the reuse gate then refused
+			// one polecat at a time (gt-49dp).
+			name:   "clean idle is unverified, not reusable",
 			fields: &beads.AgentFields{AgentState: string(beads.AgentStateIdle), CleanupStatus: "clean"},
-			want:   polecatCapacitySnapshot{ReusableIdle: 1},
+			want:   polecatCapacitySnapshot{UnverifiedIdle: 1},
 		},
 		{
 			name:       "active work consumes capacity",
@@ -424,7 +430,7 @@ func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			snapshot := polecatCapacitySnapshot{}
 			applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", "synth", tt.fields, tt.activeWork, nil, nil)
-			if snapshot.Working != tt.want.Working || snapshot.RecoveryBlocked != tt.want.RecoveryBlocked || snapshot.ReusableIdle != tt.want.ReusableIdle || snapshot.PendingMR != tt.want.PendingMR || snapshot.capacityUsed != tt.want.capacityUsed {
+			if snapshot.Working != tt.want.Working || snapshot.RecoveryBlocked != tt.want.RecoveryBlocked || snapshot.ReusableIdle != tt.want.ReusableIdle || snapshot.UnverifiedIdle != tt.want.UnverifiedIdle || snapshot.PendingMR != tt.want.PendingMR || snapshot.capacityUsed != tt.want.capacityUsed {
 				t.Fatalf("snapshot = %+v, want %+v", snapshot, tt.want)
 			}
 		})
