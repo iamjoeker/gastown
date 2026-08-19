@@ -194,6 +194,12 @@ func newDoctorForCommand(rig string) *doctor.Doctor {
 	// Must run before infrastructure checks that might fail confusingly on full disks.
 	d.Register(doctor.NewDiskSpaceCheck())
 
+	// TMPDIR is usually a different — and much smaller — filesystem than the
+	// town root, and it is where every build, worktree and fixture lands. The
+	// check above cannot see it, so a full /tmp surfaces as an unrelated
+	// "insufficient disk space" failure in polecat creation (gt-yb33).
+	d.Register(doctor.NewTmpSpaceCheck())
+
 	// Infrastructure prerequisites — these must pass before any check that
 	// shells out to bd/dolt or queries the database. Order matters:
 	// 1. gt binary freshness
