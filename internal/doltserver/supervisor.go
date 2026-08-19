@@ -29,6 +29,27 @@ type Supervisor struct {
 	Unit     string // unit name, e.g. "gt-dolt.service"
 	UserUnit bool   // true for a `systemctl --user` unit, false for a system unit
 	Restart  string // the unit's Restart= policy ("always", "no", ...); "" if unknown
+
+	// NRestarts is systemd's count of automatic restarts of this unit, i.e. how
+	// many times the supervisor replaced a dead server behind gt's back. -1 means
+	// systemd gave no answer.
+	//
+	// The counter resets whenever the unit is started or restarted by hand, so it
+	// counts restarts within the current manual start, not since boot. That makes
+	// it a lower bound on how often the server has died — never an overstatement.
+	NRestarts int
+
+	// RateLimitDisabled reports that the unit's start-limit burst check is known to
+	// be off. systemd then restarts forever and NEVER marks the unit failed, so no
+	// status surface — not `systemctl status`, not `journalctl -p err`, not
+	// `gt dolt status` — reports a problem no matter how often the server dies.
+	// That is the observability defect in gt-qiok: the restart policy hides its own
+	// restarts and a crash becomes a mystery.
+	//
+	// Stated as "known to be disabled" rather than "armed" so that the zero value,
+	// and any unreadable property, stay silent. Claiming crash-loop detection is
+	// off when it is on would send an operator to edit a unit that needs no edit.
+	RateLimitDisabled bool
 }
 
 // AutoRestarts reports whether the supervisor brings the server back up on its
@@ -124,7 +145,88 @@ func DetectSupervisor(pid int) *Supervisor {
 		Unit:     unit,
 		UserUnit: userUnit,
 		Restart:  systemctlProperty(unit, userUnit, "Restart"),
+		NRestarts: parseNRestarts(
+			systemctlProperty(unit, userUnit, "NRestarts")),
+		RateLimitDisabled: parseRateLimitDisabled(
+			systemctlProperty(unit, userUnit, "StartLimitIntervalUSec"),
+			systemctlProperty(unit, userUnit, "StartLimitBurst")),
 	}
+}
+
+// RestartNotice renders the operator-facing notices about restarts this unit has
+// performed and about whether a crash loop would ever surface. Each element is
+// one notice; a notice may span several lines, separated by "\n". Returns nil
+// when there is nothing worth saying.
+//
+// The two facts are separate notices on purpose. A restart count answers "did the
+// server die?" for the incident in front of the operator; the missing rate limit
+// answers "would I be told if it kept dying?", which stays true and worth fixing
+// even when the count is zero.
+func (s *Supervisor) RestartNotice() []string {
+	if s == nil || s.Unit == "" {
+		return nil
+	}
+	var notices []string
+	if s.NRestarts > 0 {
+		// Names the unit but not its Restart= policy: callers print Describe()
+		// alongside, and repeating the policy here pushes the count — the fact that
+		// matters — off the end of the line.
+		notices = append(notices, fmt.Sprintf(
+			"Restarted %d time(s) by %s unit %s since it was last started by hand.\n"+
+				"A restart replaces the PID silently, so the PID and uptime above\n"+
+				"describe the REPLACEMENT and the server reads as healthy. If you did\n"+
+				"not restart it, the previous process died.\n"+
+				"What happened: %s",
+			s.NRestarts, s.Kind, s.Unit, s.JournalCommand()))
+	}
+	if s.RateLimitDisabled {
+		notices = append(notices,
+			"Crash-loop detection is OFF for this unit (StartLimitIntervalSec=0 or\n"+
+				"StartLimitBurst=0). systemd restarts forever and never marks the unit\n"+
+				"failed, so no status surface reports a problem however often Dolt dies.")
+	}
+	return notices
+}
+
+// JournalCommand returns the command that shows what the unit did, including the
+// exits that a silent restart leaves no other trace of.
+func (s *Supervisor) JournalCommand() string {
+	if s == nil || s.Unit == "" {
+		return ""
+	}
+	return fmt.Sprintf("journalctl %s-u %s -n 100", s.systemctlScope(), s.Unit)
+}
+
+// parseNRestarts reads systemd's NRestarts property. Anything unparseable — the
+// property is absent on older systemd, and "" is what systemctlProperty returns
+// on any failure — becomes -1 ("unknown"), which callers must not report as zero.
+func parseNRestarts(property string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(property))
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// parseRateLimitDisabled decides whether the start-limit burst check is known to
+// be off, from the unit's StartLimitIntervalUSec and StartLimitBurst properties.
+// Setting EITHER to zero disables rate limiting outright (systemd.unit(5)), so
+// reading only the interval — the key the town's unit actually sets — would miss
+// the other half.
+func parseRateLimitDisabled(intervalProperty, burstProperty string) bool {
+	return isZeroProperty(intervalProperty) || isZeroProperty(burstProperty)
+}
+
+// isZeroProperty reports whether a systemd property is an explicit zero. USec
+// properties render as a plain "0" when disabled and as a duration ("10s",
+// "1min 30s") otherwise, and "infinity" is the opposite of zero, not a form of
+// it. An empty or unrecognised value is unknown, never zero.
+func isZeroProperty(property string) bool {
+	switch strings.TrimSpace(property) {
+	case "0", "0s", "0us":
+		return true
+	}
+	return false
 }
 
 // unitOwns reports whether pid is the unit's MAIN process, i.e. the process the
