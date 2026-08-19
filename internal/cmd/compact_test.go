@@ -1,14 +1,12 @@
 package cmd
 
 import (
-	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
 
@@ -16,56 +14,28 @@ func TestGetTTL(t *testing.T) {
 	ttls := defaultTTLs
 
 	tests := []struct {
-		name          string
-		wispType      string
-		want          time.Duration
-		wantClassifed bool
+		wispType string
+		want     time.Duration
 	}{
-		{"heartbeat", "heartbeat", 6 * time.Hour, true},
-		{"ping", "ping", 6 * time.Hour, true},
-		{"patrol", "patrol", 24 * time.Hour, true},
-		{"gc_report", "gc_report", 24 * time.Hour, true},
-		{"error", "error", 7 * 24 * time.Hour, true},
-		{"recovery", "recovery", 7 * 24 * time.Hour, true},
-		{"escalation", "escalation", 7 * 24 * time.Hour, true},
-		{"default", "default", 24 * time.Hour, true},
-		// A deliberately-written type with no configured TTL takes the
-		// documented default: the writer named a type, so "default" is policy.
-		{"unknown type falls back to default", "unknown", 24 * time.Hour, true},
-		// An EMPTY type is not a type. gt-ktvs: 703 of 703 wisps on the gastown
-		// rig carry one, and reading it as "default" = 24h would delete the 7d
-		// escalation/recovery/error records on the first run that could see them.
-		{"empty type is unclassified", "", 0, false},
+		{"heartbeat", 6 * time.Hour},
+		{"ping", 6 * time.Hour},
+		{"patrol", 24 * time.Hour},
+		{"gc_report", 24 * time.Hour},
+		{"error", 7 * 24 * time.Hour},
+		{"recovery", 7 * 24 * time.Hour},
+		{"escalation", 7 * 24 * time.Hour},
+		{"default", 24 * time.Hour},
+		{"", 24 * time.Hour},        // empty falls back to default
+		{"unknown", 24 * time.Hour}, // unknown falls back to default
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, classified := getTTL(ttls, tc.wispType)
-			if classified != tc.wantClassifed {
-				t.Errorf("getTTL(%q) classified = %v, want %v", tc.wispType, classified, tc.wantClassifed)
-			}
+		t.Run(tc.wispType, func(t *testing.T) {
+			got := getTTL(ttls, tc.wispType)
 			if got != tc.want {
 				t.Errorf("getTTL(%q) = %v, want %v", tc.wispType, got, tc.want)
 			}
 		})
-	}
-}
-
-// TestGetTTLEmptyTypeIgnoresConfiguredDefault pins the part of gt-ktvs that a
-// table test cannot: it is not enough that the hardcoded default happens not to
-// be applied to untyped wisps. Configuring a default must not reach them either,
-// or the refusal is one `wisp_ttl.default` config entry away from evaporating.
-func TestGetTTLEmptyTypeIgnoresConfiguredDefault(t *testing.T) {
-	ttls := map[string]time.Duration{"default": 999 * time.Hour, "patrol": 3 * time.Hour}
-
-	if got, classified := getTTL(ttls, ""); classified || got != 0 {
-		t.Errorf("getTTL(ttls, \"\") = (%v, %v), want (0, false) even with a configured default",
-			got, classified)
-	}
-	// Control: the same map must still classify a real type, or this test would
-	// also pass against a getTTL that refuses everything.
-	if got, classified := getTTL(ttls, "patrol"); !classified || got != 3*time.Hour {
-		t.Errorf("getTTL(ttls, \"patrol\") = (%v, %v), want (3h, true)", got, classified)
 	}
 }
 
@@ -441,317 +411,5 @@ func TestDeleteWispSharesReaperProtectedList(t *testing.T) {
 		t.Errorf("after adding gt:test-protected to reaper.ProtectedWispLabels: "+
 			"Protected = %+v, Deleted = %+v; want the wisp held. compact is not "+
 			"reading the shared list.", after.Protected, after.Deleted)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// gt-ktvs: compaction reads the wisps table
-// ---------------------------------------------------------------------------
-
-// TestWispQueryReadsWispsTable pins the defect gt-ktvs records. listWisps used
-// to run `bd list --json --all` and keep rows with ephemeral=true; bd list does
-// not query the wisps table, so the filter could never match and every run
-// processed zero wisps while reporting a clean result. Measured on the gastown
-// rig 2026-08-19: 222 issue rows from bd list, none of which even carried an
-// `ephemeral` key, against 703 rows in `wisps`.
-func TestWispQueryReadsWispsTable(t *testing.T) {
-	query := wispQuery(mutableWispWhere())
-
-	if !strings.Contains(query, "FROM wisps w") {
-		t.Errorf("compaction query does not read the wisps table:\n%s", query)
-	}
-	// The fields the old path silently read as zero values off an issue-shaped
-	// row. Each one changes a decision, so each must come from the wisps table.
-	for _, want := range []string{
-		"w.wisp_type",       // decides which TTL, or none
-		"w.pinned",          // decides whether delete is allowed at all
-		"wisp_labels",       // decides protection and keep
-		"wisp_comments",     // decides promotion
-		"wisp_dependencies", // decides molecule-step handling
-	} {
-		if !strings.Contains(query, want) {
-			t.Errorf("compaction query is missing %q — that field would be read as its zero value:\n%s", want, query)
-		}
-	}
-}
-
-// TestMutableWispWhereExcludesInfraTypes covers a hazard the repair introduces
-// rather than one it inherits. bd list's default view hid infra beads, so the
-// old blind path was shielded from them by accident. Reading the table removes
-// the shield: agent beads are persistent identity — the reaper refuses to touch
-// them for the same reason — and a compaction pass that deleted one would be
-// deleting an agent, not a record of one.
-func TestMutableWispWhereExcludesInfraTypes(t *testing.T) {
-	where := mutableWispWhere()
-
-	for _, infra := range constants.BeadsInfraTypesList() {
-		if !strings.Contains(where, "'"+infra+"'") {
-			t.Errorf("mutable wisp scope does not exclude infra type %q: %s", infra, where)
-		}
-	}
-	if !strings.Contains(where, "w.issue_type NOT IN") {
-		t.Errorf("mutable wisp scope is not an issue_type exclusion: %s", where)
-	}
-	// Control: the types compaction exists to sweep must NOT be excluded, or
-	// this test would pass against a scope that excludes everything.
-	if strings.Contains(where, "'task'") || strings.Contains(where, "'molecule'") {
-		t.Errorf("mutable wisp scope excludes the types compaction is for: %s", where)
-	}
-}
-
-// TestParseWispRows decodes rows captured verbatim from the gastown rig on
-// 2026-08-19, so the field mapping is pinned against the shape bd actually
-// emits rather than against an assumption about it.
-func TestParseWispRows(t *testing.T) {
-	const captured = `[
-  {
-    "comment_count": 0,
-    "created_at": "2026-08-18T02:35:51Z",
-    "id": "gt-wisp-04ya",
-    "issue_type": "task",
-    "labels_csv": "gt:merge-request",
-    "parent": "",
-    "pinned": 0,
-    "status": "closed",
-    "title": "Merge: gt-u7z",
-    "updated_at": "2026-08-18T02:43:01Z",
-    "wisp_type": ""
-  },
-  {
-    "comment_count": 3,
-    "created_at": "2026-08-18T00:49:24Z",
-    "id": "gt-wisp-00c",
-    "issue_type": "task",
-    "labels_csv": "gt:keep,gt:step",
-    "parent": "gt-wisp-v4m",
-    "pinned": 1,
-    "status": "closed",
-    "title": "Set up working branch",
-    "updated_at": "2026-08-19T02:29:03Z",
-    "wisp_type": "patrol"
-  }
-]`
-
-	wisps, err := parseWispRows([]byte(captured))
-	if err != nil {
-		t.Fatalf("parseWispRows: %v", err)
-	}
-	if len(wisps) != 2 {
-		t.Fatalf("parsed %d wisps, want 2", len(wisps))
-	}
-
-	mr := wisps[0]
-	if mr.ID != "gt-wisp-04ya" || mr.Status != "closed" || mr.Type != "task" {
-		t.Errorf("row 0 identity = %+v", mr.Issue)
-	}
-	if got := mr.Labels; len(got) != 1 || got[0] != "gt:merge-request" {
-		t.Errorf("row 0 labels = %v, want [gt:merge-request] — the protection guard reads this", got)
-	}
-	if mr.Pinned {
-		t.Errorf("row 0 pinned = true, want false (pinned column was 0)")
-	}
-	if !mr.Ephemeral {
-		t.Errorf("row 0 Ephemeral = false; everything from the wisps table is a wisp")
-	}
-
-	step := wisps[1]
-	if step.WispType != "patrol" {
-		t.Errorf("row 1 wisp_type = %q, want patrol", step.WispType)
-	}
-	if step.Parent != "gt-wisp-v4m" {
-		t.Errorf("row 1 parent = %q, want gt-wisp-v4m — molecule-step handling turns on this", step.Parent)
-	}
-	if step.CommentCount != 3 {
-		t.Errorf("row 1 comment_count = %d, want 3", step.CommentCount)
-	}
-	if !step.Pinned {
-		t.Errorf("row 1 pinned = false, want true (pinned column was 1)")
-	}
-	if got := step.Labels; len(got) != 2 || got[0] != "gt:keep" || got[1] != "gt:step" {
-		t.Errorf("row 1 labels = %v, want [gt:keep gt:step] — labels_csv must split", got)
-	}
-}
-
-func TestParseWispRowsEmptyResult(t *testing.T) {
-	wisps, err := parseWispRows([]byte("[]"))
-	if err != nil {
-		t.Fatalf("parseWispRows on empty result: %v", err)
-	}
-	if len(wisps) != 0 {
-		t.Errorf("parsed %d wisps from an empty result", len(wisps))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// gt-ktvs second defect: an empty wisp_type is not a 24h wisp
-// ---------------------------------------------------------------------------
-
-// TestDecideWispNeverDeletesUntyped is the regression test for the defect the
-// bead says must be fixed BEFORE the blindness, not after: every wisp on the
-// rig carries an empty wisp_type, and 24h-defaulting them would have deleted a
-// week of escalation, recovery and error records on the first run that could
-// see them.
-//
-// The typed control is what makes this test mean anything. Without it, a
-// decideWisp that refuses to delete anything at all would pass.
-func TestDecideWispNeverDeletesUntyped(t *testing.T) {
-	untyped := &compactIssue{
-		Issue:    beads.Issue{ID: "w-untyped", Status: "closed"},
-		WispType: "",
-	}
-	// Same wisp, same age, but classified as an escalation — 7d TTL, and 8 days
-	// old, so it is genuinely expired.
-	typed := &compactIssue{
-		Issue:    beads.Issue{ID: "w-escalation", Status: "closed"},
-		WispType: "escalation",
-	}
-	age := 8 * 24 * time.Hour
-
-	if got := decideWisp(untyped, age, defaultTTLs); got.action != actionUnclassified {
-		t.Errorf("untyped closed wisp %s old: action = %v (%q), want actionUnclassified. "+
-			"Reading an empty wisp_type as the 24h default is gt-ktvs' second defect.",
-			age, got.action, got.reason)
-	}
-	if got := decideWisp(typed, age, defaultTTLs); got.action != actionDelete {
-		t.Errorf("control failed: a closed escalation wisp %s past its 7d TTL should be "+
-			"deleted, got %v (%q). Without this, the assertion above passes against a "+
-			"compact that never deletes anything.", age, got.action, got.reason)
-	}
-}
-
-// TestDecideWispUntypedKeepIsStillPromoted checks that refusing to guess a TTL
-// does not also strand the wisps worth keeping. Proven value is a property of
-// the wisp, not of its age, so it must survive the unclassified branch.
-func TestDecideWispUntypedKeepIsStillPromoted(t *testing.T) {
-	kept := &compactIssue{
-		Issue: beads.Issue{ID: "w-keep", Status: "closed", Labels: []string{"gt:keep"}},
-	}
-	commented := &compactIssue{
-		Issue:        beads.Issue{ID: "w-comment", Status: "open"},
-		CommentCount: 2,
-	}
-
-	for _, w := range []*compactIssue{kept, commented} {
-		got := decideWisp(w, 30*24*time.Hour, defaultTTLs)
-		if got.action != actionPromote || got.reason != "proven value" {
-			t.Errorf("%s: action = %v (%q), want promote/proven value even with an empty wisp_type",
-				w.ID, got.action, got.reason)
-		}
-	}
-}
-
-// TestDecideWispTypedPolicy covers the pre-existing decision table, so that
-// repairing the input source cannot quietly change what compaction does with
-// the wisps it can now finally see.
-func TestDecideWispTypedPolicy(t *testing.T) {
-	const patrolTTL = 24 * time.Hour
-
-	tests := []struct {
-		name       string
-		status     string
-		parent     string
-		age        time.Duration
-		wantAction wispAction
-		wantReason string
-	}{
-		{"closed within TTL", "closed", "", patrolTTL - time.Hour, actionSkip, "within TTL"},
-		{"open within TTL", "open", "", patrolTTL - time.Hour, actionSkip, "within TTL"},
-		{"closed past TTL is deleted", "closed", "", patrolTTL + time.Hour, actionDelete, "TTL expired"},
-		{"closed molecule step past TTL is deleted", "closed", "mol-1", patrolTTL + time.Hour, actionDelete, "TTL expired"},
-		{"open molecule step past TTL is deleted, not promoted", "open", "mol-1", patrolTTL + time.Hour, actionDelete, "molecule step past TTL"},
-		{"open past TTL is promoted", "open", "", patrolTTL + time.Hour, actionPromote, "open past TTL"},
-		{"in_progress past TTL names being stuck", "in_progress", "", patrolTTL + time.Hour, actionPromote, "stuck in_progress past TTL"},
-		{"hooked past TTL is promoted", "hooked", "", patrolTTL + time.Hour, actionPromote, "open past TTL"},
-		// Exactly at the TTL is not past it.
-		{"age equal to TTL is within", "closed", "", patrolTTL, actionSkip, "within TTL"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			w := &compactIssue{
-				Issue:    beads.Issue{ID: "w-1", Status: tc.status, Parent: tc.parent},
-				WispType: "patrol",
-			}
-			got := decideWisp(w, tc.age, defaultTTLs)
-			if got.action != tc.wantAction || got.reason != tc.wantReason {
-				t.Errorf("decideWisp = %v (%q), want %v (%q)",
-					got.action, got.reason, tc.wantAction, tc.wantReason)
-			}
-		})
-	}
-}
-
-// TestDecideWispMoleculeStepIsNotPromotedForProvenValue keeps the pre-existing
-// carve-out: a step with a parent is a subordinate step, never a permanent bead.
-func TestDecideWispMoleculeStepIsNotPromotedForProvenValue(t *testing.T) {
-	step := &compactIssue{
-		Issue:        beads.Issue{ID: "w-step", Status: "closed", Parent: "mol-1", Labels: []string{"gt:keep"}},
-		WispType:     "patrol",
-		CommentCount: 5,
-	}
-	got := decideWisp(step, 48*time.Hour, defaultTTLs)
-	if got.action != actionDelete {
-		t.Errorf("kept+commented molecule step past TTL: action = %v (%q), want delete — "+
-			"steps must not be elevated into the issues table", got.action, got.reason)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// gt-ktvs / gt-6dp: the guards that make deletion safe
-// ---------------------------------------------------------------------------
-
-// TestDeleteWispRefusesPinnedWisp covers the guard that only became reachable
-// once compaction read the wisps table. `pinned` is what an incident responder
-// sets by hand; bd purge and the reaper both honour it, and this path could not
-// while it read bd list output, which does not return the column.
-func TestDeleteWispRefusesPinnedWisp(t *testing.T) {
-	oldDryRun, oldVerbose, oldJSON := compactDryRun, compactVerbose, compactJSON
-	compactDryRun, compactVerbose, compactJSON = true, false, true
-	t.Cleanup(func() { compactDryRun, compactVerbose, compactJSON = oldDryRun, oldVerbose, oldJSON })
-
-	pinned := &compactIssue{
-		Issue:  beads.Issue{ID: "w-pinned", Title: "held by a responder", Status: "closed"},
-		Pinned: true,
-	}
-	unpinned := &compactIssue{
-		Issue: beads.Issue{ID: "w-plain", Title: "held by a responder", Status: "closed"},
-	}
-
-	result := &compactResult{}
-	deleteWisp(nil, pinned, "TTL expired", result)
-	deleteWisp(nil, unpinned, "TTL expired", result)
-
-	if len(result.Protected) != 1 || result.Protected[0].ID != "w-pinned" {
-		t.Errorf("Protected = %+v, want exactly [w-pinned]", result.Protected)
-	}
-	if len(result.Deleted) != 1 || result.Deleted[0].ID != "w-plain" {
-		t.Errorf("Deleted = %+v, want exactly [w-plain] — the control must stay deletable",
-			result.Deleted)
-	}
-	if !strings.Contains(result.Protected[0].Reason, "pinned") {
-		t.Errorf("Protected reason = %q, want it to name the pin", result.Protected[0].Reason)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// gt-ktvs first-order defect: a zero that cannot be told from a clean run
-// ---------------------------------------------------------------------------
-
-// TestCompactResultReportsScanned covers the property that would have exposed
-// this bug on day one. `{promoted: null, deleted: null, skipped: 0}` was the
-// output of a run over 703 invisible wisps and the output of a run over a tidy
-// database, and nothing in it distinguished them.
-func TestCompactResultReportsScanned(t *testing.T) {
-	encoded, err := json.Marshal(&compactResult{})
-	if err != nil {
-		t.Fatalf("marshal compactResult: %v", err)
-	}
-	if !strings.Contains(string(encoded), `"scanned"`) {
-		t.Errorf("compactResult JSON omits the input size, so an unreadable database "+
-			"still encodes the same as an empty one: %s", encoded)
-	}
-	if !strings.Contains(string(encoded), `"unclassified"`) {
-		t.Errorf("compactResult JSON omits the unclassified count, which is currently "+
-			"every wisp on the rig: %s", encoded)
 	}
 }

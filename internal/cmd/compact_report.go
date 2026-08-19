@@ -80,17 +80,11 @@ type categoryStats struct {
 
 // compactReport is the full daily digest data.
 type compactReport struct {
-	Date string `json:"date"`
-	// Scanned and Unclassified are carried through from the compaction run so
-	// the digest reports the size of the input alongside the outcome. Without
-	// them a digest of all-zeroes describes a tidy town and a compaction pass
-	// that saw nothing identically — the shape of gt-ktvs.
-	Scanned      int                       `json:"scanned"`
-	Unclassified int                       `json:"unclassified"`
-	Categories   map[string]*categoryStats `json:"categories"`
-	Promotions   []compactAction           `json:"promotions,omitempty"`
-	Anomalies    []string                  `json:"anomalies,omitempty"`
-	Errors       []string                  `json:"errors,omitempty"`
+	Date       string                    `json:"date"`
+	Categories map[string]*categoryStats `json:"categories"`
+	Promotions []compactAction           `json:"promotions,omitempty"`
+	Anomalies  []string                  `json:"anomalies,omitempty"`
+	Errors     []string                  `json:"errors,omitempty"`
 }
 
 // weeklyRollup aggregates daily reports for trend data.
@@ -224,30 +218,35 @@ func runDailyDigest() error {
 	return nil
 }
 
-// listReportWisps returns every surviving wisp, for the digest's Active column.
-//
-// It reads the wisps table, and it was blind for the same reason listWisps was
-// (gt-ktvs): `bd list --include-infra` still does not query the wisps table, so
-// filtering its output on ephemeral=true could never match and the Active
-// column has been reporting an empty database. --include-infra was covering a
-// distinction that does not exist on this route.
-//
-// It stays separate from listWisps because the scopes genuinely differ, just
-// not in the way the flag suggested: listWisps drives deletion and therefore
-// excludes infra types (agent identity beads must not be compacted away), while
-// counting them here is harmless and makes the digest's total honest.
+// listReportWisps includes infrastructure wisps that the default bd list view
+// hides. This is intentionally separate from listWisps, whose result drives
+// mutating compaction decisions and must retain its existing scope.
 func listReportWisps(bd *beads.Beads) ([]*compactIssue, error) {
-	return queryWisps(bd, "")
+	out, err := bd.Run("list", "--include-infra", "--json", "--all", "-n", "0")
+	if err != nil {
+		return nil, err
+	}
+
+	var allIssues []*compactIssue
+	if err := json.Unmarshal(extractJSONArray(out), &allIssues); err != nil {
+		return nil, fmt.Errorf("parsing report issue list: %w", err)
+	}
+
+	var wisps []*compactIssue
+	for _, issue := range allIssues {
+		if issue.Ephemeral {
+			wisps = append(wisps, issue)
+		}
+	}
+	return wisps, nil
 }
 
 // buildReport aggregates compaction results by category.
 func buildReport(dateStr string, result *compactResult, activeWisps []*compactIssue) *compactReport {
 	report := &compactReport{
-		Date:         dateStr,
-		Scanned:      result.Scanned,
-		Unclassified: result.Unclassified,
-		Categories:   make(map[string]*categoryStats),
-		Errors:       result.Errors,
+		Date:       dateStr,
+		Categories: make(map[string]*categoryStats),
+		Errors:     result.Errors,
 	}
 
 	// Initialize all categories
@@ -291,16 +290,6 @@ func wispTypeToCategory(wispType, title string) string {
 // detectAnomalies checks for unusual patterns in the compaction data.
 func detectAnomalies(report *compactReport) []string {
 	var anomalies []string
-
-	// An untyped wisp is one compaction is not permitted to act on, so a large
-	// share of them means the L0 lifecycle is not running — regardless of how
-	// clean the per-category rows below look. Reported as an anomaly rather
-	// than left to be inferred from a table of zeroes (gt-ktvs).
-	if report.Unclassified > 0 {
-		anomalies = append(anomalies, fmt.Sprintf(
-			"%d of %d wisps have no wisp_type and were left untouched — no TTL policy applies to them",
-			report.Unclassified, report.Scanned))
-	}
 
 	for _, cat := range categoryOrder {
 		stats := report.Categories[cat]
@@ -349,16 +338,6 @@ func formatDailyDigest(report *compactReport) string {
 		sb.WriteString(fmt.Sprintf("| %s | %d | %d | %d |\n",
 			cat, stats.Deleted, stats.Promoted, stats.Active))
 	}
-
-	// Printed after the table and unconditionally, including when it is zero.
-	// The per-category rows above skip themselves when empty, so a digest with
-	// nothing to say used to be a table with no rows at all — which reads as a
-	// clean town whether or not compaction could see anything (gt-ktvs).
-	sb.WriteString(fmt.Sprintf("\n%d wisps scanned", report.Scanned))
-	if report.Unclassified > 0 {
-		sb.WriteString(fmt.Sprintf(", %d left untouched for having no wisp_type", report.Unclassified))
-	}
-	sb.WriteString(".\n")
 
 	// Promotions
 	if len(report.Promotions) > 0 {
