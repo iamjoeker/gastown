@@ -1386,7 +1386,7 @@ func NukePolecat(bd *BdCli, workDir, rigName, polecatName string) error {
 	// Check if session exists and kill it
 	if running, _ := t.HasSession(sessionName); running {
 		// Try graceful shutdown first (Ctrl-C), then force kill
-		_ = t.InterruptAgent(sessionName, tmux.KeyCtrlC)
+		_ = t.SendKeysRaw(sessionName, "C-c")
 		// Brief delay for graceful handling
 		time.Sleep(100 * time.Millisecond)
 		// Force kill the session
