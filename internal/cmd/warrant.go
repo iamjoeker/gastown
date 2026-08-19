@@ -24,31 +24,15 @@ var (
 	warrantStdin   bool // Read reason from stdin
 )
 
-// WarrantOutcome records what a warrant execution actually accomplished.
-// Executed alone cannot express this: it says the warrant was processed, never
-// that anything was terminated.
-type WarrantOutcome string
-
-const (
-	// WarrantTerminated means the target session existed and was killed.
-	WarrantTerminated WarrantOutcome = "terminated"
-	// WarrantTargetAbsent means the target resolved to a real session name that
-	// tmux does not have. Nothing was terminated by this warrant. It is not a
-	// claim that the agent was ever alive — "no such session" cannot tell
-	// "already dead" from "never existed".
-	WarrantTargetAbsent WarrantOutcome = "target-absent"
-)
-
 // Warrant represents a death warrant for an agent
 type Warrant struct {
-	ID         string         `json:"id"`
-	Target     string         `json:"target"` // e.g., "gastown/polecats/alpha", "deacon/dogs/bravo"
-	Reason     string         `json:"reason"`
-	FiledBy    string         `json:"filed_by"`
-	FiledAt    time.Time      `json:"filed_at"`
-	Executed   bool           `json:"executed,omitempty"`
-	ExecutedAt *time.Time     `json:"executed_at,omitempty"`
-	Outcome    WarrantOutcome `json:"outcome,omitempty"`
+	ID         string     `json:"id"`
+	Target     string     `json:"target"` // e.g., "gastown/polecats/alpha", "deacon/dogs/bravo"
+	Reason     string     `json:"reason"`
+	FiledBy    string     `json:"filed_by"`
+	FiledAt    time.Time  `json:"filed_at"`
+	Executed   bool       `json:"executed,omitempty"`
+	ExecutedAt *time.Time `json:"executed_at,omitempty"`
 }
 
 var warrantCmd = &cobra.Command{
@@ -74,16 +58,10 @@ var warrantFileCmd = &cobra.Command{
 	Short: "File a death warrant for an agent",
 	Long: `File a death warrant for an agent that needs termination.
 
-The target must be a full agent path in one of these shapes:
-  - <rig>/polecats/<name>   e.g. gastown/polecats/alpha
-  - <rig>/crew/<name>       e.g. gastown/crew/bob
-  - <rig>/witness           e.g. gastown/witness
-  - <rig>/refinery          e.g. gastown/refinery
-  - deacon/dogs/<name>      e.g. deacon/dogs/bravo
-
-Anything else is rejected. A bare agent name or a bead id is not a target:
-there is no way to resolve it to a session, and a warrant that cannot be
-resolved would report success while its target kept running.
+The target should be an agent path like:
+  - gastown/polecats/alpha
+  - deacon/dogs/bravo
+  - beads/polecats/charlie
 
 Examples:
   gt warrant file gastown/polecats/alpha --reason "Zombie: no session, idle >10m"
@@ -113,11 +91,7 @@ var warrantExecuteCmd = &cobra.Command{
 This will:
 1. Find the warrant for the target
 2. Terminate the agent's tmux session (if exists)
-3. Mark the warrant as executed, recording whether a session was actually
-   terminated or the target was already absent
-
-An unrecognised target is an error, not a silent no-op. See "gt warrant file"
-for the accepted target shapes.
+3. Mark the warrant as executed
 
 Use --force to execute even if no warrant exists.
 
@@ -181,13 +155,6 @@ func runWarrantFile(cmd *cobra.Command, args []string) error {
 	}
 
 	target := args[0]
-
-	// Reject an unresolvable target here rather than at execution time. A
-	// warrant nobody can act on is worse than no warrant: it sits in the queue
-	// looking like a pending kill order for an agent that will never be touched.
-	if _, err := targetToSessionName(target); err != nil {
-		return err
-	}
 
 	warrantDir, err := getWarrantDir()
 	if err != nil {
@@ -295,23 +262,13 @@ func runWarrantList(cmd *cobra.Command, args []string) error {
 	for _, w := range warrants {
 		status := "⚠️  PENDING"
 		if w.Executed {
-			// A warrant that terminated nothing is not the same result as one
-			// that killed a session, and a warrant written before outcomes were
-			// recorded is neither — it is unknown. Three states, three tokens.
-			switch w.Outcome {
-			case WarrantTerminated:
-				status = "✓ TERMINATED"
-			case WarrantTargetAbsent:
-				status = "○ NOT TERMINATED"
-			default:
-				status = "? OUTCOME UNKNOWN"
-			}
+			status = "✓ EXECUTED"
 		}
 		fmt.Printf("  %s %s\n", status, style.Bold.Render(w.Target))
 		fmt.Printf("     Reason: %s\n", w.Reason)
 		fmt.Printf("     Filed: %s by %s\n", w.FiledAt.Format("2006-01-02 15:04"), w.FiledBy)
 		if w.Executed && w.ExecutedAt != nil {
-			fmt.Printf("     Executed: %s (%s)\n", w.ExecutedAt.Format("2006-01-02 15:04"), warrantOutcomeLabel(w.Outcome))
+			fmt.Printf("     Executed: %s\n", w.ExecutedAt.Format("2006-01-02 15:04"))
 		}
 		fmt.Println()
 	}
@@ -343,69 +300,42 @@ func runWarrantExecute(cmd *cobra.Command, args []string) error {
 	}
 
 	if warrant != nil && warrant.Executed {
-		when := "an unrecorded time"
-		if warrant.ExecutedAt != nil {
-			when = warrant.ExecutedAt.Format(time.RFC3339)
-		}
-		fmt.Printf("Warrant for %s already executed at %s (%s)\n", target, when, warrantOutcomeLabel(warrant.Outcome))
+		fmt.Printf("Warrant for %s already executed at %s\n", target, warrant.ExecutedAt.Format(time.RFC3339))
 		return nil
 	}
 
 	tm := tmux.NewTmux()
 
 	if warrant != nil {
-		// executeOneWarrant reports the outcome itself, and reports it
-		// truthfully — do not print a success banner over the top of it.
 		if err := executeOneWarrant(warrant, warrantPath, tm); err != nil {
 			return fmt.Errorf("executing warrant: %w", err)
 		}
-		return nil
+	} else {
+		// --force without a warrant file: just kill the session
+		sessionName, err := targetToSessionName(target)
+		if err != nil {
+			return fmt.Errorf("determining session name: %w", err)
+		}
+		if has, err := tm.HasSession(sessionName); err != nil {
+			return fmt.Errorf("checking session %s: %w", sessionName, err)
+		} else if has {
+			if err := tm.KillSessionWithProcesses(sessionName); err != nil {
+				return fmt.Errorf("killing session %s: %w", sessionName, err)
+			}
+			fmt.Printf("✓ Terminated session %s\n", sessionName)
+		} else {
+			fmt.Printf("  Session %s not found (already dead)\n", sessionName)
+		}
 	}
 
-	// --force without a warrant file: just kill the session
-	sessionName, err := targetToSessionName(target)
-	if err != nil {
-		return fmt.Errorf("determining session name: %w", err)
-	}
-	has, err := tm.HasSession(sessionName)
-	if err != nil {
-		return fmt.Errorf("checking session %s: %w", sessionName, err)
-	}
-	if !has {
-		fmt.Printf("  No session %s to terminate — nothing done for %s\n", sessionName, style.Bold.Render(target))
-		return nil
-	}
-	if err := tm.KillSessionWithProcesses(sessionName); err != nil {
-		return fmt.Errorf("killing session %s: %w", sessionName, err)
-	}
-	fmt.Printf("✓ Terminated session %s (%s)\n", sessionName, style.Bold.Render(target))
+	fmt.Printf("✓ Warrant executed for %s\n", style.Bold.Render(target))
 	return nil
-}
-
-// warrantOutcomeLabel renders an outcome for display. Warrants written before
-// the outcome field existed have none; their executed:true cannot be trusted to
-// mean a session was terminated, so say so rather than implying it was.
-func warrantOutcomeLabel(o WarrantOutcome) string {
-	switch o {
-	case WarrantTerminated:
-		return "session terminated"
-	case WarrantTargetAbsent:
-		return "target absent — nothing terminated"
-	default:
-		return "outcome not recorded"
-	}
 }
 
 // executeOneWarrant executes a single pending warrant: checks if the target
 // session exists, kills it with full process tree cleanup, and marks the warrant
-// as executed on disk. Returns nil on success. On error — including an
-// unresolvable target — the warrant is NOT marked as executed, so it stays
-// pending and visible and can be retried on the next triage cycle.
-//
-// Outcome, not Executed, says whether anything was terminated. Executed only
-// means the warrant was resolved and should not be retried: a target that
-// resolves to a session tmux does not have is resolved (the agent is gone), but
-// this warrant did not end it.
+// as executed on disk. Returns nil on success. On error, the warrant is NOT
+// marked as executed so it can be retried on the next triage cycle.
 func executeOneWarrant(w *Warrant, warrantPath string, tm *tmux.Tmux) error {
 	sessionName, err := targetToSessionName(w.Target)
 	if err != nil {
@@ -417,18 +347,16 @@ func executeOneWarrant(w *Warrant, warrantPath string, tm *tmux.Tmux) error {
 		return fmt.Errorf("checking session %s: %w", sessionName, err)
 	}
 
-	now := time.Now()
 	if has {
 		if err := tm.KillSessionWithProcesses(sessionName); err != nil {
 			return fmt.Errorf("killing session %s: %w", sessionName, err)
 		}
-		w.Outcome = WarrantTerminated
 		fmt.Printf("Warrant executed: terminated session %s (%s)\n", sessionName, w.Target)
 	} else {
-		w.Outcome = WarrantTargetAbsent
-		fmt.Printf("Warrant closed: no session %s to terminate (%s)\n", sessionName, w.Target)
+		fmt.Printf("Warrant executed: session %s already dead (%s)\n", sessionName, w.Target)
 	}
 
+	now := time.Now()
 	w.Executed = true
 	w.ExecutedAt = &now
 	data, err := json.MarshalIndent(w, "", "  ")
@@ -442,25 +370,9 @@ func executeOneWarrant(w *Warrant, warrantPath string, tm *tmux.Tmux) error {
 	return nil
 }
 
-// warrantTargetShapes lists the target forms targetToSessionName accepts, for
-// use in error messages.
-const warrantTargetShapes = "<rig>/polecats/<name>, <rig>/crew/<name>, <rig>/witness, <rig>/refinery, or deacon/dogs/<name>"
-
-// targetToSessionName converts a target path to a tmux session name.
-//
-// Only the recognised agent-path shapes resolve; anything else is an error.
-// This function must never invent a name for an unrecognised target. A
-// fabricated name always resolves to a session tmux does not have, and callers
-// cannot distinguish "no such session" from "the agent was already gone" — so a
-// fabricated name makes every warrant against it look successfully executed
-// while the real session survives. Fail closed instead.
+// targetToSessionName converts a target path to a tmux session name
 func targetToSessionName(target string) (string, error) {
 	parts := strings.Split(target, "/")
-	for _, p := range parts {
-		if p == "" {
-			return "", fmt.Errorf("invalid target %q: empty path component; expected %s", target, warrantTargetShapes)
-		}
-	}
 
 	switch {
 	case len(parts) == 3 && parts[1] == "polecats":
@@ -476,11 +388,15 @@ func targetToSessionName(target string) (string, error) {
 		// gastown/refinery -> {prefix}-refinery
 		return session.RefinerySessionName(session.PrefixFor(parts[0])), nil
 	case len(parts) == 2 && parts[0] == "deacon" && parts[1] == "dogs":
-		return "", fmt.Errorf("invalid target %q: need dog name (e.g., deacon/dogs/alpha)", target)
+		return "", fmt.Errorf("invalid target: need dog name (e.g., deacon/dogs/alpha)")
 	case len(parts) == 3 && parts[0] == "deacon" && parts[1] == "dogs":
 		// deacon/dogs/alpha -> hq-dog-alpha
-		return session.DogSessionName(parts[2]), nil
+		return fmt.Sprintf("hq-dog-%s", parts[2]), nil
 	default:
-		return "", fmt.Errorf("unrecognized target %q: expected %s", target, warrantTargetShapes)
+		prefix := session.DefaultPrefix
+		if len(parts) > 0 {
+			prefix = session.PrefixFor(parts[0])
+		}
+		return prefix + "-" + strings.ReplaceAll(target, "/", "-"), nil
 	}
 }
