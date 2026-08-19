@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func setupWarrantTestRegistry(t *testing.T) {
@@ -192,7 +194,8 @@ func TestTargetToSessionName(t *testing.T) {
 		{"gastown/refinery", false, "gt-refinery"},
 		{"beads/witness", false, "bd-witness"},
 		{"beads/refinery", false, "bd-refinery"},
-		{"unknownrig/something/else", false, "gt-unknownrig-something-else"},
+		// Unrecognised shapes must error, never resolve to a fabricated name.
+		{"unknownrig/something/else", true, ""},
 	}
 
 	for _, tt := range tests {
@@ -206,6 +209,114 @@ func TestTargetToSessionName(t *testing.T) {
 				t.Errorf("targetToSessionName(%q) = %q, want %q", tt.target, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTargetToSessionName_RejectsUnresolvableTargets is the regression test for
+// the defect chain: targetToSessionName used to fabricate a plausible session
+// name for any unrecognised target and return a nil error. Because tmux never
+// has a session by a fabricated name, the caller read "not found", reported it
+// as "already dead", and marked the warrant executed — while the real agent
+// kept running. Every one of these inputs must produce an error.
+func TestTargetToSessionName_RejectsUnresolvableTargets(t *testing.T) {
+	setupWarrantTestRegistry(t)
+
+	targets := []string{
+		"gt-abc123",                 // bead id — the reported case
+		"hq-6h21",                   // bead id, town prefix
+		"institute",                 // bare agent name, no path
+		"gastown/polecats",          // truncated: no polecat name
+		"gastown/polecats/a/b",      // over-long path
+		"gastown/mayor",             // unsupported role
+		"deacon",                    // town singleton, no shape for it
+		"gastown/polecats/",         // empty name component
+		"/polecats/alpha",           // empty rig component
+		"gastown//alpha",            // empty middle component
+		"",                          // empty target
+		"unknownrig/something/else", // three parts, unknown middle
+	}
+
+	for _, target := range targets {
+		t.Run(target, func(t *testing.T) {
+			got, err := targetToSessionName(target)
+			if err == nil {
+				t.Errorf("targetToSessionName(%q) = %q with nil error; want an error — a fabricated name makes an unexecuted warrant look executed", target, got)
+			}
+			if got != "" {
+				t.Errorf("targetToSessionName(%q) returned session name %q alongside error; want empty string", target, got)
+			}
+		})
+	}
+}
+
+// TestExecuteOneWarrant_UnresolvableTargetStaysPending verifies the composed
+// behaviour that the defect report describes: a warrant whose target cannot be
+// resolved must NOT be marked executed. Before the fix it was, so the warrant
+// disappeared from the pending list having terminated nothing.
+//
+// No tmux session is involved — resolution fails before any session lookup.
+func TestExecuteOneWarrant_UnresolvableTargetStaysPending(t *testing.T) {
+	setupWarrantTestRegistry(t)
+
+	warrantDir := t.TempDir()
+	w := Warrant{
+		ID:       "warrant-bead-id-target",
+		Target:   "gt-abc123", // bead id, not an agent path
+		Reason:   "Zombie: no session, idle >10m",
+		FiledBy:  "test",
+		FiledAt:  time.Now().Add(-5 * time.Minute),
+		Executed: false,
+	}
+	warrantPath := filepath.Join(warrantDir, "gt-abc123.warrant.json")
+	data, _ := json.MarshalIndent(w, "", "  ")
+	if err := os.WriteFile(warrantPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// A real Tmux is passed deliberately: if the resolution guard were ever
+	// removed, the fabricated name would look up cleanly as "not found" and the
+	// assertions below would catch the warrant being marked executed.
+	err := executeOneWarrant(&w, warrantPath, tmux.NewTmux())
+	if err == nil {
+		t.Fatal("executeOneWarrant() error = nil, want an error for an unresolvable target")
+	}
+	if w.Executed {
+		t.Error("Executed = true after a failed resolution, want false — the warrant must stay pending")
+	}
+	if w.ExecutedAt != nil {
+		t.Error("ExecutedAt is set after a failed resolution, want nil")
+	}
+	if w.Outcome != "" {
+		t.Errorf("Outcome = %q after a failed resolution, want empty", w.Outcome)
+	}
+
+	// The on-disk warrant must be untouched, so the next triage cycle sees it.
+	onDisk := Warrant{}
+	readData, readErr := os.ReadFile(warrantPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile() error = %v", readErr)
+	}
+	if err := json.Unmarshal(readData, &onDisk); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if onDisk.Executed {
+		t.Error("on-disk Executed = true, want false — a warrant that resolved to nothing was recorded as carried out")
+	}
+}
+
+// TestWarrantOutcomeLabel verifies that each outcome renders distinctly, and
+// that a warrant with no recorded outcome does not read as a termination.
+func TestWarrantOutcomeLabel(t *testing.T) {
+	if got := warrantOutcomeLabel(WarrantTerminated); !strings.Contains(got, "terminated") {
+		t.Errorf("warrantOutcomeLabel(terminated) = %q, want it to mention termination", got)
+	}
+	absent := warrantOutcomeLabel(WarrantTargetAbsent)
+	if !strings.Contains(absent, "nothing terminated") {
+		t.Errorf("warrantOutcomeLabel(target-absent) = %q, want it to say nothing was terminated", absent)
+	}
+	legacy := warrantOutcomeLabel("")
+	if strings.Contains(legacy, "session terminated") {
+		t.Errorf("warrantOutcomeLabel(\"\") = %q, want it not to claim a termination", legacy)
 	}
 }
 

@@ -282,12 +282,6 @@ func runDown(cmd *cobra.Command, args []string) error {
 		doltRunning, doltPid, doltErr := doltserver.IsRunning(townRoot)
 		// Probe before the signal: /proc/<pid>/cgroup dies with the process.
 		doltSup := doltserver.DetectSupervisor(doltPid)
-		if !downDryRun {
-			// Remember it, so the start that follows this stop hands itself
-			// back to the same unit rather than spawning outside it. Not in a
-			// dry run: --dry-run reports, it does not write. (gt-cru5)
-			_ = doltserver.RememberSupervisor(townRoot, doltSup)
-		}
 		if doltErr != nil {
 			printDownStatus("Dolt", false, fmt.Sprintf("status check failed: %v", doltErr))
 			allOK = false
