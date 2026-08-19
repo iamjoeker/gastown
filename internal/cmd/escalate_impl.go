@@ -654,13 +654,7 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 		result, err := bd.ReescalateEscalation(issue.ID, reescalatedBy, maxReescalations)
 		if err != nil {
 			style.PrintWarning("failed to reescalate %s: %v", issue.ID, err)
-			// A non-nil result alongside the error is a PARTIAL bump: the record
-			// carries the new severity and the error names the delivered copies
-			// left behind. Dropping it here would suppress the re-routing mail
-			// for a severity that has already been raised.
-			if result == nil {
-				continue
-			}
+			continue
 		}
 		results = append(results, result)
 
