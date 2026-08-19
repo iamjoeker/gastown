@@ -488,46 +488,12 @@ func runDoltStop(cmd *cobra.Command, args []string) error {
 
 	_, pid, _ := doltserver.IsRunning(townRoot)
 
-	// Probe BEFORE stopping: /proc/<pid>/cgroup dies with the process, and the
-	// unit's MainPID changes the moment it restarts.
-	sup := doltserver.DetectSupervisor(pid)
-
 	if err := doltserver.Stop(townRoot); err != nil {
 		return err
 	}
 
-	if sup.AutoRestarts() {
-		fmt.Print(supervisedStopNotice(pid, sup))
-		return nil
-	}
-
 	fmt.Printf("%s Dolt server stopped (was PID %d)\n", style.Bold.Render("✓"), pid)
 	return nil
-}
-
-// supervisedStopNotice replaces the "stopped" line when a supervisor is about to
-// undo the stop.
-//
-// Claiming success here is not a cosmetic problem. On 2026-08-18 an operator ran
-// `gt down` three times in six minutes because each run reported Dolt stopped
-// while gt-dolt.service (Restart=always) brought it back 5s later with a new PID
-// — the changed PID reading as "something is wrong" rather than as "gt cannot
-// stop this" (gt-09e4).
-func supervisedStopNotice(pid int, sup *doltserver.Supervisor) string {
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "%s Signalled Dolt server (PID %d) — but it is NOT stopped.\n\n",
-		style.Warning.Render("!"), pid)
-	fmt.Fprintf(&b, "  This server is supervised by %s.\n", sup.Describe())
-	b.WriteString("  gt signalled the process; the supervisor starts a replacement on the same\n")
-	b.WriteString("  data directory seconds from now, with a new PID. gt does not manage that\n")
-	b.WriteString("  unit — running this command again will not change the outcome.\n\n")
-	fmt.Fprintf(&b, "  To stop the server for real:\n      %s\n\n", sup.StopCommand())
-	b.WriteString("  That takes the town's data plane — beads, mail, identity — offline for\n")
-	b.WriteString("  every agent. Bring it back with:\n")
-	fmt.Fprintf(&b, "      %s\n", sup.StartCommand())
-
-	return b.String()
 }
 
 func runDoltRestart(cmd *cobra.Command, args []string) error {
@@ -543,25 +509,6 @@ func runDoltRestart(cmd *cobra.Command, args []string) error {
 
 	// Step 1: Stop tracked server (if running)
 	running, pid, _ := doltserver.IsRunning(townRoot)
-
-	// A gt-side restart under a reviving supervisor is not a restart, it is a
-	// port fight: gt rebinds within a second, then the unit's own restart timer
-	// fires and its replacement cannot bind. With StartLimitIntervalSec=0 — what
-	// this town's unit sets — systemd retries that failure forever. Refuse and
-	// hand over the command that restarts the thing actually in charge (gt-09e4).
-	if sup := doltserver.DetectSupervisor(pid); sup.AutoRestarts() {
-		return fmt.Errorf(`Dolt server is supervised by %s — gt cannot restart it
-
-gt would stop the process and immediately rebind port %d. The supervisor's own
-restart then fires and fails to bind, and retries on a loop, while the server gt
-started runs unsupervised.
-
-Restart through the supervisor instead:
-    %s`,
-			sup.Describe(), config.Port,
-			strings.Replace(sup.StopCommand(), " stop ", " restart ", 1))
-	}
-
 	if running {
 		fmt.Printf("Stopping Dolt server (PID %d)...\n", pid)
 		if err := doltserver.Stop(townRoot); err != nil {

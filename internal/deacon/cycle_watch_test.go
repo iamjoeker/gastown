@@ -303,50 +303,81 @@ func TestObserveCycle_RoundTripsThroughDisk(t *testing.T) {
 // path: hq-deacon at a frozen cycle 421 whose heartbeat timestamp kept moving.
 // The old age-only verdict called this "fresh" at every poll; it must now
 // surface as wedged.
+// The gt-bvo wedge as it was actually recorded, replayed against the detector
+// built to catch it. The detector does not catch it.
+//
+// An earlier version of this test replayed the trace as gt-bvo described it —
+// two polls "4 minutes apart" whose ages differed by only 45s, implying the
+// timestamp advanced under a frozen cycle — plus an invented third poll to
+// reach the confirmation count. It passed, and certified a state that has never
+// occurred. gt-s6r recovered the Mayor's transcript: the polls were 45.06s
+// apart, so the 45s age delta means the heartbeat was FROZEN, not advancing.
+//
+// The timings below are the transcript's, not a reconstruction:
+//
+//	23:27:14.437  age 3m25s  cycle 421   Mayor poll 1
+//	23:27:59.497  age 4m10s  cycle 421   Mayor poll 2
+//
+// Both reconstruct the same write at 23:23:49.4, which twelve polls of cycle
+// 421 by four different sessions also agree on.
 func TestEvaluateHealth_FieldTraceFromBead(t *testing.T) {
 	townRoot := t.TempDir()
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 	th := DefaultHealthThresholds()
 
-	// Poll 1 — the Mayor's first reading: heartbeat 3m25s old, cycle 421.
-	// Nothing to compare against yet, so this correctly reads fresh.
-	hb1 := &Heartbeat{Timestamp: at(base, -3*time.Minute-25*time.Second), Cycle: 421}
-	obs := ObserveCycle(townRoot, hb1, base)
-	if got := EvaluateHealth(hb1, obs, base, th); got != VerdictFresh {
-		t.Fatalf("poll 1 verdict = %q, want %q — one reading cannot show advancement", got, VerdictFresh)
+	// The single write that served all of cycle 421, and the two Mayor polls of
+	// it. Deriving both heartbeats from one timestamp is the point: that is what
+	// the field data shows, and what a coupled writer can only produce.
+	write := time.Date(2026, 8, 2, 23, 23, 49, 437_000_000, time.UTC)
+	hb := &Heartbeat{Timestamp: write, Cycle: 421, LastAction: "cycle 415 closed (abbreviated)"}
+
+	p1 := time.Date(2026, 8, 2, 23, 27, 14, 437_000_000, time.UTC)
+	p2 := time.Date(2026, 8, 2, 23, 27, 59, 497_000_000, time.UTC)
+
+	if gap := p2.Sub(p1); gap > time.Minute {
+		t.Fatalf("precondition: the polls are 45s apart, not %s — the trace has been altered", gap)
+	}
+	if age1, age2 := p1.Sub(write), p2.Sub(write); age2-age1 != p2.Sub(p1) {
+		t.Fatalf("precondition: age must track elapsed time exactly for a frozen writer, got %s vs %s",
+			age2-age1, p2.Sub(p1))
 	}
 
-	// Poll 2 — "4 minutes later: still cycle 421", heartbeat only 4m10s old.
-	// A frozen writer would read ~7m25s here; the timestamp moved.
-	p2 := at(base, 4*time.Minute)
-	hb2 := &Heartbeat{Timestamp: at(p2, -4*time.Minute-10*time.Second), Cycle: 421}
-	obs = ObserveCycle(townRoot, hb2, p2)
+	obs := ObserveCycle(townRoot, hb, p1)
+	obs = ObserveCycle(townRoot, hb, p2)
 
-	// Poll 3 — second confirmation of the same signature.
-	p3 := at(base, 8*time.Minute)
-	hb3 := &Heartbeat{Timestamp: at(p3, -30*time.Second), Cycle: 421}
-	obs = ObserveCycle(townRoot, hb3, p3)
-
-	if obs.TimestampAdvances != CycleWedgeAdvanceConfirmations {
-		t.Fatalf("TimestampAdvances = %d, want %d", obs.TimestampAdvances, CycleWedgeAdvanceConfirmations)
+	// No advance to count, so no confirmation, so no wedge verdict — for the
+	// one wedge the town has ever recorded in full.
+	if obs.TimestampAdvances != 0 {
+		t.Errorf("TimestampAdvances = %d, want 0 — the recorded wedge froze the timestamp too",
+			obs.TimestampAdvances)
+	}
+	if obs.WedgeConfirmed() {
+		t.Error("WedgeConfirmed() = true, want false — this signal cannot fire on the real trace")
 	}
 
-	got := EvaluateHealth(hb3, obs, p3, th)
-	if got != VerdictWedged {
-		t.Errorf("EvaluateHealth() = %q, want %q for the recorded field trace", got, VerdictWedged)
-	}
-	if got.Healthy() {
-		t.Error("a wedged Deacon must not report Healthy()")
+	// It reads fresh, which is the reporting bug gt-bvo filed, still unfixed:
+	// not because the wedge writes heartbeats, but because the Mayor polled
+	// 3m25s and 4m10s in and the stale threshold is 5m.
+	if got := EvaluateHealth(hb, obs, p2, th); got != VerdictFresh {
+		t.Errorf("EvaluateHealth() = %q, want %q — the wedge is invisible to this verdict", got, VerdictFresh)
 	}
 
-	// The heartbeat is 30s old here — the age-only verdict this replaces would
-	// still be calling it "fresh", which is the reporting bug gt-bvo filed.
-	// Compare against the injected clock: hb.IsFresh() reads the wall clock,
-	// which these synthetic timestamps are not anchored to.
-	if age := p3.Sub(hb3.Timestamp); age >= th.Stale {
-		t.Fatalf("precondition: trace must end on a heartbeat the old verdict called fresh, got age %s", age)
+	// Age alone would have caught it 50s after the Mayor gave up waiting. That
+	// is the detection the town actually has today.
+	if got := EvaluateHealth(hb, obs, write.Add(th.Stale), th); got != VerdictStale {
+		t.Errorf("EvaluateHealth() at the stale threshold = %q, want %q", got, VerdictStale)
+	}
+
+	// LastAction is what separates this from a Deacon legitimately parked in
+	// await-signal, which is equally frozen. Nothing reads it yet (gt-s6r).
+	if hb.LastAction == deaconPreAwaitAction {
+		t.Fatalf("precondition: the wedged trace must not rest on %q", deaconPreAwaitAction)
 	}
 }
+
+// deaconPreAwaitAction is the LastAction the Deacon writes immediately before
+// parking in await-signal (mol-deacon-patrol.formula.toml). A frozen heartbeat
+// resting on it is asleep; on anything else, it stopped mid-patrol.
+const deaconPreAwaitAction = "pre-await checkpoint"
 
 func TestObserveCycle_NoHeartbeat(t *testing.T) {
 	townRoot := t.TempDir()
