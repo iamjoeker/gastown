@@ -83,8 +83,23 @@ func polecatSessionKey(rigName, polecatName string) string {
 // SAFE_TO_NUKE with an open MR against a branch that recycling would delete
 // (gt-46rk). The branch is the durable join key; the stored field is not.
 type polecatBranchMRIndex struct {
-	openMR    map[string]string // branch -> ID of an open MR for that branch
-	submitted map[string]bool   // branch -> an MR exists, open or closed
+	openMR    map[string]string       // branch -> ID of an open MR for that branch
+	submitted map[string]bool         // branch -> an MR exists, open or closed
+	byID      map[string]*beads.Issue // MR ID -> the MR bead, open or closed
+
+	// bd resolves IDs the merge-queue listing does not cover — chiefly the
+	// source issue of a terminal MR, which is what decides whether a recorded
+	// active_mr is stale or still guarding unmerged work. It is nil in tests and
+	// wherever the index was built by hand rather than read from a store.
+	bd *beads.Beads
+	// lookups memoises bd.Show across every polecat in the rig, so a shared
+	// source issue costs one process call for the whole listing.
+	lookups map[string]polecatMRLookup
+}
+
+type polecatMRLookup struct {
+	issue *beads.Issue
+	err   error
 }
 
 // newPolecatBranchMRIndex builds the index from one ListMergeRequests call.
@@ -98,8 +113,17 @@ func newPolecatBranchMRIndex(bd *beads.Beads) (*polecatBranchMRIndex, error) {
 	index := &polecatBranchMRIndex{
 		openMR:    make(map[string]string),
 		submitted: make(map[string]bool),
+		byID:      make(map[string]*beads.Issue, len(issues)),
+		bd:        bd,
 	}
 	for _, issue := range issues {
+		if issue == nil || issue.ID == "" {
+			continue
+		}
+		// Keyed by ID before the branch check: a recorded active_mr is looked up
+		// by ID, and an MR whose description carries no branch still has a status
+		// worth reporting.
+		index.byID[issue.ID] = issue
 		mrFields := beads.ParseMRFields(issue)
 		if mrFields == nil {
 			continue
@@ -114,6 +138,48 @@ func newPolecatBranchMRIndex(bd *beads.Beads) (*polecatBranchMRIndex, error) {
 		}
 	}
 	return index, nil
+}
+
+// polecatMRIssueReader answers active_mr classification lookups. MR beads come
+// out of the queue listing the index already holds, so classifying the common
+// case (an open MR) costs no extra process calls; anything the listing does not
+// cover falls through to a memoised bd lookup.
+type polecatMRIssueReader struct{ index *polecatBranchMRIndex }
+
+func (r polecatMRIssueReader) Show(issueID string) (*beads.Issue, error) {
+	index := r.index
+	if index == nil {
+		return nil, beads.ErrNotFound
+	}
+	if issue, ok := index.byID[issueID]; ok {
+		return issue, nil
+	}
+	if index.bd == nil {
+		// The listing was consulted and does not hold this ID, and there is no
+		// second source to ask. Not-found is the honest answer; AssessActiveMR
+		// fails closed on it.
+		return nil, beads.ErrNotFound
+	}
+	if cached, ok := index.lookups[issueID]; ok {
+		return cached.issue, cached.err
+	}
+	issue, err := index.bd.Show(issueID)
+	if index.lookups == nil {
+		index.lookups = make(map[string]polecatMRLookup)
+	}
+	index.lookups[issueID] = polecatMRLookup{issue: issue, err: err}
+	return issue, err
+}
+
+// issueReader returns the reader AssessActiveMR should classify against, or nil
+// when the queue was never consulted. Nil is load-bearing: AssessActiveMR
+// reports status=unverified and stays blocking for a nil reader, which is the
+// difference between "we looked and the MR is gone" and "we never looked".
+func (i *polecatBranchMRIndex) issueReader() polecat.IssueReader {
+	if i == nil {
+		return nil
+	}
+	return polecatMRIssueReader{index: i}
 }
 
 func (i *polecatBranchMRIndex) hasMR(branch string) bool {
@@ -195,16 +261,35 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 			input.ActiveWorkBlocker = fmt.Sprintf("hook_bead=%s status=unverified", hookBead)
 		}
 	}
+	// The recorded active_mr gets classified, not just echoed. This used to
+	// format a literal `status=unknown` for every polecat carrying the field —
+	// 19 of 19 town-wide — so a pointer at an MR that closed a day ago was
+	// indistinguishable at a glance from one filed seconds ago, and both read
+	// PENDING_MR forever (gt-hx10). AssessActiveMR is the same fail-closed
+	// classifier the recovery and reuse paths use: a terminal MR only stops
+	// blocking when its source issue is proven terminal too, and an unconsulted
+	// queue stays blocking as status=unverified.
 	if item.ActiveMR != "" {
-		input.ActiveMRBlocker = "active_mr=" + item.ActiveMR + " status=unknown"
-	} else if openMR := mrIndex.openMRFor(item.Branch); openMR != "" {
-		// An open MR nobody recorded on this agent bead — the rescue-submit case
-		// (gt-46rk). The branch it points at is the only copy of that work, and
-		// the polecat would otherwise read SAFE_TO_NUKE right up until recycling
-		// force-deleted the branch out from under the queue.
-		item.ActiveMR = openMR
-		input.ActiveMR = openMR
-		input.ActiveMRBlocker = "active_mr=" + openMR + " status=open source=branch-index"
+		assessment := polecat.AssessActiveMR(mrIndex.issueReader(), polecat.ActiveMRInput{
+			ActiveMR:        item.ActiveMR,
+			SourceIssueHint: polecatActiveMRSourceHint(fields),
+		})
+		if assessment.Pending {
+			input.ActiveMRBlocker = assessment.Reason
+		}
+	}
+	if input.ActiveMRBlocker == "" {
+		if openMR := mrIndex.openMRFor(item.Branch); openMR != "" {
+			// An open MR nobody recorded on this agent bead — the rescue-submit case
+			// (gt-46rk). The branch it points at is the only copy of that work, and
+			// the polecat would otherwise read SAFE_TO_NUKE right up until recycling
+			// force-deleted the branch out from under the queue. This also catches
+			// the polecat whose recorded active_mr just proved stale while a live MR
+			// for its branch exists under a different ID.
+			item.ActiveMR = openMR
+			input.ActiveMR = openMR
+			input.ActiveMRBlocker = "active_mr=" + openMR + " status=open source=branch-index"
+		}
 	}
 
 	input.State = item.State
@@ -324,6 +409,21 @@ func polecatActiveWorkLookupError(err error) polecatActiveWorkEvidence {
 		BlocksCleanup: true,
 		Blocker:       fmt.Sprintf("assigned_work status=lookup_error: %v", err),
 	}
+}
+
+// polecatActiveMRSourceHint supplies the source issue AssessActiveMR needs when
+// a terminal MR bead no longer carries one — either because the MR was reaped
+// or because its description predates the field. last_source_issue survives the
+// hook being cleared, which is exactly when active_mr is set, so it is the
+// better hint of the two.
+func polecatActiveMRSourceHint(fields *beads.AgentFields) string {
+	if fields == nil {
+		return ""
+	}
+	if source := strings.TrimSpace(fields.LastSourceIssue); source != "" {
+		return source
+	}
+	return strings.TrimSpace(fields.HookBead)
 }
 
 func parsePolecatAgentFields(issue *beads.Issue) *beads.AgentFields {
