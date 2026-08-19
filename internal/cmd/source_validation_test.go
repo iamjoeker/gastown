@@ -64,6 +64,30 @@ func TestResolveSubmitSourceIssueFailureNamesRoutingContext(t *testing.T) {
 	}
 }
 
+// gt-zu5n: gt:keep is the sanctioned reaper exemption, and applying it also made
+// the bead an invalid gt done source — so hardening a bead converted the polecat
+// working it into a zombie. Resolution must not judge concreteness; only the
+// caller that is about to create an MR may.
+func TestLookupSubmitSourceIssueTakesProtectedSourceResolveRejectsIt(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	installSubmitSourceBDStubWithOwnerJSON(t, currentBeadsDir, ownerBeadsDir, false,
+		`[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task","labels":["gt:keep"]}]`)
+
+	source, err := lookupSubmitSourceIssue(workDir, "bd-source")
+	if err != nil {
+		t.Fatalf("lookupSubmitSourceIssue on gt:keep source: %v; want the bead resolved, not rejected", err)
+	}
+	if source.Issue.Title != "owner source" {
+		t.Fatalf("source title = %q, want routed owner source", source.Issue.Title)
+	}
+
+	// The same bead is still refused where an MR really would be created.
+	if _, err := resolveSubmitSourceIssue(workDir, "bd-source"); err == nil ||
+		!strings.Contains(err.Error(), "protected-label:gt:keep") {
+		t.Fatalf("resolveSubmitSourceIssue on gt:keep source = %v, want protected-label rejection", err)
+	}
+}
+
 func TestValidateMergeRequestSourceUsesPreResolvedSource(t *testing.T) {
 	mr := &beads.Issue{ID: "gt-mr", Description: "source_issue: bd-source\n"}
 	if err := validateMergeRequestSource(mr, "bd-source", nil); err == nil || !strings.Contains(err.Error(), "pre-resolved") {
@@ -380,12 +404,19 @@ func setupRoutedSubmitGitRepo(t *testing.T, workDir string, pushBranch bool) str
 
 func installSubmitSourceBDStub(t *testing.T, currentBeadsDir, ownerBeadsDir string, ownerMissing bool) {
 	t.Helper()
+	installSubmitSourceBDStubWithOwnerJSON(t, currentBeadsDir, ownerBeadsDir, ownerMissing,
+		`[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task"}]`)
+}
+
+func installSubmitSourceBDStubWithOwnerJSON(t *testing.T, currentBeadsDir, ownerBeadsDir string, ownerMissing bool, ownerJSON string) {
+	t.Helper()
 	binDir := t.TempDir()
+	// Single-quoted so the JSON's double quotes survive /bin/sh verbatim.
 	ownerCase := fmt.Sprintf(`
 if [ "$BEADS_DIR" = %q ]; then
-  echo '[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task"}]'
+  echo '%s'
   exit 0
-fi`, ownerBeadsDir)
+fi`, ownerBeadsDir, ownerJSON)
 	if ownerMissing {
 		ownerCase = fmt.Sprintf(`
 if [ "$BEADS_DIR" = %q ]; then
