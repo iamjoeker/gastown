@@ -21,35 +21,16 @@ import (
 // branch. A guard tested only on its happy path is how the last one shipped.
 //
 // See: gt-32z
-const staleTempDirSection = "**2. Stale test temp dirs**"
+//
+// The TITLE, without the section number — see stalePIDFileSection and
+// patrol_section_test.go for what pinning the number costs.
+const staleTempDirSection = "Stale test temp dirs"
 
 // extractStaleTempDirScript pulls the shell block that follows the
 // "stale test temp dirs" heading out of the deacon patrol formula.
 func extractStaleTempDirScript(t *testing.T) string {
 	t.Helper()
-
-	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
-	if err != nil {
-		t.Fatalf("reading deacon patrol formula: %v", err)
-	}
-
-	body := string(content)
-	sectionIdx := strings.Index(body, staleTempDirSection)
-	if sectionIdx < 0 {
-		t.Fatalf("deacon patrol formula: %q section not found", staleTempDirSection)
-	}
-
-	rest := body[sectionIdx:]
-	open := strings.Index(rest, "```bash\n")
-	if open < 0 {
-		t.Fatal("deacon patrol formula: no bash block after stale test temp dirs section")
-	}
-	rest = rest[open+len("```bash\n"):]
-	closeIdx := strings.Index(rest, "\n```")
-	if closeIdx < 0 {
-		t.Fatal("deacon patrol formula: unterminated bash block in stale test temp dirs section")
-	}
-	return rest[:closeIdx]
+	return patrolSectionScript(t, deaconPatrolFormula, staleTempDirSection)
 }
 
 // TestStaleTempDirGuardHasNoExitStatusTest is a cheap regression fence: the

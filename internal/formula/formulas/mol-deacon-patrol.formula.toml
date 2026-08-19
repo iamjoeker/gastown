@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 16
+version = 17
 
 [vars]
 [vars.wisp_type]
@@ -415,7 +415,40 @@ that dependency on shell glob semantics, which is why the guard had to be fixed 
 the same change. **Never restore an exit-status test here, and never re-add a bare
 glob `for` loop over these patterns.**
 
-**3. Stale PID/lock files**
+**3. Orphaned Go build work directories**
+
+The Go toolchain creates a work directory under TMPDIR for every build, test and
+vet run, and removes it on normal exit. A KILLED build — OOM killer, test
+timeout, polecat recycle — strands it, at 100-300MB a time. Where TMPDIR is a
+RAM-backed tmpfs this exhausts the filesystem: 34 stranded directories held
+5.35GB of a 31GB tmpfs on 2026-08-19, and gastown's own disk-space guard began
+refusing polecat creation with `insufficient disk space` while `df /` still
+reported 1.3TB free, because /tmp is a different filesystem (gt-yb33). The error
+names disk space rather than the test, so it reads as a code regression to
+whichever agent hits it next.
+
+```bash
+gt deacon sweep-tmp --json
+```
+
+The command owns the safety rules; do not reimplement them in shell. It removes
+only directories whose name is exactly a Go work directory, that are real
+directories owned by this user, whose whole tree is readable and has been
+untouched for `--min-age` (default 1h), and which no running process names in
+its argv. If the process table cannot be read it removes NOTHING, however old
+the directories look. It never touches agent scratchpads, test fixtures, or
+anything it did not positively identify.
+
+Read `removed` and `removed_bytes` from the JSON for the digest. A non-zero
+`inconclusive` means the sweep refused for lack of evidence — report it, do not
+work around it.
+
+**This is a symptom, not the disease.** Something is killing builds often enough
+to strand dozens of work directories in three days. If `removed` is routinely
+high, that is worth an investigation of its own (OOM killer, test timeouts,
+mid-build recycles), not a bigger sweep.
+
+**4. Stale PID/lock files**
 
 Remove test-server PID files whose process is PROVEN dead. Same discipline as
 sub-section 2, one blast radius smaller: alive beats every probe, and a probe
@@ -498,7 +531,7 @@ kill -0 999999 (unallocated)   -> rc=1, "No such process"           dead
 **Never restore an exit-status-only `kill -0` test here, and never re-add a bare
 glob `for` loop over these patterns.**
 
-**4. Dead dog worktrees**
+**5. Dead dog worktrees**
 
 If a dog's tmux session is dead but worktree dirs remain, prune them.
 
@@ -543,13 +576,13 @@ only counts. **If you restore deletion here, you re-arm exactly that hazard** �
 a worktree is frequently the only thing holding a commit reachable. Prefer a tag
 (`preserve/*`) plus an explicit human decision over any automated prune.
 
-**5. Report**
+**6. Report**
 
 Log counts of cleaned items. If any items were cleaned, include counts in a
 brief summary for the patrol digest:
 
 ```
-Test pollution cleanup: rogue_dolt=N stale_dirs=N stale_pids=N dead_worktrees=N
+Test pollution cleanup: rogue_dolt=N stale_dirs=N go_build_dirs=N stale_pids=N dead_worktrees=N
 ```
 
 If all counts are 0, log "Test pollution cleanup: clean" and move on.
