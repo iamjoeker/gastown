@@ -68,8 +68,10 @@ func runMailThread(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s from %s to %s\n",
 			style.Dim.Render(msg.ID),
 			msg.From, msg.To)
+		// Zone label: local here, UTC in bd — see readMessage's Date line. A
+		// thread is read for ordering, which is exactly what a hidden offset breaks.
 		fmt.Printf("    %s\n",
-			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04")))
+			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04 MST")))
 
 		if msg.Body != "" {
 			fmt.Printf("    %s\n", msg.Body)
