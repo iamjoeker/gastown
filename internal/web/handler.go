@@ -201,15 +201,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		// the error means tmux could not be asked, so there is no worker list;
 		// the warning means the list exists but a rig store could not say what
 		// its workers are carrying. Both are rendered.
-		workersErr error
-		mail       []MailRow
-		rigs       []RigRow
-		dogs       []DogRow
-		// FetchDogs already tells a kennel that has never held a dog from one it
-		// could not read. That distinction died here, one layer above it: the
-		// error was logged and the template got an empty slice either way, so an
-		// unreadable kennel rendered "No dogs in kennel" (gt-1jrl).
-		dogsErr     error
+		workersErr  error
+		mail        []MailRow
+		rigs        []RigRow
+		dogs        []DogRow
 		escalations []EscalationRow
 		// escalationsErr is rendered, not just logged: an unreadable escalation
 		// panel must not look like an empty one (gt-edty).
@@ -271,9 +266,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		dogs, dogsErr = h.fetcher.FetchDogs()
-		if dogsErr != nil {
-			log.Printf("dashboard: FetchDogs failed: %v", dogsErr)
+		var err error
+		dogs, err = h.fetcher.FetchDogs()
+		if err != nil {
+			log.Printf("dashboard: FetchDogs failed: %v", err)
 		}
 	}()
 	go func() {
@@ -379,7 +375,6 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		Mail:                   mail,
 		Rigs:                   rigs,
 		Dogs:                   dogs,
-		DogsUnavailable:        unavailableMessage(dogsErr),
 		Escalations:            escalations,
 		EscalationsUnavailable: unavailableMessage(escalationsErr),
 		Health:                 health,
