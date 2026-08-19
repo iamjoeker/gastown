@@ -199,6 +199,23 @@ For packages with many Dolt-dependent tests, prefer adding
 `testutil.EnsureDoltContainerForTestMain()` in a `TestMain` function so all
 tests in the package share a single container.
 
+**Publishing a container's port.** A helper that starts a Dolt server must point
+*every* variable in `testenv.DoltPortEnvVars()` at it, not just the one its own
+caller reads. `testenv.GuardProductionDolt` — which runs from every `TestMain` —
+sets all of them to a dead port, so whichever one a helper leaves alone still
+holds that dead port, and `bd` reads `BEADS_DOLT_SERVER_PORT` and
+`BEADS_DOLT_PORT` ahead of `GT_DOLT_PORT`. The container comes up fine and the
+subprocess cannot reach it. The container helpers in `internal/testutil` do this
+through `setDoltPortEnv`/`setDoltPortEnvForTest`; use those rather than calling
+`t.Setenv` on a single variable.
+
+**Do not skip on a failure the fixture caused.** `t.Skipf` on "cannot reach the
+server" turns this class of bug into a green run: two tests in
+`internal/doltserver` reported `ok` while asserting nothing (gt-bbh0). Reserve
+skips for genuinely absent prerequisites — no Docker, no `bd` on `PATH` — and
+check those *before* starting a container. Once the container is up and the
+fixture has named it, a failure to connect is a failure.
+
 ## Releasing
 
 Releases are cut from tags of the form `vX.Y.Z`. See [RELEASING.md](RELEASING.md)
