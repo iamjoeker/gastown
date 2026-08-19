@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFormatEscalationDescription(t *testing.T) {
@@ -1018,5 +1019,260 @@ func TestListEscalations_HidesResolvedEscalations(t *testing.T) {
 			ids = append(ids, issue.ID)
 		}
 		t.Errorf("ListEscalations() = %v, want only the unresolved escalation hq-live", ids)
+	}
+}
+
+// --- Severity actually applied, and ack/close surviving the record (gt-psh) ---
+//
+// Two halves of one complaint. Severity was recorded as a label and nowhere
+// else, so `--severity high` landed at bd's default P2 and everything that
+// triages by priority read it as routine. And the record is an ephemeral wisp,
+// so the ID printed in every escalation mail — the one the mail body itself
+// tells you to ack and close with — stops resolving once the record ages out.
+
+// The reported shape exactly: severity:high on the bead, priority 2 in the row.
+func TestCreateEscalationBead_CarriesSeverityAsPriority(t *testing.T) {
+	for severity, want := range map[string]string{
+		"critical": "--priority=0",
+		"high":     "--priority=1",
+		"medium":   "--priority=2",
+		"low":      "--priority=3",
+	} {
+		t.Run(severity, func(t *testing.T) {
+			stubDir := t.TempDir()
+			argsPath := filepath.Join(stubDir, "args.txt")
+			stubScript := `#!/bin/sh
+for a in "$@"; do
+  printf '%s\n' "$a" >> "` + argsPath + `"
+done
+cat > /dev/null
+echo '{"id":"hq-wisp-p1","title":"x","status":"open","type":"task","labels":["gt:escalation"]}'
+exit 0
+`
+			if err := os.WriteFile(filepath.Join(stubDir, "bd"), []byte(stubScript), 0755); err != nil {
+				t.Fatalf("write bd stub: %v", err)
+			}
+			t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			ResetBdAllowStaleCacheForTest()
+
+			b := New(t.TempDir())
+			if _, err := b.CreateEscalationBead("Dolt: server unreachable", &EscalationFields{Severity: severity}); err != nil {
+				t.Fatalf("CreateEscalationBead: %v", err)
+			}
+
+			argsData, err := os.ReadFile(argsPath)
+			if err != nil {
+				t.Fatalf("read stub args: %v", err)
+			}
+			if !slices.Contains(strings.Split(string(argsData), "\n"), want) {
+				t.Errorf("severity %q must set %s on the record, got:\n%s", severity, want, string(argsData))
+			}
+		})
+	}
+}
+
+// An unrecognised severity must keep bd's default rather than landing at P0 —
+// the same guard escalationPriority gives the delivery bead.
+func TestCreateEscalationBead_LeavesUnknownSeverityAtDefaultPriority(t *testing.T) {
+	stubDir := t.TempDir()
+	argsPath := filepath.Join(stubDir, "args.txt")
+	stubScript := `#!/bin/sh
+for a in "$@"; do
+  printf '%s\n' "$a" >> "` + argsPath + `"
+done
+cat > /dev/null
+echo '{"id":"hq-wisp-p2","title":"x","status":"open","type":"task","labels":["gt:escalation"]}'
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(stubDir, "bd"), []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+
+	b := New(t.TempDir())
+	if _, err := b.CreateEscalationBead("odd one", &EscalationFields{Severity: "bogus"}); err != nil {
+		t.Fatalf("CreateEscalationBead: %v", err)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	for _, arg := range strings.Split(string(argsData), "\n") {
+		if strings.HasPrefix(arg, "--priority=") {
+			t.Errorf("unknown severity must not set a priority, got %q", arg)
+		}
+	}
+}
+
+// The documented command is `gt escalate close <record-id>`, printed in the mail
+// body and in the delivery bead. Once the record wisp ages out, that ID must
+// still resolve through the copies — failing here left the escalation live in
+// the Mayor's queue forever with no command able to clear it.
+func TestCloseEscalation_AcceptsReapedRecordID(t *testing.T) {
+	stub := newEscalationStub(t)
+	copyA := escalationCopy("hq-c1", "hq-wisp-gone", "mayor/")
+	stub.bead(copyA) // no fixture for hq-wisp-gone: bd show returns []
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-gone", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-gone", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation by reaped record ID: %v", err)
+	}
+	if result.RecordID != "hq-wisp-gone" {
+		t.Errorf("RecordID = %q, want hq-wisp-gone", result.RecordID)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
+	}
+	if !stub.hasWrite("close hq-c1", "--force") {
+		t.Errorf("the stranded copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+func TestAckEscalation_AcceptsReapedRecordID(t *testing.T) {
+	stub := newEscalationStub(t)
+	copyA := escalationCopy("hq-c1", "hq-wisp-gone", "mayor/")
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-gone", copyA)
+
+	b := New(t.TempDir())
+	if err := b.AckEscalation("hq-wisp-gone", "mayor/"); err != nil {
+		t.Fatalf("AckEscalation by reaped record ID: %v", err)
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=acked") {
+		t.Errorf("the copy was not marked acked; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// A genuinely unknown ID must still fail. Without this the fallback would turn
+// every typo into a silent no-op success.
+func TestCloseEscalation_StillFailsOnUnknownID(t *testing.T) {
+	newEscalationStub(t) // no fixtures at all: show returns [], list returns []
+
+	b := New(t.TempDir())
+	if _, err := b.CloseEscalation("hq-wisp-nosuch", "mayor/", "resolved"); err == nil {
+		t.Fatal("closing an ID with no record and no copies must fail, not report success")
+	}
+}
+
+// --- Re-escalation applies the new severity where it is read (gt-psh) --------
+
+func TestReescalateEscalation_RaisesPriorityWithSeverity(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1") // severity high
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.ReescalateEscalation("hq-wisp-r1", "gastown/deacon", 0)
+	if err != nil {
+		t.Fatalf("ReescalateEscalation: %v", err)
+	}
+	if result.NewSeverity != "critical" {
+		t.Fatalf("NewSeverity = %q, want critical", result.NewSeverity)
+	}
+
+	// critical is P0. Bumping the label without the priority is the whole defect:
+	// the escalation still sorts as routine work after being re-escalated.
+	if !stub.hasWrite("update hq-wisp-r1", "--priority=0", "--add-label=severity:critical") {
+		t.Errorf("record priority did not follow the severity; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	// The copy is what `gt escalate list` and the Mayor's queue render.
+	if !stub.hasWrite("update hq-c1", "--priority=0", "--add-label=severity:critical", "--remove-label=severity:high") {
+		t.Errorf("delivered copy did not follow the severity; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	// ...but its description is the mail body and must survive untouched.
+	for _, line := range stub.writes() {
+		if strings.HasPrefix(line, "update hq-c1") && strings.Contains(line, "--body-file") {
+			t.Errorf("copy description must not be rewritten, got: %q", line)
+		}
+	}
+}
+
+// `gt escalate stale` feeds this whatever bead its list turned up, and that list
+// renders copies. Running the bump against a copy would rewrite the mail body as
+// a structured record and re-derive severity from it.
+func TestReescalateEscalation_BumpsTheRecordWhenGivenACopyID(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.ReescalateEscalation("hq-c1", "gastown/deacon", 0)
+	if err != nil {
+		t.Fatalf("ReescalateEscalation: %v", err)
+	}
+	if result.ID != "hq-wisp-r1" {
+		t.Errorf("ID = %q, want the record hq-wisp-r1", result.ID)
+	}
+	if !stub.hasWrite("update hq-wisp-r1", "--body-file=-") {
+		t.Errorf("the structured record was not rewritten; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// A reaped record has no severity, count or history to bump, and the copies'
+// severity must not be re-derived from a mail body.
+func TestReescalateEscalation_SkipsWhenRecordWasReaped(t *testing.T) {
+	stub := newEscalationStub(t)
+	copyA := escalationCopy("hq-c1", "hq-wisp-gone", "mayor/")
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-gone", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.ReescalateEscalation("hq-wisp-gone", "gastown/deacon", 0)
+	if err != nil {
+		t.Fatalf("ReescalateEscalation with a reaped record: %v", err)
+	}
+	if !result.Skipped || result.SkipReason == "" {
+		t.Errorf("expected a reported skip, got %#v", result)
+	}
+	if stub.hasWrite("update hq-c1") {
+		t.Errorf("a reaped record must not bump its copies blindly; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// A record and every one of its copies carry "gt:escalation", so an un-deduped
+// stale list bumped the same escalation once per bead in one pass — low reaching
+// high in a single run, re-mailing the targets at each step.
+func TestListStaleEscalations_ReturnsOneEntryPerEscalation(t *testing.T) {
+	stub := newEscalationStub(t)
+	old := "2020-01-01T00:00:00Z"
+
+	record := escalationRecord("hq-wisp-r1")
+	record.CreatedAt = old
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	copyA.CreatedAt = old
+	copyB := escalationCopy("hq-c2", "hq-wisp-r1", "gastown/witness")
+	copyB.CreatedAt = old
+	other := escalationRecord("hq-wisp-r2")
+	other.CreatedAt = old
+
+	stub.bead(record)
+	stub.bead(other)
+	stub.list("gt:escalation", record, copyA, copyB, other)
+
+	b := New(t.TempDir())
+	stale, err := b.ListStaleEscalations(time.Hour)
+	if err != nil {
+		t.Fatalf("ListStaleEscalations: %v", err)
+	}
+
+	seen := map[string]int{}
+	for _, issue := range stale {
+		seen[EscalationRecordID(issue)]++
+	}
+	if len(stale) != 2 || seen["hq-wisp-r1"] != 1 || seen["hq-wisp-r2"] != 1 {
+		var ids []string
+		for _, issue := range stale {
+			ids = append(ids, issue.ID)
+		}
+		t.Errorf("ListStaleEscalations() = %v, want one entry per escalation record", ids)
 	}
 }
