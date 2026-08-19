@@ -21,10 +21,14 @@ type ConvoyData struct {
 	// means the rendered count is a floor, not a total.
 	MergeQueueFailedRigs []string
 	Workers              []WorkerRow
-	Mail                 []MailRow
-	Rigs                 []RigRow
-	Dogs                 []DogRow
-	Escalations          []EscalationRow
+	// WorkersWarning names the stores whose assigned-bead query did not fully
+	// answer. Non-empty means some workers may be shown as idle only because
+	// the bead they are carrying could not be read.
+	WorkersWarning string
+	Mail           []MailRow
+	Rigs           []RigRow
+	Dogs           []DogRow
+	Escalations    []EscalationRow
 	// EscalationsUnavailable holds the reason the escalation query failed, or
 	// "" when it succeeded. Non-empty means the escalation count is unknown —
 	// which the panel must render differently from a count of zero.

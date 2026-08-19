@@ -23,7 +23,7 @@ var staticFiles embed.FS
 type ConvoyFetcher interface {
 	FetchConvoys() ([]ConvoyRow, error)
 	FetchMergeQueue() (MergeQueueResult, error)
-	FetchWorkers() ([]WorkerRow, error)
+	FetchWorkers() (StoreResult[WorkerRow], error)
 	FetchMail() ([]MailRow, error)
 	FetchRigs() ([]RigRow, error)
 	FetchDogs() ([]DogRow, error)
@@ -191,7 +191,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	var (
 		convoys     []ConvoyRow
 		mergeQueue  MergeQueueResult
-		workers     []WorkerRow
+		workers     StoreResult[WorkerRow]
 		mail        []MailRow
 		rigs        []RigRow
 		dogs        []DogRow
@@ -342,13 +342,14 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}
 
 	// Compute summary from already-fetched data
-	summary := computeSummary(workers, hooks.Rows, issues.Rows, convoys, escalations, escalationsErr, activity)
+	summary := computeSummary(workers.Rows, hooks.Rows, issues.Rows, convoys, escalations, escalationsErr, activity)
 
 	data := ConvoyData{
 		Convoys:              convoys,
 		MergeQueue:           mergeQueue.Rows,
 		MergeQueueFailedRigs: mergeQueue.FailedRigs,
-		Workers:              workers,
+		Workers:              workers.Rows,
+		WorkersWarning:       workers.Warning(),
 		Mail:                 mail,
 		Rigs:                 rigs,
 		Dogs:                 dogs,
