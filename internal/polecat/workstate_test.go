@@ -34,6 +34,34 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-not-submitted", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "not_submitted", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
 		},
 		{
+			// gt-46rk. This is the surface-independent half of the fix: the
+			// refusal is a bead fact, so it fires even where no git or
+			// merge-queue lookup ever ran (MQCheckRequired false).
+			name: "recorded mr refusal needs mq submit without any queue lookup",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRRefused: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-refused-closed-source", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "refused_closed_source", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"mq_status=refused_closed_source (gt done made no MR: source issue was closed)"}},
+		},
+		{
+			name: "mr refusal is discharged by an mr that now exists",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRRefused: true, MRSubmitted: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-preserved"},
+		},
+		{
+			// Proof, not silence: a surface that actually ran the check and
+			// found nothing left to submit may retire the refusal.
+			name: "mr refusal is discharged by a completed check with nothing to submit",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRRefused: true, MQCheckRequired: true, HasSubmittableWork: false},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "not_required", ReuseStatus: "idle-preserved"},
+		},
+		{
+			// ...but a check that could not complete may not. MQLookupFailed
+			// already returns NEEDS_RECOVERY above; this pins the ordering so a
+			// future refactor cannot let uncertainty discharge the refusal.
+			name: "mr refusal survives a failed queue lookup",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRRefused: true, MQCheckRequired: true, MQLookupFailed: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "mq-lookup-failed", NeedsRecovery: true, MQStatus: "unknown", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"mq_status=unknown"}},
+		},
+		{
 			name: "mq lookup uncertainty blocks cleanup",
 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, MQLookupFailed: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "mq-lookup-failed", NeedsRecovery: true, MQStatus: "unknown", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"mq_status=unknown"}},
@@ -175,5 +203,45 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApplyBranchMRToWorkstateInput(t *testing.T) {
+	// An MR found by branch when the agent bead recorded nothing: this is the
+	// rescue-submit case gt-46rk left invisible. The MR must both prove
+	// submission and, while open, block the polecat as PENDING_MR — recycling
+	// force-deletes the branch the MR points at.
+	var in WorkstateInput
+	ApplyBranchMRToWorkstateInput(&in, "bd-wisp-4v7m", true)
+	if !in.MRSubmitted || in.ActiveMR != "bd-wisp-4v7m" || in.ActiveMRBlocker == "" {
+		t.Fatalf("open branch MR = %+v", in)
+	}
+
+	// A closed MR still proves submission, but is no longer a reason to preserve.
+	closed := WorkstateInput{}
+	ApplyBranchMRToWorkstateInput(&closed, "bd-wisp-old", false)
+	if !closed.MRSubmitted {
+		t.Fatal("a closed MR still proves the branch reached the queue")
+	}
+	if closed.ActiveMR != "" || closed.ActiveMRBlocker != "" {
+		t.Fatalf("closed MR must not block: %+v", closed)
+	}
+
+	// A stored active_mr wins: the caller has already assessed it, and that
+	// assessment carries provenance a branch lookup cannot reconstruct.
+	stored := WorkstateInput{ActiveMR: "bd-wisp-stored", ActiveMRBlocker: "active_mr=bd-wisp-stored status=open"}
+	ApplyBranchMRToWorkstateInput(&stored, "bd-wisp-4v7m", true)
+	if stored.ActiveMR != "bd-wisp-stored" || stored.ActiveMRBlocker != "active_mr=bd-wisp-stored status=open" {
+		t.Fatalf("stored active_mr must win: %+v", stored)
+	}
+	if !stored.MRSubmitted {
+		t.Fatal("submission is still proven when a stored active_mr wins")
+	}
+
+	// No MR found is not a fact about the queue — it must write nothing.
+	var none WorkstateInput
+	ApplyBranchMRToWorkstateInput(&none, "", true)
+	if none.MRSubmitted || none.ActiveMR != "" || none.ActiveMRBlocker != "" {
+		t.Fatalf("empty MR id must be a no-op: %+v", none)
 	}
 }

@@ -188,20 +188,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
 	defer cancel()
 
-	// Each panel's error is kept, not just logged. A log line is a record for
-	// whoever reads the server's output later; the operator reading the page
-	// sees only the rows, and rows alone cannot say "I could not look"
-	// (gt-edty, gt-egq9).
 	var (
-		convoys    []ConvoyRow
-		convoysErr error
-		mergeQueue MergeQueueResult
-		workers    StoreResult[WorkerRow]
-		// workersErr and workers.Warning() are not two spellings of one fact:
-		// the error means tmux could not be asked, so there is no worker list;
-		// the warning means the list exists but a rig store could not say what
-		// its workers are carrying. Both are rendered.
-		workersErr  error
+		convoys     []ConvoyRow
+		mergeQueue  MergeQueueResult
+		workers     StoreResult[WorkerRow]
 		mail        []MailRow
 		rigs        []RigRow
 		dogs        []DogRow
@@ -211,15 +201,11 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		escalationsErr error
 		health         *HealthRow
 		queues         []QueueRow
-		queuesErr      error
 		sessions       []SessionRow
-		sessionsErr    error
 		hooks          StoreResult[HookRow]
 		mayor          *MayorStatus
-		mayorErr       error
 		issues         StoreResult[IssueRow]
 		activity       []ActivityRow
-		activityErr    error
 		wg             sync.WaitGroup
 	)
 
@@ -228,9 +214,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 
 	go func() {
 		defer wg.Done()
-		convoys, convoysErr = h.fetcher.FetchConvoys()
-		if convoysErr != nil {
-			log.Printf("dashboard: FetchConvoys failed: %v", convoysErr)
+		var err error
+		convoys, err = h.fetcher.FetchConvoys()
+		if err != nil {
+			log.Printf("dashboard: FetchConvoys failed: %v", err)
 		}
 	}()
 	go func() {
@@ -243,9 +230,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		workers, workersErr = h.fetcher.FetchWorkers()
-		if workersErr != nil {
-			log.Printf("dashboard: FetchWorkers failed: %v", workersErr)
+		var err error
+		workers, err = h.fetcher.FetchWorkers()
+		if err != nil {
+			log.Printf("dashboard: FetchWorkers failed: %v", err)
 		}
 	}()
 	go func() {
@@ -289,16 +277,18 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		queues, queuesErr = h.fetcher.FetchQueues()
-		if queuesErr != nil {
-			log.Printf("dashboard: FetchQueues failed: %v", queuesErr)
+		var err error
+		queues, err = h.fetcher.FetchQueues()
+		if err != nil {
+			log.Printf("dashboard: FetchQueues failed: %v", err)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		sessions, sessionsErr = h.fetcher.FetchSessions()
-		if sessionsErr != nil {
-			log.Printf("dashboard: FetchSessions failed: %v", sessionsErr)
+		var err error
+		sessions, err = h.fetcher.FetchSessions()
+		if err != nil {
+			log.Printf("dashboard: FetchSessions failed: %v", err)
 		}
 	}()
 	go func() {
@@ -311,9 +301,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		mayor, mayorErr = h.fetcher.FetchMayor()
-		if mayorErr != nil {
-			log.Printf("dashboard: FetchMayor failed: %v", mayorErr)
+		var err error
+		mayor, err = h.fetcher.FetchMayor()
+		if err != nil {
+			log.Printf("dashboard: FetchMayor failed: %v", err)
 		}
 	}()
 	go func() {
@@ -326,9 +317,10 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		activity, activityErr = h.fetcher.FetchActivity()
-		if activityErr != nil {
-			log.Printf("dashboard: FetchActivity failed: %v", activityErr)
+		var err error
+		activity, err = h.fetcher.FetchActivity()
+		if err != nil {
+			log.Printf("dashboard: FetchActivity failed: %v", err)
 		}
 	}()
 
@@ -350,46 +342,30 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}
 
 	// Compute summary from already-fetched data
-	summary := computeSummary(summaryInput{
-		workers:        workers.Rows,
-		workersErr:     workersErr,
-		hooks:          hooks.Rows,
-		issues:         issues.Rows,
-		convoys:        convoys,
-		convoysErr:     convoysErr,
-		escalations:    escalations,
-		escalationsErr: escalationsErr,
-		activity:       activity,
-	})
+	summary := computeSummary(workers.Rows, hooks.Rows, issues.Rows, convoys, escalations, escalationsErr, activity)
 
 	data := ConvoyData{
-		Convoys: convoys,
-		// A failed query is reported, never rendered as an empty panel: zero
-		// must mean zero, and unknown must look different.
-		ConvoysUnavailable:     unavailableMessage(convoysErr),
-		MergeQueue:             mergeQueue.Rows,
-		MergeQueueFailedRigs:   mergeQueue.FailedRigs,
-		Workers:                workers.Rows,
-		WorkersUnavailable:     unavailableMessage(workersErr),
-		WorkersWarning:         workers.Warning(),
-		Mail:                   mail,
-		Rigs:                   rigs,
-		Dogs:                   dogs,
-		Escalations:            escalations,
-		EscalationsUnavailable: unavailableMessage(escalationsErr),
+		Convoys:              convoys,
+		MergeQueue:           mergeQueue.Rows,
+		MergeQueueFailedRigs: mergeQueue.FailedRigs,
+		Workers:              workers.Rows,
+		WorkersWarning:       workers.Warning(),
+		Mail:                 mail,
+		Rigs:                 rigs,
+		Dogs:                 dogs,
+		Escalations:          escalations,
+		// A failed escalation query is reported, never rendered as an empty
+		// panel: zero must mean zero, and unknown must look different.
+		EscalationsUnavailable: escalationErrorMessage(escalationsErr),
 		Health:                 health,
 		Queues:                 queues,
-		QueuesUnavailable:      unavailableMessage(queuesErr),
 		Sessions:               sessions,
-		SessionsUnavailable:    unavailableMessage(sessionsErr),
 		Hooks:                  hooks.Rows,
 		HooksWarning:           hooks.Warning(),
 		Mayor:                  mayor,
-		MayorUnavailable:       unavailableMessage(mayorErr),
 		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
 		IssuesWarning:          issues.Warning(),
 		Activity:               activity,
-		ActivityUnavailable:    unavailableMessage(activityErr),
 		Summary:                summary,
 		Expand:                 expandPanel,
 		CSRFToken:              h.csrfToken,
@@ -404,38 +380,23 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	return buf.Bytes()
 }
 
-// summaryInput is what the banner is computed from: each panel's rows AND
-// whether that panel could be read at all.
-//
-// They travel together because len(nil) is 0 either way, and the summary is
-// where that difference decides between "✓ All clear" and an alert (gt-edty).
-type summaryInput struct {
-	workers        []WorkerRow
-	workersErr     error
-	hooks          []HookRow
-	issues         []IssueRow
-	convoys        []ConvoyRow
-	convoysErr     error
-	escalations    []EscalationRow
-	escalationsErr error
-	activity       []ActivityRow
-}
-
 // computeSummary calculates dashboard stats and alerts from fetched data.
-func computeSummary(in summaryInput) *DashboardSummary {
-	summary := &DashboardSummary{
-		PolecatCount:           len(in.workers),
-		HookCount:              len(in.hooks),
-		IssueCount:             len(in.issues),
-		ConvoyCount:            len(in.convoys),
-		EscalationCount:        len(in.escalations),
-		EscalationsUnavailable: in.escalationsErr != nil,
-		PolecatsUnavailable:    in.workersErr != nil,
-		ConvoysUnavailable:     in.convoysErr != nil,
-	}
+//
+// escalationsErr is taken alongside the rows because len(nil) is 0 whether the
+// town is quiet or the query failed, and the summary is where that difference
+// decides between "✓ All clear" and an alert (gt-edty).
+func computeSummary(workers []WorkerRow, hooks []HookRow, issues []IssueRow,
+	convoys []ConvoyRow, escalations []EscalationRow, escalationsErr error,
+	activity []ActivityRow) *DashboardSummary {
 
-	workers, hooks, issues, escalations, activity :=
-		in.workers, in.hooks, in.issues, in.escalations, in.activity
+	summary := &DashboardSummary{
+		PolecatCount:           len(workers),
+		HookCount:              len(hooks),
+		IssueCount:             len(issues),
+		ConvoyCount:            len(convoys),
+		EscalationCount:        len(escalations),
+		EscalationsUnavailable: escalationsErr != nil,
+	}
 
 	// Count stuck workers (status = "stuck")
 	for _, w := range workers {
@@ -472,12 +433,10 @@ func computeSummary(in summaryInput) *DashboardSummary {
 		}
 	}
 
-	// Set HasAlerts flag. Not being able to read a panel is itself an alert —
-	// otherwise the banner reads "All clear" precisely when the dashboard has
-	// lost sight of the panels that report trouble.
+	// Set HasAlerts flag. Not being able to read escalations is itself an
+	// alert — otherwise the banner reads "All clear" precisely when the
+	// dashboard has lost sight of the panel that reports trouble.
 	summary.HasAlerts = summary.EscalationsUnavailable ||
-		summary.PolecatsUnavailable ||
-		summary.ConvoysUnavailable ||
 		summary.StuckPolecats > 0 ||
 		summary.StaleHooks > 0 ||
 		summary.UnackedEscalations > 0 ||
@@ -487,11 +446,11 @@ func computeSummary(in summaryInput) *DashboardSummary {
 	return summary
 }
 
-// unavailableMessage renders a failed panel query for display, or "" when the
-// query succeeded. The reason is shown rather than a bare "failed" because the
-// operator's next move differs by cause — bd timing out points at Dolt, a parse
-// failure points at bd itself, an unreachable tmux at the session layer.
-func unavailableMessage(err error) string {
+// escalationErrorMessage renders a failed escalation query for display, or ""
+// when the query succeeded. The reason is shown rather than a bare "failed"
+// because the operator's next move differs by cause — bd timing out points at
+// Dolt, a parse failure points at bd itself.
+func escalationErrorMessage(err error) string {
 	if err == nil {
 		return ""
 	}

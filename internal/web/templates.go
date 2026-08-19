@@ -14,33 +14,16 @@ import (
 var templateFS embed.FS
 
 // ConvoyData represents data passed to the convoy template.
-//
-// Every panel whose source can fail carries the reason alongside its rows. The
-// pairing is deliberate and load-bearing: len(nil) is 0 whether the town is
-// quiet or the query never ran, so a panel handed rows alone cannot render the
-// difference, and "could not read" reaches the operator as "nothing there".
 type ConvoyData struct {
-	Convoys []ConvoyRow
-	// ConvoysUnavailable holds the reason the convoy query failed, or "" when it
-	// succeeded. The circuit breaker makes this routine: while it is open no
-	// query runs at all, so the panel knows nothing rather than nothing being there.
-	ConvoysUnavailable string
-	MergeQueue         []MergeQueueRow
+	Convoys    []ConvoyRow
+	MergeQueue []MergeQueueRow
 	// MergeQueueFailedRigs names rigs whose merge-queue query errored. Non-empty
 	// means the rendered count is a floor, not a total.
 	MergeQueueFailedRigs []string
 	Workers              []WorkerRow
-	// WorkersUnavailable holds the reason the worker query failed, or "" when it
-	// succeeded. An unaskable tmux is not a town with no polecats.
-	WorkersUnavailable string
 	// WorkersWarning names the stores whose assigned-bead query did not fully
 	// answer. Non-empty means some workers may be shown as idle only because
 	// the bead they are carrying could not be read.
-	//
-	// It is a separate field from WorkersUnavailable because it describes a
-	// different source failing in a different way — the worker list is present
-	// and complete, only the beads behind it are partial. Collapsing the two
-	// would lose whichever fact the survivor was not about.
 	WorkersWarning string
 	Mail           []MailRow
 	Rigs           []RigRow
@@ -52,34 +35,19 @@ type ConvoyData struct {
 	EscalationsUnavailable string
 	Health                 *HealthRow
 	Queues                 []QueueRow
-	// QueuesUnavailable holds the reason the queue query failed, or "" when it
-	// succeeded. The panel hides itself when there are no queues, so without
-	// this a failed query would remove the panel from the page entirely.
-	QueuesUnavailable string
-	Sessions          []SessionRow
-	// SessionsUnavailable holds the reason the session query failed, or "" when
-	// it succeeded.
-	SessionsUnavailable string
-	Hooks               []HookRow
+	Sessions               []SessionRow
+	Hooks                  []HookRow
 	// HooksWarning names the stores whose hooked-bead query did not fully
 	// answer. Non-empty means the rendered count is a floor, not a total.
 	HooksWarning string
 	Mayor        *MayorStatus
-	// MayorUnavailable holds the reason the Mayor lookup failed, or "" when it
-	// succeeded. A nil Mayor with no reason is the banner's "Unknown" state; a
-	// reason turns that into a stated one, so the banner never claims "Detached"
-	// on the strength of a tmux it could not reach.
-	MayorUnavailable string
-	Issues           []IssueRow
+	Issues       []IssueRow
 	// IssuesWarning is the same caveat for the backlog union.
 	IssuesWarning string
 	Activity      []ActivityRow
-	// ActivityUnavailable holds the reason the event log could not be read, or
-	// "" when it was read (including when it does not exist yet).
-	ActivityUnavailable string
-	Summary             *DashboardSummary
-	Expand              string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken           string // Token for CSRF protection on POST requests
+	Summary       *DashboardSummary
+	Expand        string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken     string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
@@ -197,13 +165,6 @@ type DashboardSummary struct {
 	// EscalationCount and UnackedEscalations meaningless zeroes. It is itself an
 	// alert: a dashboard that cannot see escalations is not "all clear".
 	EscalationsUnavailable bool
-
-	// PolecatsUnavailable and ConvoysUnavailable say the same thing about the
-	// other two stats the banner prints. A count computed from rows a failed
-	// query never returned is not a count, and the banner is where an operator
-	// forms their impression of the town at a glance.
-	PolecatsUnavailable bool
-	ConvoysUnavailable  bool
 
 	// Alerts (things needing attention)
 	StuckPolecats      int // No activity > 5 min
