@@ -60,6 +60,25 @@ const LogEnv = "GT_TEST_NUDGE_LOG"
 // flag; it is granted only by having built the isolation the flag describes.
 const AllowEnv = "GT_ALLOW_TEST_NUDGE"
 
+// AllowDoltEnv opts a test process in to the production Dolt server, the fifth
+// route into a live town (gt-wz3y). It follows the same rule as AllowEnv: the
+// value must name the boundary being crossed — here the port — so a bare "1"
+// authorizes nothing.
+//
+// It is a separate variable rather than a reuse of AllowEnv because the two
+// grant different things and are held for different durations. AllowEnv is set
+// by a test that owns a socket or a fixture town for the length of one action;
+// this one is set by hand, for a whole process, by an operator running a smoke
+// check against the real server. Neither should be able to grant the other by
+// accident.
+//
+// Unlike the other routes, the Dolt guard's ordinary authorization is not this
+// variable at all: a test that owns a server names its port in GT_DOLT_PORT and
+// the guard leaves it alone. That is the same principle — isolation is granted
+// by having built it, not by remembering a flag — expressed in the variable the
+// production resolvers already read.
+const AllowDoltEnv = "GT_ALLOW_TEST_DOLT"
+
 // ErrRefused reports that an action originating in a test binary did not touch
 // live town state. It is returned rather than silently swallowed: a caller that
 // believes it succeeded is how the gt-vmj deliveries hid under a green suite.
@@ -76,10 +95,17 @@ func TestLog() (logPath string, inTest bool) {
 // The empty boundary is never authorized: it means the caller never chose one,
 // and an unnamed default is precisely the live target a stray test reaches.
 func Authorized(boundary string) bool {
+	return AuthorizedBy(AllowEnv, boundary)
+}
+
+// AuthorizedBy is Authorized against a named variable, for routes that keep
+// their own opt-in (see AllowDoltEnv). The rule is the same one in both cases
+// and lives here once so the two cannot drift apart.
+func AuthorizedBy(env, boundary string) bool {
 	if boundary == "" {
 		return false
 	}
-	allowed, ok := os.LookupEnv(AllowEnv)
+	allowed, ok := os.LookupEnv(env)
 	return ok && allowed == boundary
 }
 
