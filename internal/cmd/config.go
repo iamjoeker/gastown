@@ -974,10 +974,6 @@ func setMaintenanceConfig(townRoot, key, value string) error {
 func getMaintenanceConfig(townRoot, key string) error {
 	patrolConfig := daemon.LoadPatrolConfig(townRoot)
 
-	// Defaults come from the provisioned tree, not from literals typed here —
-	// see the note in getLifecycleConfig (gt-r4lv).
-	defaults := daemon.DefaultLifecycleConfig().Patrols
-
 	var value string
 	switch key {
 	case "maintenance.window":
@@ -993,11 +989,11 @@ func getMaintenanceConfig(townRoot, key string) error {
 			value = patrolConfig.Patrols.ScheduledMaintenance.Interval
 		}
 		if value == "" {
-			value = defaults.ScheduledMaintenance.Interval
+			value = "daily"
 		}
 
 	case "maintenance.threshold":
-		threshold := *defaults.ScheduledMaintenance.Threshold
+		threshold := 1000 // default
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.ScheduledMaintenance != nil {
 			if patrolConfig.Patrols.ScheduledMaintenance.Threshold != nil {
 				threshold = *patrolConfig.Patrols.ScheduledMaintenance.Threshold
@@ -1162,13 +1158,6 @@ func setLifecycleConfig(townRoot, key, value string) error {
 func getLifecycleConfig(townRoot, key string) error {
 	patrolConfig := daemon.LoadPatrolConfig(townRoot)
 
-	// The "(default)" answers come from the provisioned default tree, which is
-	// itself built from each patrol's compiled-in fallback. Do not re-type the
-	// numbers here: this function used to answer "30m" for a reaper that ran at
-	// 1h and "500" for a compactor whose threshold has been 2000 since it was
-	// raised, because it was a third copy nobody updated (gt-r4lv).
-	defaults := daemon.DefaultLifecycleConfig().Patrols
-
 	var value string
 	switch key {
 	// Reaper
@@ -1183,28 +1172,28 @@ func getLifecycleConfig(townRoot, key string) error {
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.IntervalStr != "" {
 			value = patrolConfig.Patrols.WispReaper.IntervalStr
 		} else {
-			value = defaults.WispReaper.IntervalStr + " (default)"
+			value = "30m (default)"
 		}
 
 	case "lifecycle.reaper.delete_age":
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.DeleteAgeStr != "" {
 			value = patrolConfig.Patrols.WispReaper.DeleteAgeStr
 		} else {
-			value = defaults.WispReaper.DeleteAgeStr + " (default, 7 days)"
+			value = "168h (default, 7 days)"
 		}
 
 	case "lifecycle.reaper.stale_issue_age":
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.StaleIssueAgeStr != "" {
 			value = patrolConfig.Patrols.WispReaper.StaleIssueAgeStr
 		} else {
-			value = defaults.WispReaper.StaleIssueAgeStr + " (default, 30 days)"
+			value = "720h (default, 30 days)"
 		}
 
 	case "lifecycle.reaper.mail_delete_age":
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.WispReaper != nil && patrolConfig.Patrols.WispReaper.MailDeleteAgeStr != "" {
 			value = patrolConfig.Patrols.WispReaper.MailDeleteAgeStr
 		} else {
-			value = defaults.WispReaper.MailDeleteAgeStr + " (default, 7 days)"
+			value = "168h (default, 7 days)"
 		}
 
 	// Compactor
@@ -1219,14 +1208,14 @@ func getLifecycleConfig(townRoot, key string) error {
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.CompactorDog != nil && patrolConfig.Patrols.CompactorDog.IntervalStr != "" {
 			value = patrolConfig.Patrols.CompactorDog.IntervalStr
 		} else {
-			value = defaults.CompactorDog.IntervalStr + " (default)"
+			value = "24h (default)"
 		}
 
 	case "lifecycle.compactor.threshold":
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.CompactorDog != nil && patrolConfig.Patrols.CompactorDog.Threshold > 0 {
 			value = strconv.Itoa(patrolConfig.Patrols.CompactorDog.Threshold)
 		} else {
-			value = strconv.Itoa(defaults.CompactorDog.Threshold) + " (default)"
+			value = "500 (default)"
 		}
 
 	// Doctor
@@ -1241,7 +1230,7 @@ func getLifecycleConfig(townRoot, key string) error {
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoctorDog != nil && patrolConfig.Patrols.DoctorDog.IntervalStr != "" {
 			value = patrolConfig.Patrols.DoctorDog.IntervalStr
 		} else {
-			value = defaults.DoctorDog.IntervalStr + " (default)"
+			value = "5m (default)"
 		}
 
 	// Backup
@@ -1258,7 +1247,7 @@ func getLifecycleConfig(townRoot, key string) error {
 		if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.JsonlGitBackup != nil && patrolConfig.Patrols.JsonlGitBackup.IntervalStr != "" {
 			value = patrolConfig.Patrols.JsonlGitBackup.IntervalStr
 		} else {
-			value = defaults.JsonlGitBackup.IntervalStr + " (default)"
+			value = "15m (default)"
 		}
 
 	default:

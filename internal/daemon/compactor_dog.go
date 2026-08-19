@@ -76,10 +76,7 @@ func compactorDogInterval(config *DaemonPatrolConfig) time.Duration {
 	return defaultCompactorDogInterval
 }
 
-// compactorDogThreshold returns the configured commit threshold, or the default
-// (defaultCompactorCommitThreshold — 2000). It read 500 in this comment for as
-// long as the raised threshold sat two lines above it, and `gt config get
-// lifecycle.compactor.threshold` printed that stale 500 as the live default.
+// compactorDogThreshold returns the configured commit threshold, or the default (500).
 func compactorDogThreshold(config *DaemonPatrolConfig) int {
 	if config != nil && config.Patrols != nil && config.Patrols.CompactorDog != nil {
 		if config.Patrols.CompactorDog.Threshold > 0 {
