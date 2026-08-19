@@ -38,14 +38,6 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
-
-	// MRRefused is the agent bead's record that gt done deliberately created no
-	// merge request because the source issue was already closed, leaving a
-	// pushed branch outside the queue (gt-46rk). Unlike every other merge-queue
-	// input here it needs no git or queue lookup, so surfaces too cheap to set
-	// MQCheckRequired can still report the condition instead of answering
-	// SAFE_TO_NUKE to a question they never asked.
-	MRRefused bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -224,33 +216,6 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
-	// A recorded MR refusal outranks the absence of merge-queue facts. gt done
-	// takes this path on purpose (gt-7qm: no MR against a closed source issue),
-	// and on purpose leaves MRFailed false so the hook clears and the session
-	// retires — so nothing above this line has any reason to block, and the
-	// polecat reads SAFE_TO_NUKE while its pushed branch sits outside the queue.
-	// Recycling force-deletes branches, so that verdict is the destructive one.
-	//
-	// Suppressed only by proof, never by silence: an MR that now exists for the
-	// branch, or a surface that actually ran the merge-queue check and found
-	// nothing left to submit. A surface that never looked does not get to
-	// conclude the work is safe (gt-46rk).
-	if in.MRRefused && !in.MRSubmitted {
-		checked := in.MQCheckRequired && !in.MQLookupFailed
-		resolved := checked && (!in.HasSubmittableWork || in.MQNotRequired)
-		if !resolved {
-			d.Verdict = WorkstateVerdictNeedsMQSubmit
-			d.Reason = "mq-refused-closed-source"
-			d.NeedsRecovery = true
-			d.NeedsMQSubmit = true
-			d.MQStatus = "refused_closed_source"
-			d.CountsTowardCapacity = true
-			d.ReuseStatus = "idle-recovery-needed"
-			d.Blockers = append(d.Blockers, "mq_status=refused_closed_source (gt done made no MR: source issue was closed)")
-			return d
-		}
-	}
-
 	d.Reusable = true
 	d.SafeToNuke = true
 	d.Reason = "reusable"
@@ -260,28 +225,6 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		d.ReuseStatus = "idle-clean"
 	}
 	return d
-}
-
-// ApplyBranchMRToWorkstateInput folds a merge-request bead found by looking up
-// the polecat's BRANCH into the input. Callers pass the MR's ID and whether it
-// is still open.
-//
-// The branch is the join key that survives; the agent bead's active_mr field is
-// not. gt done writes that field, and nothing else does — so an MR someone else
-// submitted for a stranded branch leaves it empty, and the polecat reports
-// SAFE_TO_NUKE while recycling stands ready to force-delete the only branch the
-// open MR points at (gt-46rk). A stored active_mr still wins when present: it
-// carries provenance this lookup cannot, and the caller has already assessed it.
-func ApplyBranchMRToWorkstateInput(in *WorkstateInput, mrID string, mrOpen bool) {
-	if in == nil || mrID == "" {
-		return
-	}
-	in.MRSubmitted = true
-	if in.ActiveMR != "" || !mrOpen {
-		return
-	}
-	in.ActiveMR = mrID
-	in.ActiveMRBlocker = "active_mr=" + mrID + " status=open source=branch-lookup"
 }
 
 // CanIgnoreStaleCleanupStatus returns true when a dirty persisted

@@ -1007,7 +1007,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	var mrID string
 	var pushFailed bool
 	var mrFailed bool
-	var mrRefused bool
 	var doneErrors []string
 	var convoyInfo *ConvoyInfo // Populated if issue is tracked by a convoy
 	var sourceIssueForNoMerge *beads.Issue
@@ -1804,15 +1803,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// respawn. This is a refusal, not a failure — mrFailed stays false so
 			// the hook clears and the session retires instead of being recovered
 			// into the next turn of the same loop.
-			//
-			// mrRefused records the refusal separately (gt-46rk). Without it the
-			// agent bead cannot tell this outcome from an ordinary completion that
-			// simply had no MR to make: both leave mr_failed false and mr_id empty.
-			// That is how a refused polecat kept reading SAFE_TO_NUKE while a
-			// pushed branch sat outside the queue, with the mail below as the only
-			// trace. It is deliberately NOT mrFailed — the retire/hook-clear
-			// behaviour gt-7qm chose is unchanged; only the record improves.
-			mrRefused = true
 			style.PrintWarning("%s", closedRefusal)
 			fmt.Printf("  Skipping MR creation — completing without merge request.\n")
 			fmt.Printf("  Nothing is lost: branch %s is pushed to origin.\n", branch)
@@ -2003,7 +1993,6 @@ notifyWitness:
 			HookBead:       issueID,
 			MRFailed:       mrFailed,
 			PushFailed:     pushFailed,
-			MRRefused:      mrRefused,
 			CompletionTime: time.Now().UTC().Format(time.RFC3339),
 		}
 		if err := completionBd.UpdateAgentCompletion(agentBeadID, meta); err != nil {

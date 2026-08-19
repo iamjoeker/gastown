@@ -1027,7 +1027,6 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
-		input.MRRefused = fields.MRRefused
 		input.ActiveMR = fields.ActiveMR
 		if fields.CleanupStatus != "" {
 			input.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
@@ -1083,19 +1082,12 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = witnessMQNotRequiredSource(rigBeads, issueID)
-	// A terminal source bead no longer skips this lookup: the closed bead IS the
-	// stranding signature, so skipping it blinded the check to both directions
-	// of the fact — no MR at all, and an MR someone else submitted (gt-46rk).
-	if input.MQCheckRequired && input.HasSubmittableWork && !input.MQNotRequired {
+	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
 		mr, err := rigBeads.FindMRForBranchAny(input.Branch)
 		if err != nil {
 			input.MQLookupFailed = true
-		} else if mr != nil {
-			input.MRSubmitted = true
-			if input.ActiveMR == "" && !beads.IssueStatus(mr.Status).IsTerminal() {
-				input.ActiveMR = mr.ID
-				input.ActiveMRBlocker = "active_mr=" + mr.ID + " status=open source=branch-lookup"
-			}
+		} else {
+			input.MRSubmitted = mr != nil
 		}
 	}
 	return polecat.DecideSlotReuse(input)
@@ -2668,18 +2660,10 @@ func clearCompletionMetadata(bd *BdCli, workDir, agentBeadID string) error {
 		return nil
 	}
 
-	// Clear completion metadata fields.
-	//
-	// The branch is kept whenever work may still be at risk. A refusal belongs
-	// in that set alongside the two failures: gt done left a pushed branch
-	// outside the queue on purpose, and the branch name is the only pointer
-	// anything downstream has to it — the MR lookup, the recovery command in the
-	// witness's mail, and the polecat verdict all key on it (gt-46rk). mr_refused
-	// itself is deliberately not cleared here; it is discharged when the branch
-	// reaches the queue or when the polecat is re-slung.
+	// Clear completion metadata fields
 	fields.ExitType = ""
 	fields.MRID = ""
-	if !fields.MRFailed && !fields.PushFailed && !fields.MRRefused {
+	if !fields.MRFailed && !fields.PushFailed {
 		fields.Branch = ""
 	}
 	fields.CompletionTime = ""

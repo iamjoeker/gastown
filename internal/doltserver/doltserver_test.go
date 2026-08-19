@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/testenv"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1840,6 +1841,11 @@ func TestEnsureMetadata_RepairsMissingDoltFields(t *testing.T) {
 // correct port from DefaultConfig. This is the root cause of "connection
 // refused" errors reported by community users after gt dolt fix-metadata.
 func TestEnsureMetadata_RepairsStalePort(t *testing.T) {
+	// This test's subject is the unconfigured fallback, which the port guard
+	// exists to keep tests from reaching. Drop the guard so the real default
+	// is what gets asserted. Nothing here opens a connection.
+	testenv.WithoutDoltPortGuard(t)
+
 	townRoot := t.TempDir()
 
 	beadsDir := filepath.Join(townRoot, ".beads")
@@ -2356,6 +2362,11 @@ func TestIsDoltRetryableError_CatalogRace(t *testing.T) {
 }
 
 func TestWaitForCatalog_NoServer(t *testing.T) {
+	// This test names the port it wants in the fixture's config.yaml, and
+	// ResolveDoltPort reads the environment ahead of config.yaml. Drop the port
+	// guard so the fixture is what decides, as it did before the guard existed.
+	testenv.WithoutDoltPortGuard(t)
+
 	// When no Dolt server is reachable, waitForCatalog should fail.
 	// Use port 13399 (unlikely to be in use) to ensure no server responds.
 	townRoot := t.TempDir()
@@ -2436,6 +2447,11 @@ func TestListDatabases_MixedContent(t *testing.T) {
 // =============================================================================
 
 func TestGetConnectionString(t *testing.T) {
+	// This test's subject is the unconfigured fallback, which the port guard
+	// exists to keep tests from reaching. Drop the guard so the real default
+	// is what gets asserted. Nothing here opens a connection.
+	testenv.WithoutDoltPortGuard(t)
+
 	townRoot := t.TempDir()
 	s := GetConnectionString(townRoot)
 	if s != "root@tcp(127.0.0.1:3307)/" {
@@ -2444,6 +2460,11 @@ func TestGetConnectionString(t *testing.T) {
 }
 
 func TestGetConnectionStringForRig(t *testing.T) {
+	// This test's subject is the unconfigured fallback, which the port guard
+	// exists to keep tests from reaching. Drop the guard so the real default
+	// is what gets asserted. Nothing here opens a connection.
+	testenv.WithoutDoltPortGuard(t)
+
 	townRoot := t.TempDir()
 	s := GetConnectionStringForRig(townRoot, "hq")
 	if s != "root@tcp(127.0.0.1:3307)/hq" {
@@ -2833,6 +2854,11 @@ func TestDatabaseExists_NoDataDir(t *testing.T) {
 // =============================================================================
 
 func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
+	// This test names the port it wants in the fixture's config.yaml, and
+	// ResolveDoltPort reads the environment ahead of config.yaml. Drop the port
+	// guard so the fixture is what decides, as it did before the guard existed.
+	testenv.WithoutDoltPortGuard(t)
+
 	townRoot := t.TempDir()
 
 	// Point the test at a port nothing listens on so IsRunning returns false
@@ -2985,6 +3011,11 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 }
 
 func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
+	// This test names the port it wants in the fixture's config.yaml, and
+	// ResolveDoltPort reads the environment ahead of config.yaml. Drop the port
+	// guard so the fixture is what decides, as it did before the guard existed.
+	testenv.WithoutDoltPortGuard(t)
+
 	townRoot := t.TempDir()
 
 	// Isolate from real Dolt server on default port
