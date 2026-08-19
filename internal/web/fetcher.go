@@ -46,12 +46,26 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("%s timed out after %v", name, timeout)
 		}
-		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+		if detail := firstLine(stderr.String()); detail != "" {
 			return nil, fmt.Errorf("%s: %w: %s", name, err, detail)
 		}
 		return nil, err
 	}
 	return &stdout, nil
+}
+
+// firstLine returns the first non-empty line of s, trimmed.
+//
+// A failing command's stderr can run to many lines, and these errors are
+// rendered inline in a panel notice rather than only logged. One line is enough
+// to say what happened; the rest would break the notice across the layout.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // tmuxServerAbsent reports whether a tmux command failed because there is no
@@ -88,6 +102,12 @@ var fetcherGetSessionEnv = func(sessionName, key string) (string, error) {
 }
 
 // runBdCmd executes a bd command with the configured cmdTimeout in the specified beads directory.
+//
+// Like runCmd, it folds bd's own words into the error instead of discarding
+// them. The panels that read through here now render the reason a query failed,
+// and "connection refused" and "unknown label" send an operator to different
+// places — "exit status 1" sends them nowhere, which is a notice that admits it
+// could not look while withholding the one fact worth having (gt-1jrl).
 func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Buffer, error) {
 	// bd v0.59+ requires --flat for list --json to produce JSON output
 	args = beads.InjectFlatForListJSON(args)
@@ -101,8 +121,9 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = beadsDir
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 	if err != nil {
@@ -112,6 +133,9 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 		// If we got some output, return it anyway (bd may exit non-zero with warnings)
 		if stdout.Len() > 0 {
 			return &stdout, nil
+		}
+		if detail := firstLine(stderr.String()); detail != "" {
+			return nil, fmt.Errorf("%w: %s", err, detail)
 		}
 		return nil, err
 	}
@@ -2153,10 +2177,11 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 		return nil, fmt.Errorf("reading event log: %w", err)
 	}
 
+	// An empty log yields one empty line, which the loop below skips. There is no
+	// "no lines" case for strings.Split to produce, so the guard that used to
+	// stand here could only ever have been a third spelling of "no rows, no
+	// error" that never ran (gt-1jrl).
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) == 0 {
-		return nil, nil
-	}
 
 	// Take last 50 events for richer timeline
 	start := 0
