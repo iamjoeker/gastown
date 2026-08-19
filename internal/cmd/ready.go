@@ -390,8 +390,12 @@ func filterFormulaScaffolds(issues []*beads.Issue, formulaNames map[string]bool)
 // Wisps are ephemeral issues (wisp/ephemeral flag) used for operational workflows.
 // This is a defense-in-depth exclusion - bd ready should already filter wisps,
 // but we double-check at the display layer to ensure operational work doesn't leak.
+//
+// --all is required: `bd mol wisp list` is open-only without it, so the
+// exclusion set would silently omit every closed wisp and any that leaked into
+// ready work would sail through this filter (gt-kb63).
 func getWispIDs(beadsPath string) map[string]bool {
-	output, err := BdCmd("mol", "wisp", "list", "--json").
+	output, err := BdCmd("mol", "wisp", "list", "--json", "--all").
 		Dir(beadsPath).
 		StripBeadsDir().
 		Stderr(io.Discard).
