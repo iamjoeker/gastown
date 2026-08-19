@@ -349,14 +349,34 @@ var beadsFixtureDDL = []string{
 	// Nullable is load-bearing for the purge guard, which must COALESCE it —
 	// a NOT NULL column here would let a guard that reads `pinned = 0`
 	// directly pass this fixture and skip NULL-pinned rows in production.
+	// description/design/notes/close_reason and the identity columns are here
+	// because the archive path reads them: a merge-request wisp keeps its
+	// branch, target and source_issue as "key: value" lines inside description,
+	// so a fixture without that column cannot tell an archive that preserves
+	// the record from one that writes a husk (gt-6xwt).
+	//
+	// assignee, wisp_type and closed_at are declared NULLABLE on purpose,
+	// matching production. A fixture that made them NOT NULL would let a
+	// collector that scans straight into string/time.Time pass here and fail on
+	// the first real NULL row, which purge answers by leaving rows protected.
 	`CREATE TABLE wisps (
 		id varchar(255) NOT NULL PRIMARY KEY,
 		title varchar(500) NOT NULL DEFAULT '',
+		description text NOT NULL DEFAULT '',
+		design text NOT NULL DEFAULT '',
+		notes text NOT NULL DEFAULT '',
+		close_reason text DEFAULT '',
 		status varchar(32) NOT NULL DEFAULT 'open',
+		priority int NOT NULL DEFAULT 2,
 		issue_type varchar(32) NOT NULL DEFAULT 'task',
 		wisp_type varchar(32),
+		assignee varchar(255),
+		created_by varchar(255) DEFAULT '',
+		owner varchar(255) DEFAULT '',
+		source_repo varchar(512) DEFAULT '',
 		pinned tinyint(1) DEFAULT 0,
 		created_at datetime NOT NULL,
+		updated_at datetime,
 		closed_at datetime
 	)`,
 	`CREATE TABLE wisp_labels (
@@ -439,11 +459,17 @@ func (f *fixture) insertDependency(t *testing.T, id, issueID, dependsOnIssueID, 
 
 type wispRow struct {
 	id        string
+	title     string
 	status    string
 	issueType string
 	wispType  string
 	createdAt time.Time
 	closedAt  *time.Time
+	// description carries the structured MR fields in production; archive tests
+	// assert it survives verbatim.
+	description string
+	closeReason string
+	assignee    string
 	// pinned mirrors the wisps.pinned column an incident responder sets by hand
 	// to protect one record. nil leaves it SQL NULL, which is a state real rows
 	// reach and which a guard must treat as "not pinned" rather than as unknown.
@@ -466,9 +492,16 @@ func (f *fixture) insertWisps(t *testing.T, rows ...wispRow) {
 		if r.pinned != nil {
 			pinned = *r.pinned
 		}
+		title := r.title
+		if title == "" {
+			title = r.id
+		}
 		if _, err := f.db.Exec(
-			"INSERT INTO wisps (id, title, status, issue_type, wisp_type, pinned, created_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			r.id, r.id, r.status, r.issueType, nullString(r.wispType), pinned, r.createdAt, r.closedAt); err != nil {
+			`INSERT INTO wisps (id, title, description, close_reason, status, issue_type, wisp_type,
+				assignee, pinned, created_at, updated_at, closed_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.id, title, r.description, r.closeReason, r.status, r.issueType, nullString(r.wispType),
+			nullString(r.assignee), pinned, r.createdAt, r.createdAt, r.closedAt); err != nil {
 			t.Fatalf("insert wisp %s: %v", r.id, err)
 		}
 		for _, label := range r.labels {
@@ -498,6 +531,16 @@ func (f *fixture) insertWispAux(t *testing.T, wispID string) {
 		if _, err := f.db.Exec(stmt.query, stmt.args...); err != nil {
 			t.Fatalf("insert aux row for %s: %v", wispID, err)
 		}
+	}
+}
+
+// insertWispComment attaches one comment to a wisp. Comments are where a
+// rejection rationale that did not fit the close reason ends up, so archive
+// tests need to place a known one and find it again.
+func (f *fixture) insertWispComment(t *testing.T, wispID, text string) {
+	t.Helper()
+	if _, err := f.db.Exec("INSERT INTO wisp_comments (issue_id, text) VALUES (?, ?)", wispID, text); err != nil {
+		t.Fatalf("insert comment for %s: %v", wispID, err)
 	}
 }
 
