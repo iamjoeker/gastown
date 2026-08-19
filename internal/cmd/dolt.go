@@ -1586,7 +1586,8 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	// under a live server. (gt-4ruo)
 	//
 	// The check itself stays point-in-time — nothing holds the server down for
-	// the duration of the migration. That residual race is gt-2xsa.
+	// the duration of the migration. migrationGuard below bounds that residual
+	// race (gt-2xsa); it does not close it.
 	running, pid, _ := doltserver.IsRunning(townRoot)
 	if running {
 		sup := doltserver.DetectSupervisor(pid)
@@ -1616,13 +1617,20 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Perform migrations
-	for _, m := range migrations {
-		fmt.Printf("Migrating %s...\n", m.RigName)
-		if err := doltserver.MigrateRigFromBeads(townRoot, m.RigName, m.SourcePath); err != nil {
-			return fmt.Errorf("migrating %s: %w", m.RigName, err)
-		}
-		fmt.Printf("  %s Migrated to %s\n", style.Bold.Render("✓"), m.TargetPath)
+	// Perform migrations, re-checking at every directory boundary that the
+	// server the precheck found stopped is still stopped. (gt-2xsa)
+	guard := &migrationGuard{
+		isRunning: func() (bool, int) {
+			running, pid, _ := doltserver.IsRunning(townRoot)
+			return running, pid
+		},
+		detect:  doltserver.DetectSupervisor,
+		dataDir: config.DataDir,
+	}
+	if err := runGuardedMigrations(guard, migrations, func(m doltserver.Migration) error {
+		return doltserver.MigrateRigFromBeads(townRoot, m.RigName, m.SourcePath)
+	}); err != nil {
+		return err
 	}
 
 	// Update metadata.json for all migrated rigs
@@ -1677,6 +1685,160 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// runGuardedMigrations moves each database, re-checking through guard that no
+// Dolt server has appeared before every move and once after the last one.
+//
+// The trailing check is not decoration. Without it, a server that appears
+// during the final move is never seen: the caller goes on to rewrite
+// metadata.json and auto-start a server, and the run reports a clean migration.
+//
+// migrate is injected so the ordering — check, move, record, check — is pinned
+// by tests without moving real database directories.
+func runGuardedMigrations(guard *migrationGuard, migrations []doltserver.Migration, migrate func(doltserver.Migration) error) error {
+	guard.order = nil
+	guard.completed = 0
+	for _, m := range migrations {
+		guard.order = append(guard.order, m.RigName)
+	}
+
+	for _, m := range migrations {
+		if err := guard.check(); err != nil {
+			return err
+		}
+		fmt.Printf("Migrating %s...\n", m.RigName)
+		if err := migrate(m); err != nil {
+			return fmt.Errorf("migrating %s: %w", m.RigName, err)
+		}
+		guard.recordMoved()
+		fmt.Printf("  %s Migrated to %s\n", style.Bold.Render("✓"), m.TargetPath)
+	}
+
+	return guard.check()
+}
+
+// migrationGuard re-checks, at every database boundary of `gt dolt migrate`,
+// that no Dolt server has appeared on the data directory.
+//
+// runDoltMigrate refuses to start while a server is running, but that check is
+// point-in-time and nothing holds the server down for the rest of the run.
+// Under a supervisor with Restart=always, an operator who runs `gt dolt stop`
+// and immediately runs migrate is inside the ~5s restart window: the precheck
+// sees no server, migration starts, and the supervisor puts a live server back
+// on the same .dolt-data while directories are still being moved. gt-4ruo made
+// that less likely by naming the supervisor's stop command in the precheck's
+// advice; advice is not a guarantee, and any other restart cause reopens the
+// window. (gt-2xsa)
+//
+// The guard does not close the window — nothing in gt can stop a supervisor
+// from starting a server — it bounds the exposure. A server that appears is
+// caught at the next boundary, so the run stops instead of moving the rest of
+// the town's databases under it, and the operator is told which databases
+// moved and which did not rather than being left to work it out.
+//
+// Holding the unit stopped for the duration, the other remedy considered, is
+// not available here: DetectSupervisor identifies the unit from the running
+// process's cgroup, so with the server down there is no PID and no unit name —
+// undiscoverable in exactly the window that matters.
+type migrationGuard struct {
+	// isRunning and detect are injected so the guard's behaviour is testable
+	// without a live Dolt server or a live systemd.
+	isRunning func() (bool, int)
+	detect    func(pid int) *doltserver.Supervisor
+
+	dataDir string
+
+	order     []string // rig names, in the order they are migrated
+	completed int      // how many of order have been moved
+}
+
+// check reports an error when a Dolt server is on the data directory now. The
+// error text is the operator's whole recovery, so callers return it as-is.
+func (g *migrationGuard) check() error {
+	running, pid := g.isRunning()
+	if !running {
+		return nil
+	}
+	return errors.New(serverAppearedDuringMigrationRemedy(
+		g.detect(pid), g.dataDir, g.order[:g.completed], g.order[g.completed:]))
+}
+
+// recordMoved marks the next database in order as migrated.
+func (g *migrationGuard) recordMoved() {
+	if g.completed < len(g.order) {
+		g.completed++
+	}
+}
+
+// serverAppearedDuringMigrationRemedy renders the refusal printed when a Dolt
+// server turns up part-way through migration.
+//
+// Two things this has to get right beyond naming the supervisor's stop command:
+//
+//   - It must report the on-disk state. Migration is a sequence of directory
+//     moves, so aborting leaves the town split between the old per-rig layout
+//     and .dolt-data. An operator who is not told which databases are where has
+//     to reconstruct it before they can safely do anything.
+//   - It must not overstate what the check proves. The guard runs BETWEEN
+//     moves, so it establishes that no server was visible at each boundary —
+//     never that none was up during a move. The most recently moved database is
+//     the one that could have been moved out from under a live server, and the
+//     message says so instead of implying the abort caught everything.
+func serverAppearedDuringMigrationRemedy(sup *doltserver.Supervisor, dataDir string, moved, remaining []string) string {
+	var b strings.Builder
+
+	supervised := sup.Describe() != ""
+
+	b.WriteString("A Dolt server appeared while migration was running.\n\n")
+	b.WriteString("  The precheck found no server. This run re-checks before every database\n")
+	b.WriteString("  move, and a server is on the data directory now, so migration stopped at\n")
+	b.WriteString("  the boundary rather than move more directories under a live server.\n\n")
+
+	if supervised {
+		b.WriteString(fmt.Sprintf("  ! This server is supervised by %s.\n", sup.Describe()))
+		if sup.AutoRestarts() {
+			b.WriteString("    `gt dolt stop` would only signal the process — the supervisor starts\n")
+			b.WriteString("    a new server on the same data directory seconds later. Stop the unit.\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("  Moved:     %s\n", joinOrNone(moved)))
+	b.WriteString(fmt.Sprintf("  Not moved: %s\n\n", joinOrNone(remaining)))
+
+	if len(moved) > 0 {
+		b.WriteString(fmt.Sprintf(
+			"  The check runs between moves, so it does not prove the server was down\n"+
+				"  for the whole of the last one. Verify %s first — a database moved while\n"+
+				"  a server held it open can be corrupt.\n\n", moved[len(moved)-1]))
+	}
+
+	b.WriteString("  To finish the migration:\n\n")
+	b.WriteString(fmt.Sprintf("    1. Stop the server:   %s\n", sup.StopCommand()))
+	b.WriteString("    2. Verify it is down: gt dolt status    # REQUIRED: must say \"not running\"\n")
+	b.WriteString("    3. Re-run migration:  gt dolt migrate\n\n")
+
+	b.WriteString(fmt.Sprintf("  Migration is resumable: it skips databases already present in\n  %s, so re-running moves only what is left.\n", dataDir))
+
+	if supervised {
+		b.WriteString(fmt.Sprintf(
+			"\n  `gt dolt migrate` starts a server itself when it finishes, and that\n"+
+				"  process is not the unit's. Hand the server back afterwards with\n"+
+				"  `gt dolt stop`, then `%s`.\n", sup.StartCommand()))
+	}
+
+	return b.String()
+}
+
+// joinOrNone renders a database list for the abort message. An empty list is
+// "none" rather than a blank: a blank reads as a rendering bug, and "none" is
+// load-bearing on both lines — nothing moved, or nothing is left to move.
+func joinOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
 }
 
 // dirSizeHuman returns a human-readable size string for a directory tree.
