@@ -55,10 +55,17 @@ Commands:
   run     Execute a formula (pour and dispatch)
   create  Create a new formula template
 
-Search paths (in order):
-  1. .beads/formulas/ (project)
-  2. ~/.beads/formulas/ (user)
-  3. $GT_ROOT/.beads/formulas/ (orchestrator)
+Search paths: 'list' and 'show' delegate to bd, which owns the search order.
+Run 'bd formula list --help' for the authoritative, current list.
+
+NOTE: this is NOT the order gt uses when rendering formula steps at prime time.
+'gt prime' resolves rig > town > embedded (formula.ResolveFormulaContent):
+  1. <townRoot>/<rig>/.beads/formulas/<name>.formula.toml
+  2. <townRoot>/.beads/formulas/<name>.formula.toml
+  3. embedded in the gt binary
+A disk copy shadows the embedded one, so editing it takes effect on the next
+'gt prime' with no rebuild -- and a rebuild will not undo it. See
+docs/design/directives-and-overlays.md for what survives 'gt upgrade'.
 
 Examples:
   gt formula list                    # List all formulas
@@ -72,10 +79,13 @@ var formulaListCmd = &cobra.Command{
 	Short: "List available formulas",
 	Long: `List available formulas from all search paths.
 
-Searches for formula files (.formula.toml, .formula.json) in:
-  1. .beads/formulas/ (project)
-  2. ~/.beads/formulas/ (user)
-  3. $GT_ROOT/.beads/formulas/ (orchestrator)
+Delegates to 'bd formula list', which owns the search order for formula files
+(.formula.toml, .formula.json). Run 'bd formula list --help' for the
+authoritative, current list of search paths.
+
+This listing does not tell you which copy an agent runs: 'gt prime' resolves
+formula steps rig > town > embedded via formula.ResolveFormulaContent. See
+docs/design/formula-resolution.md.
 
 Examples:
   gt formula list            # List all formulas

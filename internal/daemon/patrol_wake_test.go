@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -242,6 +244,127 @@ func TestWakeStoppedPatrolAgents(t *testing.T) {
 	}
 }
 
+// An ended turn is not proof that nothing is pending. An await launched in the
+// background outlives the turn that launched it, so the pane reads stopped while
+// the wait is very much alive — measured twice on gastown/witness inside seven
+// minutes, with the await pid confirmed alive at both wakes (gt-ghw7). A wake
+// there interrupts a healthy wait.
+//
+// The last case is the disconfirming one and belongs in the same table: not
+// every wake on an ended turn is false. An agent caught between one await
+// finishing and the next starting is genuinely parked, and the process check
+// must not suppress that wake — otherwise the fix trades a false wake for a
+// missed one.
+func TestWakeSuppressedWhileAnAwaitIsAlive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows — fake tmux requires bash")
+	}
+
+	const rigName = "gastown"
+	prefix := session.PrefixFor(rigName)
+	witnessSession := session.WitnessSessionName(prefix)
+	witnessBead := beads.WitnessBeadIDWithPrefix(prefix, rigName)
+
+	tests := []struct {
+		name     string
+		procs    []string
+		procsErr error
+		wantWake bool
+	}{
+		{
+			name:     "backgrounded await still running — not woken",
+			procs:    []string{`gt mol step await-signal --agent-bead ` + witnessBead + ` --backoff-base 30s`},
+			wantWake: false,
+		},
+		{
+			name:     "no await for this agent — woken",
+			procs:    []string{psDeaconAwait},
+			wantWake: true,
+		},
+		{
+			name:     "empty process table — woken",
+			procs:    nil,
+			wantWake: true,
+		},
+		{
+			// A false wake costs one cycle and is self-correcting; a wake
+			// withheld from a stopped agent costs the loop. With no evidence,
+			// take the recoverable error.
+			name:     "unreadable process table — woken",
+			procsErr: fmt.Errorf("ps: command not found"),
+			wantWake: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			paneDir := t.TempDir()
+			nudgeLog := filepath.Join(t.TempDir(), "nudges.log")
+
+			writeFakePaneTmux(t, binDir, paneDir)
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv(tmux.TestNudgeLogEnv, nudgeLog)
+			writePaneFixture(t, paneDir, witnessSession, stoppedPane())
+
+			prevDelay := patrolWakeConfirmDelay
+			patrolWakeConfirmDelay = time.Millisecond
+			t.Cleanup(func() { patrolWakeConfirmDelay = prevDelay })
+
+			defer stubProcessTable(t, tc.procs, tc.procsErr)()
+
+			logBuf := &strings.Builder{}
+			d := newPatrolWakeDaemon(t, t.TempDir(), []string{rigName}, logBuf)
+
+			d.wakeStoppedTargets([]patrolWakeTarget{
+				{role: "witness", rig: rigName, session: witnessSession, bead: witnessBead},
+			})
+
+			woke := strings.Contains(readNudgeLog(t, nudgeLog), "nudge:"+witnessSession+":")
+			if woke != tc.wantWake {
+				t.Errorf("woke = %v, want %v\ndaemon log:\n%s", woke, tc.wantWake, logBuf.String())
+			}
+		})
+	}
+}
+
+// The await check is only as good as the bead each target carries: a target with
+// the wrong ID matches no await and the check is silently inert. These are the
+// IDs the patrol formulas pass to their await steps.
+func TestPatrolWakeTargetsCarryTheirAgentBead(t *testing.T) {
+	logBuf := &strings.Builder{}
+	d := newPatrolWakeDaemon(t, t.TempDir(), []string{"gastown"}, logBuf)
+	// Seed the per-patrol rig cache directly: rig discovery needs an on-disk rig
+	// to call operational, and what is under test here is the bead each target
+	// carries, not how the rig list is found.
+	d.patrolRigsCache = map[string][]string{
+		"witness":  {"gastown"},
+		"refinery": {"gastown"},
+	}
+
+	byRole := map[string]patrolWakeTarget{}
+	for _, tgt := range d.patrolWakeTargets() {
+		byRole[tgt.role] = tgt
+	}
+
+	// mol-deacon-patrol hard-codes `--agent-bead hq-deacon`.
+	if got := byRole["deacon"].bead; got != "hq-deacon" {
+		t.Errorf("deacon target bead = %q, want %q", got, "hq-deacon")
+	}
+	for _, role := range []string{"witness", "refinery"} {
+		tgt, ok := byRole[role]
+		if !ok {
+			t.Fatalf("no %s target formed for rig gastown", role)
+		}
+		if tgt.bead == "" {
+			t.Errorf("%s target has no agent bead; the await check cannot attribute anything to it", role)
+		}
+		if !strings.HasSuffix(tgt.bead, "-"+role) {
+			t.Errorf("%s target bead = %q, want an ID ending in -%s", role, tgt.bead, role)
+		}
+	}
+}
+
 // The wake message must name the await step the role actually runs. Witnesses
 // run await-signal and refineries run await-event; the two roles do not share a
 // loop, and naming the wrong one sends an agent looking for a command its
@@ -380,6 +503,12 @@ func TestPatrolWakeConfigSwitch(t *testing.T) {
 			// discovery — which is what keeps the positive control meaningful.
 			deaconSession := session.DeaconSessionName()
 			writePaneFixture(t, paneDir, deaconSession, stoppedPane())
+
+			// Targets built by patrolWakeTargets carry a real agent bead, so an
+			// unstubbed table lets a Deacon actually parked on the build machine
+			// suppress the wake and break the positive control. An empty table is
+			// the one that exercises the switch rather than the await check.
+			defer stubProcessTable(t, nil, nil)()
 
 			logBuf := &strings.Builder{}
 			d := newPatrolWakeDaemon(t, townRoot, nil, logBuf)
