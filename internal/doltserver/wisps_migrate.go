@@ -17,10 +17,12 @@
 package doltserver
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,7 +97,10 @@ func MigrateAgentBeadsToWisps(townRoot, workDir string, dryRun bool) (*MigrateWi
 	}
 
 	if dryRun {
-		cnt, _ := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM issues WHERE issue_type = 'agent' AND status = 'open'")
+		cnt, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM issues WHERE issue_type = 'agent' AND status = 'open'")
+		if err != nil {
+			return nil, fmt.Errorf("counting agent beads to migrate: %w", err)
+		}
 		result.AgentsCopied = cnt
 		return result, nil
 	}
@@ -131,13 +136,21 @@ func bdSQL(workDir, query string) error {
 }
 
 // bdSQLCSV executes a SQL query via `bd sql --csv` and returns the output.
+//
+// Output, not CombinedOutput: callers parse this return value as CSV, and bd
+// writes warnings to stderr (a group- or world-readable .beads directory, an
+// unconfigured beads.role) on every invocation. Merged, a warning lands where
+// the first data row belongs, so a populated table reads as an empty one.
+// Stderr is captured separately so it still reaches the error message.
 func bdSQLCSV(workDir, query string) (string, error) {
 	cmd := exec.Command("bd", "sql", "--csv", query)
 	cmd.Dir = workDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	setProcessGroup(cmd)
-	output, err := cmd.CombinedOutput()
+	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("bd sql: %s: %w", strings.TrimSpace(string(output)), err)
+		return "", fmt.Errorf("bd sql: %s: %w", strings.TrimSpace(stderr.String()), err)
 	}
 	return string(output), nil
 }
@@ -155,18 +168,35 @@ func bdExec(workDir string, args ...string) error {
 }
 
 // bdSQLCount executes a COUNT query and returns the integer result.
+//
+// Output that does not hold a number is an error, not a zero. A COUNT query
+// always returns exactly one row, so a missing or unparseable value means the
+// output is not the count — and callers use the number to decide what still
+// needs migrating, where "0" and "unreadable" must not look alike.
 func bdSQLCount(workDir, query string) (int, error) {
 	output, err := bdSQLCSV(workDir, query)
 	if err != nil {
 		return 0, err
 	}
+	return parseCSVCount(output)
+}
+
+// parseCSVCount reads the single value of a `bd sql --csv` COUNT result.
+//
+// Split out from bdSQLCount so the parse can be tested without a bd binary or
+// a Dolt server: the silent zero this replaced was only ever reachable through
+// both.
+func parseCSVCount(output string) (int, error) {
 	// Parse CSV output: header\nvalue\n
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) < 2 {
-		return 0, nil
+		return 0, fmt.Errorf("bd sql returned no count row: %q", strings.TrimSpace(output))
 	}
-	cnt := 0
-	fmt.Sscanf(strings.TrimSpace(lines[1]), "%d", &cnt)
+	value := strings.Trim(strings.TrimSpace(lines[1]), `"`)
+	cnt, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("bd sql count %q is not an integer", value)
+	}
 	return cnt, nil
 }
 
@@ -292,7 +322,10 @@ func copyAgentBeadsToWisps(workDir string, result *MigrateWispsResult) error {
 		return err
 	}
 
-	cnt, _ := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisps WHERE issue_type = 'agent'")
+	cnt, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisps WHERE issue_type = 'agent'")
+	if err != nil {
+		return fmt.Errorf("counting copied agent beads: %w", err)
+	}
 	result.AgentsCopied = cnt
 
 	return nil
@@ -308,7 +341,10 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 			return fmt.Errorf("copying labels: %w", err)
 		}
 	}
-	cnt, _ := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_labels")
+	cnt, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_labels")
+	if err != nil {
+		return fmt.Errorf("counting copied labels: %w", err)
+	}
 	result.LabelsCopied = cnt
 
 	// Copy comments
@@ -318,7 +354,10 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 			return fmt.Errorf("copying comments: %w", err)
 		}
 	}
-	cnt, _ = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_comments")
+	cnt, err = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_comments")
+	if err != nil {
+		return fmt.Errorf("counting copied comments: %w", err)
+	}
 	result.CommentsCopied = cnt
 
 	// Copy events
@@ -328,7 +367,10 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 			return fmt.Errorf("copying events: %w", err)
 		}
 	}
-	cnt, _ = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_events")
+	cnt, err = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_events")
+	if err != nil {
+		return fmt.Errorf("counting copied events: %w", err)
+	}
 	result.EventsCopied = cnt
 
 	// Copy dependencies
@@ -350,7 +392,10 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 			return fmt.Errorf("retargeting dependency targets: %w", err)
 		}
 	}
-	cnt, _ = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_dependencies")
+	cnt, err = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_dependencies")
+	if err != nil {
+		return fmt.Errorf("counting copied dependencies: %w", err)
+	}
 	result.DepsCopied = cnt
 
 	return nil
@@ -659,7 +704,10 @@ func closeOriginalAgentBeads(workDir string, result *MigrateWispsResult) error {
 		return err
 	}
 
-	cnt, _ := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM issues WHERE issue_type = 'agent' AND status = 'closed'")
+	cnt, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM issues WHERE issue_type = 'agent' AND status = 'closed'")
+	if err != nil {
+		return fmt.Errorf("counting closed agent beads: %w", err)
+	}
 	result.AgentsClosed = cnt
 
 	return nil
