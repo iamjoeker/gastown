@@ -68,7 +68,7 @@ case "$cmd" in
   query)
     case "$all" in
       *'parent="hq-wisp-root"'*)
-        printf '[{"id":"hq-wisp-loop-or-exit","title":"loop-or-exit","status":"%s","ephemeral":true}]\n' "$(status_of hq-wisp-loop-or-exit open)"
+        echo '[{"id":"hq-wisp-loop-or-exit","title":"loop-or-exit","status":"open","ephemeral":true}]'
         ;;
       *'status="hooked"'*)
         echo '[{"id":"hq-wisp-root","title":"mol-deacon-patrol cycle","status":"hooked","assignee":"deacon","ephemeral":true}]'
@@ -81,7 +81,6 @@ case "$cmd" in
       case "$arg" in --*) continue ;; esac
       echo "$cmd $arg" >> "$closes_log"
     done
-    if [ "$cmd" = close ]; then mark_closed "$@"; fi
     ;;
 esac`
 
