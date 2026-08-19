@@ -188,7 +188,14 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := DecideWorkstate(tt.in)
+			// Every case above asserts what a FACT-GATHERING caller concludes,
+			// so the whole table runs measured. An unmeasured input never
+			// reaches most of these predicates — it short-circuits at the tail
+			// — and that path has its own test below rather than a silent
+			// second meaning for each case here (gt-49dp).
+			in := tt.in
+			in.ReuseFactsMeasured = true
+			got := DecideWorkstate(in)
 			if got.Verdict != tt.want.Verdict || got.Reason != tt.want.Reason || got.Reusable != tt.want.Reusable || got.SafeToNuke != tt.want.SafeToNuke || got.NeedsRecovery != tt.want.NeedsRecovery || got.NeedsMQSubmit != tt.want.NeedsMQSubmit || got.MQStatus != tt.want.MQStatus || got.CountsTowardCapacity != tt.want.CountsTowardCapacity || got.ReuseStatus != tt.want.ReuseStatus {
 				t.Fatalf("DecideWorkstate() = %+v, want fields %+v", got, tt.want)
 			}
@@ -243,5 +250,89 @@ func TestApplyBranchMRToWorkstateInput(t *testing.T) {
 	ApplyBranchMRToWorkstateInput(&none, "", true)
 	if none.MRSubmitted || none.ActiveMR != "" || none.ActiveMRBlocker != "" {
 		t.Fatalf("empty MR id must be a no-op: %+v", none)
+	}
+}
+
+// TestDecideWorkstateUnmeasuredSurfaceCannotClaimReusable is the guard for the
+// eleven-field gap between the two WorkstateInput constructors (gt-49dp).
+//
+// `gt polecat list` and the FindIdlePolecat reuse gate share DecideWorkstate but
+// build its input separately, and the list constructor gathers no git and no
+// merge-queue facts at all. Both then fell through to the same tail, so the same
+// polecat read "idle-preserved / reusable" to the operator while the gate
+// refused it for mq-not-submitted — and nothing in either output revealed that
+// one surface had never looked. Sharing the decision function was never enough;
+// the inputs have to agree, or the unmeasured one has to say so.
+//
+// The existing tests could not catch this because each exercises exactly one
+// constructor. This one runs both shapes of input through the classifier
+// together and asserts they never both answer confidently.
+func TestDecideWorkstateUnmeasuredSurfaceCannotClaimReusable(t *testing.T) {
+	// The reported polecat: done, clean cleanup, a preserved branch, commits
+	// still outside the merge queue. This is what the two constructors see.
+	listView := WorkstateInput{
+		State:         StateDone,
+		CleanupStatus: CleanupClean,
+		Branch:        "polecat/chrome",
+		// No git fields, no MQCheckRequired, no ReuseFactsMeasured: exactly what
+		// buildPolecatInventoryItemFromEvidence produces.
+	}
+	gateView := WorkstateInput{
+		State:              StateDone,
+		CleanupStatus:      CleanupClean,
+		Branch:             "polecat/chrome",
+		MQCheckRequired:    true,
+		HasSubmittableWork: true,
+		ReuseFactsMeasured: true,
+	}
+
+	list := DecideWorkstate(listView)
+	gate := DecideWorkstate(gateView)
+
+	if gate.Reusable {
+		t.Fatalf("fixture is wrong: the gate must refuse this polecat, got %+v", gate)
+	}
+	if gate.Reason != "mq-not-submitted" {
+		t.Fatalf("gate reason = %q, want mq-not-submitted", gate.Reason)
+	}
+	// The bug, stated directly: the surface that never looked must not answer in
+	// the same words as the surface that did.
+	if list.ReuseStatus == "idle-preserved" {
+		t.Fatalf("unmeasured list surface claimed %q while the gate refused with %q", list.ReuseStatus, gate.Reason)
+	}
+	if list.Reusable {
+		t.Fatalf("unmeasured surface must not advertise reuse: %+v", list)
+	}
+	if list.SafeToNuke {
+		t.Fatalf("unmeasured surface must not advertise safe-to-nuke: %+v", list)
+	}
+	if list.Verdict != WorkstateVerdictUnverified || list.ReuseStatus != "idle-unverified" {
+		t.Fatalf("unmeasured surface = %+v, want UNVERIFIED/idle-unverified", list)
+	}
+	// Not a recovery condition and not capacity: nothing is known to be wrong
+	// with the polecat, only with the question that was asked about it.
+	if list.NeedsRecovery || list.NeedsMQSubmit || list.CountsTowardCapacity {
+		t.Fatalf("unmeasured surface must not fabricate a recovery state: %+v", list)
+	}
+	if len(list.Blockers) == 0 {
+		t.Fatal("unmeasured surface must name what it did not check")
+	}
+
+	// Measuring is the only thing that changes the answer: same facts plus the
+	// checks the gate runs, and the two surfaces agree.
+	measuredList := listView
+	measuredList.ReuseFactsMeasured = true
+	measuredList.MQCheckRequired = true
+	measuredList.HasSubmittableWork = true
+	if agreed := DecideWorkstate(measuredList); agreed.Reason != gate.Reason || agreed.ReuseStatus != gate.ReuseStatus {
+		t.Fatalf("measured list view = %+v, want agreement with gate %+v", agreed, gate)
+	}
+
+	// The other direction: a polecat the gate genuinely clears still reads
+	// idle-preserved, so this guard cannot be satisfied by refusing everyone.
+	cleared := gateView
+	cleared.MRSubmitted = true
+	if d := DecideWorkstate(cleared); !d.Reusable || d.ReuseStatus != "idle-preserved" {
+		t.Fatalf("a measured, cleared polecat must still be reusable: %+v", d)
 	}
 }

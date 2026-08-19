@@ -233,6 +233,15 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 	// facts nobody gathered. MRSubmitted is the one merge-queue fact available
 	// cheaply, and it is only ever used to CLEAR a recorded refusal, never to
 	// assert that submission happened.
+	//
+	// ReuseFactsMeasured is left false for the same reason, and that is now the
+	// operative difference between this surface and the reuse gate rather than a
+	// silent one: an otherwise-unblocked polecat reports UNVERIFIED /
+	// "idle-unverified" here instead of borrowing the gate's "idle-preserved".
+	// Both strings used to come out of the same tail of DecideWorkstate, so a
+	// polecat FindIdlePolecat refused for mq-not-submitted still listed as
+	// reusable, and nothing said which surface had actually looked (gt-49dp).
+	// `gt polecat check-recovery <rig>/<name>` is the surface that measures.
 	input.MRSubmitted = mrIndex.hasMR(item.Branch)
 
 	if !activeWorkEvidence.BlocksCleanup && fields != nil {

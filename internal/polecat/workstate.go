@@ -8,6 +8,13 @@ const (
 	WorkstateVerdictPendingMR     = "PENDING_MR"
 	WorkstateVerdictNeedsRecovery = "NEEDS_RECOVERY"
 	WorkstateVerdictNeedsMQSubmit = "NEEDS_MQ_SUBMIT"
+
+	// WorkstateVerdictUnverified is the answer for a caller that never gathered
+	// the git and merge-queue facts (ReuseFactsMeasured false). It is not a
+	// claim that anything is wrong — it is the refusal to make a claim at all.
+	// Every `verdict != SAFE_TO_NUKE` guard in the tree therefore fails closed
+	// on it, which is the intent (gt-49dp).
+	WorkstateVerdictUnverified = "UNVERIFIED"
 )
 
 // WorkstateInput contains the lifecycle, git, and merge-queue facts needed to
@@ -46,6 +53,26 @@ type WorkstateInput struct {
 	// MQCheckRequired can still report the condition instead of answering
 	// SAFE_TO_NUKE to a question they never asked.
 	MRRefused bool
+
+	// ReuseFactsMeasured records that this caller actually ran the git and
+	// merge-queue checks the reuse gate runs — CurrentBranch, uncommitted work,
+	// branch preservation, and the merge-request lookup — rather than answering
+	// from agent-bead fields alone.
+	//
+	// It exists because sharing DecideWorkstate bought the APPEARANCE of a
+	// single source of truth without the substance (gt-49dp). `gt polecat list`
+	// and the FindIdlePolecat reuse gate do share this classifier, but they
+	// build its input with two independent constructors that differ in eleven
+	// fields: the list surface runs no git at all and deliberately leaves
+	// MQCheckRequired false. Both then fell through to the same tail below, so
+	// the same polecat read "idle-preserved / reusable" to the operator and
+	// "idle-recovery-needed / mq-not-submitted" to the allocator, with nothing
+	// in either output admitting one of them had never looked.
+	//
+	// The zero value is "not measured" on purpose. A surface that forgets to
+	// set this gets UNVERIFIED — visibly useless — instead of a confident
+	// answer it did not earn, which is the failure mode this field is for.
+	ReuseFactsMeasured bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -249,6 +276,26 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Blockers = append(d.Blockers, "mq_status=refused_closed_source (gt done made no MR: source issue was closed)")
 			return d
 		}
+	}
+
+	// Nothing above blocked. That is only an answer if the blockers above were
+	// ever evaluated against gathered facts: eleven of this input's fields are
+	// git and merge-queue facts, and a bead-only surface leaves every one of
+	// them at the zero value, which reads here as "no blocker found" and is
+	// indistinguishable from "looked and found none" (gt-49dp).
+	//
+	// So the tail splits. A caller that measured gets the disposition it earned;
+	// a caller that did not gets UNVERIFIED and says so in its blockers, instead
+	// of printing the operator the same "idle-preserved" string the reuse gate
+	// prints for a polecat it has actually cleared. The refusal to answer is not
+	// a recovery condition and is not counted against capacity — it is a caller
+	// that must go measure, not a polecat that must be repaired.
+	if !in.ReuseFactsMeasured {
+		d.Verdict = WorkstateVerdictUnverified
+		d.Reason = "reuse-facts-unmeasured"
+		d.ReuseStatus = "idle-unverified"
+		d.Blockers = append(d.Blockers, "reuse_facts=unmeasured (no git or merge-queue check was run for this polecat)")
+		return d
 	}
 
 	d.Reusable = true

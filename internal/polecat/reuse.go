@@ -31,6 +31,12 @@ type SlotReuseInput struct {
 	MRSubmitted          bool
 	MQLookupFailed       bool
 	MRRefused            bool
+
+	// ReuseFactsMeasured must be set by callers that ran the git and
+	// merge-queue checks. Reuse is destructive — it force-deletes the branch —
+	// so an unmeasured caller is told UNVERIFIED rather than Reusable. See
+	// WorkstateInput.ReuseFactsMeasured (gt-49dp).
+	ReuseFactsMeasured bool
 }
 
 // SlotReuseDecision explains whether a polecat can be reused and why not.
@@ -65,6 +71,7 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		MRSubmitted:          in.MRSubmitted,
 		MQLookupFailed:       in.MQLookupFailed,
 		MRRefused:            in.MRRefused,
+		ReuseFactsMeasured:   in.ReuseFactsMeasured,
 	})
 	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
 }
