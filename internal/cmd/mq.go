@@ -144,21 +144,11 @@ Output format:
   gt-mr-003   blocked      P1        polecat/Capable/gt-def    Capable 8m
               (waiting on gt-mr-001)
 
-With --verify, a GIT column reports what git says about each branch:
-  OK       Branch exists and carries at least one commit over its target
-  EMPTY    Branch exists but is not ahead of its target — merging it is a no-op
-  MISSING  Neither a local nor an origin ref for the branch exists
-  ERR      git could not answer (unresolvable target, unreadable repo)
-
-EMPTY is a rejection, not a merge: an empty branch rehearses and tests cleanly,
-so every downstream gate reports success while zero lines change (gt-d5u).
-
 Examples:
   gt mq list greenplace
   gt mq list greenplace --ready
   gt mq list greenplace --status=open
-  gt mq list greenplace --worker=Nux
-  gt mq list greenplace --verify`,
+  gt mq list greenplace --worker=Nux`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMQList,
 }
@@ -362,7 +352,7 @@ func init() {
 	mqListCmd.Flags().StringVar(&mqListWorker, "worker", "", "Filter by worker name")
 	mqListCmd.Flags().StringVar(&mqListEpic, "epic", "", "Show MRs targeting integration/<epic>")
 	mqListCmd.Flags().BoolVar(&mqListJSON, "json", false, "Output as JSON")
-	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Verify branches in git (MISSING for deleted branches, EMPTY for branches with no commits over their target)")
+	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Verify branches exist in git (shows MISSING for deleted branches)")
 
 	// Reject flags
 	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required unless --stdin)")
