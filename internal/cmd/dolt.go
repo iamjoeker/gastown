@@ -530,39 +530,6 @@ func supervisedStopNotice(pid int, sup *doltserver.Supervisor) string {
 	return b.String()
 }
 
-// printSupervisorStatus reports who owns the Dolt process and whether that owner
-// has been quietly replacing it.
-//
-// Without this, `gt dolt status` describes only the process running right now: a
-// healthy server, a fresh PID, a short uptime. On 2026-08-18 Dolt exited twice in
-// 75s and systemd restarted it 5s later each time; two agents independently
-// escalated "connection refused, then a new PID, and nobody restarted it" and
-// neither could attribute it, because the restarter never appears in any gt
-// surface and the unit's start limit is off so it is never marked failed
-// (hq-njloj, hq-69g3w, gt-qiok). The restart count is the one fact that turns
-// "mystery restart" into "the server died and systemd replaced it".
-func printSupervisorStatus(sup *doltserver.Supervisor) {
-	if sup == nil || sup.Unit == "" {
-		return
-	}
-	fmt.Printf("  Supervisor: %s\n", sup.Describe())
-
-	notices := sup.RestartNotice()
-	if len(notices) == 0 {
-		return
-	}
-	fmt.Printf("\n  %s\n", style.Bold.Render("Restart History:"))
-	for _, notice := range notices {
-		for i, line := range strings.Split(notice, "\n") {
-			if i == 0 {
-				fmt.Printf("    %s %s\n", style.Warning.Render("!"), line)
-			} else {
-				fmt.Printf("      %s\n", line)
-			}
-		}
-	}
-}
-
 func runDoltRestart(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -725,11 +692,6 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
 			printBeadsRuntimeConfig(townRoot)
 		}
-
-		// Who owns this process, and has it been silently replaced? Printed with
-		// the process facts above rather than under Resource Metrics: it qualifies
-		// the PID and the uptime, both of which describe only the CURRENT server.
-		printSupervisorStatus(doltserver.DetectSupervisor(pid))
 
 		// Resource metrics
 		metrics := doltserver.GetHealthMetrics(townRoot)
