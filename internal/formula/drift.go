@@ -128,7 +128,7 @@ func (r *Resolved) DriftNotice() string {
 	case DriftPinned:
 		b.WriteString("    Cause: the file was edited locally AND the shipped default moved afterwards.\n")
 		b.WriteString("    gt keeps skipping it — 'gt doctor --fix' cannot repair this one.\n")
-		fmt.Fprintf(&b, "    Reconcile: gt formula drift %s\n", r.Name)
+		b.WriteString(r.reconcileSteps())
 	case DriftOutdated:
 		b.WriteString("    Cause: an unmodified older install; a newer default has shipped since.\n")
 		b.WriteString("    Fix: gt doctor --fix (or gt upgrade)\n")
@@ -138,9 +138,34 @@ func (r *Resolved) DriftNotice() string {
 		if r.AutoFixable() {
 			b.WriteString("    Fix: gt doctor --fix (or gt upgrade)\n")
 		} else {
-			fmt.Fprintf(&b, "    Nothing updates a %s-tier copy automatically. Reconcile: gt formula drift %s\n", r.Tier, r.Name)
+			fmt.Fprintf(&b, "    Nothing updates a %s-tier copy automatically.\n", r.Tier)
+			b.WriteString(r.reconcileSteps())
 		}
 	}
+	return b.String()
+}
+
+// reconcileSteps renders the hand-merge recipe for a drift kind that no command
+// can repair on its own.
+//
+// It names the flags that actually change something. The bare pointer this
+// replaced — "Reconcile: gt formula drift <name>" — was the command that
+// PRINTED the notice, so an operator who followed it got the same warning back
+// and had nowhere to go (gt-nrzk). Every line below is runnable as written.
+func (r *Resolved) reconcileSteps() string {
+	shipped := filepath.Join(os.TempDir(), r.Name+".shipped.toml")
+	disk := r.Path
+	if disk == "" {
+		disk = "<disk copy>"
+	}
+
+	var b strings.Builder
+	b.WriteString("    Reconcile — the merge is by hand; these three commands are the whole recipe:\n")
+	fmt.Fprintf(&b, "      1. gt formula drift %s --embedded > %s\n", r.Name, shipped)
+	fmt.Fprintf(&b, "      2. diff -u %s %s\n", disk, shipped)
+	b.WriteString("         ...and copy the parts you want into the disk copy.\n")
+	fmt.Fprintf(&b, "      3. gt formula drift %s --mark-reconciled     # clears this warning\n", r.Name)
+	fmt.Fprintf(&b, "    Or discard the local edits entirely: gt formula drift %s --accept-embedded\n", r.Name)
 	return b.String()
 }
 
