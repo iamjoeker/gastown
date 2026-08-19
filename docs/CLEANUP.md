@@ -74,6 +74,9 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 | Command | What it does |
 |---------|-------------|
 | `gt compact` | TTL-based compaction: promotes/deletes wisps past their TTL |
+| `gt krc prune` | Prunes expired events from the KRC event store |
+| `gt krc config reset` | Resets KRC TTL configuration to defaults |
+| `gt krc decay` | Shows forensic value decay report (pruning guidance) |
 
 > `gt compact` acts only on wisps whose `wisp_type` is set. Rows with an empty
 > `wisp_type` are counted as **Unclassified** and left untouched — no TTL policy
@@ -82,9 +85,55 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 > the column, expect `Unclassified` to be most of `Scanned`, and read a non-zero
 > value there as a defect report rather than as normal.
 
-| `gt krc prune` | Prunes expired events from the KRC event store |
-| `gt krc config reset` | Resets KRC TTL configuration to defaults |
-| `gt krc decay` | Shows forensic value decay report (pruning guidance) |
+### Where `wisp_type` comes from
+
+`gt compact` keys its whole policy on `wisps.wisp_type` — 6h for `heartbeat`
+and `ping`, 24h for `patrol` and `gc_report`, 7d for `recovery`, `error` and
+`escalation`. The column is only as useful as the writers that populate it, and
+until gt-fqd5 almost nothing did.
+
+Read the two halves together before changing either. Since gt-ktvs an untyped
+wisp is **skipped entirely**, not given the default TTL, so classifying a wisp
+is not a cosmetic act: it moves that wisp from "compaction never touches it" to
+"compaction enforces its TTL". Add a type only where you have decided what
+should happen to the wisp at that age.
+
+The vocabulary is bd's and it is closed: bd rejects any other value at create
+time. There is deliberately no type for merge-request, sling-context or
+work-molecule wisps, so those stay unclassified and take the 24h default.
+Leave them that way rather than borrowing a bucket whose retention was reasoned
+about for something else.
+
+Two write paths exist, because bd only offers one and it does not cover
+molecules:
+
+| Wisp | Written by | How |
+|------|-----------|-----|
+| Escalation records | `beads.CreateEscalationBead` | `bd create --wisp-type=escalation` |
+| Plugin/dog run receipts | `plugin.Recorder` | `bd create --wisp-type=gc_report` |
+| Patrol cycle digests | `gt mol` digest path | `beads.CreateOptions{WispType: ...}` |
+| Swarm tracking wisps | `witness.createSwarmWisp` | `bd create --wisp-type=patrol` |
+| Patrol molecule wisps | `cmd.stampPatrolWispType` | post-spawn `UPDATE wisps` |
+| Slung molecule wisps + steps | `cmd.stampMoleculeWispType` | post-spawn `UPDATE wisps` |
+| Dog molecule wisps + steps | `daemon.dogMol.stampWispType` | post-spawn `UPDATE wisps` |
+
+The UPDATE path exists because `bd mol wisp`, `bd mol wisp create` and
+`bd mol bond` accept no `--wisp-type`, and `bd update` has none either — a
+molecule wisp has no other route to the column. Retire it if beads grows the
+flag.
+
+For molecules the value comes from the formula's `[vars.wisp_type]`, resolved
+rig > town > embedded. Note what that precedence means in practice: a town that
+has already provisioned a formula to `.beads/formulas/` shadows the embedded
+copy, so adding a declaration to an embedded formula does **not** reach it. The
+dog spawner therefore carries its own `gc_report` default rather than trusting
+resolution.
+
+Verify with SQL, never by reading the writer:
+
+```bash
+bd sql --json "select coalesce(wisp_type,'') t, count(*) c from wisps group by t"
+```
 
 ## Dolt Database Cleanup
 

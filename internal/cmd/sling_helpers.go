@@ -1097,6 +1097,17 @@ func bondFormulaDirect(bondTarget, formulaName, beadID, formulaWorkDir, townRoot
 	if rootID == "" {
 		return "", fmt.Errorf("direct bond output missing spawned root id (output: %s)", trimJSONForError(bondOut))
 	}
+
+	// Classify the spawned wisps for gt compact (gt-fqd5). `bd mol bond` takes
+	// no --wisp-type, so this is a post-spawn UPDATE. It is a no-op — not even
+	// a bd call — for a formula that declares no wisp_type, which is every work
+	// formula including mol-polecat-work: bd's seven TTL buckets have no member
+	// meaning "a polecat implementing a bead", and unclassified is the honest
+	// answer rather than a borrowed bucket.
+	stampMoleculeWispType(formulaName, townRoot, "", rootID, true, func(c *bdCmd) *bdCmd {
+		return formulaBeadBdCmd(beadID, formulaWorkDir, townRoot, c.args...).WithAutoCommit()
+	})
+
 	return rootID, nil
 }
 
