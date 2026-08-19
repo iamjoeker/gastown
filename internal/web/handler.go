@@ -188,24 +188,33 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
 	defer cancel()
 
+	// Every fetch error below is rendered, not just logged. A panel the
+	// dashboard could not read must not look like a panel with nothing in it:
+	// during a Dolt outage every one of these renders a calm, empty, healthy
+	// dashboard, which is the moment the operator can least afford it
+	// (gt-edty, gt-1jrl).
 	var (
-		convoys     []ConvoyRow
-		mergeQueue  MergeQueueResult
-		workers     []WorkerRow
-		mail        []MailRow
-		rigs        []RigRow
-		dogs        []DogRow
-		escalations []EscalationRow
-		// escalationsErr is rendered, not just logged: an unreadable escalation
-		// panel must not look like an empty one (gt-edty).
+		convoys        []ConvoyRow
+		convoysErr     error
+		mergeQueue     MergeQueueResult
+		workers        []WorkerRow
+		workersErr     error
+		mail           []MailRow
+		rigs           []RigRow
+		dogs           []DogRow
+		dogsErr        error
+		escalations    []EscalationRow
 		escalationsErr error
 		health         *HealthRow
 		queues         []QueueRow
+		queuesErr      error
 		sessions       []SessionRow
+		sessionsErr    error
 		hooks          StoreResult[HookRow]
 		mayor          *MayorStatus
 		issues         StoreResult[IssueRow]
 		activity       []ActivityRow
+		activityErr    error
 		wg             sync.WaitGroup
 	)
 
@@ -214,10 +223,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 
 	go func() {
 		defer wg.Done()
-		var err error
-		convoys, err = h.fetcher.FetchConvoys()
-		if err != nil {
-			log.Printf("dashboard: FetchConvoys failed: %v", err)
+		convoys, convoysErr = h.fetcher.FetchConvoys()
+		if convoysErr != nil {
+			log.Printf("dashboard: FetchConvoys failed: %v", convoysErr)
 		}
 	}()
 	go func() {
@@ -230,10 +238,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		workers, err = h.fetcher.FetchWorkers()
-		if err != nil {
-			log.Printf("dashboard: FetchWorkers failed: %v", err)
+		workers, workersErr = h.fetcher.FetchWorkers()
+		if workersErr != nil {
+			log.Printf("dashboard: FetchWorkers failed: %v", workersErr)
 		}
 	}()
 	go func() {
@@ -254,10 +261,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		dogs, err = h.fetcher.FetchDogs()
-		if err != nil {
-			log.Printf("dashboard: FetchDogs failed: %v", err)
+		dogs, dogsErr = h.fetcher.FetchDogs()
+		if dogsErr != nil {
+			log.Printf("dashboard: FetchDogs failed: %v", dogsErr)
 		}
 	}()
 	go func() {
@@ -277,18 +283,16 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		queues, err = h.fetcher.FetchQueues()
-		if err != nil {
-			log.Printf("dashboard: FetchQueues failed: %v", err)
+		queues, queuesErr = h.fetcher.FetchQueues()
+		if queuesErr != nil {
+			log.Printf("dashboard: FetchQueues failed: %v", queuesErr)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		sessions, err = h.fetcher.FetchSessions()
-		if err != nil {
-			log.Printf("dashboard: FetchSessions failed: %v", err)
+		sessions, sessionsErr = h.fetcher.FetchSessions()
+		if sessionsErr != nil {
+			log.Printf("dashboard: FetchSessions failed: %v", sessionsErr)
 		}
 	}()
 	go func() {
@@ -317,10 +321,9 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}()
 	go func() {
 		defer wg.Done()
-		var err error
-		activity, err = h.fetcher.FetchActivity()
-		if err != nil {
-			log.Printf("dashboard: FetchActivity failed: %v", err)
+		activity, activityErr = h.fetcher.FetchActivity()
+		if activityErr != nil {
+			log.Printf("dashboard: FetchActivity failed: %v", activityErr)
 		}
 	}()
 
@@ -342,29 +345,47 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	}
 
 	// Compute summary from already-fetched data
-	summary := computeSummary(workers, hooks.Rows, issues.Rows, convoys, escalations, escalationsErr, activity)
+	summary := computeSummary(summaryInput{
+		workers:        workers,
+		workersErr:     workersErr,
+		hooks:          hooks.Rows,
+		issues:         issues.Rows,
+		convoys:        convoys,
+		convoysErr:     convoysErr,
+		escalations:    escalations,
+		escalationsErr: escalationsErr,
+		activity:       activity,
+		activityErr:    activityErr,
+		unreadable:     unreadablePanels(convoysErr, workersErr, sessionsErr, dogsErr, queuesErr, activityErr),
+	})
 
 	data := ConvoyData{
-		Convoys:              convoys,
-		MergeQueue:           mergeQueue.Rows,
-		MergeQueueFailedRigs: mergeQueue.FailedRigs,
-		Workers:              workers,
-		Mail:                 mail,
-		Rigs:                 rigs,
-		Dogs:                 dogs,
-		Escalations:          escalations,
-		// A failed escalation query is reported, never rendered as an empty
-		// panel: zero must mean zero, and unknown must look different.
-		EscalationsUnavailable: escalationErrorMessage(escalationsErr),
+		Convoys: convoys,
+		// A failed query is reported, never rendered as an empty panel: zero
+		// must mean zero, and unknown must look different.
+		ConvoysUnavailable:     panelErrorMessage(convoysErr),
+		MergeQueue:             mergeQueue.Rows,
+		MergeQueueFailedRigs:   mergeQueue.FailedRigs,
+		Workers:                workers,
+		WorkersUnavailable:     panelErrorMessage(workersErr),
+		Mail:                   mail,
+		Rigs:                   rigs,
+		Dogs:                   dogs,
+		DogsUnavailable:        panelErrorMessage(dogsErr),
+		Escalations:            escalations,
+		EscalationsUnavailable: panelErrorMessage(escalationsErr),
 		Health:                 health,
 		Queues:                 queues,
+		QueuesUnavailable:      panelErrorMessage(queuesErr),
 		Sessions:               sessions,
+		SessionsUnavailable:    panelErrorMessage(sessionsErr),
 		Hooks:                  hooks.Rows,
 		HooksWarning:           hooks.Warning(),
 		Mayor:                  mayor,
 		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
 		IssuesWarning:          issues.Warning(),
 		Activity:               activity,
+		ActivityUnavailable:    panelErrorMessage(activityErr),
 		Summary:                summary,
 		Expand:                 expandPanel,
 		CSRFToken:              h.csrfToken,
@@ -379,22 +400,68 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	return buf.Bytes()
 }
 
-// computeSummary calculates dashboard stats and alerts from fetched data.
+// summaryInput carries the fetched rows AND the error each fetch returned.
 //
-// escalationsErr is taken alongside the rows because len(nil) is 0 whether the
-// town is quiet or the query failed, and the summary is where that difference
-// decides between "✓ All clear" and an alert (gt-edty).
-func computeSummary(workers []WorkerRow, hooks []HookRow, issues []IssueRow,
-	convoys []ConvoyRow, escalations []EscalationRow, escalationsErr error,
-	activity []ActivityRow) *DashboardSummary {
+// The errors travel with the rows because len(nil) is 0 whether the town is
+// quiet or the query failed, and the summary is where that difference decides
+// between "✓ All clear" and an alert (gt-edty, gt-1jrl).
+type summaryInput struct {
+	workers        []WorkerRow
+	workersErr     error
+	hooks          []HookRow
+	issues         []IssueRow
+	convoys        []ConvoyRow
+	convoysErr     error
+	escalations    []EscalationRow
+	escalationsErr error
+	activity       []ActivityRow
+	activityErr    error
+
+	// unreadable names every panel whose query failed, for the banner.
+	unreadable []string
+}
+
+// unreadablePanels names the panels whose fetch failed, in the order they are
+// listed. Escalations are deliberately absent: they carry their own, louder
+// alert item, and naming them twice would read as two separate problems.
+func unreadablePanels(convoysErr, workersErr, sessionsErr, dogsErr, queuesErr, activityErr error) []string {
+	panels := []struct {
+		name string
+		err  error
+	}{
+		{"convoys", convoysErr},
+		{"polecats", workersErr},
+		{"sessions", sessionsErr},
+		{"dogs", dogsErr},
+		{"queues", queuesErr},
+		{"activity", activityErr},
+	}
+
+	var names []string
+	for _, p := range panels {
+		if p.err != nil {
+			names = append(names, p.name)
+		}
+	}
+	return names
+}
+
+// computeSummary calculates dashboard stats and alerts from fetched data.
+func computeSummary(in summaryInput) *DashboardSummary {
+	workers, hooks, issues := in.workers, in.hooks, in.issues
+	escalations, activity := in.escalations, in.activity
 
 	summary := &DashboardSummary{
 		PolecatCount:           len(workers),
 		HookCount:              len(hooks),
 		IssueCount:             len(issues),
-		ConvoyCount:            len(convoys),
+		ConvoyCount:            len(in.convoys),
 		EscalationCount:        len(escalations),
-		EscalationsUnavailable: escalationsErr != nil,
+		EscalationsUnavailable: in.escalationsErr != nil,
+		PolecatsUnavailable:    in.workersErr != nil,
+		ConvoysUnavailable:     in.convoysErr != nil,
+		ActivityUnavailable:    in.activityErr != nil,
+		UnreadablePanels:       in.unreadable,
 	}
 
 	// Count stuck workers (status = "stuck")
@@ -432,10 +499,11 @@ func computeSummary(workers []WorkerRow, hooks []HookRow, issues []IssueRow,
 		}
 	}
 
-	// Set HasAlerts flag. Not being able to read escalations is itself an
-	// alert — otherwise the banner reads "All clear" precisely when the
-	// dashboard has lost sight of the panel that reports trouble.
+	// Set HasAlerts flag. Not being able to read a panel is itself an alert —
+	// otherwise the banner reads "All clear" precisely when the dashboard has
+	// lost sight of the panels that report trouble.
 	summary.HasAlerts = summary.EscalationsUnavailable ||
+		len(summary.UnreadablePanels) > 0 ||
 		summary.StuckPolecats > 0 ||
 		summary.StaleHooks > 0 ||
 		summary.UnackedEscalations > 0 ||
@@ -445,11 +513,11 @@ func computeSummary(workers []WorkerRow, hooks []HookRow, issues []IssueRow,
 	return summary
 }
 
-// escalationErrorMessage renders a failed escalation query for display, or ""
-// when the query succeeded. The reason is shown rather than a bare "failed"
-// because the operator's next move differs by cause — bd timing out points at
-// Dolt, a parse failure points at bd itself.
-func escalationErrorMessage(err error) string {
+// panelErrorMessage renders a failed panel query for display, or "" when the
+// query succeeded. The reason is shown rather than a bare "failed" because the
+// operator's next move differs by cause — bd timing out points at Dolt, a parse
+// failure points at bd itself.
+func panelErrorMessage(err error) string {
 	if err == nil {
 		return ""
 	}

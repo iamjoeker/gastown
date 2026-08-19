@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -614,8 +615,14 @@ exit 0
 				t.Fatal("expected first FetchConvoys call to fail")
 			}
 
-			if _, err := f.FetchConvoys(); err != nil {
-				t.Fatalf("expected immediate retry to be backed off silently, got: %v", err)
+			// Backed off means "not asked", which means "not known". The
+			// breaker's job is to skip the bd call, not to invent an answer:
+			// it opens only after bd has already failed, so an empty convoy
+			// list here would be the least trustworthy zero on the dashboard
+			// (gt-1jrl).
+			_, err := f.FetchConvoys()
+			if !errors.Is(err, errConvoysBackedOff) {
+				t.Fatalf("backed-off retry err = %v, want errConvoysBackedOff", err)
 			}
 
 			countBytes, err := os.ReadFile(bdPath + ".count")
@@ -663,14 +670,24 @@ exit 0
 	wg.Wait()
 	close(errCh)
 
-	errCount := 0
+	// Every caller learns nothing: one because bd returned garbage, seven
+	// because the breaker refused to ask. The guard exists to stop the process
+	// storm below — not to hand the other seven an empty list they would render
+	// as a town with no convoys.
+	errCount, backedOff := 0, 0
 	for err := range errCh {
 		if err != nil {
 			errCount++
 		}
+		if errors.Is(err, errConvoysBackedOff) {
+			backedOff++
+		}
 	}
-	if errCount != 1 {
-		t.Fatalf("FetchConvoys errors = %d, want 1; backed-off callers should return nil", errCount)
+	if errCount != 8 {
+		t.Fatalf("FetchConvoys errors = %d, want 8; no caller got an answer", errCount)
+	}
+	if backedOff != 7 {
+		t.Fatalf("backed-off errors = %d, want 7 (one caller made the real call)", backedOff)
 	}
 
 	countBytes, err := os.ReadFile(bdPath + ".count")

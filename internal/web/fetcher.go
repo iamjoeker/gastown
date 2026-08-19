@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -27,24 +28,60 @@ import (
 
 // runCmd executes a command with a timeout and returns stdout.
 // Returns empty buffer on timeout or error.
-// Security: errors from this function are logged server-side only (via log.Printf
-// in callers) and never included in HTTP responses. The handler renders templates
-// with whatever data was successfully fetched; fetch failures result in empty panels.
+//
+// The command's first line of stderr is folded into the returned error. "exit
+// status 1" alone cannot be classified, and the callers now have to tell one
+// failure from another: tmux reporting no server running is a definite zero
+// sessions, while tmux failing any other way leaves the count unknown.
 func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("%s timed out after %v", name, timeout)
 		}
+		if detail := firstLine(stderr.String()); detail != "" {
+			return nil, fmt.Errorf("%s: %w: %s", name, err, detail)
+		}
 		return nil, err
 	}
 	return &stdout, nil
+}
+
+// firstLine returns the first non-empty line of s, trimmed. Command stderr can
+// run to many lines; one line is enough to say what happened and keeps the
+// dashboard's "unavailable" notices to a single readable sentence.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// tmuxReportsNoServer reports whether a tmux failure means there is no tmux
+// server to ask — which is a definite zero sessions, not an unknown.
+//
+// Every other tmux failure (a timeout, tmux missing from PATH, a socket that
+// exists but will not answer) leaves the session list unknown. Collapsing the
+// two is what let a broken tmux render as a town with nobody working in it.
+func tmuxReportsNoServer(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// "no server running on /tmp/tmux-1000/gt" — tmux was reached and says the
+	// server is not up. "No such file or directory" is the same fact seen from
+	// the socket path, reported by tmux as a connect error.
+	return strings.Contains(msg, "no server running") ||
+		strings.Contains(msg, "error connecting to")
 }
 
 // runTmuxCmd runs a tmux command using the per-town socket.
@@ -77,8 +114,9 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = beadsDir
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 	if err != nil {
@@ -88,6 +126,12 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 		// If we got some output, return it anyway (bd may exit non-zero with warnings)
 		if stdout.Len() > 0 {
 			return &stdout, nil
+		}
+		// Carry bd's own words. These errors are now rendered on the panel that
+		// failed, and "connection refused" and "unknown label" send the
+		// operator to different places; "exit status 1" sends them nowhere.
+		if detail := firstLine(stderr.String()); detail != "" {
+			return nil, fmt.Errorf("%w: %s", err, detail)
 		}
 		return nil, err
 	}
@@ -231,12 +275,20 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 	}, nil
 }
 
+// errConvoysBackedOff reports that the convoy circuit breaker is open, so no
+// query was made and the convoy list is unknown rather than empty.
+var errConvoysBackedOff = errors.New("convoy listing backed off after repeated bd failures")
+
 // FetchConvoys fetches all open convoys with their activity data.
 // Uses a circuit breaker to avoid hammering bd/dolt when listing fails
 // persistently (e.g., "invalid issue type: convoy" schema mismatch).
 func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	if !f.convoyBreaker.allow() {
-		return nil, nil // Backed off — return empty result silently
+		// Backed off. The breaker only opens after bd has already failed
+		// repeatedly, so this is the state where the convoy list is LEAST
+		// knowable — reporting it as an empty list would render the healthiest
+		// possible panel out of the unhealthiest possible town (gt-1jrl).
+		return nil, errConvoysBackedOff
 	}
 
 	// List all open issues and filter locally so legacy type=convoy beads remain visible.
@@ -992,7 +1044,13 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	// Query all tmux sessions with window_activity for more accurate timing
 	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
-		// tmux not running or no sessions
+		if !tmuxReportsNoServer(err) {
+			// tmux failed for a reason that is not "there is no server": the
+			// worker list is unknown. Returning an empty one would report a
+			// town where nobody is working (gt-1jrl).
+			return nil, fmt.Errorf("listing worker sessions: %w", err)
+		}
+		// No tmux server means no sessions, which really is zero workers.
 		return nil, nil
 	}
 
@@ -1403,8 +1461,12 @@ func (f *LiveConvoyFetcher) FetchDogs() ([]DogRow, error) {
 	entries, err := os.ReadDir(kennelPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // No kennel yet
+			// No kennel directory means no dogs have ever been created here.
+			// Unlike a failed query, this is a fact the filesystem answered:
+			// zero really is zero, so it is not reported as unknown (gt-1jrl).
+			return nil, nil
 		}
+		// The kennel exists but could not be read — the dog list is unknown.
 		return nil, fmt.Errorf("reading kennel: %w", err)
 	}
 
@@ -1568,7 +1630,10 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 	// List queue beads
 	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:queue", "--json")
 	if err != nil {
-		return nil, nil // No queues or bd not available
+		// "No queues" and "bd not available" were two different facts returning
+		// one value. Only bd can say the first one; this branch only ever knew
+		// the second (gt-1jrl).
+		return nil, fmt.Errorf("listing queues: %w", err)
 	}
 
 	var queues []struct {
@@ -1621,7 +1686,11 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
 	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
-		return nil, nil // tmux not running or no sessions
+		if !tmuxReportsNoServer(err) {
+			// See FetchWorkers: only "no server running" is a real zero.
+			return nil, fmt.Errorf("listing tmux sessions: %w", err)
+		}
+		return nil, nil
 	}
 
 	var rows []SessionRow
@@ -2009,13 +2078,19 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 	// Read events file
 	data, err := os.ReadFile(eventsPath)
 	if err != nil {
-		return nil, nil // No events file
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) == 0 {
+		if !os.IsNotExist(err) {
+			// The log exists but could not be read — a permission or I/O fault.
+			// That is a blind timeline, not a quiet one (gt-1jrl).
+			return nil, fmt.Errorf("reading event log: %w", err)
+		}
+		// No event log yet: nothing has ever been recorded, which really is
+		// zero activity.
 		return nil, nil
 	}
+
+	// An empty log yields one empty line, which the loop below skips; there is
+	// no separate "no lines" case to return early for.
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
 	// Take last 50 events for richer timeline
 	start := 0

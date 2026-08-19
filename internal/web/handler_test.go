@@ -22,14 +22,18 @@ type MockConvoyFetcher struct {
 	MergeQueue           []MergeQueueRow
 	MergeQueueFailedRigs []string
 	Workers              []WorkerRow
+	WorkersError         error
 	Mail                 []MailRow
 	Rigs                 []RigRow
 	Dogs                 []DogRow
+	DogsError            error
 	Escalations          []EscalationRow
 	EscalationsError     error
 	Health               *HealthRow
 	Queues               []QueueRow
+	QueuesError          error
 	Sessions             []SessionRow
+	SessionsError        error
 	Hooks                []HookRow
 	// HooksFailedStores names stores whose hooked-bead query failed, so the
 	// handler's partial-union caveat can be driven from a test.
@@ -39,6 +43,7 @@ type MockConvoyFetcher struct {
 	// IssuesFailedStores is the same lever for the backlog union.
 	IssuesFailedStores []string
 	Activity           []ActivityRow
+	ActivityError      error
 	Error              error
 }
 
@@ -51,7 +56,7 @@ func (m *MockConvoyFetcher) FetchMergeQueue() (MergeQueueResult, error) {
 }
 
 func (m *MockConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
-	return m.Workers, nil
+	return m.Workers, m.WorkersError
 }
 
 func (m *MockConvoyFetcher) FetchMail() ([]MailRow, error) {
@@ -63,7 +68,7 @@ func (m *MockConvoyFetcher) FetchRigs() ([]RigRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchDogs() ([]DogRow, error) {
-	return m.Dogs, nil
+	return m.Dogs, m.DogsError
 }
 
 func (m *MockConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
@@ -75,11 +80,11 @@ func (m *MockConvoyFetcher) FetchHealth() (*HealthRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchQueues() ([]QueueRow, error) {
-	return m.Queues, nil
+	return m.Queues, m.QueuesError
 }
 
 func (m *MockConvoyFetcher) FetchSessions() ([]SessionRow, error) {
-	return m.Sessions, nil
+	return m.Sessions, m.SessionsError
 }
 
 func (m *MockConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
@@ -95,7 +100,7 @@ func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 }
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
-	return m.Activity, nil
+	return m.Activity, m.ActivityError
 }
 
 func TestConvoyHandler_RendersTemplate(t *testing.T) {
@@ -281,9 +286,17 @@ func TestConvoyHandler_FetchConvoysError(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	// Should show the empty state for convoys section
-	if !strings.Contains(body, "No active convoys") {
-		t.Error("Response should show empty state when fetch fails")
+	// A failed fetch is not an empty town. The panel must say it could not
+	// read the convoys, and must not render the empty state that a successful
+	// query returning nothing would produce (gt-1jrl).
+	if strings.Contains(body, "No active convoys") {
+		t.Error("A failed fetch must not render the empty state")
+	}
+	if !strings.Contains(body, "Convoys unavailable") {
+		t.Error("Panel should say the convoy list could not be read")
+	}
+	if !strings.Contains(body, errFetchFailed.Error()) {
+		t.Error("Notice should name the reason the fetch failed")
 	}
 }
 

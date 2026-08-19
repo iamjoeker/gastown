@@ -69,7 +69,7 @@
                 </div>
                 {{end}}
                 <div class="stat">
-                    <span class="stat-value">{{.Summary.PolecatCount}}</span>
+                    <span class="stat-value">{{if .Summary.PolecatsUnavailable}}?{{else}}{{.Summary.PolecatCount}}{{end}}</span>
                     <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
@@ -81,7 +81,7 @@
                     <span class="stat-label">📋 Work</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{.Summary.ConvoyCount}}</span>
+                    <span class="stat-value">{{if .Summary.ConvoysUnavailable}}?{{else}}{{.Summary.ConvoyCount}}{{end}}</span>
                     <span class="stat-label">🚚 Convoys</span>
                 </div>
                 <div class="stat">
@@ -94,6 +94,11 @@
             <div class="summary-alerts">
                 {{if .Summary.EscalationsUnavailable}}
                 <span class="alert-item alert-red">🚨 escalations unreadable</span>
+                {{end}}
+                {{if .Summary.UnreadablePanels}}
+                <!-- A blind panel is an alert. Naming the panels tells the
+                     operator which numbers on this page mean nothing. -->
+                <span class="alert-item alert-red">🙈 unreadable: {{range $i, $p := .Summary.UnreadablePanels}}{{if $i}}, {{end}}{{$p}}{{end}}</span>
                 {{end}}
                 {{if .Summary.StuckPolecats}}
                 <span class="alert-item alert-red">💀 {{.Summary.StuckPolecats}} stuck</span>
@@ -126,7 +131,7 @@
             <div class="panel" id="convoy-panel">
                 <div class="panel-header">
                     <h2>🚚 Convoys</h2>
-                    <span class="count">{{len .Convoys}}</span>
+                    <span class="count">{{if .ConvoysUnavailable}}?{{else}}{{len .Convoys}}{{end}}</span>
                     <button class="new-convoy-btn" id="new-convoy-btn">+ New Convoy</button>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
@@ -134,7 +139,9 @@
                 <div class="panel-body">
                     <!-- Convoy List View -->
                     <div id="convoy-list">
-                        {{if .Convoys}}
+                        {{if .ConvoysUnavailable}}
+                        {{template "panelUnavailable" unavailable "Convoys" .ConvoysUnavailable}}
+                        {{else if .Convoys}}
                         <table>
                             <thead>
                                 <tr>
@@ -302,12 +309,14 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🦨 Polecats</h2>
-                    <span class="count">{{len .Workers}}</span>
+                    <span class="count">{{if .WorkersUnavailable}}?{{else}}{{len .Workers}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Workers}}
+                    {{if .WorkersUnavailable}}
+                    {{template "panelUnavailable" unavailable "Polecats" .WorkersUnavailable}}
+                    {{else if .Workers}}
                     <table>
                         <thead>
                             <tr>
@@ -364,12 +373,14 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>📟 Sessions</h2>
-                    <span class="count">{{len .Sessions}}</span>
+                    <span class="count">{{if .SessionsUnavailable}}?{{else}}{{len .Sessions}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Sessions}}
+                    {{if .SessionsUnavailable}}
+                    {{template "panelUnavailable" unavailable "Sessions" .SessionsUnavailable}}
+                    {{else if .Sessions}}
                     <table>
                         <thead>
                             <tr>
@@ -413,7 +424,7 @@
             <div class="panel" id="activity-panel">
                 <div class="panel-header">
                     <h2>📜 Activity</h2>
-                    <span class="count">{{len .Activity}}</span>
+                    <span class="count">{{if .ActivityUnavailable}}?{{else}}{{len .Activity}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
@@ -442,7 +453,9 @@
                 </div>
                 {{end}}
                 <div class="panel-body activity-feed">
-                    {{if .Activity}}
+                    {{if .ActivityUnavailable}}
+                    {{template "panelUnavailable" unavailable "Activity" .ActivityUnavailable}}
+                    {{else if .Activity}}
                     <div class="tl-timeline" id="activity-timeline">
                         {{range .Activity}}
                         <div class="tl-entry {{activityTypeClass .Category}}" data-category="{{.Category}}" data-rig="{{.Rig}}" data-agent="{{.Actor}}" data-type="{{.Type}}" data-ts="{{.RawTimestamp}}">
@@ -689,10 +702,7 @@
                     {{if .EscalationsUnavailable}}
                     <!-- Unreadable, not empty: the query failed, so there are no
                          rows to show and no count to claim. -->
-                    <div class="empty-state">
-                        <p class="truncation-notice">⚠️ Escalations unavailable: {{.EscalationsUnavailable}}</p>
-                        <p>This is NOT "no escalations" — the dashboard could not read them.</p>
-                    </div>
+                    {{template "panelUnavailable" unavailable "Escalations" .EscalationsUnavailable}}
                     {{else if .Escalations}}
                     <table>
                         <thead>
@@ -785,12 +795,14 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🐕 Dogs</h2>
-                    <span class="count">{{len .Dogs}}</span>
+                    <span class="count">{{if .DogsUnavailable}}?{{else}}{{len .Dogs}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Dogs}}
+                    {{if .DogsUnavailable}}
+                    {{template "panelUnavailable" unavailable "Dogs" .DogsUnavailable}}
+                    {{else if .Dogs}}
                     <table>
                         <thead>
                             <tr>
@@ -822,16 +834,21 @@
                 </div>
             </div>
 
-            <!-- Queues Panel (optional, only show if there are queues) -->
-            {{if .Queues}}
+            <!-- Queues Panel (optional: shown when there are queues, and when the
+                 query failed — a panel that disappears on failure is the same
+                 silence as an empty one). -->
+            {{if or .Queues .QueuesUnavailable}}
             <div class="panel">
                 <div class="panel-header">
                     <h2>📋 Queues</h2>
-                    <span class="count">{{len .Queues}}</span>
+                    <span class="count">{{if .QueuesUnavailable}}?{{else}}{{len .Queues}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
+                    {{if .QueuesUnavailable}}
+                    {{template "panelUnavailable" unavailable "Queues" .QueuesUnavailable}}
+                    {{else}}
                     <table>
                         <thead>
                             <tr>
@@ -860,6 +877,7 @@
                             {{end}}
                         </tbody>
                     </table>
+                    {{end}}
                 </div>
             </div>
             {{end}}
@@ -1108,3 +1126,15 @@
     <script src="/static/dashboard.js?v=3"></script>
 </body>
 </html>
+{{/*
+    panelUnavailable renders a panel whose query failed. It deliberately shows
+    no rows and no count: the dashboard does not know what is there, and an
+    empty table would claim it does. One shared block, so every blind panel
+    says it the same way (gt-1jrl).
+*/}}
+{{define "panelUnavailable"}}
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ {{.Panel}} unavailable: {{.Reason}}</p>
+                        <p>This is NOT an empty panel — the dashboard could not read it.</p>
+                    </div>
+{{end}}

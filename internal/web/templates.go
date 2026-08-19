@@ -14,24 +14,33 @@ import (
 var templateFS embed.FS
 
 // ConvoyData represents data passed to the convoy template.
+// Every "…Unavailable" field below holds the reason its query failed, or "" when
+// it succeeded. Non-empty means that panel's count is unknown — which it must
+// render differently from a count of zero, because an empty panel and an
+// unreadable panel otherwise look identical (gt-1jrl).
 type ConvoyData struct {
-	Convoys    []ConvoyRow
-	MergeQueue []MergeQueueRow
+	Convoys            []ConvoyRow
+	ConvoysUnavailable string
+	MergeQueue         []MergeQueueRow
 	// MergeQueueFailedRigs names rigs whose merge-queue query errored. Non-empty
 	// means the rendered count is a floor, not a total.
 	MergeQueueFailedRigs []string
 	Workers              []WorkerRow
+	WorkersUnavailable   string
 	Mail                 []MailRow
 	Rigs                 []RigRow
 	Dogs                 []DogRow
+	DogsUnavailable      string
 	Escalations          []EscalationRow
-	// EscalationsUnavailable holds the reason the escalation query failed, or
-	// "" when it succeeded. Non-empty means the escalation count is unknown —
-	// which the panel must render differently from a count of zero.
+	// EscalationsUnavailable is the same caveat for the panel whose whole job is
+	// to report trouble: bd being unreachable is exactly when escalations are
+	// most likely to exist (gt-edty).
 	EscalationsUnavailable string
 	Health                 *HealthRow
 	Queues                 []QueueRow
+	QueuesUnavailable      string
 	Sessions               []SessionRow
+	SessionsUnavailable    string
 	Hooks                  []HookRow
 	// HooksWarning names the stores whose hooked-bead query did not fully
 	// answer. Non-empty means the rendered count is a floor, not a total.
@@ -39,11 +48,12 @@ type ConvoyData struct {
 	Mayor        *MayorStatus
 	Issues       []IssueRow
 	// IssuesWarning is the same caveat for the backlog union.
-	IssuesWarning string
-	Activity      []ActivityRow
-	Summary       *DashboardSummary
-	Expand        string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken     string // Token for CSRF protection on POST requests
+	IssuesWarning       string
+	Activity            []ActivityRow
+	ActivityUnavailable string
+	Summary             *DashboardSummary
+	Expand              string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken           string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
@@ -162,6 +172,18 @@ type DashboardSummary struct {
 	// alert: a dashboard that cannot see escalations is not "all clear".
 	EscalationsUnavailable bool
 
+	// PolecatsUnavailable, ConvoysUnavailable and ActivityUnavailable mark the
+	// other counts above as unknown for the same reason. The stat tile renders
+	// "?" rather than the zero these leave behind.
+	PolecatsUnavailable bool
+	ConvoysUnavailable  bool
+	ActivityUnavailable bool
+
+	// UnreadablePanels names every panel whose fetch failed, escalations
+	// excepted — they get their own, louder alert. A blind panel is an alert in
+	// its own right, so this list also drives HasAlerts.
+	UnreadablePanels []string
+
 	// Alerts (things needing attention)
 	StuckPolecats      int // No activity > 5 min
 	StaleHooks         int // Hooked > 1 hour
@@ -252,6 +274,17 @@ type TrackedIssue struct {
 	Assignee string
 }
 
+// unavailableNotice is the input to the shared "panelUnavailable" template
+// block: which panel could not be read, and why.
+//
+// One block rather than one copy per panel, so every blind panel says the same
+// thing the same way. A dashboard that phrases "I could not read this" six
+// different ways teaches the operator to skim past it.
+type unavailableNotice struct {
+	Panel  string
+	Reason string
+}
+
 // LoadTemplates loads and parses all HTML templates.
 func LoadTemplates() (*template.Template, error) {
 	// Define template functions
@@ -267,6 +300,9 @@ func LoadTemplates() (*template.Template, error) {
 		"activityTypeClass":  activityTypeClass,
 		"contains": func(s, substr string) bool {
 			return strings.Contains(s, substr)
+		},
+		"unavailable": func(panel, reason string) unavailableNotice {
+			return unavailableNotice{Panel: panel, Reason: reason}
 		},
 	}
 

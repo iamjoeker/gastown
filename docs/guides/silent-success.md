@@ -98,6 +98,37 @@ Two rules for read paths:
 Aggregates inherit the defect: a summary that counts an unreadable panel as 0
 will happily report "✓ All clear". Not being able to see is itself an alert.
 
+### The rest of the family (gt-1jrl)
+
+`FetchEscalations` was not alone. The same `return nil, nil` sat in the convoy,
+polecat, session, dog, queue and activity fetchers — six more panels that
+rendered a calm, empty, healthy dashboard out of a failed query. They are fixed
+the same way: the fetcher returns the error, the handler keeps it beside the
+rows, and the panel renders the shared `panelUnavailable` block instead of its
+empty state. One block, so a blind panel always says it the same way; six
+different phrasings teach the operator to skim past all of them.
+
+Two of the swallows were not bugs, and telling them apart is the whole skill:
+
+| Branch | Verdict | Why |
+|---|---|---|
+| kennel directory does not exist | **real zero** | the filesystem answered: no dogs were ever created |
+| `.events.jsonl` does not exist | **real zero** | nothing has ever been recorded |
+| kennel exists but `ReadDir` failed | unknown | the source was asked and did not answer |
+| `tmux list-sessions` says *no server running* | **real zero** | tmux answered; there are no sessions |
+| `tmux list-sessions` failed any other way | unknown | tmux never answered |
+
+**The discriminator is whether the source answered, not whether the call
+returned an error.** "No such thing" is an answer; "I could not ask" is not.
+Getting this backwards costs in both directions — a false alarm on every quiet
+town trains operators to ignore the notice, which is how the panel goes silent
+again with the warning still on screen.
+
+Note what that classification needs: `runCmd` discarded stderr, so every failure
+arrived as `exit status 1` and *could not* be classified. A fix that only edits
+the `if err != nil` branch cannot be complete when the error carries no fact to
+branch on.
+
 ## Reviewer checklist
 
 - Does any success path return `nil` without having confirmed the effect?
