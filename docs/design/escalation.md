@@ -34,7 +34,10 @@ Each tier can resolve OR forward. The chain is tracked via bead comments.
 
 ## Configuration
 
-Config file: `~/gt/settings/escalation.json`
+Config file: `$GT_ROOT/settings/escalation.json` — the town root `gt` resolves from
+your cwd. It is **not** `~/gt`, which is not a town root; that path exists on some
+hosts holding unrelated files, so looking there yields a missing config rather
+than an error.
 
 ### Default Configuration
 
@@ -43,6 +46,7 @@ Config file: `~/gt/settings/escalation.json`
   "type": "escalation",
   "version": 1,
   "routes": {
+    "low": ["bead"],
     "medium": ["bead", "mail:mayor"],
     "high": ["bead", "mail:mayor", "email:human"],
     "critical": ["bead", "mail:mayor", "email:human", "sms:human"]
@@ -67,7 +71,7 @@ Config file: `~/gt/settings/escalation.json`
 
 | Action | Format | Behavior |
 |--------|--------|----------|
-| `bead` | `bead` | Create escalation bead (always first, implicit) |
+| `bead` | `bead` | Record the escalation as a durable bead |
 | `mail:<target>` | `mail:mayor` | Send gt mail to target |
 | `email:human` | `email:human` | Send email to `contacts.human_email` |
 | `sms:human` | `sms:human` | Send SMS to `contacts.human_sms` |
@@ -87,8 +91,8 @@ classic way to convince yourself an escalation is resolved when it is not:
 |---|---|---|
 | Where | `wisps` table (ephemeral, has a TTL) | `issues` table (durable) |
 | ID shape | `hq-wisp-<x>` | `hq-<x>` |
-| How many | exactly one | one per mail target |
-| Carries | the structured `severity:`/`reason:`/`closed_by:` fields | the mail body |
+| How many | exactly one | one per mail target, or one from the `bead` action |
+| Carries | the structured `severity:`/`reason:`/`closed_by:` fields | the mail body, or the structured fields for a `bead`-action copy |
 | Links | — | `escalation:<record-id>`, `thread:<record-id>` |
 | ID printed in | the escalation mail body ("To close: …") | `gt escalate list`, the Mayor's queue |
 
@@ -101,6 +105,30 @@ escalations closed before this reconciliation existed (gt-4xl).
 
 Closing a copy directly with `bd close` does not touch the record, and closing
 the record with `bd close` does not touch the copies. Use `gt escalate close`.
+
+### The `bead` action, and why a route must deliver something
+
+The record is a wisp: unversioned, unbacked, `dolt_ignore`'d and age-GC'd with no
+restore path. **The durable half of an escalation is the copy**, so a route that
+produces no copy loses the escalation outright once the wisp ages out.
+
+That is what the `bead` action is for, and for a long time it did not exist. It
+was configured on all four routes, reported as `"created": true` on every
+escalation, and dispatched nowhere — the copy was only ever a side effect of the
+`mail:` actions. `critical`, `high` and `medium` all carry `mail:mayor`, so they
+looked fine; `low` is `["bead"]` alone, so it delivered nothing, appeared on no
+surface, and was destroyed unread. Severity was the revealer, not the cause
+(gt-3i4e).
+
+Now:
+
+- `bead` creates the durable copy — labelled `gt:escalation`, `severity:<sev>`
+  and `escalation:<record-id>`, carrying the record's structured fields so they
+  outlive the wisp. When a `mail:` action already produced a linked copy, that
+  copy satisfies the action; escalations are never duplicated in the queue.
+- Every delivery status is set from a real result. Nothing is seeded successful.
+- **A route that delivers nothing exits non-zero** and reports
+  `"status": "undelivered"`. A no-op can no longer print a success banner.
 
 ### Label Schema
 
