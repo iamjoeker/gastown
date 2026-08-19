@@ -912,10 +912,9 @@ gt deacon zombie-scan --dry-run
 
 **If zombies detected:**
 1. Review the output to confirm they are truly abandoned
-2. File a death warrant for each detected zombie, using the full agent path —
-   a bare polecat name or a bead id is not a valid target and is rejected:
+2. File a death warrant for each detected zombie:
    ```bash
-   gt warrant file <rig>/polecats/<name> --reason "Zombie detected: no session, no hook, idle >10m"
+   gt warrant file <polecat> --reason "Zombie detected: no session, no hook, idle >10m"
    ```
 3. Boot will handle interrogation and execution
 4. Notify the Mayor about Witness failure:

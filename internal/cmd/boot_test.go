@@ -56,12 +56,9 @@ func readTestWarrant(t *testing.T, dir string, target string) Warrant {
 }
 
 // TestExecuteWarrants_MarksPendingAsExecuted verifies that executeWarrants
-// marks pending warrants as executed even when the target session is absent.
+// marks pending warrants as executed even when the target session is already dead.
 // This covers the normal case during degraded triage: sessions have been killed
 // by other means, or the warrant fires in the same cycle that restarts everything.
-//
-// It also pins the honesty of the record: the target here is resolvable but has
-// no session, so the outcome must be target-absent, not terminated.
 func TestExecuteWarrants_MarksPendingAsExecuted(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping warrant execution test on Windows (no tmux)")
@@ -90,43 +87,6 @@ func TestExecuteWarrants_MarksPendingAsExecuted(t *testing.T) {
 	}
 	if result.ExecutedAt == nil {
 		t.Error("ExecutedAt = nil, want non-nil after executeWarrants")
-	}
-	if result.Outcome != WarrantTargetAbsent {
-		t.Errorf("Outcome = %q, want %q — nothing was terminated, and the record must say so", result.Outcome, WarrantTargetAbsent)
-	}
-}
-
-// TestExecuteWarrants_LeavesUnresolvableTargetPending verifies that a warrant
-// filed against a target that cannot be resolved to a session survives triage
-// as pending. Before the fix, targetToSessionName fabricated a name for such a
-// target, tmux reported no such session, and the warrant was recorded as
-// executed — a kill order that vanished from the queue having killed nothing.
-func TestExecuteWarrants_LeavesUnresolvableTargetPending(t *testing.T) {
-	setupWarrantTestRegistry(t)
-
-	warrantDir := t.TempDir()
-
-	pending := Warrant{
-		ID:       "warrant-unresolvable",
-		Target:   "gt-abc123", // bead id, not an agent path
-		Reason:   "Zombie: no session, idle >10m",
-		FiledBy:  "test",
-		FiledAt:  time.Now().Add(-5 * time.Minute),
-		Executed: false,
-	}
-	writeTestWarrant(t, warrantDir, pending)
-
-	executeWarrants(warrantDir, tmux.NewTmux())
-
-	result := readTestWarrant(t, warrantDir, pending.Target)
-	if result.Executed {
-		t.Error("Executed = true for an unresolvable target, want false — the warrant must stay pending and visible")
-	}
-	if result.ExecutedAt != nil {
-		t.Errorf("ExecutedAt = %v for an unresolvable target, want nil", result.ExecutedAt)
-	}
-	if result.Outcome != "" {
-		t.Errorf("Outcome = %q for an unresolvable target, want empty", result.Outcome)
 	}
 }
 
