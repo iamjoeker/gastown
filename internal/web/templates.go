@@ -29,14 +29,7 @@ type ConvoyData struct {
 	// MergeQueueFailedRigs names rigs whose merge-queue query errored. Non-empty
 	// means the rendered count is a floor, not a total.
 	MergeQueueFailedRigs []string
-	// MergeQueueUnavailable holds the reason no rig could be asked at all, or ""
-	// when the queue was read. It is the floor of the same scale
-	// MergeQueueFailedRigs measures: a count short by every rig is not a count,
-	// and "Merge queue empty" is the most consequential thing this dashboard can
-	// wrongly claim — it is what an operator checks before concluding that work
-	// has stopped arriving.
-	MergeQueueUnavailable string
-	Workers               []WorkerRow
+	Workers              []WorkerRow
 	// WorkersUnavailable holds the reason the worker query failed, or "" when it
 	// succeeded. An unaskable tmux is not a town with no polecats.
 	WorkersUnavailable string
@@ -50,15 +43,8 @@ type ConvoyData struct {
 	// would lose whichever fact the survivor was not about.
 	WorkersWarning string
 	Mail           []MailRow
-	// MailUnavailable holds the reason the mail query failed, or "" when it
-	// succeeded. A town whose bd cannot be reached has not gone quiet.
-	MailUnavailable string
-	Rigs            []RigRow
-	// RigsUnavailable holds the reason the rig list could not be read, or ""
-	// when it was read — including when the town genuinely has no rigs
-	// registered, which is a real zero rather than an unknown one.
-	RigsUnavailable string
-	Dogs            []DogRow
+	Rigs           []RigRow
+	Dogs           []DogRow
 	// DogsUnavailable holds the reason the kennel could not be read, or "" when
 	// it was read — including when there is no kennel at all, which is a real
 	// zero rather than an unknown one.
@@ -69,13 +55,7 @@ type ConvoyData struct {
 	// which the panel must render differently from a count of zero.
 	EscalationsUnavailable string
 	Health                 *HealthRow
-	// HealthUnavailable holds the reason the heartbeat could not be read, or ""
-	// when it was read. This one hides rather than lies: the banner renders its
-	// liveness stat only when Health is non-nil, so a failed read used to delete
-	// the indicator from the page — and an absent warning light reads as a
-	// working one.
-	HealthUnavailable string
-	Queues            []QueueRow
+	Queues                 []QueueRow
 	// QueuesUnavailable holds the reason the queue query failed, or "" when it
 	// succeeded. The panel hides itself when there are no queues, so without
 	// this a failed query would remove the panel from the page entirely.
@@ -243,15 +223,6 @@ type DashboardSummary struct {
 	// calm "0 Hooks / 0 Work" for a town whose beads are simply unreachable.
 	HooksUnavailable  bool
 	IssuesUnavailable bool
-
-	// These four panels print no stat in the banner, so they are alert-only.
-	// They are here because HasAlerts is what decides between "✓ All clear" and
-	// a warning, and a panel the dashboard could not read is precisely the case
-	// where "All clear" is a claim it has no basis for (gt-xw1t).
-	MailUnavailable       bool
-	RigsUnavailable       bool
-	HealthUnavailable     bool
-	MergeQueueUnavailable bool
 
 	// Alerts (things needing attention)
 	StuckPolecats      int // No activity > 5 min

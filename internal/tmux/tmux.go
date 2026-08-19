@@ -3325,43 +3325,43 @@ func hasBusyIndicator(line string) bool {
 	return false
 }
 
-// shouldSendEscapeForLines reports whether the vim-mode Escape keystroke
+// shouldSendEscapeFromLines reports whether the vim-mode Escape keystroke
 // (nudge delivery step 5) is safe to send, given a snapshot of pane lines.
 //
 // The Escape exists to exit a vim-mode composer's INSERT mode so the following
 // Enter submits the line (GH#307). But in Claude Code — and Codex/Gemini —
 // Escape also cancels in-flight generation; the status bar literally reads
 // "esc to interrupt" while the agent is working. Sending Escape in that state
-// would interrupt the agent's current turn (e.g. the Mayor). Returns false when
-// any line shows the busy indicator so the caller suppresses the Escape.
+// would interrupt the agent's current turn (e.g. the Mayor). So the answer is
+// exactly the negation of the busy evidence (see busyFromLines): suppress the
+// Escape while a turn is in flight, send it otherwise.
 //
 // FRAGILITY: this depends on the agent TUI rendering the literal substring
 // "esc to interrupt" while generating (via hasBusyIndicator — the same
 // assumption IsIdle/WaitForIdle already make). If that upstream status text
 // changes, the gate fails open and silently: the Escape is sent again and
 // nudges can resume interrupting the agent. Tracked in gastownhall/gastown#4240.
-func shouldSendEscapeForLines(lines []string) bool {
-	for _, line := range lines {
-		if hasBusyIndicator(line) {
-			return false
-		}
-	}
-	return true
+func shouldSendEscapeFromLines(lines []string, promptPrefix string) bool {
+	return !busyFromLines(lines, promptPrefix)
 }
 
 // shouldSendEscape captures the target's pane and reports whether the vim-mode
-// Escape is safe to send right now (see shouldSendEscapeForLines). Callers
+// Escape is safe to send right now (see shouldSendEscapeFromLines). Callers
 // snapshot before writing nudge text so the message itself cannot masquerade as
 // the busy indicator. On capture failure it returns false: when we cannot
 // confirm the agent is idle, skipping the Escape is the safe default — it avoids
 // interrupting an active agent and is harmless for the common (non-vim) case
 // where Enter alone submits.
+//
+// target is a pane (session:window.pane or a pane id), not a bare session;
+// readyPromptPrefixForSession resolves the agent's prompt through it and falls
+// back to the Claude Code prompt when the environment cannot be read there.
 func (t *Tmux) shouldSendEscape(target string) bool {
-	lines, err := t.CapturePaneLines(target, 5)
+	lines, err := t.CapturePaneLines(target, idleCaptureHistoryLines)
 	if err != nil {
 		return false
 	}
-	return shouldSendEscapeForLines(lines)
+	return shouldSendEscapeFromLines(lines, readyPromptPrefixForSession(t, target))
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
@@ -3545,11 +3545,56 @@ const idleCaptureHistoryLines = 0
 // to a guess.
 func idleFromLines(lines []string, promptPrefix string) bool {
 	lines = trimTrailingBlankLines(lines)
-	anchor := findComposerLine(lines, promptPrefix)
-	if anchor < 0 {
-		anchor = findModeStatusLine(lines)
-	}
+	anchor := statusAnchor(lines, promptPrefix)
 	return anchor >= 0 && !busyIndicatorNearAnchor(lines, anchor)
+}
+
+// statusAnchor returns the line the busy-indicator scan is bounded around: the
+// composer if it is on screen, otherwise the mode-status footer, which sits in
+// the same region. -1 means the snapshot holds neither, so it cannot be read as
+// an agent pane and there is no status region to scan. Callers pass a snapshot
+// with trailing blank padding already trimmed.
+func statusAnchor(lines []string, promptPrefix string) int {
+	if anchor := findComposerLine(lines, promptPrefix); anchor >= 0 {
+		return anchor
+	}
+	return findModeStatusLine(lines)
+}
+
+// busyFromLines reports whether a pane snapshot shows a turn in flight. It is
+// the busy-side counterpart of idleFromLines and the single oracle behind both
+// IsBusy and the nudge Escape gate.
+//
+// It is NOT !idleFromLines: both answer "no" on a pane that is neither, and
+// they differ in what they do with an unreadable one. The scan is anchored
+// because the snapshot is the whole visible pane (see idleCaptureHistoryLines)
+// and an agent's own transcript can quote the busy marker as prose — the defect
+// that made a parked agent read as working (gt-qye, gt-zwpu).
+//
+// With no anchor the scan falls back to the whole snapshot, which is what every
+// caller did before anchoring existed. That fallback only fires on a pane whose
+// layout cannot be located at all — never on the contaminated-transcript case,
+// which by construction has a composer on screen — and both callers fail safe in
+// that direction: over-reporting busy costs a suppressed Escape or a deferred
+// reclaim, while under-reporting it interrupts or destroys a working agent.
+func busyFromLines(lines []string, promptPrefix string) bool {
+	lines = trimTrailingBlankLines(lines)
+	anchor := statusAnchor(lines, promptPrefix)
+	if anchor < 0 {
+		return anyLineHasBusyIndicator(lines)
+	}
+	return busyIndicatorNearAnchor(lines, anchor)
+}
+
+// anyLineHasBusyIndicator is the unanchored whole-snapshot scan. It is only
+// correct where no anchor exists; see busyFromLines.
+func anyLineHasBusyIndicator(lines []string) bool {
+	for _, line := range lines {
+		if hasBusyIndicator(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // atIdlePromptFromLines is idleFromLines without the mode-status fallback: the
@@ -3588,17 +3633,20 @@ func findModeStatusLine(lines []string) int {
 // rather than as a blocker — otherwise every rig without tmux would stall.
 // Callers get a one-way guarantee: true means the agent was demonstrably
 // mid-turn at capture time; false means only that nothing proved it was.
+//
+// The busy scan is anchored on the composer (see busyFromLines) rather than run
+// over the whole capture. CapturePaneLines returns the whole visible pane, and
+// an agent whose transcript quotes "esc to interrupt" — prose about pane
+// reading, a quoted command — used to read as mid-turn forever, so the sessions
+// that most needed reclaiming were the ones this reported busy (gt-zwpu). On a
+// pane with no anchor at all the evidence is only the unanchored scan, which
+// can over-report; that is the direction reclaim callers can absorb.
 func (t *Tmux) IsBusy(session string) bool {
-	lines, err := t.CapturePaneLines(session, 5)
+	lines, err := t.CapturePaneLines(session, idleCaptureHistoryLines)
 	if err != nil {
 		return false
 	}
-	for _, line := range lines {
-		if hasBusyIndicator(line) {
-			return true
-		}
-	}
-	return false
+	return busyFromLines(lines, readyPromptPrefixForSession(t, session))
 }
 
 // GetSessionInfo returns detailed information about a session.
