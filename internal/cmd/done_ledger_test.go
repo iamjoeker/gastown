@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,166 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 )
+
+// stubLedgerWrites replaces the ledger write seams for the duration of a test
+// and returns the annotations that reached them.
+func stubLedgerWrites(t *testing.T, commentErr, updateErr error) *[]string {
+	t.Helper()
+	origComment, origUpdate := ledgerAddComment, ledgerUpdateIssue
+	t.Cleanup(func() {
+		ledgerAddComment, ledgerUpdateIssue = origComment, origUpdate
+	})
+
+	var written []string
+	ledgerAddComment = func(_ *beads.Beads, _, msg string) error {
+		written = append(written, msg)
+		return commentErr
+	}
+	ledgerUpdateIssue = func(_ *beads.Beads, _ string, _ beads.UpdateOptions) error {
+		return updateErr
+	}
+	return &written
+}
+
+// The gt-290c hazard: noteVerifiedPushSkipped writes the only durable record
+// that a completion bypassed verified-push checks (the DONE_SKIP_VERIFY
+// witness mail is a wisp and gets reaped). Dropping that write silently left
+// the close with no audit trail at all.
+func TestNoteVerifiedPushSkipped_LostAnnotationIsVisibleAndFails(t *testing.T) {
+	writeErr := errors.New("dolt: connection refused")
+	stubLedgerWrites(t, writeErr, nil)
+
+	var err error
+	stderr := captureStderr(t, func() {
+		// commit "" and a nil git context keep this away from a real repo: the
+		// annotation still has to be written, which is the point.
+		err = noteVerifiedPushSkipped(nil, &beads.Beads{}, nil, t.TempDir(), "gt-290c", "main", "", "--skip-verify on no-MR non-code close")
+	})
+
+	if err == nil {
+		t.Fatal("expected a lost skip-verify annotation to return an error, got nil")
+	}
+	if !errors.Is(err, writeErr) {
+		t.Errorf("returned error should wrap the write failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "gt-290c") {
+		t.Errorf("returned error should name the bead, got: %v", err)
+	}
+	for _, want := range []string{"gt-290c", "LEDGER ANNOTATION LOST", "verified_push_skipped:", "bd comments add"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr should contain %q so the lost record is recoverable, got:\n%s", want, stderr)
+		}
+	}
+}
+
+func TestNoteVerifiedPushSkipped_SuccessfulAnnotationIsSilent(t *testing.T) {
+	written := stubLedgerWrites(t, nil, nil)
+
+	var err error
+	stderr := captureStderr(t, func() {
+		err = noteVerifiedPushSkipped(nil, &beads.Beads{}, nil, t.TempDir(), "gt-290c", "main", "", "--skip-verify on branch push")
+	})
+
+	if err != nil {
+		t.Fatalf("expected a successful annotation to return nil, got: %v", err)
+	}
+	if len(*written) != 1 || !strings.Contains((*written)[0], "verified_push_skipped:") {
+		t.Errorf("expected one verified_push_skipped annotation, got: %v", *written)
+	}
+	if strings.Contains(stderr, "LEDGER ANNOTATION LOST") {
+		t.Errorf("a successful write should not report a lost annotation, got:\n%s", stderr)
+	}
+}
+
+func TestNoteVerifiedPushSkipped_NoIssueWritesNothing(t *testing.T) {
+	written := stubLedgerWrites(t, errors.New("must not be called"), nil)
+
+	if err := noteVerifiedPushSkipped(nil, &beads.Beads{}, nil, t.TempDir(), "", "main", "", "reason"); err != nil {
+		t.Fatalf("expected no error with an empty issue ID, got: %v", err)
+	}
+	if len(*written) != 0 {
+		t.Errorf("expected no annotation write with an empty issue ID, got: %v", *written)
+	}
+}
+
+func TestNoteVerifiedPushFailure_LostWritesAreReported(t *testing.T) {
+	tests := []struct {
+		name       string
+		commentErr error
+		updateErr  error
+		wantErr    bool
+		wantIn     []string
+	}{
+		{
+			name:    "both writes land",
+			wantErr: false,
+		},
+		{
+			name:       "lost comment is reported",
+			commentErr: errors.New("dolt: connection refused"),
+			wantErr:    true,
+			wantIn:     []string{"comment write failed"},
+		},
+		{
+			name:      "lost status update is reported even when the comment lands",
+			updateErr: errors.New("schema gate closed"),
+			wantErr:   true,
+			wantIn:    []string{"in_progress"},
+		},
+		{
+			name:       "both losses are reported together",
+			commentErr: errors.New("dolt: connection refused"),
+			updateErr:  errors.New("schema gate closed"),
+			wantErr:    true,
+			wantIn:     []string{"comment write failed", "in_progress"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubLedgerWrites(t, tt.commentErr, tt.updateErr)
+
+			var err error
+			stderr := captureStderr(t, func() {
+				err = noteVerifiedPushFailure(&beads.Beads{}, t.TempDir(), "gt-290c", "main", "abc123", errors.New("commit not on origin"))
+			})
+
+			if tt.wantErr && err == nil {
+				t.Fatal("expected a lost ledger write to return an error, got nil")
+			}
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("expected nil when both writes land, got: %v", err)
+				}
+				if strings.Contains(stderr, "LEDGER ANNOTATION LOST") {
+					t.Errorf("successful writes should stay quiet, got:\n%s", stderr)
+				}
+				return
+			}
+			if !strings.Contains(stderr, "verified_push_failed:") {
+				t.Errorf("stderr should echo the lost annotation, got:\n%s", stderr)
+			}
+			for _, want := range tt.wantIn {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error should mention %q, got: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestReportLostLedgerAnnotation_NoWriteErrorIsSilent(t *testing.T) {
+	var err error
+	stderr := captureStderr(t, func() {
+		err = reportLostLedgerAnnotation("gt-290c", "verified_push_skipped: ...", nil)
+	})
+	if err != nil {
+		t.Errorf("expected nil for a successful write, got: %v", err)
+	}
+	if stderr != "" {
+		t.Errorf("expected no output for a successful write, got:\n%s", stderr)
+	}
+}
 
 // The gt-y20 incident: a polecat in a fresh sandbox (HEAD == origin/main, zero
 // commits, no branch) closed a P1 code bead with --skip-verify, and the ledger
