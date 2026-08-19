@@ -193,7 +193,7 @@ func formulaDriftAll(townRoot, rigName string) error {
 	for _, r := range drifted {
 		fix := "gt doctor --fix"
 		if !r.AutoFixable() {
-			fix = "needs a hand merge — gt formula drift " + r.Name + "   (prints the recipe)"
+			fix = "needs a human merge — gt formula drift " + r.Name
 		}
 		fmt.Printf("  %-38s %-9s %s\n", r.Name, r.Drift, r.Tier)
 		fmt.Printf("  %s\n", style.Dim.Render(r.Path))
