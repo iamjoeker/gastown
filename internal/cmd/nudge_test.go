@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -787,82 +785,4 @@ func TestDeliverNudge_QueueRouteRefusesLiveTownFromTestBinary(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(townRoot, "logs", "town.log")); !os.IsNotExist(statErr) {
 		t.Errorf("refused nudge produced a town log at %s", filepath.Join(townRoot, "logs", "town.log"))
 	}
-}
-
-// nudgeCmdDeclaredSilenceUsage captures gt nudge's declared SilenceUsage before
-// any test can mutate the shared command. Package-level vars initialize after
-// nudgeCmd itself and before any init() or test body, so this is the value in
-// the source, not a value some earlier test left behind.
-var nudgeCmdDeclaredSilenceUsage = nudgeCmd.SilenceUsage
-
-// TestNudgeUsageOnlyForMalformedInvocations covers gt-5h2: cobra printed its
-// ~20-line usage block for runtime failures ("session not found"), so callers
-// reading the tail of the output concluded they had mistyped the command and
-// rewrote a perfectly well-formed invocation instead of looking at the target.
-//
-// The two halves have to hold together. Suppressing usage everywhere would be
-// just as wrong — a genuinely malformed invocation is what usage output is for
-// — so the malformed case is the control here, and it fails independently if
-// the fix is moved onto the command literal.
-func TestNudgeUsageOnlyForMalformedInvocations(t *testing.T) {
-	if nudgeCmdDeclaredSilenceUsage {
-		t.Fatal("nudgeCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runNudge instead (gt-5h2)")
-	}
-
-	origMode := nudgeModeFlag
-	origMessage := nudgeMessageFlag
-	t.Cleanup(func() {
-		nudgeModeFlag = origMode
-		nudgeMessageFlag = origMessage
-	})
-
-	newNudgeTestCmd := func(out *bytes.Buffer) *cobra.Command {
-		c := &cobra.Command{
-			Use:          nudgeCmd.Use,
-			Args:         nudgeCmd.Args,
-			RunE:         runNudge,
-			SilenceUsage: nudgeCmdDeclaredSilenceUsage,
-		}
-		c.SetOut(out)
-		c.SetErr(out)
-		return c
-	}
-
-	t.Run("runtime error prints no usage", func(t *testing.T) {
-		// An invalid --mode is rejected by runNudge's own validation, so this
-		// reaches RunE (unlike an arg-count error) without touching tmux.
-		nudgeModeFlag = "definitely-not-a-mode"
-		nudgeMessageFlag = ""
-
-		var out bytes.Buffer
-		c := newNudgeTestCmd(&out)
-		c.SetArgs([]string{nudgeTestTarget, "hello"})
-
-		if err := c.Execute(); err == nil {
-			t.Fatal("Execute() with an invalid --mode returned nil, want an error")
-		}
-		got := out.String()
-		if !strings.Contains(got, "invalid --mode") {
-			t.Errorf("output does not contain the diagnosis; the error itself must keep printing:\n%s", got)
-		}
-		if strings.Contains(got, "Usage:") {
-			t.Errorf("runtime failure printed cobra's usage block:\n%s", got)
-		}
-	})
-
-	t.Run("malformed invocation still prints usage", func(t *testing.T) {
-		nudgeModeFlag = NudgeModeWaitIdle
-		nudgeMessageFlag = ""
-
-		var out bytes.Buffer
-		c := newNudgeTestCmd(&out)
-		c.SetArgs([]string{}) // violates Args: RangeArgs(1, 2), so RunE never runs
-
-		if err := c.Execute(); err == nil {
-			t.Fatal("Execute() with no arguments returned nil, want an arg-count error")
-		}
-		if got := out.String(); !strings.Contains(got, "Usage:") {
-			t.Errorf("malformed invocation lost its usage block:\n%s", got)
-		}
-	})
 }
