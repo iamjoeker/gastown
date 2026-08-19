@@ -129,6 +129,7 @@ func installMockBd(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		psPath := filepath.Join(binDir, "bd.ps1")
 		psScript := `# Mock bd for polecat tests (PowerShell)
+if ($env:MOCK_BD_LOG) { Add-Content -Path $env:MOCK_BD_LOG -Value ($args -join ' ') }
 $cmd = ''
 foreach ($arg in $args) {
   if ($arg -like '--*') { continue }
@@ -163,6 +164,11 @@ switch ($cmd) {
 	} else {
 		script := `#!/bin/sh
 # Mock bd for polecat tests.
+# Record every invocation when MOCK_BD_LOG is set, so tests can assert which
+# bd subcommands a code path actually issued.
+if [ -n "$MOCK_BD_LOG" ]; then
+  echo "$*" >> "$MOCK_BD_LOG"
+fi
 # Find the actual command (skip global flags like --allow-stale).
 cmd=""
 for arg in "$@"; do
