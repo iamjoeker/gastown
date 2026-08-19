@@ -115,6 +115,13 @@ func write(event Event) error {
 		return nil
 	}
 
+	// Structural backstop: a unit test must never append to a live town's event
+	// feed. Checked here because this is the one function every event passes
+	// through. See guardTestEvents.
+	if handled, err := guardTestEvents(townRoot); handled {
+		return err
+	}
+
 	eventsPath := filepath.Join(townRoot, EventsFile)
 
 	// Marshal event to JSON
