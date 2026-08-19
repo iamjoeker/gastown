@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -591,56 +590,9 @@ func (g *Git) wrapError(err error, stdout, stderr string, args []string) error {
 		Args:    args,
 		Stdout:  stdout,
 		Stderr:  stderr,
-		Err:     g.explainExecFailure(err),
+		Err:     err,
 	}
 }
-
-// explainExecFailure rewrites a process-start failure that names the git binary
-// when the thing that is actually missing is the directory git was told to run
-// in. Errors it cannot attribute are returned untouched — an unexplained
-// failure is better than a manufactured explanation.
-//
-// A failed fork/exec reports ENOENT against Path, and Path is the resolved
-// binary even when the chdir is what failed. Go attributes it correctly
-// ("chdir <dir>: no such file or directory") only on its fast path; setting
-// SysProcAttr — which every git call here does, via SetDetachedProcessGroup —
-// drops it back to the generic "fork/exec /usr/bin/git: no such file or
-// directory". Read literally that sends an operator to look for a broken git
-// installation, which cannot be the problem: exec resolved the binary, or it
-// would have no path to name. (gt-m7cc)
-//
-// A genuinely absent git is a *exec.Error, not a *fs.PathError, so it still
-// reports itself as "executable file not found in $PATH" and is left alone.
-func (g *Git) explainExecFailure(err error) error {
-	var pathErr *fs.PathError
-	if !errors.As(err, &pathErr) || pathErr.Op != "fork/exec" {
-		return err
-	}
-	if !errors.Is(pathErr.Err, fs.ErrNotExist) || g.workDir == "" {
-		return err
-	}
-	if _, statErr := os.Stat(g.workDir); statErr == nil {
-		// The working directory is there, so it is not the explanation.
-		return err
-	}
-	return &ExecDirError{Dir: g.workDir, Binary: pathErr.Path, Err: err}
-}
-
-// ExecDirError reports a git invocation that could not start because its
-// working directory does not exist. It keeps the original exec error in the
-// chain so errors.Is(err, fs.ErrNotExist) still holds.
-type ExecDirError struct {
-	Dir    string // the working directory git was told to run in
-	Binary string // the git binary exec resolved, named only to rule it out
-	Err    error  // the original *fs.PathError from exec
-}
-
-func (e *ExecDirError) Error() string {
-	return fmt.Sprintf("cannot run in %s: no such directory (git itself resolved to %s — the missing path is the working directory, not the binary)",
-		e.Dir, e.Binary)
-}
-
-func (e *ExecDirError) Unwrap() error { return e.Err }
 
 // cloneOptions configures a clone operation for cloneInternal.
 type cloneOptions struct {

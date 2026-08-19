@@ -621,7 +621,7 @@ func runDeaconStop(cmd *cobra.Command, args []string) error {
 	stopDeaconNudgePoller(sessionName)
 
 	// Try graceful shutdown first (best-effort interrupt)
-	_ = t.SendKeysRaw(sessionName, "C-c")
+	_ = t.InterruptAgent(sessionName, tmux.KeyCtrlC)
 	time.Sleep(100 * time.Millisecond)
 
 	// Kill the session.

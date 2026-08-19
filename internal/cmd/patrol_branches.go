@@ -13,7 +13,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -73,7 +72,7 @@ Examples:
 func init() {
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesJSON, "json", false, "Output as JSON")
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesAll, "all", false, "Show every branch, including landed, queued and active ones")
-	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRig, "rig", "", "Rig to sweep (default: GT_RIG, else inferred from cwd, else the only registered rig)")
+	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRig, "rig", "", "Rig to sweep (default: infer from cwd or GT_RIG)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesTarget, "target", "", "Target branch to compare against (default: the rig's default branch)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRemote, "remote", "origin", "Remote to sweep (branches are listed from its PUSH url)")
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesNoFetch, "no-fetch", false, "Skip refreshing the target ref before comparing (faster, and wrong if the target moved)")
@@ -95,20 +94,23 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	rigName, rigSource, err := resolvePatrolBranchesRig(townRoot, patrolBranchesRig)
-	if err != nil {
-		return err
+	rigName := patrolBranchesRig
+	if rigName == "" {
+		rigName = os.Getenv("GT_RIG")
+	}
+	if rigName == "" {
+		rigName, err = inferRigFromCwd(townRoot)
+		if err != nil {
+			return fmt.Errorf("could not determine rig: %w\nUse --rig to specify", err)
+		}
 	}
 
 	rigPath := filepath.Join(townRoot, rigName)
 	if _, statErr := os.Stat(rigPath); statErr != nil {
-		return fmt.Errorf("rig %s not found at %s (%s)", rigName, rigPath, rigSource)
+		return fmt.Errorf("rig %s not found at %s", rigName, rigPath)
 	}
 
 	repoGit := getRepoGitForRig(rigPath)
-	if err := ensureRigRepoUsable(rigName, rigPath, rigSource, repoGit); err != nil {
-		return err
-	}
 	remote := strings.TrimSpace(patrolBranchesRemote)
 	if remote == "" {
 		remote = "origin"
@@ -144,94 +146,6 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 		return writePatrolBranchesJSON(cmd.OutOrStdout(), rigName, result)
 	}
 	return writePatrolBranchesHuman(cmd.OutOrStdout(), rigName, result, patrolBranchesAll)
-}
-
-// resolvePatrolBranchesRig decides which rig to sweep and reports where the
-// answer came from, so a wrong one is traceable rather than merely wrong.
-//
-// An explicit name — --rig or GT_RIG — is honoured as given: an operator who
-// names a rig is asking about that rig, and quietly substituting another would
-// answer a question nobody asked.
-//
-// Inference from cwd is a guess, and a bad guess is the whole of gt-m7cc. It
-// returns the first path component under the town root, which is a rig name
-// only when cwd is inside a rig; run from the town's own mayor/, warrants/ or
-// logs/ and it confidently returns that directory name instead. So an inferred
-// name is checked against the registry before it is used, and a town with
-// exactly one rig answers the question outright rather than failing on a
-// technicality.
-func resolvePatrolBranchesRig(townRoot, explicit string) (name, source string, err error) {
-	if explicit = strings.TrimSpace(explicit); explicit != "" {
-		return explicit, "from --rig", nil
-	}
-	if env := strings.TrimSpace(os.Getenv("GT_RIG")); env != "" {
-		return env, "from GT_RIG", nil
-	}
-
-	registered := registeredRigNames(townRoot)
-	inferred, inferErr := inferRigFromCwd(townRoot)
-	if inferErr == nil && (len(registered) == 0 || slicesContains(registered, inferred)) {
-		// An unreadable registry cannot veto the guess, only fail to confirm
-		// it; ensureRigRepoUsable is what stops an unusable one.
-		return inferred, "inferred from the current directory", nil
-	}
-	if len(registered) == 1 {
-		return registered[0], "defaulted to the only registered rig", nil
-	}
-
-	detail := "the current directory is not inside a rig"
-	if inferErr == nil {
-		detail = fmt.Sprintf("%q is not a registered rig", inferred)
-	}
-	if len(registered) == 0 {
-		return "", "", fmt.Errorf("could not determine rig: %s, and no rigs are registered in %s\nUse --rig to specify",
-			detail, filepath.Join(townRoot, "mayor", "rigs.json"))
-	}
-	return "", "", fmt.Errorf("could not determine rig: %s\nUse --rig to specify one of: %s",
-		detail, strings.Join(registered, ", "))
-}
-
-// registeredRigNames lists the rigs in the town registry, sorted.
-//
-// An unreadable registry yields nothing, which callers must read as "could not
-// check" and never as "there are none" — the two are indistinguishable in the
-// return value, so the only safe use of an empty result is to skip the check.
-func registeredRigNames(townRoot string) []string {
-	cfg, cfgErr := config.LoadRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"))
-	if cfgErr != nil || cfg == nil {
-		return nil
-	}
-	names := make([]string, 0, len(cfg.Rigs))
-	for rigName := range cfg.Rigs {
-		names = append(names, rigName)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// ensureRigRepoUsable proves the resolved repository exists before any git is
-// asked to run in it.
-//
-// A git handed a working directory it cannot chdir into fails at exec, and the
-// failure names the git BINARY rather than the missing directory — so an
-// operator goes looking for a broken git installation, which was never the
-// problem (gt-m7cc). The git layer now re-attributes that error, but this is
-// the message worth having: it can name the rig that was picked, say where
-// that came from, and give the flag that overrides it.
-func ensureRigRepoUsable(rigName, rigPath, source string, repoGit *git.Git) error {
-	workDir := repoGit.WorkDir()
-	if workDir == "" {
-		// A bare mirror: git is passed --git-dir and never chdirs.
-		return nil
-	}
-	if _, statErr := os.Stat(workDir); statErr == nil {
-		return nil
-	}
-	bare, worktree := rigRepoCandidates(rigPath)
-	return fmt.Errorf("no repository for rig %q at %s (%s)\n"+
-		"  looked for a bare mirror at %s and a worktree at %s — neither exists\n"+
-		"  pass --rig <name> or run from a rig worktree",
-		rigName, rigPath, source, bare, worktree)
 }
 
 // branchSweepRefResolver is the slice of git that target selection needs.
