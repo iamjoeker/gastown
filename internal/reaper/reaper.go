@@ -115,12 +115,17 @@ type ScanResult struct {
 
 // ReapResult holds the results of a reap operation.
 type ReapResult struct {
-	Database            string    `json:"database"`
-	Reaped              int       `json:"reaped"`
-	MoleculeStepsClosed int       `json:"molecule_steps_closed,omitempty"`
-	OpenRemain          int       `json:"open_remain"`
-	DryRun              bool      `json:"dry_run,omitempty"`
-	Anomalies           []Anomaly `json:"anomalies,omitempty"`
+	Database            string `json:"database"`
+	Reaped              int    `json:"reaped"`
+	MoleculeStepsClosed int    `json:"molecule_steps_closed,omitempty"`
+	OpenRemain          int    `json:"open_remain"`
+	// Passes counts the closing rounds Reap ran, including the final round that
+	// closed nothing and thereby proved the fixed point. A run with nothing to do
+	// is 1; any run that closes anything is at least 2. Omitted for dry runs,
+	// which close nothing and so run no rounds at all.
+	Passes    int       `json:"passes,omitempty"`
+	DryRun    bool      `json:"dry_run,omitempty"`
+	Anomalies []Anomaly `json:"anomalies,omitempty"`
 }
 
 // PurgeResult holds the results of a purge operation.
@@ -175,6 +180,15 @@ const (
 	// being wrong. Raised to 3000 so the alert tracks runaway growth rather than
 	// the normal working set. See hq-57jr8.
 	DefaultAlertThreshold = 3000
+	// maxReapPasses bounds Reap's fixed-point loop (see the loop in Reap for why
+	// one pass cannot converge). Each pass releases the children of whatever the
+	// previous pass closed, so the passes a real cascade needs is the depth of the
+	// molecule/parent chain — 2-4 in the field, and every pass past the last one
+	// with work is two cheap COUNT-shaped SELECTs that return nothing. The limit
+	// exists only so a candidate query that somehow reopens work cannot spin
+	// against production Dolt until the context deadline; reaching it is an
+	// anomaly, not a normal outcome.
+	maxReapPasses = 20
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
@@ -556,6 +570,10 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 // Reap closes stale wisps in a database whose parent molecule is already closed.
 // UPDATEs are batched to avoid holding a write lock for extended periods on large tables.
+//
+// A real (non-dry-run) call is a FIXED POINT: it repeats its closing passes until
+// a pass closes nothing, so a caller never has to iterate to finish the cascade
+// (gt-r1b). See the loop below for why one pass of each cannot converge.
 func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapResult, error) {
 	// Use a longer timeout to accommodate batched processing across large tables.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -575,6 +593,12 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
 	if dryRun {
+		// These counts are ONE pass, and so a lower bound on what a real reap
+		// closes: they report the wisps closable against the database as it stands
+		// now, and cannot see the cascade a close releases (a molecule wisp counted
+		// here frees its steps only once it is actually closed). Simulating that
+		// would mean mutating, which is the one thing a dry run must not do. Read a
+		// dry-run count as "at least this many", not as a prediction of Reaped.
 		moleculeStepCountQuery := fmt.Sprintf(
 			"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent'",
 			moleculeStepJoin, openWispStatusWhere)
@@ -606,11 +630,6 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	moleculeStepIDQuery := fmt.Sprintf(
 		"SELECT w.id FROM wisps w %s WHERE %s AND w.issue_type != 'agent' LIMIT %d",
 		moleculeStepJoin, openWispStatusWhere, DefaultBatchSize)
-	moleculeStepsClosed, stepsStalled, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
-	if err != nil {
-		return nil, err
-	}
-	result.MoleculeStepsClosed = moleculeStepsClosed
 
 	// Batch UPDATE: select IDs in chunks, update each chunk.
 	// This avoids holding a write lock on the entire table for minutes.
@@ -621,10 +640,69 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		"SELECT w.id FROM wisps w %s %s WHERE %s LIMIT %d",
 		parentJoin, moleculeStepExcludeJoin, whereClause, DefaultBatchSize)
 
-	totalReaped, staleStalled, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
-	if err != nil {
-		return nil, err
+	// Run both passes to a FIXED POINT rather than once each (gt-r1b).
+	//
+	// The two passes feed each other, so one round of each cannot converge:
+	//
+	//   - The stale pass closes any wisp past max-age, molecule wisps included.
+	//     closedMoleculeStepSubquery selects steps whose parent molecule is
+	//     ALREADY closed, so the steps of a molecule this round just closed only
+	//     become step-pass candidates afterwards.
+	//   - Symmetrically, parentExcludeJoin holds a child back while any parent is
+	//     open, so closing a parent in the step pass releases its children to the
+	//     stale pass.
+	//
+	// Observed on hq at --max-age=24h: run 1 reaped 23 (3 of them orphaned
+	// molecule wisps) and closed 0 steps; run 2 closed 9 steps as the cascade;
+	// runs 3-4 drained the rest. A single invocation left 10 wisps open and
+	// reported success, and nothing downstream re-checked. Looping here — rather
+	// than asking every caller and formula to iterate — is what makes one call
+	// honour its own postcondition.
+	//
+	// Termination: a round that closes nothing ends the loop, and every close
+	// moves a row out of the open set the candidate queries read, so progress is
+	// monotone. maxReapPasses is a backstop for a candidate/UPDATE pair that
+	// somehow reopens work, not the expected exit — exhausting it is reported as
+	// an anomaly rather than passed off as a converged run.
+	var (
+		moleculeStepsClosed        int
+		totalReaped                int
+		stepsStalled, staleStalled int
+		converged                  bool
+	)
+	for result.Passes = 1; result.Passes <= maxReapPasses; result.Passes++ {
+		stepsThisPass, stepsStalledThisPass, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
+		if err != nil {
+			return nil, err
+		}
+		staleThisPass, staleStalledThisPass, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
+		if err != nil {
+			return nil, err
+		}
+
+		moleculeStepsClosed += stepsThisPass
+		totalReaped += staleThisPass
+		// Stalls are the CURRENT disagreement, not a running total: a stalled row
+		// is left open, so it is re-selected and re-declined on every later pass.
+		// Summing would multiply one stuck row by the pass count.
+		stepsStalled, staleStalled = stepsStalledThisPass, staleStalledThisPass
+
+		if stepsThisPass+staleThisPass == 0 {
+			converged = true
+			break
+		}
 	}
+	if !converged {
+		result.Passes = maxReapPasses
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type: "reap_did_not_converge",
+			Message: fmt.Sprintf(
+				"reap still closed wisps on pass %d and stopped at the pass limit — closable wisps may remain open; re-run and investigate the candidate queries if it recurs",
+				maxReapPasses),
+			Count: maxReapPasses,
+		})
+	}
+	result.MoleculeStepsClosed = moleculeStepsClosed
 
 	// A stalled batch means a candidate query and the UPDATE disagree about what
 	// is closable. The loop stops rather than re-selecting the same rows forever,
