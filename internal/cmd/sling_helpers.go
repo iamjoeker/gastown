@@ -1245,6 +1245,19 @@ func spawnFormulaRootOnly(spawnTarget, formulaName, beadID, formulaWorkDir, town
 		Run(); err != nil {
 		style.PrintWarning("could not link root-only wisp %s to %s: %v", rootID, beadID, err)
 	}
+
+	// Classify the root for gt compact (gt-fqd5), the same post-spawn UPDATE the
+	// three other molecule spawn sites make. Splitting the pour = true path off
+	// to bondFormulaDirect left this one as the only spawner that never
+	// classified (gt-3gbt). No formula declares a wisp_type today, so it is a
+	// no-op — but an unclassified wisp is SKIPPED by gt compact rather than
+	// collected, so the first pour = false formula to declare one would leak its
+	// roots forever with no error to show for it. includeChildren is false for
+	// the same reason as the patrol spawner: --root-only means there are none.
+	stampMoleculeWispType(formulaName, townRoot, "", rootID, false, func(c *bdCmd) *bdCmd {
+		return formulaBeadBdCmd(beadID, formulaWorkDir, townRoot, c.args...).WithAutoCommit()
+	})
+
 	return rootID, nil
 }
 
