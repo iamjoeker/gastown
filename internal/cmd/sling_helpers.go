@@ -988,6 +988,17 @@ func nudgeRefinery(rigName, message string) {
 	}
 }
 
+// slingTargetRigName returns the rig that owns an agent address
+// ("gastown/polecats/mutant" → "gastown"). Town-level targets like "deacon"
+// have no rig, which is exactly what formula resolution wants: an empty rig
+// name skips the rig tier and resolves town > embedded.
+func slingTargetRigName(targetAgent string) string {
+	if rigName, _, found := strings.Cut(targetAgent, "/"); found {
+		return rigName
+	}
+	return ""
+}
+
 // isPolecatTarget checks if the target string refers to a polecat.
 // Returns true if the target format is "rig/polecats/name".
 // This is used to determine if we should respawn a dead polecat
@@ -1058,9 +1069,22 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 	}
 
 	formulaVars := formulaVarsForBead(formulaName, beadID, title, extraVars)
-	wispRootID, err := bondFormulaDirect(resolvedFormula, formulaName, beadID, formulaWorkDir, townRoot, formulaVars)
+
+	// Honor the formula's pour setting (gt-pzx). Only pour = true formulas get
+	// their steps materialized as child wisps; everything else is instantiated
+	// root-only, which is what `gt prime` already assumes for polecats — it
+	// renders the checklist inline from attached_formula and never queries step
+	// children.
+	rigName := beads.GetRigNameForPrefix(townRoot, beads.ExtractPrefix(beadID))
+	var wispRootID string
+	var err error
+	if formulaPoursSteps(resolvedFormula, townRoot, rigName) {
+		wispRootID, err = bondFormulaDirect(resolvedFormula, formulaName, beadID, formulaWorkDir, townRoot, formulaVars)
+	} else {
+		wispRootID, err = spawnFormulaRootOnly(resolvedFormula, formulaName, beadID, formulaWorkDir, townRoot, formulaVars)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("bonding formula %s to bead %s: %w", formulaName, beadID, err)
+		return nil, fmt.Errorf("attaching formula %s to bead %s: %w", formulaName, beadID, err)
 	}
 	telemetry.RecordMolWisp(ctx, formulaName, wispRootID, beadID, nil)
 
@@ -1078,6 +1102,76 @@ func formulaVarsForBead(formulaName, beadID, title string, extraVars []string) [
 	}
 	formulaVars = append(formulaVars, extraVars...)
 	return ensureFormulaRequiredVars(formulaName, formulaVars)
+}
+
+// formulaPoursSteps reports whether bd should be asked to materialize the
+// formula's steps as child wisps.
+//
+// gt-pzx: internal/formula has parsed `pour` since the field was added and
+// nothing ever read it, so both sling paths poured every formula. `bd mol wisp
+// create` honors the setting through --root-only — that is how patrol wisps
+// stay one row — but `bd mol bond` has no such flag, so formula-on-bead sling
+// materialized eight step wisps for every mol-polecat-work dispatch and 26 for
+// a slung patrol formula. Nothing reads those rows: gt prime renders the
+// checklist inline from the formula file.
+//
+// A formula we cannot resolve or parse falls back to pouring, which is the
+// behavior every caller had before this check existed. Losing steps is the
+// worse failure of the two.
+func formulaPoursSteps(formulaRef, townRoot, rigName string) bool {
+	pours, err := formula.Pours(formulaRef, townRoot, rigName)
+	if err == nil {
+		return pours
+	}
+	// Sling accepts formula names without the mol- prefix, the same retry
+	// verifyFormulaExists makes before declaring a formula missing.
+	if !strings.HasPrefix(formulaRef, "mol-") {
+		if pours, retryErr := formula.Pours("mol-"+formulaRef, townRoot, rigName); retryErr == nil {
+			return pours
+		}
+	}
+	style.PrintWarning("could not read pour setting for %s (%v) — materializing steps", formulaRef, err)
+	return true
+}
+
+// spawnFormulaRootOnly instantiates a pour = false formula as a bare root wisp
+// and wires the same dependency edge `bd mol bond` would have created.
+//
+// bd's bond verb spawns the whole proto tree and takes no --root-only flag, so
+// honoring pour = false means driving the two halves by hand: create the root
+// wisp root-only, then add the blocks edge from wisp to bead. `bd dep add
+// <blocked> <blocker>` writes the same row bond does (issue_id=<wisp>,
+// depends_on_issue_id=<bead>, type=blocks).
+//
+// This is not a return to the pre-#288 two-step path. That one attached with
+// `bd mol bond <wispRoot> <bead>`, a mol+mol join that failed outright on wisp
+// IDs bd would not resolve and needed an orphan-cleanup fallback (gt-4gjd).
+// `bd dep add` does not spawn or resolve protos, and a failed edge is warned
+// about rather than fatal: gt reaches the wisp through the bead's
+// attached_molecule field, not through this row.
+func spawnFormulaRootOnly(spawnTarget, formulaName, beadID, formulaWorkDir, townRoot string, vars []string) (string, error) {
+	spawnArgs := []string{"mol", "wisp", "create", spawnTarget, "--root-only", "--json"}
+	for _, variable := range vars {
+		spawnArgs = append(spawnArgs, "--var", variable)
+	}
+	spawnOut, err := formulaBeadBdCmd(beadID, formulaWorkDir, townRoot, spawnArgs...).
+		WithAutoCommit().
+		Output()
+	if err != nil {
+		return "", fmt.Errorf("%w (args: %s)", err, strings.Join(spawnArgs, " "))
+	}
+
+	rootID := parseBondSpawnRootID(spawnOut, formulaName, beadID, "")
+	if rootID == "" {
+		return "", fmt.Errorf("root-only spawn output missing spawned root id (output: %s)", trimJSONForError(spawnOut))
+	}
+
+	if err := formulaBeadBdCmd(beadID, formulaWorkDir, townRoot, "dep", "add", rootID, beadID).
+		WithAutoCommit().
+		Run(); err != nil {
+		style.PrintWarning("could not link root-only wisp %s to %s: %v", rootID, beadID, err)
+	}
+	return rootID, nil
 }
 
 // bondFormulaDirect attaches a formula to a bead through bd's canonical bond path.
