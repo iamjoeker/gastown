@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -464,6 +465,96 @@ exit 0
 	// Sanity: stdin must contain newlines (it's the multi-line description).
 	if !strings.Contains(stdin, "\n") {
 		t.Errorf("expected stdin to be multi-line, got %q", stdin)
+	}
+}
+
+// TestCreateEscalationDeliveryBead_IsDurableAndLinked verifies the bead written
+// for the "bead" routing action is the artifact the rest of the escalation
+// machinery keys off: durable (never --ephemeral) and carrying the
+// "escalation:<record-id>" link plus the severity label.
+//
+// Regression test for gt-3i4e: the "bead" action was reported as created on
+// every escalation and implemented nowhere, so a route with no mail: action
+// (the default "low" route) left the escalation as a wisp only — GC'd unread.
+func TestCreateEscalationDeliveryBead_IsDurableAndLinked(t *testing.T) {
+	stubDir := t.TempDir()
+	argsPath := filepath.Join(stubDir, "args.txt")
+	stdinPath := filepath.Join(stubDir, "stdin.txt")
+
+	stubScript := `#!/bin/sh
+for a in "$@"; do
+  printf '%s\n' "$a" >> "` + argsPath + `"
+done
+cat > "` + stdinPath + `"
+echo '{"id":"hq-copy1","title":"x","status":"open","priority":3,"type":"task","labels":["gt:escalation"]}'
+exit 0
+`
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+
+	b := New(t.TempDir())
+	issue, err := b.CreateEscalationDeliveryBead("[LOW] disk filling", "Escalation ID: hq-rec1\nSeverity: low\n", "hq-rec1", "low")
+	if err != nil {
+		t.Fatalf("CreateEscalationDeliveryBead: %v", err)
+	}
+	if issue.ID != "hq-copy1" {
+		t.Fatalf("expected the created bead, got %#v", issue)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	args := strings.Split(string(argsData), "\n")
+	has := func(want string) bool { return slices.Contains(args, want) }
+
+	for _, want := range []string{
+		"--labels=gt:escalation",
+		"--labels=escalation:hq-rec1", // what openEscalationCopies lists by
+		"--labels=severity:low",
+		"--priority=3",
+		"--body-file=-", // bd 1.0.3+ rejects newlines in flag values (dc-1bxe)
+	} {
+		if !has(want) {
+			t.Errorf("expected %q in bd args, got:\n%s", want, string(argsData))
+		}
+	}
+	// The whole point: this bead must OUTLIVE the escalation record wisp.
+	if has("--ephemeral") {
+		t.Error("the escalation delivery bead must not be ephemeral — a wisp is exactly what gets GC'd unread")
+	}
+
+	stdinData, err := os.ReadFile(stdinPath)
+	if err != nil {
+		t.Fatalf("read stub stdin: %v", err)
+	}
+	if !strings.Contains(string(stdinData), "hq-rec1") {
+		t.Errorf("expected the escalation body on stdin, got %q", string(stdinData))
+	}
+}
+
+func TestCreateEscalationDeliveryBead_RefusesUnlinkedBead(t *testing.T) {
+	// An unlinked copy is unreachable from its record: it would never be listed,
+	// acked or closed with the escalation.
+	if _, err := New(t.TempDir()).CreateEscalationDeliveryBead("[LOW] x", "body", "", "low"); err == nil {
+		t.Fatal("expected an error when no escalation record ID is given")
+	}
+}
+
+func TestEscalationPriority(t *testing.T) {
+	for severity, want := range map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3} {
+		got, ok := escalationPriority(severity)
+		if !ok || got != want {
+			t.Errorf("escalationPriority(%q) = %d, %v; want %d, true", severity, got, ok, want)
+		}
+	}
+	// An unknown severity must not silently land at P0.
+	if _, ok := escalationPriority("bogus"); ok {
+		t.Error("escalationPriority should not map an unknown severity")
 	}
 }
 
