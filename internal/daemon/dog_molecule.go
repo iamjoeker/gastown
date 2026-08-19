@@ -3,14 +3,15 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/formula"
 )
 
 const (
@@ -47,14 +48,8 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 // Graceful degradation: if bd fails, the dog still does its work — molecule
 // tracking is observability, not control flow.
 type dogMol struct {
-	rootID  string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
-	stepIDs map[string]string // step slug -> wisp issue ID
-	// childIDs is every child wisp discovered under rootID, including the ones
-	// discoverSteps could not map to a known slug. stepIDs drives lifecycle
-	// calls and so only holds recognized steps; wisp_type has to reach the
-	// unrecognized rows too, or a formula gaining a step nobody taught
-	// discoverSteps about would quietly go back to landing unclassified.
-	childIDs []string
+	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
+	stepIDs  map[string]string // step slug -> wisp issue ID
 	bdPath   string
 	townRoot string
 	logger   interface{ Printf(string, ...interface{}) }
@@ -94,51 +89,8 @@ func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *do
 	// Discover step IDs by listing children of the root wisp.
 	dm.discoverSteps()
 
-	dm.stampWispType(formulaName)
-
 	d.logger.Printf("dog_molecule: poured %s → %s (%d steps)", formulaName, dm.rootID, len(dm.stepIDs))
 	return dm
-}
-
-// stampWispType writes wisp_type onto the dog molecule root and every child
-// wisp under it (gt-fqd5).
-//
-// bd exposes wisp_type only on `bd create --wisp-type`, and this molecule was
-// not created that way — `bd mol wisp <formula>` takes no such flag and
-// `bd update` has none either — so an UPDATE is the only write path. Dog
-// molecules were the largest untyped population in the wisps table.
-//
-// The type comes from the formula's [vars.wisp_type] when it declares one, and
-// otherwise defaults to gc_report: every mol-dog-* formula is an operational
-// maintenance run (reap, export, backup, compact, checkpoint, doctor), which is
-// what that bucket names. The fallback is not cosmetic — formulas provisioned
-// to a town's .beads/formulas/ shadow the embedded copies, so a town whose disk
-// copy predates any declaration would otherwise keep landing unclassified
-// rows. gc_report's TTL is 24h, identical to the untyped default these already
-// got, so nothing expires sooner than it does today.
-//
-// Non-fatal: dog molecules are observability, and an unclassified wisp is the
-// pre-gt-fqd5 status quo.
-func (dm *dogMol) stampWispType(formulaName string) {
-	if dm.rootID == "" {
-		return
-	}
-
-	wispType := formula.DeclaredWispType(formulaName, dm.townRoot, "")
-	if wispType == "" {
-		wispType = beads.WispTypeGCReport
-	}
-
-	ids := append([]string{dm.rootID}, dm.childIDs...)
-	stmt, err := beads.WispTypeUpdateSQL(wispType, ids)
-	if err != nil {
-		dm.logger.Printf("dog_molecule: wisp_type %q for %s unusable (non-fatal): %v", wispType, formulaName, err)
-		return
-	}
-	if _, err := dm.runBd("sql", stmt); err != nil {
-		dm.logger.Printf("dog_molecule: set wisp_type=%s on %s +%d children failed (non-fatal): %v",
-			wispType, dm.rootID, len(dm.childIDs), err)
-	}
 }
 
 // closeStep marks a molecule step as closed.
@@ -256,13 +208,7 @@ func (dm *dogMol) discoverSteps() {
 	// Map known step slugs from each child's title. The wisp title typically starts
 	// with the step title from the formula.
 	for _, child := range children {
-		if child.ID == "" {
-			continue
-		}
-		// Recorded before the title check: a child with no title is still a row
-		// in the wisps table and still needs a wisp_type.
-		dm.childIDs = append(dm.childIDs, child.ID)
-		if child.Title == "" {
+		if child.ID == "" || child.Title == "" {
 			continue
 		}
 
@@ -308,14 +254,75 @@ func (dm *dogMol) discoverSteps() {
 	}
 }
 
-// childInfo is beads.ChildInfo. The parsing lives in internal/beads so the
-// cmd-side wisp classifier decodes bd's parent-keyed children envelope with the
-// same code rather than a second, subtly wrong copy of it (gt-fqd5).
-type childInfo = beads.ChildInfo
+// childInfo holds fields from child wisp JSON used by discoverSteps and
+// closeRemainingSteps.
+type childInfo struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
 
 // parseChildrenJSON parses the output of `bd show <id> --children --json`.
+// bd returns a map keyed by parent ID plus envelope metadata:
+// {"hq-wisp-abc": [{...}, ...], "schema_version": 1}.
+// For legacy compatibility, a bare array is also accepted.
 func parseChildrenJSON(raw string) ([]childInfo, error) {
-	return beads.ParseChildrenJSON(raw)
+	data := bytes.TrimSpace([]byte(raw))
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty children JSON")
+	}
+
+	var arr []childInfo
+	if data[0] == '[' {
+		if err := json.Unmarshal(data, &arr); err != nil {
+			return nil, err
+		}
+		return arr, nil
+	}
+
+	if data[0] != '{' {
+		return nil, fmt.Errorf("unrecognized JSON shape: %.200s", raw)
+	}
+
+	var wrapped map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return nil, err
+	}
+
+	keys := make([]string, 0, len(wrapped))
+	for key := range wrapped {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var children []childInfo
+	sawChildArray := false
+	for _, key := range keys {
+		if key == "schema_version" {
+			continue
+		}
+
+		value := bytes.TrimSpace(wrapped[key])
+		if len(value) == 0 {
+			return nil, fmt.Errorf("empty child payload for key %q", key)
+		}
+		if value[0] != '[' {
+			return nil, fmt.Errorf("non-array child payload for key %q", key)
+		}
+
+		var group []childInfo
+		if err := json.Unmarshal(value, &group); err != nil {
+			return nil, fmt.Errorf("parse child array for key %q: %w", key, err)
+		}
+		children = append(children, group...)
+		sawChildArray = true
+	}
+
+	if !sawChildArray {
+		return nil, fmt.Errorf("children JSON object has no child arrays")
+	}
+
+	return children, nil
 }
 
 // knownSteps returns the list of known step slugs for debugging.

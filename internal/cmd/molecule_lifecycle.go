@@ -283,19 +283,9 @@ squashed_at: %s
 			Title:       digestTitle,
 			Description: digestDesc,
 			Labels:      []string{"gt:task"},
-			Priority:    4, // P4 - backlog priority for digests
+			Priority:    4,       // P4 - backlog priority for digests
 			Actor:       target,
-			Ephemeral:   true, // Don't export to JSONL - daily aggregation handles permanent record
-			// DELIBERATELY NO WispType (gt-fqd5). A per-cycle digest reads like
-			// compaction's "patrol" bucket, but that bucket's TTL is 24h and
-			// these digests are closed on creation, so classifying them would
-			// make gt compact delete each one 24h later — while the aggregation
-			// that consumes them, `gt patrol digest --yesterday`, reads digests
-			// that are 24-48h old by the time it runs. The typed version
-			// destroys its own input.
-			//
-			// Since gt-ktvs an untyped wisp is skipped entirely, so leaving this
-			// empty is what keeps the digests alive for aggregation.
+			Ephemeral:   true,    // Don't export to JSONL - daily aggregation handles permanent record
 		})
 		if err != nil {
 			return fmt.Errorf("creating digest: %w", err)
