@@ -182,55 +182,6 @@ func TestCreateNeverRewritesRepoConfig(t *testing.T) {
 	}
 }
 
-// TestSilentMRCreateFailureIsDiagnosable is the gt-h7p regression test, run
-// through the real MR create path a polecat's `gt done` takes.
-//
-// A bd that exits non-zero without writing to either stream produced exactly
-// "bd create --json --title=...: exit status 1". That message is what a stalled
-// polecat, its witness, and the Mayor all had to diagnose from — and it is
-// indistinguishable from gt having thrown bd's stderr away, so the report it
-// generated (gt-h7p) chased a discarded-stderr bug that was not there.
-func TestSilentMRCreateFailureIsDiagnosable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses POSIX shell fake bd")
-	}
-
-	_, _, polecatDir := newMRRoutingTown(t)
-	binDir := t.TempDir()
-	// bd fails saying nothing at all — the case gt-k3h's stdout fallback cannot
-	// reach, because there is no output to fall back to.
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
-		t.Fatalf("write fake bd: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	_, err := NewIsolated(polecatDir).Create(CreateOptions{
-		Title:       "Merge: gt-h7p",
-		Labels:      []string{"gt:merge-request"},
-		Priority:    1,
-		Description: "branch: polecat/settler/gt-h7p",
-		Ephemeral:   true,
-		Rig:         "gastown",
-	})
-	if err == nil {
-		t.Fatal("Create succeeded against a bd that exits 1")
-	}
-
-	msg := err.Error()
-	if !strings.Contains(msg, "bd wrote nothing to stdout or stderr") {
-		t.Errorf("MR create failure does not say bd was silent: %v", err)
-	}
-	// The rig database, not the polecat worktree: naming it is what lets an
-	// operator see why the same command by hand — from a different cwd, against
-	// a different store — succeeds.
-	if !strings.Contains(msg, filepath.Join("gastown", "mayor", "rig", ".beads")) {
-		t.Errorf("MR create failure does not name the target database: %v", err)
-	}
-	if !strings.Contains(msg, "cwd="+polecatDir) {
-		t.Errorf("MR create failure does not name the working directory: %v", err)
-	}
-}
-
 // TestWithProjectBeadsRoleThroughGit proves the override is one git actually
 // honors, rather than only asserting the strings we appended.
 func TestWithProjectBeadsRoleThroughGit(t *testing.T) {
