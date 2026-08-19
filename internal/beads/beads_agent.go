@@ -59,6 +59,16 @@ type AgentFields struct {
 	MRFailed        bool   // True when MR creation was attempted but failed
 	PushFailed      bool   // True when branch push to origin failed (gas-556)
 	CompletionTime  string // RFC3339 timestamp of when gt done was called
+
+	// MRRefused records that gt done deliberately created no merge request
+	// because the source issue was already closed (gt-7qm's gate), leaving a
+	// pushed branch outside the queue. It is NOT MRFailed: nothing went wrong,
+	// so the hook still clears and the session still retires. But the two
+	// outcomes are indistinguishable on the agent bead without it — MRFailed is
+	// false and MRID is empty for both a refusal and an ordinary no-MR
+	// completion — which is how a refused polecat came to read SAFE_TO_NUKE with
+	// its work stranded, visible only in a mail nobody had to read (gt-46rk).
+	MRRefused bool
 }
 
 // Notification level constants
@@ -136,6 +146,9 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 	if fields.PushFailed {
 		lines = append(lines, "push_failed: true")
 	}
+	if fields.MRRefused {
+		lines = append(lines, "mr_refused: true")
+	}
 	if fields.CompletionTime != "" {
 		lines = append(lines, fmt.Sprintf("completion_time: %s", fields.CompletionTime))
 	}
@@ -194,6 +207,8 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.MRFailed = value == "true"
 		case "push_failed":
 			fields.PushFailed = value == "true"
+		case "mr_refused":
+			fields.MRRefused = value == "true"
 		case "completion_time":
 			fields.CompletionTime = value
 		}
@@ -460,6 +475,7 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	fields.LastSourceIssue = ""
 	fields.MRFailed = false
 	fields.PushFailed = false
+	fields.MRRefused = false
 	fields.CompletionTime = ""
 
 	// Update description with cleared fields
@@ -508,6 +524,7 @@ type AgentFieldUpdates struct {
 	LastSourceIssue *string
 	MRFailed        *bool
 	PushFailed      *bool // True when branch push to origin failed (gas-556)
+	MRRefused       *bool // True when gt done declined to open an MR (gt-46rk)
 	CompletionTime  *string
 }
 
@@ -580,6 +597,9 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	}
 	if updates.PushFailed != nil {
 		fields.PushFailed = *updates.PushFailed
+	}
+	if updates.MRRefused != nil {
+		fields.MRRefused = *updates.MRRefused
 	}
 	if updates.CompletionTime != nil {
 		fields.CompletionTime = *updates.CompletionTime
@@ -664,6 +684,7 @@ type CompletionMetadata struct {
 	HookBead       string // The work bead ID
 	MRFailed       bool   // True when MR creation was attempted but failed
 	PushFailed     bool   // True when branch push to origin failed (gas-556)
+	MRRefused      bool   // True when gt done declined to open an MR (gt-46rk)
 	CompletionTime string // RFC3339 timestamp
 }
 
@@ -672,6 +693,7 @@ type CompletionMetadata struct {
 func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error {
 	mrFailed := meta.MRFailed
 	pushFailed := meta.PushFailed
+	mrRefused := meta.MRRefused
 	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
 		ExitType:        &meta.ExitType,
 		MRID:            &meta.MRID,
@@ -679,6 +701,7 @@ func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error
 		LastSourceIssue: &meta.HookBead,
 		MRFailed:        &mrFailed,
 		PushFailed:      &pushFailed,
+		MRRefused:       &mrRefused,
 		CompletionTime:  &meta.CompletionTime,
 	})
 }
@@ -695,6 +718,7 @@ func (b *Beads) ClearAgentCompletion(id string) error {
 		LastSourceIssue: &empty,
 		MRFailed:        &notFailed,
 		PushFailed:      &notFailed,
+		MRRefused:       &notFailed,
 		CompletionTime:  &empty,
 	})
 }

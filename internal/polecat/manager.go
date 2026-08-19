@@ -2446,6 +2446,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
+		input.MRRefused = fields.MRRefused
 		input.ActiveMR = fields.ActiveMR
 		activeMR = fields.ActiveMR
 		sourceHint = issue
@@ -2516,12 +2517,15 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = m.mqNotRequiredSource(workIssue)
-	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
+	// A terminal source bead no longer skips this lookup: the closed bead IS the
+	// stranding signature, so skipping it blinded the check to both directions
+	// of the fact — no MR at all, and an MR someone else submitted (gt-46rk).
+	if input.MQCheckRequired && input.HasSubmittableWork && !input.MQNotRequired {
 		mr, err := m.beads.FindMRForBranchAny(input.Branch)
 		if err != nil {
 			input.MQLookupFailed = true
-		} else {
-			input.MRSubmitted = mr != nil
+		} else if mr != nil {
+			ApplyBranchMRToWorkstateInput(&input, mr.ID, !beads.IssueStatus(mr.Status).IsTerminal())
 		}
 	}
 	return input
