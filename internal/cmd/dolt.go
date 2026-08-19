@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1228,6 +1229,52 @@ func filesystemCleanupRemedy(townRoot string, sup *doltserver.Supervisor) string
 	return b.String()
 }
 
+// staleManifestRemedy renders the operator instructions printed when migration
+// finishes but some databases on disk are not served, which usually means a
+// stale manifest that `dolt fsck --repair` rewrites.
+//
+// Same hazard as filesystemCleanupRemedy, same reason (gt-4ruo, sibling of
+// gt-xvwu): `dolt fsck --repair` WRITES to the database directory, so the stop
+// step has to stop whatever would otherwise put a live server back on that
+// directory. Under a systemd unit with Restart=always, `gt dolt stop` signals
+// the process and the supervisor starts a replacement ~5s later — the operator
+// then repairs a database a running server holds open.
+//
+// dataDir is the town's .dolt-data directory; missing is the set of databases
+// that exist there but are not served. Naming each one beats a `<db>`
+// placeholder: the operator copies a path instead of composing one, and a
+// mistyped path under `fsck --repair` is a write to the wrong database.
+func staleManifestRemedy(dataDir string, missing []string, sup *doltserver.Supervisor) string {
+	var b strings.Builder
+
+	b.WriteString("  This usually means the database has a stale manifest from migration.\n")
+	b.WriteString("  To fix:\n\n")
+
+	if desc := sup.Describe(); desc != "" {
+		b.WriteString(fmt.Sprintf("  ! This server is supervised by %s.\n", desc))
+		if sup.AutoRestarts() {
+			b.WriteString("    `gt dolt stop` would only signal the process — the supervisor starts\n")
+			b.WriteString("    a new server on the same data directory seconds later. Stop the unit.\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("    1. Stop the server:   %s\n", sup.StopCommand()))
+	b.WriteString("    2. Verify it is down: gt dolt status    # REQUIRED: must say \"not running\"\n")
+	b.WriteString("    3. Repair the DB(s):\n")
+	for _, db := range missing {
+		b.WriteString(fmt.Sprintf("         cd %s && dolt fsck --repair\n", filepath.Join(dataDir, db)))
+	}
+	b.WriteString(fmt.Sprintf("    4. Restart:           %s\n\n", sup.StartCommand()))
+
+	b.WriteString("  `dolt fsck --repair` writes to the database directory. Running it while\n")
+	b.WriteString("  any Dolt server still holds that database open can corrupt data\n")
+	b.WriteString("  unrecoverably. Verify the server is stopped first — do not skip the\n")
+	b.WriteString("  status check.\n")
+
+	return b.String()
+}
+
 // Thresholds for the orphan-ratio balk (gt-xvh). A high ratio means the run is
 // about to delete most of the town, which is worth a stop either way — but see
 // orphanRatioBalkMessage for why it is not evidence that detection broke.
@@ -1531,10 +1578,23 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Gas Town daemon is running. Stop it first with: gt daemon stop\n\nThe daemon spawns bd processes that can race with migration.\nStop the daemon, run migration, then restart it.")
 	}
 
-	// Check if Dolt server is running - must stop first
-	running, _, _ := doltserver.IsRunning(townRoot)
+	// Check if Dolt server is running - must stop first. Migration moves
+	// database directories on disk, so the advice for getting the server down
+	// has to name the thing that keeps it down: under an auto-restarting
+	// supervisor `gt dolt stop` only signals the process, and an operator who
+	// re-runs migrate inside the restart window gets a filesystem migration
+	// under a live server. (gt-4ruo)
+	//
+	// The check itself stays point-in-time — nothing holds the server down for
+	// the duration of the migration. That residual race is gt-2xsa.
+	running, pid, _ := doltserver.IsRunning(townRoot)
 	if running {
-		return fmt.Errorf("Dolt server is running. Stop it first with: gt dolt stop")
+		sup := doltserver.DetectSupervisor(pid)
+		msg := fmt.Sprintf("Dolt server is running. Stop it first with: %s", sup.StopCommand())
+		if sup.AutoRestarts() {
+			msg += fmt.Sprintf("\n\nThis server is supervised by %s: `gt dolt stop` would only\nsignal the process and the supervisor starts a new server on the same data\ndirectory seconds later, while migration is moving it.", sup.Describe())
+		}
+		return errors.New(msg)
 	}
 
 	// Find databases to migrate
@@ -1604,12 +1664,12 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 			for _, db := range missing {
 				fmt.Printf("  - %s\n", db)
 			}
-			fmt.Printf("\n  Served databases: %v\n", served)
-			fmt.Printf("\n  This usually means the database has a stale manifest from migration.\n")
-			fmt.Printf("  To fix, try:\n")
-			fmt.Printf("    1. Stop the server:  %s\n", style.Dim.Render("gt dolt stop"))
-			fmt.Printf("    2. Repair the DB:    %s\n", style.Dim.Render("cd \"$GT_ROOT\"/.dolt-data/<db> && dolt fsck --repair"))
-			fmt.Printf("    3. Restart:           %s\n", style.Dim.Render("gt dolt start"))
+			fmt.Printf("\n  Served databases: %v\n\n", served)
+			// Detect against the server that is running NOW, not the PID gt
+			// recorded when it started one: on a supervised town the process
+			// gt started may already have been replaced.
+			_, pid, _ := doltserver.IsRunning(townRoot)
+			fmt.Print(staleManifestRemedy(config.DataDir, missing, doltserver.DetectSupervisor(pid)))
 			return fmt.Errorf("migration incomplete: %d database(s) exist on disk but are not served: %v", len(missing), missing)
 		} else {
 			fmt.Printf("  %s All %d databases verified as served\n", style.Bold.Render("✓"), len(served))
