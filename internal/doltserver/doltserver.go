@@ -3004,13 +3004,6 @@ type OrphanedDatabase struct {
 
 	// SizeBytes is the total size of the database directory.
 	SizeBytes int64
-
-	// CreatedAt is the filesystem birth time of the database directory, or the
-	// zero time when the platform does not record one. It is the evidence that
-	// separates test fixtures (created in a burst, minutes ago) from real
-	// databases (created when the town was set up); see dirBirthTime for why
-	// mtime is not substituted when birth time is unavailable.
-	CreatedAt time.Time
 }
 
 // protectedSharedServerDatabases returns the registry of databases that are
@@ -3035,48 +3028,6 @@ func isProtectedSharedServerDatabase(dbName string) bool {
 	return ok
 }
 
-// ReferencedDatabases returns the set of database names that orphan detection
-// treats as claimed. Exported so that reporting surfaces (`gt dolt list`) can
-// label databases with the same inputs `gt dolt cleanup` deletes by, instead of
-// deriving a second, narrower answer of their own. (gt-ti84)
-func ReferencedDatabases(townRoot string) map[string]bool {
-	return collectReferencedDatabases(townRoot)
-}
-
-// IsOrphanDatabase reports whether dbName is an orphan, given the referenced
-// set from ReferencedDatabases.
-//
-// This is the single orphan predicate. `gt dolt list` and `gt dolt cleanup` are
-// the two surfaces an operator consults before deleting anything, so they must
-// not be able to disagree: list previously called a database an orphan whenever
-// no metadata.json named it, while cleanup also honoured the rig-prefix safety
-// net in collectReferencedDatabases — which is how a real database ("gt") was
-// shown in a deletion list that cleanup would never have touched. (gt-ti84)
-func IsOrphanDatabase(referenced map[string]bool, dbName string) bool {
-	return !referenced[dbName] && !isProtectedSharedServerDatabase(dbName)
-}
-
-// IsRigPrefixDatabase reports whether dbName is named after a rig prefix in
-// rigs.json. Those databases are claimed by the prefix safety net in
-// collectReferencedDatabases (gt-85w7) rather than by any metadata.json, so
-// reporting surfaces need a truthful label for them — "gt" is a real database
-// with no metadata.json pointing at it. (gt-ti84)
-func IsRigPrefixDatabase(townRoot, dbName string) bool {
-	for _, prefix := range configpkg.AllRigPrefixes(townRoot) {
-		if prefix == dbName {
-			return true
-		}
-	}
-	return false
-}
-
-// DatabaseBirthTime returns the filesystem birth time of a database directory
-// and whether the platform recorded one. Callers must not substitute mtime when
-// it reports false — see dirBirthTime. (gt-ti84)
-func DatabaseBirthTime(dbPath string) (time.Time, bool) {
-	return dirBirthTime(dbPath)
-}
-
 // FindOrphanedDatabases scans .dolt-data/ for databases that are not referenced
 // by any rig's metadata.json dolt_database field. These orphans consume disk space
 // and are served by the Dolt server unnecessarily.
@@ -3090,23 +3041,21 @@ func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 	}
 
 	// Collect all referenced database names from metadata.json files
-	referenced := ReferencedDatabases(townRoot)
+	referenced := collectReferencedDatabases(townRoot)
 
 	// Find databases that exist on disk but aren't referenced
 	config := DefaultConfig(townRoot)
 	var orphans []OrphanedDatabase
 	for _, dbName := range databases {
-		if !IsOrphanDatabase(referenced, dbName) {
+		if referenced[dbName] || isProtectedSharedServerDatabase(dbName) {
 			continue
 		}
 		dbPath := filepath.Join(config.DataDir, dbName)
 		size := dirSize(dbPath)
-		created, _ := dirBirthTime(dbPath)
 		orphans = append(orphans, OrphanedDatabase{
 			Name:      dbName,
 			Path:      dbPath,
 			SizeBytes: size,
-			CreatedAt: created,
 		})
 	}
 
