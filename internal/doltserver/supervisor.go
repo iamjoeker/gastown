@@ -98,6 +98,16 @@ func (s *Supervisor) StartCommand() string {
 	return fmt.Sprintf("systemctl %sstart %s", s.systemctlScope(), s.Unit)
 }
 
+// ConfirmStoppedCommand returns the command that PROVES the unit is down, for
+// instructions that must not end at "stop it" — a stop command that failed and
+// a stop command that worked look the same in a terminal.
+func (s *Supervisor) ConfirmStoppedCommand() string {
+	if s == nil || s.Unit == "" {
+		return "gt dolt status"
+	}
+	return fmt.Sprintf("systemctl %sshow -p ActiveState --value %s", s.systemctlScope(), s.Unit)
+}
+
 // Describe renders the supervisor for operator-facing messages, e.g.
 // "systemd unit gt-dolt.service (Restart=always)".
 func (s *Supervisor) Describe() string {
@@ -288,6 +298,238 @@ func parseSystemdUnit(cgroupFile string) (unit string, userUnit bool) {
 		return leaf, strings.Contains(cgPath, "/user@")
 	}
 	return "", false
+}
+
+// SupervisorRecord is the persisted identity of the supervisor that owned this
+// town's Dolt server the last time gt saw one running. It lives in
+// daemon/dolt-state.json.
+//
+// It exists because DetectSupervisor answers "what owns THIS process" from
+// /proc/<pid>/cgroup, so the answer disappears exactly when it is most needed:
+// with the server stopped there is no PID, no cgroup, and no unit name. Every
+// remedy gt prints tells the operator to stop the unit before touching the
+// filesystem, and the commands that then bring a server back up — `gt dolt
+// start`, and the auto-start at the end of `gt dolt migrate` — had no way to
+// find out that a supervisor was ever involved. (gt-cru5)
+//
+// Only identity is stored. Restart=, NRestarts and the start-limit properties
+// are volatile — this town's unit had its Restart policy changed under it on
+// 2026-08-18 (gt-09e4) — so they are re-read from systemd on every recall
+// rather than served stale from disk.
+type SupervisorRecord struct {
+	Kind       string    `json:"kind"`
+	Unit       string    `json:"unit"`
+	UserUnit   bool      `json:"user_unit"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+// Record renders the persistable identity of a detected supervisor. Returns nil
+// when there is no unit to remember.
+func (s *Supervisor) Record() *SupervisorRecord {
+	if s == nil || s.Unit == "" {
+		return nil
+	}
+	return &SupervisorRecord{
+		Kind:       s.Kind,
+		Unit:       s.Unit,
+		UserUnit:   s.UserUnit,
+		ObservedAt: time.Now(),
+	}
+}
+
+// propertyReader reads one systemd unit property. Injected so the recall path
+// is testable without a live systemd.
+type propertyReader func(unit string, userUnit bool, property string) string
+
+// ObserveSupervisor detects the supervisor owning pid and remembers it for this
+// town, returning what it detected.
+//
+// Call it wherever gt already holds the PID of a *running* server — that is the
+// only moment the unit is discoverable, and the remembered answer is what later
+// commands consult once the process is gone. Remembering is best-effort: a
+// failed write costs the memory, never the caller's operation.
+func ObserveSupervisor(townRoot string, pid int) *Supervisor {
+	sup := DetectSupervisor(pid)
+	if sup != nil {
+		_ = RememberSupervisor(townRoot, sup)
+	}
+	return sup
+}
+
+// RememberSupervisor persists sup as the owner of this town's Dolt server.
+//
+// A nil sup, or one with no unit, does NOT erase an existing record. Detection
+// returns nil for "unsupervised" and for every flavour of "cannot tell" —
+// unsupported platform, unreadable /proc, no systemctl — and treating those
+// alike would let one unlucky probe forget a real unit. Records are discarded
+// on recall instead, where the unit's continued existence can be checked
+// directly.
+func RememberSupervisor(townRoot string, sup *Supervisor) error {
+	record := sup.Record()
+	if record == nil {
+		return nil
+	}
+	state, err := LoadState(townRoot)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		state = &State{}
+	}
+	if !supervisorRecordChanged(state.Supervisor, record) {
+		// Steady state. Rewriting dolt-state.json on every status probe would
+		// churn the file for no new information.
+		return nil
+	}
+	state.Supervisor = record
+	return SaveState(townRoot, state)
+}
+
+// supervisorRecordChanged compares the identity fields only: ObservedAt differs
+// on every call and is not a reason to rewrite the file.
+func supervisorRecordChanged(old, current *SupervisorRecord) bool {
+	if old == nil {
+		return current != nil
+	}
+	return old.Unit != current.Unit || old.UserUnit != current.UserUnit || old.Kind != current.Kind
+}
+
+// RecallSupervisor returns the supervisor remembered for this town's Dolt
+// server, with its volatile properties re-read from systemd. Returns nil when
+// nothing is remembered or the unit no longer exists.
+//
+// Unlike DetectSupervisor this answers with the server DOWN, which is the whole
+// point: it is what lets `gt dolt start` hand the start to the unit instead of
+// spawning a server the unit believes is not there.
+func RecallSupervisor(townRoot string) *Supervisor {
+	state, err := LoadState(townRoot)
+	if err != nil {
+		return nil
+	}
+	return recallSupervisor(state, systemctlProperty)
+}
+
+func recallSupervisor(state *State, read propertyReader) *Supervisor {
+	if state == nil || state.Supervisor == nil || state.Supervisor.Unit == "" {
+		return nil
+	}
+	record := state.Supervisor
+	if !unitIsLoaded(read(record.Unit, record.UserUnit, "LoadState")) {
+		return nil
+	}
+	return &Supervisor{
+		Kind:      record.Kind,
+		Unit:      record.Unit,
+		UserUnit:  record.UserUnit,
+		Restart:   read(record.Unit, record.UserUnit, "Restart"),
+		NRestarts: parseNRestarts(read(record.Unit, record.UserUnit, "NRestarts")),
+		RateLimitDisabled: parseRateLimitDisabled(
+			read(record.Unit, record.UserUnit, "StartLimitIntervalUSec"),
+			read(record.Unit, record.UserUnit, "StartLimitBurst")),
+	}
+}
+
+// unitIsLoaded reports whether systemd still has this unit. Only an explicit
+// "loaded" counts.
+//
+// The asymmetry with the rest of this file is deliberate. Elsewhere an absent
+// answer keeps a detection standing, because the cost of forgetting a
+// supervisor is bad advice. Here the recalled unit is about to be STARTED, and
+// every non-loaded state means that would fail: "not-found" (the unit was
+// removed), "masked" (the operator deliberately took it out of service),
+// "error"/"bad-setting" (systemd cannot use it), "" (no systemctl, no bus —
+// nothing to start it with). Falling back to gt's own start keeps the server
+// coming up in all of them.
+func unitIsLoaded(loadState string) bool {
+	return strings.TrimSpace(loadState) == "loaded"
+}
+
+// DirectStartEnvVar forces Start to spawn the Dolt process itself even when a
+// supervisor is remembered.
+//
+// The escape hatch exists because routing through the unit inherits the unit's
+// configuration — its data directory, its port, its ExecStart. An operator
+// recovering from a unit that is wrong, or bringing up a second town on the
+// same host, needs a way to say "start the server I configured, not the one the
+// unit describes" without editing systemd first.
+const DirectStartEnvVar = "GT_DOLT_DIRECT_START"
+
+// supervisorForStart returns the supervisor Start should hand the launch to, or
+// nil to start the process directly.
+func supervisorForStart(townRoot string) *Supervisor {
+	if isTruthyEnv(os.Getenv(DirectStartEnvVar)) {
+		return nil
+	}
+	return RecallSupervisor(townRoot)
+}
+
+func isTruthyEnv(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// StartUnit asks the supervisor to start its unit, returning the unit's main
+// PID (0 when systemd gives no answer).
+func (s *Supervisor) StartUnit() (int, error) {
+	if s == nil || s.Unit == "" {
+		return 0, fmt.Errorf("no supervisor unit to start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	args := []string{}
+	if s.UserUnit {
+		args = append(args, "--user")
+	}
+	args = append(args, "start", s.Unit)
+
+	out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			return 0, fmt.Errorf("%s: %w: %s", s.StartCommand(), err, detail)
+		}
+		return 0, fmt.Errorf("%s: %w", s.StartCommand(), err)
+	}
+
+	pid, convErr := strconv.Atoi(strings.TrimSpace(
+		systemctlProperty(s.Unit, s.UserUnit, "MainPID")))
+	if convErr != nil || pid < 0 {
+		return 0, nil
+	}
+	return pid, nil
+}
+
+// ConfirmedStopped reports whether the unit is positively known to be down,
+// alongside the ActiveState it read (for the operator-facing message).
+//
+// "Down" here means "will not put a server back on the data directory by
+// itself". systemd's Restart= policy applies to a unit that is running, so an
+// inactive or failed unit stays inactive until something starts it; every other
+// state — active, activating (which includes the pause between a crash and an
+// auto-restart), deactivating, reloading — can produce a live server moments
+// from now.
+//
+// An unreadable state is NOT stopped. This is the one place in this file where
+// unknown must fail closed: the caller is about to move database directories,
+// and "I could not tell" is not permission to do that.
+func (s *Supervisor) ConfirmedStopped() (string, bool) {
+	if s == nil || s.Unit == "" {
+		return "", true
+	}
+	activeState := systemctlProperty(s.Unit, s.UserUnit, "ActiveState")
+	return activeState, unitConfirmedStopped(activeState)
+}
+
+func unitConfirmedStopped(activeState string) bool {
+	switch strings.TrimSpace(activeState) {
+	case "inactive", "failed":
+		return true
+	}
+	return false
 }
 
 // systemctlProperty reads one property of a unit. Returns "" on any failure —
