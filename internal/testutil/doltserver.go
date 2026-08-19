@@ -94,8 +94,8 @@ func runDoltContainerWithRetry(ctx context.Context) (*dolt.DoltContainer, error)
 	return nil, lastErr
 }
 
-// startSharedDoltContainer starts the shared Dolt container and sets
-// GT_DOLT_PORT and BEADS_DOLT_PORT process-wide.
+// startSharedDoltContainer starts the shared Dolt container and points every
+// Dolt port variable at it process-wide.
 func startSharedDoltContainer() {
 	ctx := context.Background()
 	ctr, err := runDoltContainerWithRetry(ctx)
@@ -113,13 +113,15 @@ func startSharedDoltContainer() {
 
 	doltCtr = ctr
 	doltCtrPort = p.Port()
-	os.Setenv("GT_DOLT_PORT", doltCtrPort)    //nolint:tenv // intentional process-wide env
-	os.Setenv("BEADS_DOLT_PORT", doltCtrPort) //nolint:tenv // intentional process-wide env
-	os.Setenv("GT_TEST_EXTERNAL_DOLT", "1")   //nolint:tenv // integration tests reuse this container
+	setDoltPortEnv(doltCtrPort)
+	os.Setenv("GT_TEST_EXTERNAL_DOLT", "1") //nolint:tenv // integration tests reuse this container
 }
 
 // StartIsolatedDoltContainer starts a per-test Dolt container and returns the
-// mapped host port. GT_DOLT_PORT is set via t.Setenv (scoped to the test).
+// mapped host port. Every Dolt port variable is pointed at it via t.Setenv
+// (scoped to the test), so a bd/gt subprocess the test spawns reaches the
+// container rather than the guarded port testenv.GuardProductionDolt left in
+// the ones this helper does not set.
 // The container is terminated automatically when the test finishes.
 func StartIsolatedDoltContainer(t *testing.T) string {
 	t.Helper()
@@ -147,13 +149,13 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 	}
 
 	portStr := port.Port()
-	t.Setenv("GT_DOLT_PORT", portStr)
+	setDoltPortEnvForTest(t, portStr)
 	return portStr
 }
 
 // EnsureDoltContainerForTestMain starts a shared Dolt container for use in
 // TestMain functions. Call TerminateDoltContainer() after m.Run() to clean up.
-// Sets both GT_DOLT_PORT and BEADS_DOLT_PORT process-wide.
+// Points every Dolt port variable at the container process-wide.
 func EnsureDoltContainerForTestMain() error {
 	if !isDockerAvailable() {
 		return fmt.Errorf("Docker not available")
