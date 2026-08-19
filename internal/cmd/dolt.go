@@ -490,8 +490,10 @@ func runDoltStop(cmd *cobra.Command, args []string) error {
 	_, pid, _ := doltserver.IsRunning(townRoot)
 
 	// Probe BEFORE stopping: /proc/<pid>/cgroup dies with the process, and the
-	// unit's MainPID changes the moment it restarts.
-	sup := doltserver.DetectSupervisor(pid)
+	// unit's MainPID changes the moment it restarts. Remember what it finds —
+	// this command is about to destroy the evidence, and the start that follows
+	// has to route back through the same unit. (gt-cru5)
+	sup := doltserver.ObserveSupervisor(townRoot, pid)
 
 	if err := doltserver.Stop(townRoot); err != nil {
 		return err
@@ -730,7 +732,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		// Who owns this process, and has it been silently replaced? Printed with
 		// the process facts above rather than under Resource Metrics: it qualifies
 		// the PID and the uptime, both of which describe only the CURRENT server.
-		printSupervisorStatus(doltserver.DetectSupervisor(pid))
+		printSupervisorStatus(doltserver.ObserveSupervisor(townRoot, pid))
 
 		// Resource metrics
 		metrics := doltserver.GetHealthMetrics(townRoot)
@@ -1673,12 +1675,25 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	// race (gt-2xsa); it does not close it.
 	running, pid, _ := doltserver.IsRunning(townRoot)
 	if running {
-		sup := doltserver.DetectSupervisor(pid)
+		sup := doltserver.ObserveSupervisor(townRoot, pid)
 		msg := fmt.Sprintf("Dolt server is running. Stop it first with: %s", sup.StopCommand())
 		if sup.AutoRestarts() {
 			msg += fmt.Sprintf("\n\nThis server is supervised by %s: `gt dolt stop` would only\nsignal the process and the supervisor starts a new server on the same data\ndirectory seconds later, while migration is moving it.", sup.Describe())
 		}
 		return errors.New(msg)
+	}
+
+	// No server is running — but "no server right now" is not "no server for
+	// the next several minutes". If a supervisor unit owns this town's server
+	// and that unit is not confirmed stopped, it can put a live one back on the
+	// data directory mid-migration. DetectSupervisor cannot answer this with the
+	// server down (no PID, no cgroup), which is why gt-2xsa could only bound the
+	// exposure with migrationGuard; the unit remembered in dolt-state.json makes
+	// the refusal possible. (gt-cru5)
+	if sup := doltserver.RecallSupervisor(townRoot); sup != nil {
+		if activeState, stopped := sup.ConfirmedStopped(); !stopped {
+			return errors.New(unitNotStoppedRemedy(sup, activeState))
+		}
 	}
 
 	// Find databases to migrate
@@ -1768,6 +1783,42 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// unitNotStoppedRemedy renders the refusal printed when migration is asked to
+// move database directories while the unit that owns the town's Dolt server is
+// not confirmed stopped.
+//
+// It reports the ActiveState it read rather than asserting what the unit is
+// doing. "activating" is a unit between a crash and its auto-restart, "active"
+// with no server visible is a unit still binding its port or serving elsewhere,
+// and an empty string is systemd not answering at all — three different
+// situations that need three different operator responses, all of them "not
+// yet" for migration.
+func unitNotStoppedRemedy(sup *doltserver.Supervisor, activeState string) string {
+	var b strings.Builder
+
+	b.WriteString("Dolt is not running, but its supervisor is not confirmed stopped.\n\n")
+	fmt.Fprintf(&b, "  This town's Dolt server is owned by %s.\n", sup.Describe())
+	if activeState == "" {
+		b.WriteString("  systemd gave no ActiveState for it — with no answer, gt cannot establish\n" +
+			"  that the unit is down.\n\n")
+	} else {
+		fmt.Fprintf(&b, "  systemd reports ActiveState=%s, not inactive.\n\n", activeState)
+	}
+	b.WriteString("  Migration moves database directories on disk and nothing holds the server\n" +
+		"  down for the minutes that takes. A unit that is not stopped can put a live\n" +
+		"  server back on the data directory while directories are still moving —\n" +
+		"  which corrupts whatever is being moved at that moment.\n\n")
+
+	b.WriteString("  Stop the unit, then confirm it:\n\n")
+	fmt.Fprintf(&b, "    1. %s\n", sup.StopCommand())
+	fmt.Fprintf(&b, "    2. %s   # must print: inactive\n", sup.ConfirmStoppedCommand())
+	b.WriteString("    3. gt dolt migrate\n\n")
+
+	fmt.Fprintf(&b, "  Migration starts a server again when it finishes, through %s.\n", sup.Unit)
+
+	return b.String()
 }
 
 // runGuardedMigrations moves each database, re-checking through guard that no
@@ -1905,10 +1956,15 @@ func serverAppearedDuringMigrationRemedy(sup *doltserver.Supervisor, dataDir str
 	b.WriteString(fmt.Sprintf("  Migration is resumable: it skips databases already present in\n  %s, so re-running moves only what is left.\n", dataDir))
 
 	if supervised {
+		// This paragraph used to tell the operator to hand the server back to
+		// the unit by hand, because the auto-start at the end of migration
+		// spawned a process outside it. Start now routes through the unit
+		// itself, so that instruction would send them to start a unit that is
+		// already running. (gt-cru5)
 		b.WriteString(fmt.Sprintf(
-			"\n  `gt dolt migrate` starts a server itself when it finishes, and that\n"+
-				"  process is not the unit's. Hand the server back afterwards with\n"+
-				"  `gt dolt stop`, then `%s`.\n", sup.StartCommand()))
+			"\n  `gt dolt migrate` starts a server again when it finishes, through\n"+
+				"  %s, so it comes back supervised. Nothing to hand back by hand.\n",
+			sup.Unit))
 	}
 
 	return b.String()
