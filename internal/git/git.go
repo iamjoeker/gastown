@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/util"
@@ -2206,18 +2205,11 @@ func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit s
 		return nil
 	}
 
-	// Into a private ref, not FETCH_HEAD: that file is per-repository and any
-	// concurrent fetch in the same gitdir overwrites it (gt-880s). Here the
-	// clobbered value would be some other ref's tip, and the failure could go
-	// either way — a real push reported unverified, or worse, a stale push
-	// "verified" because commit happened to be an ancestor of whatever landed in
-	// FETCH_HEAD instead.
-	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
-	if err != nil {
+	fetchTarget := g.pushTarget(remote)
+	if _, err := g.run("fetch", "--no-tags", fetchTarget, "refs/heads/"+branch); err != nil {
 		return fmt.Errorf("verified_push_failed: unable to fetch %s/%s for ancestry check: %w", remote, branch, err)
 	}
-	defer cleanup()
-	reachable, err := g.IsAncestor(commit, fetched)
+	reachable, err := g.IsAncestor(commit, "FETCH_HEAD")
 	if err != nil {
 		return fmt.Errorf("verified_push_failed: unable to verify commit %s on %s/%s: %w", shortSHA(commit), remote, branch, err)
 	}
@@ -3131,12 +3123,10 @@ func (g *Git) mergeTreeNoopBetweenRefs(head, ref string) (bool, error) {
 // fetch/push remotes are classified against the listed hash, not stale tracking
 // refs.
 func (g *Git) PushRemoteRefTargetStatus(remote string, ref RemoteRef, target string) (BranchPreservationStatus, error) {
-	candidate, cleanup, err := g.fetchPushRemoteRefExactly(remote, ref)
-	if err != nil {
+	if err := g.fetchPushRemoteRefExactly(remote, ref); err != nil {
 		return BranchPreservationStatus{}, err
 	}
-	defer cleanup()
-	return g.preservationOfRefAgainstRef(candidate, target)
+	return g.preservationOfRefAgainstRef("FETCH_HEAD", target)
 }
 
 // PushRemoteRefTargetStatusAny checks a push-remote ref against several targets
@@ -3159,16 +3149,14 @@ func (g *Git) PushRemoteRefTargetStatusAny(remote string, ref RemoteRef, targets
 	if len(targets) == 0 {
 		return BranchPreservationStatus{}, fmt.Errorf("no comparison targets given")
 	}
-	candidate, cleanup, err := g.fetchPushRemoteRefExactly(remote, ref)
-	if err != nil {
+	if err := g.fetchPushRemoteRefExactly(remote, ref); err != nil {
 		return BranchPreservationStatus{}, err
 	}
-	defer cleanup()
 
 	var first BranchPreservationStatus
 	var firstErr error
 	for i, target := range targets {
-		status, err := g.preservationOfRefAgainstRef(candidate, target)
+		status, err := g.preservationOfRefAgainstRef("FETCH_HEAD", target)
 		if i == 0 {
 			first, firstErr = status, err
 		}
@@ -3179,89 +3167,28 @@ func (g *Git) PushRemoteRefTargetStatusAny(remote string, ref RemoteRef, targets
 	return first, firstErr
 }
 
-// privateFetchRefNamespace holds the refs a fetch-and-compare writes for its own
-// use. It is outside refs/heads/ and refs/remotes/ deliberately: nothing that
-// lists branches, and no branch-hygiene rule, should ever see these.
-const privateFetchRefNamespace = "refs/gt/fetched/"
-
-// privateFetchRefSeq numbers private fetch refs within one process. Together
-// with the pid it makes a name no concurrent fetch can collide with.
-var privateFetchRefSeq atomic.Uint64
-
-// fetchPushRemoteRefToPrivateRef fetches refName from remote's PUSH url into a
-// ref private to this call, and returns that ref with a func that removes it.
-//
-// The destination is the whole point, and FETCH_HEAD is why (gt-880s). FETCH_HEAD
-// is ONE FILE PER REPOSITORY, rewritten by every fetch that runs in that gitdir.
-// A rig's .repo.git is shared by every polecat worktree, the deacon's dogs and
-// the refinery, and most gt paths that touch git go through it — so a plain
-// `git fetch` anywhere in the town could overwrite the value between our fetch
-// and our read of it. Measured on gastown: `gt patrol branches` fetched a polecat
-// tip, read back origin/main's tip instead, and reported the BRANCH as
-// unclassifiable. The count of such branches tracked how busy the repo happened
-// to be, which is why successive runs against an unchanged remote disagreed.
-//
-// A named destination also keeps the fetched objects reachable for as long as the
-// comparison needs them, rather than relying on an unreferenced fetch surviving
-// until the next gc.
-func (g *Git) fetchPushRemoteRefToPrivateRef(remote, refName string) (ref string, cleanup func(), err error) {
-	refName = strings.TrimSpace(refName)
-	if refName == "" {
-		return "", func() {}, fmt.Errorf("remote ref is missing a name")
-	}
-	dest := fmt.Sprintf("%s%d/%d", privateFetchRefNamespace, os.Getpid(), privateFetchRefSeq.Add(1))
-	remove := func() { _, _ = g.run("update-ref", "-d", dest) }
-
-	// --no-write-fetch-head is the other half of the fix, and it is about being a
-	// good neighbour rather than about this call: a destination refspec still
-	// rewrites FETCH_HEAD, so a sweep of nine branches used to clobber it nine
-	// times under every other agent working in the same shared gitdir. Nothing
-	// here reads it, so nothing here should write it. (git 2.29+; the repo already
-	// requires 2.38 for `merge-tree --write-tree`.)
-	//
-	// --force because a crashed run can leave a ref at this name behind: pids are
-	// reused, and a non-fast-forward update would otherwise fail on the leftover
-	// rather than on anything real.
-	if _, err := g.run("fetch", "--no-tags", "--no-write-fetch-head", "--force", g.pushTarget(remote), refName+":"+dest); err != nil {
-		remove()
-		return "", func() {}, fmt.Errorf("fetching candidate %s: %w", refName, err)
-	}
-	return dest, remove, nil
-}
-
-// fetchPushRemoteRefExactly brings the listed hash into the object store under a
-// private ref and verifies the remote has not moved underneath the listing.
-// Classifying against a stale remote-tracking ref instead would answer about a
-// different commit.
-//
-// The caller must invoke the returned cleanup func. It is safe to call after a
-// failure return too, though callers get a no-op then.
-func (g *Git) fetchPushRemoteRefExactly(remote string, ref RemoteRef) (fetched string, cleanup func(), err error) {
+// fetchPushRemoteRefExactly brings the listed hash into the object store and
+// verifies the remote has not moved underneath the listing. Classifying against
+// a stale remote-tracking ref instead would answer about a different commit.
+func (g *Git) fetchPushRemoteRefExactly(remote string, ref RemoteRef) error {
 	refName := strings.TrimSpace(ref.Name)
 	expectedHash := strings.TrimSpace(ref.Hash)
 	if refName == "" || expectedHash == "" {
-		return "", func() {}, fmt.Errorf("remote ref is missing name or hash")
+		return fmt.Errorf("remote ref is missing name or hash")
 	}
 
-	dest, remove, err := g.fetchPushRemoteRefToPrivateRef(remote, refName)
-	if err != nil {
-		return "", func() {}, err
+	if _, err := g.run("fetch", "--no-tags", g.pushTarget(remote), refName); err != nil {
+		return fmt.Errorf("fetching candidate %s: %w", refName, err)
 	}
-	fetchedHash, err := g.Rev(dest)
+	fetchedHash, err := g.Rev("FETCH_HEAD")
 	if err != nil {
-		remove()
-		return "", func() {}, fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
+		return fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
 	}
 	fetchedHash = strings.TrimSpace(fetchedHash)
 	if fetchedHash != expectedHash {
-		remove()
-		// This can now mean only one thing: the tip moved on the remote between
-		// the listing and the fetch. Say that, because the reader's next move is
-		// to re-run — it is not a fact about the branch's contents.
-		return "", func() {}, fmt.Errorf("remote tip for %s moved between listing and fetch: listed %s, fetched %s (re-run to classify it)",
-			refName, shortSHA(expectedHash), shortSHA(fetchedHash))
+		return fmt.Errorf("candidate %s changed while pruning: expected %s, fetched %s", refName, shortSHA(expectedHash), shortSHA(fetchedHash))
 	}
-	return dest, remove, nil
+	return nil
 }
 
 // CountCherryUnmergedCommits counts `git cherry` lines whose patches are not

@@ -414,15 +414,9 @@ func classifyBranch(
 	status, err := g.PushRemoteRefTargetStatusAny(remote, ref, targets)
 	if err != nil {
 		// Could not compare. Not clean, not stranded — unknown, and said so.
-		//
-		// The reason travels in the NOTE and not only in Err, because the human
-		// table shows the note alone. "could not compare" on its own is what let
-		// a fetch-level fault (gt-880s) read as a property of the branch: the
-		// class is the same for a tip that moved, a store that would not answer
-		// and a git that would not run, and those want different responses.
 		finding.Class = BranchSweepUnknown
 		finding.Err = err.Error()
-		finding.Note = "could not compare against " + strings.Join(targets, " or ") + ": " + err.Error()
+		finding.Note = "could not compare against " + strings.Join(targets, " or ")
 		return finding
 	}
 	finding.Evidence = status.Evidence

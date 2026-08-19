@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/testguard"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -521,6 +522,9 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 	}
 	sessions := newPolecatSessionSet(sessionNames)
 	allPolecats := make([]PolecatListItem, 0)
+	// Resolved once for the whole listing. An unreadable town root leaves this
+	// empty and recording becomes a no-op — the listing itself is unaffected.
+	journalRoot, _ := workspace.FindFromCwd()
 
 	for _, r := range rigs {
 		bd := beads.New(r.Path)
@@ -560,6 +564,13 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				item = buildPolecatInventoryItemFromEvidence(r.Name, name, fields, polecatActiveWorkLookupError(activeWorkErr), sessions, mrIndex)
 			}
 			disposition := item.Disposition
+			recordNeedsMQSubmitObservation(journalRoot, polecat.MQSubmitObservation{
+				Rig:     r.Name,
+				Polecat: name,
+				Issue:   item.Issue,
+				Branch:  item.Branch,
+				Source:  "polecat-list",
+			}, disposition)
 			state := effectivePolecatState(PolecatListItem{
 				State:                item.State,
 				Issue:                item.Issue,
@@ -1237,6 +1248,25 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// and the permitted witness action must track the verdict actually reported.
 	status.WitnessAction = witnessActionFor(status.Verdict)
 
+	// Recorded from the final status, not from `disposition`: reconcile above can
+	// still change the verdict, and the journal must agree with what this command
+	// actually reported.
+	if journalRoot, rootErr := workspace.FindFromCwd(); rootErr == nil {
+		recordNeedsMQSubmitObservation(journalRoot, polecat.MQSubmitObservation{
+			Rig:     rigName,
+			Polecat: polecatName,
+			Issue:   status.Issue,
+			Branch:  status.Branch,
+			Source:  "check-recovery",
+		}, polecat.WorkstateDisposition{
+			Verdict:       status.Verdict,
+			Reason:        status.Reason,
+			NeedsMQSubmit: status.NeedsMQSubmit,
+			MQStatus:      status.MQStatus,
+			Blockers:      status.Blockers,
+		})
+	}
+
 	// JSON output
 	if polecatCheckRecoveryJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -1388,6 +1418,25 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	}
 	polecat.ApplyBranchMRToWorkstateInput(input, mr.ID, !beads.IssueStatus(mr.Status).IsTerminal())
 	status.ActiveMR = input.ActiveMR
+}
+
+// recordNeedsMQSubmitObservation journals the needs_mq_submit transitions for
+// one polecat. The verdict itself stays computed-on-read; this is what makes the
+// EPISODE durable, so that a fired check is still answerable minutes later and a
+// check that silently stops firing stops leaving lines (gt-7i07).
+//
+// Failures are reported on stderr and never returned: the caller was asked to
+// report on a polecat, not to maintain the journal, and a listing that aborts
+// because a log line could not be written is a worse outcome than a gap. The
+// warning exists because a silent gap is exactly the failure mode being fixed.
+// A test binary's refusal to touch a live town is expected, not a defect.
+func recordNeedsMQSubmitObservation(townRoot string, obs polecat.MQSubmitObservation, disposition polecat.WorkstateDisposition) {
+	if townRoot == "" {
+		return
+	}
+	if _, err := polecat.RecordNeedsMQSubmit(townRoot, obs, disposition); err != nil && !errors.Is(err, testguard.ErrRefused) {
+		fmt.Fprintf(os.Stderr, "warning: failed to record needs_mq_submit for %s/%s: %v\n", obs.Rig, obs.Polecat, err)
+	}
 }
 
 func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, disposition polecat.WorkstateDisposition) {
