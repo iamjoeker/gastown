@@ -74,6 +74,101 @@ func TestWispDeleteAge(t *testing.T) {
 	}
 }
 
+func TestStaleIssueAge(t *testing.T) {
+	if got := staleIssueAge(nil); got != defaultStaleIssueAge {
+		t.Errorf("expected default %v, got %v", defaultStaleIssueAge, got)
+	}
+
+	config := &DaemonPatrolConfig{
+		Patrols: &PatrolsConfig{
+			WispReaper: &WispReaperConfig{
+				Enabled:          true,
+				StaleIssueAgeStr: "1440h",
+			},
+		},
+	}
+	if got := staleIssueAge(config); got != 60*24*time.Hour {
+		t.Errorf("expected 1440h, got %v", got)
+	}
+
+	// Unparseable and non-positive values fall back rather than acting. A zero
+	// or negative staleness would make every open issue eligible for auto-close.
+	for _, bad := range []string{"nope", "0h", "-720h", ""} {
+		config.Patrols.WispReaper.StaleIssueAgeStr = bad
+		if got := staleIssueAge(config); got != defaultStaleIssueAge {
+			t.Errorf("StaleIssueAgeStr=%q: expected fallback to %v, got %v", bad, defaultStaleIssueAge, got)
+		}
+	}
+}
+
+func TestMailDeleteAge(t *testing.T) {
+	if got := mailDeleteAge(nil); got != defaultMailDeleteAge {
+		t.Errorf("expected default %v, got %v", defaultMailDeleteAge, got)
+	}
+
+	config := &DaemonPatrolConfig{
+		Patrols: &PatrolsConfig{
+			WispReaper: &WispReaperConfig{
+				Enabled:          true,
+				MailDeleteAgeStr: "336h",
+			},
+		},
+	}
+	if got := mailDeleteAge(config); got != 14*24*time.Hour {
+		t.Errorf("expected 336h, got %v", got)
+	}
+}
+
+// TestReaperFormulaVarsAreConfigurable is the regression guard for the half of
+// gt-zjb/gt-7hs that outlived the constant fix: stale_issue_age and
+// mail_delete_age were rendered into the sling vars straight from their package
+// constants, while max_age and purge_age went through accessors. The formula
+// declared all four as vars, so all four looked configurable and two were not.
+//
+// This asserts the wiring, not the values — it fails if someone reverts an
+// accessor back to a bare constant, which is what the original bug was.
+func TestReaperFormulaVarsAreConfigurable(t *testing.T) {
+	config := &DaemonPatrolConfig{
+		Patrols: &PatrolsConfig{
+			WispReaper: &WispReaperConfig{
+				Enabled:          true,
+				MaxAgeStr:        "1h",
+				DeleteAgeStr:     "2h",
+				StaleIssueAgeStr: "3h",
+				MailDeleteAgeStr: "4h",
+			},
+		},
+	}
+
+	// Every value is distinct and distinct from every default, so a var that is
+	// still reading a constant cannot coincidentally match.
+	want := map[string]string{
+		"max_age":         "1h0m0s",
+		"purge_age":       "2h0m0s",
+		"stale_issue_age": "3h0m0s",
+		"mail_delete_age": "4h0m0s",
+	}
+	vars := reaperFormulaVars(config)
+	for k, exp := range want {
+		if got := vars[k]; got != exp {
+			t.Errorf("var %s = %q, want %q — configured value did not reach the formula; "+
+				"it is probably being rendered from a package constant instead of an accessor", k, got, exp)
+		}
+	}
+
+	// A nil config must still produce every var, at its default.
+	defaults := reaperFormulaVars(nil)
+	for _, k := range []string{"max_age", "purge_age", "stale_issue_age", "mail_delete_age", "alert_threshold"} {
+		if defaults[k] == "" {
+			t.Errorf("var %s missing from nil-config vars; the formula interpolates it into a "+
+				"gt reaper flag, so an empty value becomes a malformed command", k)
+		}
+	}
+	if got := defaults["stale_issue_age"]; got != "720h0m0s" {
+		t.Errorf("default stale_issue_age var = %q, want \"720h0m0s\"", got)
+	}
+}
+
 func TestDefaultReaperIntervalIsOneHour(t *testing.T) {
 	// Verify the default changed from 30m to 1h per issue gt-caf7.
 	if defaultWispReaperInterval != 1*time.Hour {
