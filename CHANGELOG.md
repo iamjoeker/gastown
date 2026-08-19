@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gt patrol branches` finds strandings that already exist** (gt-by1e). The
+  refinery reports a stranding at the moment it makes one (gt-h1cw); nothing
+  found the ones already made. On 2026-08-19 a single session produced six, each
+  by a different route — a shared bead auto-closed under a pushed branch, a
+  polecat that closed its own bead before submitting, an MR rejected after the
+  bead had closed, a bead closed with no MR ever created, and twice a `gt done`
+  that refused to submit and left no trace of the refusal. Five were found by an
+  agent choosing to look, one by hand, none by tooling. All six presented as the
+  same shape: a polecat branch on the remote whose content is not in the target.
+  The new command sweeps for that shape, so it catches routes nobody has
+  enumerated, and classifies each branch by the four facts that separate most
+  cases cheaply — branch, work bead, bead status, and whether an MR exists and
+  in what state. An open MR alone cleared four of the seven hits that night.
+
+  Three things it deliberately does not do. It does not decide containment by
+  ancestry alone: a branch that is not an ancestor may still have landed by
+  squash or cherry-pick, which is what `gt-aqk` turned out to be, so it pairs
+  `merge-base` with an empty-merge check and `git cherry` before calling a
+  branch unmerged. It does not claim work is lost: a stranded branch and a
+  superseded one are indistinguishable without a rehearsal merge, so the output
+  is a short list of branches to CHECK, and an unclassifiable branch is reported
+  as a question rather than folded into the all-clear. And it writes nothing —
+  no beads filed, no issues reopened, no branches deleted — because the sweep
+  cannot tell "correctly closed, branch redundant" from "closed prematurely",
+  and auto-filing and auto-submitting were each wrong at least once that night
+  with a human deciding.
+
+  Containment is tested against every trunk the rig has, not one. A rig whose
+  origin is a fork carries both `origin/main` and `upstream/main`, and on
+  gastown those differ by 289 commits: comparing against upstream alone put six
+  branches on the short list of which three had demonstrably landed. `git
+  PushRemoteRefTargetStatusAny` takes the list, fetches the candidate once, and
+  reports which trunk contained it.
+
+  Added as the `sweep-branches` step of `mol-witness-patrol`. Note that the
+  town overlay for that formula is currently pinned, so the step is live only
+  after the overlay is merged — check `gt formula drift`.
+
 - **`gt:record` marks a bead as a durable archive, not work** (gt-f8td). After
   seven closed MR wisps were destroyed, the standing defence became writing
   incident and merge-ledger state onto a *normal* bead rather than a wisp —
