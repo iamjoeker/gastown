@@ -58,6 +58,11 @@ func (m *Model) renderHeader() string {
 	} else {
 		title = TitleStyle.Render("GT Feed")
 	}
+	// Zone label: event times below are local while bd renders UTC, and an
+	// unlabelled local time compared against a bead timestamp silently carries the
+	// offset. The per-line format is HH:MM, so the zone is stated once here rather
+	// than repeated on every row.
+	title += " " + TimestampStyle.Render(localZoneLabel())
 
 	// Show summary stats on the right
 	var stats string
@@ -81,6 +86,12 @@ func (m *Model) renderHeader() string {
 	}
 
 	return HeaderStyle.Render(title + strings.Repeat(" ", gap) + stats)
+}
+
+// localZoneLabel renders the zone the feed's event times are shown in, e.g.
+// "(times MST)". Reported once in the header because every event row shares it.
+func localZoneLabel() string {
+	return fmt.Sprintf("(times %s)", time.Now().Format("MST"))
 }
 
 // countAgentStates returns counts of ok, stuck, and idle agents
