@@ -68,25 +68,7 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	}
 	labels = append(labels, record.ExtraLabels...)
 
-	// Build bd create command.
-	//
-	// DELIBERATELY NO --wisp-type (gt-fqd5). A plugin receipt looks exactly like
-	// a gc_report and classifying it as one would be wrong in a way that is hard
-	// to see: since gt-ktvs an untyped wisp is SKIPPED by gt compact, while a
-	// gc_report is DELETED once it is 24h old and closed — and these receipts
-	// are closed the moment they are written.
-	//
-	// The receipts are not a report. They are the cooldown ledger: the daemon's
-	// gate is CountRunsSince(plugin, gate.Duration) > 0, so a receipt is
-	// load-bearing for as long as the longest gate that reads it.
-	// plugins/tool-updater/plugin.md sets duration = "168h". Deleting its
-	// receipts at 24h would make the gate read "never ran" for the remaining six
-	// days and dispatch a brew upgrade on every daemon scan.
-	//
-	// These receipts DO accumulate (5683 rows in hq on 2026-08-19) and want a
-	// TTL — but one that outlives the longest cooldown reading them, which no
-	// member of bd's seven-value vocabulary expresses. Filed separately rather
-	// than borrowed from a bucket that means something else.
+	// Build bd create command
 	args := []string{
 		"create",
 		"--ephemeral",

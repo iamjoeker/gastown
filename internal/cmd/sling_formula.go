@@ -352,7 +352,9 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 		if resolved.NewPolecatInfo == nil {
 			return
 		}
-		fmt.Printf("%s Rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), resolved.NewPolecatInfo.PolecatName)
+		// "spawned" is not assumed here: the polecat may have been reused from the
+		// pool, and cleanupSpawnedPolecat reports which rollback it actually did.
+		fmt.Printf("%s Rolling back polecat %s...\n", style.Warning.Render("⚠"), resolved.NewPolecatInfo.PolecatName)
 		rollbackSlingArtifactsFn(resolved.NewPolecatInfo, beadID, formulaWorkDir, "")
 	}
 
@@ -503,14 +505,6 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	telemetry.RecordMolWisp(ctx, formulaName, wispRootID, "", nil)
 
 	fmt.Printf("%s Wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
-
-	// Classify the wisp and its steps for gt compact (gt-fqd5). Unlike the
-	// patrol spawner this path materializes step rows, so the children are
-	// stamped too. Formulas that declare no wisp_type — mol-polecat-work and
-	// every other work formula — are left unclassified on purpose.
-	stampMoleculeWispType(formulaName, townRoot, "", wispRootID, true, func(c *bdCmd) *bdCmd {
-		return c.Dir(formulaWorkDir).WithAutoCommit().WithGTRoot(townRoot)
-	})
 
 	// Step 3: Hook the wisp bead with retry and verification.
 	// See: https://github.com/steveyegge/gastown/issues/148.
