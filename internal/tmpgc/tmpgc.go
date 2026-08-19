@@ -1,21 +1,13 @@
-// Package tmpgc reclaims orphaned build and test scratch directories from a
+// Package tmpgc reclaims orphaned Go toolchain work directories from a
 // temporary directory.
 //
-// Two families strand directories under TMPDIR on a gastown host:
-//
-//   - Go toolchain work directories. The toolchain creates one ($WORK) for
-//     every build, test, and vet invocation and removes it on normal exit. A
-//     KILLED build — OOM killer, test timeout, session recycle — leaves it
-//     behind, at 100-300MB a time.
-//   - beads test fixture directories. The beads suite creates a Dolt data
-//     directory per run; a suite killed mid-flight leaves it, LOCK file and
-//     all.
-//
-// Where TMPDIR is a RAM-backed tmpfs, a few dozen strandings exhaust it, and
-// the first symptom is unrelated to either: gastown's own disk-space guard
-// starts refusing polecat creation with "insufficient disk space" while `df /`
-// still reports terabytes free, because /tmp is a different filesystem
-// (gt-yb33).
+// The Go toolchain creates a work directory ($WORK) under TMPDIR for every
+// build, test, and vet invocation and removes it on normal exit. A KILLED
+// build — OOM killer, test timeout, session recycle — leaves it behind. Where
+// TMPDIR is a RAM-backed tmpfs, a few dozen strandings exhaust it, and the
+// first symptom is unrelated to Go: gastown's own disk-space guard starts
+// refusing polecat creation with "insufficient disk space" while `df /` still
+// reports terabytes free, because /tmp is a different filesystem (gt-yb33).
 //
 // # Removal fails closed
 //
@@ -24,17 +16,17 @@
 // never read as a clean bill of health. A directory is removed only when all
 // of the following hold:
 //
-//   - Its name matches one of the known families exactly and it is a direct
-//     child of the swept directory.
+//   - Its name matches a Go work directory exactly (go-build<digits>,
+//     go-link-<digits>) and it is a direct child of the swept directory.
 //   - It is a real directory, not a symlink.
 //   - It is owned by the current user.
 //   - Every file in it can be walked; a single unreadable subtree refuses the
 //     whole candidate, because what cannot be inspected cannot be cleared.
 //   - Nothing anywhere in the tree has been modified within MinAge. A live
 //     build writes constantly, so a quiet tree is the primary liveness signal.
-//   - No live process references the path in its argv, has it as its working
-//     directory, or holds a file descriptor inside it. See liveReferences for
-//     why all three are needed and why /proc rather than lsof answers them.
+//   - No live process references the path in its argv. The Go driver passes
+//     $WORK paths to every compile, link, and vet subprocess it spawns, so a
+//     build in progress names its own work directory in the process table.
 //
 // If the process table cannot be read at all, the sweep is inconclusive and
 // removes NOTHING, however old the directories look.
@@ -51,11 +43,10 @@ import (
 	"time"
 )
 
-// DefaultMinAge is how long a candidate's whole tree must have been untouched
-// before it is treated as orphaned. The Go driver writes into $WORK
-// continuously while a build runs, and a Dolt server writes to its data
-// directory, so an hour of total silence is well past any live invocation —
-// including the multi-minute test binaries in this repo.
+// DefaultMinAge is how long a work directory's whole tree must have been
+// untouched before it is treated as orphaned. The Go driver writes into $WORK
+// continuously while a build runs, so an hour of total silence is well past
+// any live invocation — including the multi-minute test binaries in this repo.
 const DefaultMinAge = time.Hour
 
 // MinSafeMinAge is the shortest quiet period a destructive sweep will accept.
@@ -77,79 +68,11 @@ const MinSafeMinAge = 5 * time.Minute
 // remove nothing.
 var ErrNoProcEvidence = errors.New("no live-process evidence available")
 
-// Evidence is what the process table could tell us about a set of paths.
-type Evidence struct {
-	// Refs holds the paths some running process is using.
-	Refs map[string]bool
-	// OpaqueProcesses counts processes owned by this user whose working
-	// directory and open descriptors the kernel would not publish, because
-	// they have marked themselves non-dumpable. Their argv was still read.
-	// This is a hole in the coverage, so it is carried out to the caller and
-	// reported rather than rounded to zero. See liveReferences.
-	OpaqueProcesses int
-}
-
 // workDirPattern matches the Go toolchain's work directory names exactly:
 // "go-build2674671939" for build/test/vet, "go-link-1315979694" for the
 // external linker. Anchored on both ends so that no directory a human or
 // another tool created under TMPDIR can be mistaken for one.
 var workDirPattern = regexp.MustCompile(`^go-(build|link)-?[0-9]+$`)
-
-// beadsTestDirPattern matches the beads suite's Dolt fixture directories:
-// "beads-test-dolt-<suffix>" and "beads-bd-tests-<suffix>". Anchored the same
-// way, and requiring a non-empty suffix so the bare prefixes — which a human
-// might create by hand — are not candidates.
-var beadsTestDirPattern = regexp.MustCompile(`^beads-(test-dolt|bd-tests)-.+$`)
-
-// A Family is a class of temporary directory the sweep knows how to identify
-// by name. Membership is the FIRST safety check and the narrowest one: a
-// directory whose name is not exactly a member of some family is never
-// considered, whatever its age or size.
-type Family struct {
-	// Name identifies the family in reports and JSON.
-	Name string
-	// Pattern matches a directory's base name, anchored at both ends.
-	Pattern *regexp.Regexp
-	// Summary is a one-line description for help text.
-	Summary string
-}
-
-// FamilyGoWork is the Go toolchain's per-invocation work directory.
-var FamilyGoWork = Family{
-	Name:    "go-work",
-	Pattern: workDirPattern,
-	Summary: "Go toolchain work directories (go-build<n>, go-link-<n>)",
-}
-
-// FamilyBeadsTest is the beads suite's per-run Dolt fixture directory.
-//
-// Before gt-1gdh this family was swept by an inline shell block in the deacon
-// patrol formula, which decided liveness from `lsof +D`. That block failed
-// OPEN for years because lsof answers through an exit status that is non-zero
-// for every failure mode as well as for success-with-nothing-found; the
-// repaired version worked only by carefully not trusting that status (gt-32z).
-// Here there is no status to misread.
-var FamilyBeadsTest = Family{
-	Name:    "beads-test",
-	Pattern: beadsTestDirPattern,
-	Summary: "beads test fixture directories (beads-test-dolt-*, beads-bd-tests-*)",
-}
-
-// DefaultFamilies is what a sweep considers when Options.Families is empty.
-func DefaultFamilies() []Family {
-	return []Family{FamilyGoWork, FamilyBeadsTest}
-}
-
-// matchFamily returns the family a base name belongs to, and whether it
-// belongs to any of them.
-func matchFamily(families []Family, name string) (Family, bool) {
-	for _, f := range families {
-		if f.Pattern.MatchString(name) {
-			return f, true
-		}
-	}
-	return Family{}, false
-}
 
 // Status is the disposition of a single candidate directory.
 type Status string
@@ -158,9 +81,7 @@ const (
 	// StatusReclaimable means every safety check passed: the directory is an
 	// orphan and may be removed.
 	StatusReclaimable Status = "reclaimable"
-	// StatusLive means a running process is using this directory: it names it
-	// in its argv, has it as its working directory, or holds a descriptor
-	// inside it.
+	// StatusLive means a running process names this directory in its argv.
 	StatusLive Status = "live"
 	// StatusYoung means something in the tree was modified within MinAge.
 	StatusYoung Status = "young"
@@ -172,7 +93,6 @@ const (
 // Candidate is one directory considered by a scan.
 type Candidate struct {
 	Path      string        `json:"path"`
-	Family    string        `json:"family"`
 	SizeBytes uint64        `json:"size_bytes"`
 	Newest    time.Time     `json:"newest_mtime"`
 	Age       time.Duration `json:"age"`
@@ -183,10 +103,7 @@ type Candidate struct {
 
 // Result is the outcome of a scan or sweep.
 type Result struct {
-	Dir string `json:"dir"`
-	// Families names the classes of directory this run considered, so a
-	// report cannot be mistaken for a broader sweep than it was.
-	Families         []string      `json:"families"`
+	Dir              string        `json:"dir"`
 	MinAge           time.Duration `json:"min_age"`
 	DryRun           bool          `json:"dry_run"`
 	Candidates       []Candidate   `json:"candidates"`
@@ -195,12 +112,8 @@ type Result struct {
 	ReclaimableBytes uint64        `json:"reclaimable_bytes"`
 	// Inconclusive means liveness evidence could not be gathered, so nothing
 	// was eligible for removal regardless of age.
-	Inconclusive bool `json:"inconclusive"`
-	// OpaqueProcesses counts running processes this sweep could not fully
-	// inspect. See Evidence.OpaqueProcesses. It is not a failure, but it is a
-	// gap in the coverage, and a report that hid it would read as complete.
-	OpaqueProcesses int      `json:"opaque_processes,omitempty"`
-	Errors          []string `json:"errors,omitempty"`
+	Inconclusive bool     `json:"inconclusive"`
+	Errors       []string `json:"errors,omitempty"`
 }
 
 // Options configures a scan or sweep.
@@ -212,14 +125,11 @@ type Options struct {
 	MinAge time.Duration
 	// DryRun classifies candidates without removing anything.
 	DryRun bool
-	// Families restricts which classes of directory are considered. Empty
-	// means DefaultFamilies.
-	Families []Family
 
 	// now overrides the clock. Tests only.
 	now func() time.Time
 	// liveRefs overrides live-process evidence. Tests only.
-	liveRefs func(paths []string) (Evidence, error)
+	liveRefs func(paths []string) (map[string]bool, error)
 }
 
 func (o *Options) clock() time.Time {
@@ -229,7 +139,7 @@ func (o *Options) clock() time.Time {
 	return time.Now()
 }
 
-func (o *Options) references(paths []string) (Evidence, error) {
+func (o *Options) references(paths []string) (map[string]bool, error) {
 	if o.liveRefs != nil {
 		return o.liveRefs(paths)
 	}
@@ -250,22 +160,15 @@ func (o *Options) minAge() time.Duration {
 	return o.MinAge
 }
 
-func (o *Options) families() []Family {
-	if len(o.Families) > 0 {
-		return o.Families
-	}
-	return DefaultFamilies()
-}
-
-// Scan classifies the sweepable temp directories under opts.Dir without
-// removing anything.
+// Scan classifies the Go work directories under opts.Dir without removing
+// anything.
 func Scan(opts Options) (*Result, error) {
 	opts.DryRun = true
 	return sweep(opts, false)
 }
 
-// Sweep classifies the sweepable temp directories under opts.Dir and removes
-// the reclaimable ones. With opts.DryRun set it is equivalent to Scan.
+// Sweep classifies the Go work directories under opts.Dir and removes the
+// reclaimable ones. With opts.DryRun set it is equivalent to Scan.
 func Sweep(opts Options) (*Result, error) {
 	return sweep(opts, !opts.DryRun)
 }
@@ -284,14 +187,10 @@ func sweep(opts Options, remove bool) (*Result, error) {
 		return nil, err
 	}
 
-	families := opts.families()
 	res := &Result{
 		Dir:    dir,
 		MinAge: opts.minAge(),
 		DryRun: !remove,
-	}
-	for _, f := range families {
-		res.Families = append(res.Families, f.Name)
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -301,21 +200,10 @@ func sweep(opts Options, remove bool) (*Result, error) {
 
 	now := opts.clock()
 	for _, entry := range entries {
-		// Only directories are candidates, and symlinks are candidates only so
-		// that they are visibly REFUSED rather than silently skipped. Plain
-		// files are never considered: the PID files that sit beside these
-		// directories share their prefix, and they belong to a different
-		// cleanup with a different proof of death.
-		if !entry.IsDir() && entry.Type()&fs.ModeSymlink == 0 {
+		if !workDirPattern.MatchString(entry.Name()) {
 			continue
 		}
-		family, ok := matchFamily(families, entry.Name())
-		if !ok {
-			continue
-		}
-		c := inspect(filepath.Join(dir, entry.Name()), now, res.MinAge)
-		c.Family = family.Name
-		res.Candidates = append(res.Candidates, c)
+		res.Candidates = append(res.Candidates, inspect(filepath.Join(dir, entry.Name()), now, res.MinAge))
 	}
 	if len(res.Candidates) == 0 {
 		return res, nil
@@ -331,8 +219,7 @@ func sweep(opts Options, remove bool) (*Result, error) {
 		}
 	}
 	if len(ask) > 0 {
-		ev, err := opts.references(ask)
-		res.OpaqueProcesses = ev.OpaqueProcesses
+		refs, err := opts.references(ask)
 		if err != nil {
 			// Could not look. That is not permission to delete.
 			res.Inconclusive = true
@@ -345,7 +232,7 @@ func sweep(opts Options, remove bool) (*Result, error) {
 			}
 		} else {
 			for i := range res.Candidates {
-				if res.Candidates[i].Status == StatusReclaimable && ev.Refs[res.Candidates[i].Path] {
+				if res.Candidates[i].Status == StatusReclaimable && refs[res.Candidates[i].Path] {
 					res.Candidates[i].Status = StatusLive
 					res.Candidates[i].Reason = "referenced by a running process"
 				}
@@ -362,7 +249,7 @@ func sweep(opts Options, remove bool) (*Result, error) {
 		if !remove {
 			continue
 		}
-		if err := removeWorkDir(families, c.Path); err != nil {
+		if err := removeWorkDir(c.Path); err != nil {
 			c.Status = StatusRefused
 			c.Reason = err.Error()
 			res.ReclaimableBytes -= c.SizeBytes
@@ -491,9 +378,9 @@ func walkTree(root string, rootMod time.Time) (uint64, time.Time, error) {
 // removeWorkDir re-verifies the identity of a path immediately before deleting
 // it, so that a directory swapped between inspection and removal is not
 // removed on the strength of the old evidence.
-func removeWorkDir(families []Family, path string) error {
-	if _, ok := matchFamily(families, filepath.Base(path)); !ok {
-		return fmt.Errorf("not a sweepable temp directory: %s", path)
+func removeWorkDir(path string) error {
+	if !workDirPattern.MatchString(filepath.Base(path)) {
+		return fmt.Errorf("not a Go work directory: %s", path)
 	}
 	fi, err := os.Lstat(path)
 	if err != nil {

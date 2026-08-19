@@ -11,7 +11,7 @@ import (
 )
 
 // TmpSpaceCheck verifies that TMPDIR has room, and reports how much of any
-// shortfall is stranded build and test scratch space.
+// shortfall is stranded Go build scratch space.
 //
 // DiskSpaceCheck measures the town root, which on a typical host is the root
 // filesystem. TMPDIR is frequently a separate, much smaller, RAM-backed tmpfs,
@@ -38,7 +38,7 @@ func NewTmpSpaceCheck() *TmpSpaceCheck {
 	}
 }
 
-// CanFix reports that this check can reclaim orphaned scratch directories.
+// CanFix reports that this check can reclaim orphaned Go work directories.
 func (c *TmpSpaceCheck) CanFix() bool { return true }
 
 // Run checks free space in TMPDIR.
@@ -79,14 +79,14 @@ func (c *TmpSpaceCheck) Run(ctx *CheckContext) *CheckResult {
 		switch {
 		case scan.ReclaimableBytes > 0:
 			details = append(details, fmt.Sprintf(
-				"%s is orphaned build and test scratch in %d directories — run 'gt doctor --fix' or 'gt deacon sweep-tmp'",
+				"%s is orphaned Go build scratch in %d work directories — run 'gt doctor --fix' or 'gt deacon sweep-tmp'",
 				util.FormatBytesHuman(scan.ReclaimableBytes), countReclaimable(scan)))
 			fixHint = "gt deacon sweep-tmp"
 		case scan.Inconclusive:
-			details = append(details, "Could not tell stranded scratch dirs from live ones; nothing is safe to sweep automatically")
+			details = append(details, "Could not tell stranded Go build dirs from live ones; nothing is safe to sweep automatically")
 		default:
 			details = append(details,
-				"No orphaned build or test scratch directories: the space is held by something else (agent scratchpads, other fixtures)")
+				"No orphaned Go build directories: the space is held by something else (agent scratchpads, test fixtures)")
 		}
 	}
 
@@ -116,10 +116,9 @@ func (c *TmpSpaceCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// Fix reclaims orphaned build and test scratch directories from TMPDIR. It
-// removes only directories that pass every one of tmpgc's checks and refuses
-// whenever a check cannot be answered; it never touches agent scratchpads or
-// anything outside a known family.
+// Fix reclaims orphaned Go work directories from TMPDIR. It removes only
+// directories that pass every one of tmpgc's checks and refuses whenever a
+// check cannot be answered; it never touches agent scratchpads or fixtures.
 func (c *TmpSpaceCheck) Fix(ctx *CheckContext) error {
 	res, err := tmpgc.Sweep(tmpgc.Options{})
 	if err != nil {
@@ -129,7 +128,7 @@ func (c *TmpSpaceCheck) Fix(ctx *CheckContext) error {
 		return fmt.Errorf("refused to sweep %s: liveness evidence unavailable", res.Dir)
 	}
 	if res.Removed == 0 {
-		return fmt.Errorf("no orphaned scratch directories in %s: free space by other means", res.Dir)
+		return fmt.Errorf("no orphaned Go work directories in %s: free space by other means", res.Dir)
 	}
 	return nil
 }
