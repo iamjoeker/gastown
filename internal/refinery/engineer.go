@@ -991,7 +991,85 @@ func (e *Engineer) rejectMRBeforeMerge(mr *MRInfo, reason string) ProcessResult 
 		}
 		return ProcessResult{Success: false, Error: fmt.Sprintf("failed to close ineligible MR %s: %v", mrID, err)}
 	}
+	e.reportStrandedRejection(mr, reason)
 	return mergeIneligibleResult("%s", reason)
+}
+
+// reportStrandedRejection files a report when this rejection has left a closed
+// source issue under a branch that is not provably in the target.
+//
+// The engineer does not reopen the issue the way `gt mq reject` does — see
+// stranded_reject.go for why the unattended path reports instead of correcting.
+// Every outcome here is advisory: the MR is already rejected, and nothing in
+// this function may change that.
+func (e *Engineer) reportStrandedRejection(mr *MRInfo, reason string) {
+	if mr == nil || e.beads == nil {
+		return
+	}
+
+	workBeadID := resolveMergedWorkBead(e.beads.ForAgentBead(), mergedWorkBeadCloseRequest{
+		MRID:        mr.ID,
+		Branch:      mr.Branch,
+		SourceIssue: mr.SourceIssue,
+		AgentBead:   mr.AgentBead,
+	})
+
+	rigName := strings.TrimSpace(mr.Rig)
+	if rigName == "" && e.rig != nil {
+		rigName = e.rig.Name
+	}
+
+	result := reportStrandedReject(e.beads, e.branchMergedIntoTarget, strandedRejectRequest{
+		MRID:        mr.ID,
+		Branch:      mr.Branch,
+		Target:      mr.Target,
+		CommitSHA:   mr.CommitSHA,
+		Worker:      mr.Worker,
+		SourceIssue: workBeadID,
+		Reason:      reason,
+		Rig:         rigName,
+	})
+
+	if result.RigBindErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: stranded-rejection report for MR %s could not be bound to rig %s (%v) — filed in the default database instead\n",
+			mr.ID, rigName, result.RigBindErr)
+	}
+
+	switch {
+	case result.Err != nil:
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not report stranded rejection of MR %s (source_issue %s): %v\n",
+			mr.ID, result.SourceIssueID, result.Err)
+	case result.AlreadyMerged:
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s rejected with source_issue %s closed, but %s is already in %s — nothing stranded\n",
+			mr.ID, result.SourceIssueID, shortSHA(mr.CommitSHA), mr.Target)
+	case result.SkipReason != "":
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s rejected with terminal source_issue %s, not reported (%s)\n",
+			mr.ID, result.SourceIssueID, result.SkipReason)
+	case result.Stranded && result.Created:
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s rejected but source_issue %s is %s and %s is unmerged — filed %s for %s\n",
+			mr.ID, result.SourceIssueID, result.SourceIssueStatus, mr.Branch, result.BeadID, witnessAddress(rigName))
+	case result.Stranded:
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s rejected with source_issue %s stranded — already reported in %s\n",
+			mr.ID, result.SourceIssueID, result.BeadID)
+	}
+}
+
+// branchMergedIntoTarget reports whether commit is already contained in the
+// target branch's remote-tracking ref.
+//
+// It answers an error rather than false whenever it cannot tell — an unknown
+// commit, a missing ref, no git client — because only an error-free "yes"
+// suppresses a stranded-rejection report.
+func (e *Engineer) branchMergedIntoTarget(commit, target string) (bool, error) {
+	if e.git == nil {
+		return false, errors.New("no git client")
+	}
+	commit = strings.TrimSpace(commit)
+	target = strings.TrimSpace(target)
+	if commit == "" || target == "" {
+		return false, errors.New("commit and target are both required")
+	}
+	return e.git.IsAncestor(commit, "origin/"+target)
 }
 
 func (e *Engineer) recheckMRSourceStillMergeable(mr *MRInfo, sourceIssue string) ProcessResult {

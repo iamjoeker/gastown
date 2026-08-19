@@ -17,6 +17,7 @@ type prepushStore struct {
 	beadsdk.Storage
 	issues       map[string]*beadsdk.Issue
 	closeReasons map[string]string
+	created      []*beadsdk.Issue
 	beforeGet    func(id string)
 }
 
@@ -94,6 +95,71 @@ func (s *prepushStore) UpdateIssue(_ context.Context, id string, updates map[str
 		}
 	}
 	issue.UpdatedAt = time.Now()
+	return nil
+}
+
+// SearchIssues and CreateIssue back the stranded-rejection report the engineer
+// files when a rejection leaves a closed source issue (gt-h1cw). The embedded
+// nil Storage panics on anything unimplemented, so these have to be real enough
+// to let CreateIfNoDuplicate dedup: search returns open matches, create assigns
+// an ID.
+func (s *prepushStore) SearchIssues(_ context.Context, query string, filter beadsdk.IssueFilter) ([]*beadsdk.Issue, error) {
+	var matched []*beadsdk.Issue
+	for _, issue := range s.issues {
+		if !strings.Contains(issue.Title, query) && !strings.Contains(issue.Description, query) {
+			continue
+		}
+		if len(filter.Statuses) > 0 {
+			ok := false
+			for _, status := range filter.Statuses {
+				if issue.Status == status {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		if len(filter.Labels) > 0 {
+			ok := false
+			for _, want := range filter.Labels {
+				for _, have := range issue.Labels {
+					if have == want {
+						ok = true
+					}
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		matched = append(matched, issue)
+	}
+	return matched, nil
+}
+
+func (s *prepushStore) CreateIssue(_ context.Context, issue *beadsdk.Issue, _ string) error {
+	if issue.ID == "" {
+		issue.ID = fmt.Sprintf("gt-created-%d", len(s.issues)+1)
+	}
+	if issue.Status == "" {
+		issue.Status = beadsdk.StatusOpen
+	}
+	now := time.Now()
+	issue.CreatedAt, issue.UpdatedAt = now, now
+	s.issues[issue.ID] = issue
+	s.created = append(s.created, issue)
+	return nil
+}
+
+// createdWithTitle returns the issue this store created under title, or nil.
+func (s *prepushStore) createdWithTitle(title string) *beadsdk.Issue {
+	for _, issue := range s.created {
+		if issue.Title == title {
+			return issue
+		}
+	}
 	return nil
 }
 
@@ -255,6 +321,21 @@ func TestRecheckMRStillMergeable_RejectsClosedSource(t *testing.T) {
 	}
 	if got := store.closeReasons["gt-mr"]; got != "rejected: source_issue gt-src status is closed" {
 		t.Fatalf("MR close reason = %q, want closed source rejection", got)
+	}
+
+	// This is the gt-h1cw composition itself: the refinery rejects *because*
+	// the source issue is terminal, and used to leave the closed bead over an
+	// unmerged branch with nothing able to re-sling it. The rejection must now
+	// leave a durable report behind, and must still not reopen the issue.
+	report := store.createdWithTitle(strandedRejectTitle("gt-mr", "gt-src"))
+	if report == nil {
+		t.Fatalf("rejecting on a closed source_issue filed no stranded-work report; created: %+v", store.created)
+	}
+	if !strings.Contains(report.Description, "feature") || !strings.Contains(report.Description, "gt-src") {
+		t.Errorf("report description does not name the branch and the issue:\n%s", report.Description)
+	}
+	if store.issues["gt-src"].Status != beadsdk.StatusClosed {
+		t.Errorf("source issue status = %q, want closed — the unattended path must not reopen it", store.issues["gt-src"].Status)
 	}
 }
 

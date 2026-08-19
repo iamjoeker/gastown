@@ -57,6 +57,13 @@ func TestDoneCloseDescendantsWithChildren(t *testing.T) {
 while [ "$1" = "--allow-stale" ]; do shift; done
 cmd="$1"
 shift || true
+closes_log="%s"
+# Child listings reflect the closes this stub has already performed. A stub that
+# replayed its initial state forever would report every child still open after a
+# close that worked, which is the state closeDescendants now treats as a strand.
+status_of() {
+  if [ -f "$closes_log" ] && grep -qx "$1" "$closes_log"; then echo closed; else echo "$2"; fi
+}
 case "$cmd" in
   show)
     beadID="$1"
@@ -75,7 +82,7 @@ case "$cmd" in
   list)
     # Return children when listing with parent=gt-wisp-xyz
     if echo "$*" | grep -q "parent=gt-wisp-xyz"; then
-      echo '[{"id":"gt-step-1","title":"Step 1","status":"open"},{"id":"gt-step-2","title":"Step 2","status":"open"}]'
+      printf '[{"id":"gt-step-1","title":"Step 1","status":"%%s"},{"id":"gt-step-2","title":"Step 2","status":"%%s"}]\n' "$(status_of gt-step-1 open)" "$(status_of gt-step-2 open)"
     else
       echo '[]'
     fi
@@ -84,7 +91,7 @@ case "$cmd" in
     # Log bead IDs only, skip flags (--reason, --force, --session)
     for arg in "$@"; do
       case "$arg" in --*) continue ;; esac
-      echo "$arg" >> "%s"
+      echo "$arg" >> "$closes_log"
     done
     ;;
   agent|update|slot)
@@ -364,6 +371,10 @@ func TestDoneCloseDescendantsSomeAlreadyClosed(t *testing.T) {
 while [ "$1" = "--allow-stale" ]; do shift; done
 cmd="$1"
 shift || true
+closes_log="%s"
+status_of() {
+  if [ -f "$closes_log" ] && grep -qx "$1" "$closes_log"; then echo closed; else echo "$2"; fi
+}
 case "$cmd" in
   show)
     beadID="$1"
@@ -382,7 +393,7 @@ case "$cmd" in
   list)
     # Return one open child and one already-closed child
     if echo "$*" | grep -q "parent=gt-wisp-xyz"; then
-      echo '[{"id":"gt-step-open","title":"Step Open","status":"open"},{"id":"gt-step-closed","title":"Step Closed","status":"closed"}]'
+      printf '[{"id":"gt-step-open","title":"Step Open","status":"%%s"},{"id":"gt-step-closed","title":"Step Closed","status":"closed"}]\n' "$(status_of gt-step-open open)"
     else
       echo '[]'
     fi
@@ -391,7 +402,7 @@ case "$cmd" in
     # Log bead IDs only, skip flags (--reason, --force, --session)
     for arg in "$@"; do
       case "$arg" in --*) continue ;; esac
-      echo "$arg" >> "%s"
+      echo "$arg" >> "$closes_log"
     done
     ;;
   agent|update|slot)
@@ -512,6 +523,10 @@ func TestDoneCloseDescendantsDeeplyNested(t *testing.T) {
 while [ "$1" = "--allow-stale" ]; do shift; done
 cmd="$1"
 shift || true
+closes_log="%s"
+status_of() {
+  if [ -f "$closes_log" ] && grep -qx "$1" "$closes_log"; then echo closed; else echo "$2"; fi
+}
 case "$cmd" in
   show)
     beadID="$1"
@@ -531,10 +546,10 @@ case "$cmd" in
     # Return children based on parent
     if echo "$*" | grep -q "parent=gt-wisp-xyz"; then
       # Wisp has one child
-      echo '[{"id":"gt-child","title":"Child","status":"open"}]'
+      printf '[{"id":"gt-child","title":"Child","status":"%%s"}]\n' "$(status_of gt-child open)"
     elif echo "$*" | grep -q "parent=gt-child"; then
       # Child has one grandchild
-      echo '[{"id":"gt-grandchild","title":"Grandchild","status":"open"}]'
+      printf '[{"id":"gt-grandchild","title":"Grandchild","status":"%%s"}]\n' "$(status_of gt-grandchild open)"
     else
       echo '[]'
     fi
@@ -543,7 +558,7 @@ case "$cmd" in
     # Log bead IDs only, skip flags (--reason, --force, --session)
     for arg in "$@"; do
       case "$arg" in --*) continue ;; esac
-      echo "$arg" >> "%s"
+      echo "$arg" >> "$closes_log"
     done
     ;;
   agent|update|slot)

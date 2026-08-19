@@ -99,6 +99,17 @@ jobs:
           set -o pipefail
           gotestsum --format testname --junitfile junit.xml -- -race -short -timeout=10m -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
 
+      # ./... above stops at a module boundary: from the repo root it matches no
+      # packages under a nested go.mod, so plugins/dolt-snapshots was run by no
+      # CI job at all (gt-05p1). Its own step, because a separate module needs a
+      # separate invocation. internal/testenv's coverage check enumerates the
+      # modules that need one; keep this list and `make test-nested-modules` in
+      # step with it.
+      - name: Test nested modules
+        run: |
+          set -o pipefail
+          cd plugins/dolt-snapshots && go test -race -timeout=5m ./...
+
       - name: Test Report
         if: always()
         env:
