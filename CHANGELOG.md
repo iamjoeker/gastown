@@ -55,30 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A half-read planning scan no longer reports itself as an idle scheduler**
-  (gt-vpds). When a store cannot be read, the sling-context scan skips it and
-  plans on the rest — that isolation is deliberate (hq-v05uw), and the sentinel
-  that makes completeness-sensitive callers fail closed landed with gt-mji1. What
-  was missing is the other half: the callers that *do* continue had no way to say
-  what their view was missing. On 2026-08-19 six of twelve stores were unreadable
-  (orphan test databases plus a daemon restart, which scaffolds a `.beads` shell
-  for every Dolt database it enumerates), the planner built a dispatch plan from
-  the other six, and `gt scheduler status` printed `Scheduled: 3 total, 3 ready`
-  with 13 free capacity and nothing dispatching. The only trace of the
-  degradation was a stderr warning; the numbers themselves carried no qualifier
-  and `--json` carried no field at all, so the town read as idle-by-choice rather
-  than half-blind. The partial-scan error now carries which stores were skipped
-  as data rather than only as prose, that health travels with the records
-  through `assessScheduledContexts` — including the early return when the scan
-  finds nothing, which is exactly the case that looks like an empty scheduler —
-  and `gt scheduler status`, `gt scheduler list` and the dispatch and dry-run
-  paths print `planning scan read only N of M stores` beside the counts it
-  qualifies. `gt scheduler status --json` gains a `scan` object
-  (`incomplete`, `skipped_stores`, `stores_total`), always emitted so a consumer
-  can distinguish a complete scan from an older `gt` that never reported one.
-  Error text, the `ErrPartialSlingContextScan` identity and every existing
-  fail-closed path are unchanged.
-
 - **`gt mq list --verify` reports EMPTY for a branch that carries no commits**
   (gt-d5u). `--verify` checked only that the branch *existed*, and existence is
   not work: a branch that was never committed to still resolves — to its own

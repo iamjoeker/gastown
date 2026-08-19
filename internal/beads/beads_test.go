@@ -1108,28 +1108,6 @@ exit 0
 	}
 }
 
-func TestProtectedLabelRejectReason(t *testing.T) {
-	tests := []struct {
-		name  string
-		issue *Issue
-		want  string
-	}{
-		{name: "nil", issue: nil, want: ""},
-		{name: "plain work", issue: &Issue{ID: "gt-work", Type: "task"}, want: ""},
-		{name: "keep", issue: &Issue{ID: "gt-work", Labels: []string{"gt:keep"}}, want: "protected-label:gt:keep"},
-		{name: "rig", issue: &Issue{ID: "gt-rig", Labels: []string{"gt:rig"}}, want: "protected-label:gt:rig"},
-		// Internal labels are not work at all, so they are not the recoverable kind.
-		{name: "internal label is not protected", issue: &Issue{ID: "gt-mr", Labels: []string{"gt:merge-request"}}, want: ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := ProtectedLabelRejectReason(tt.issue); got != tt.want {
-				t.Fatalf("ProtectedLabelRejectReason() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestConcreteWorkIssueRejectReason(t *testing.T) {
 	tests := []struct {
 		name  string

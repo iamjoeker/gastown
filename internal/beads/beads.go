@@ -263,22 +263,6 @@ func ConcreteWorkIssueRejectReason(issue *Issue) string {
 		if InternalIssueLabel(label) {
 			return "internal-label:" + strings.ToLower(strings.TrimSpace(label))
 		}
-	}
-	return ProtectedLabelRejectReason(issue)
-}
-
-// ProtectedLabelRejectReason returns why issue is rejected on account of a
-// protected label alone, or "" when no label protects it.
-//
-// This is the recoverable half of ConcreteWorkIssueRejectReason. A wisp, a
-// formula or an internal type is not work at all, but a protected bead is
-// ordinary work that merely must not be auto-closed — completion paths that
-// close nothing can carry on past it (gt-zu5n).
-func ProtectedLabelRejectReason(issue *Issue) string {
-	if issue == nil {
-		return ""
-	}
-	for _, label := range issue.Labels {
 		if ProtectedIssueLabel(label) {
 			return "protected-label:" + strings.ToLower(strings.TrimSpace(label))
 		}

@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
-	"github.com/steveyegge/gastown/internal/testenv"
 )
 
 // setupDoltDB creates a fake Dolt database directory under .dolt-data/.
@@ -100,11 +99,6 @@ func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
 }
 
 func TestGetServerAddr(t *testing.T) {
-	// This test's subject is the unconfigured fallback, which the port guard
-	// exists to keep tests from reaching. Drop the guard so the real default
-	// is what gets asserted. Nothing here opens a connection.
-	testenv.WithoutDoltPortGuard(t)
-
 	check := NewDoltServerReachableCheck()
 
 	tests := []struct {
@@ -194,11 +188,6 @@ func TestGetServerAddr_NoMetadata(t *testing.T) {
 }
 
 func TestGetServerAddr_UsesConfigYAMLPort(t *testing.T) {
-	// This test's subject is the unconfigured fallback, which the port guard
-	// exists to keep tests from reaching. Drop the guard so the real default
-	// is what gets asserted. Nothing here opens a connection.
-	testenv.WithoutDoltPortGuard(t)
-
 	check := NewDoltServerReachableCheck()
 	townRoot := t.TempDir()
 
