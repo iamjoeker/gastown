@@ -162,46 +162,6 @@ mismatch.
 - **Smallest fix direction**: the least invasive code, docs, or operations change
   that would prevent repeat incidents.
 
-## Tests Cannot Reach the Production Port
-
-`go test ./...` used to create real databases on the live server. Every Dolt
-port resolver in the tree ends in the same fallback — `doltserver.DefaultPort`,
-which is 3307 — so a test that built a fixture town under `t.TempDir()` and
-then called production code inherited production. Six databases were created
-in 34 seconds that way on 2026-08-18 (`forkrig`, `pc1`, `pc2`, `pc3`,
-`testrig`, `testrip`).
-
-Every test package now calls `testenv.GuardProductionDolt()` from its
-`TestMain`, which points `GT_DOLT_PORT`, `BEADS_DOLT_PORT` and
-`BEADS_DOLT_SERVER_PORT` at port 63307. Nothing listens there, so a suite that
-reaches for Dolt without arranging its own server gets "connection refused"
-instead of silently writing to the live one.
-
-What this means in practice:
-
-- **Running the suite is safe.** `go test ./...` from a rig, a worktree, or an
-  agent sandbox no longer touches the production server. It does not need
-  `gt dolt cleanup` afterwards.
-- **A new package needs the TestMain.**
-  `TestEveryTestPackageGuardsProductionDolt` in `internal/testenv` fails on any
-  package that has tests but no guarded `TestMain`, and on any `TestMain` — a
-  build-tagged variant included — that does not call the guard. Copy the file
-  any package already has.
-- **Order matters in a TestMain that does more.** `UnsetAmbientTownEnv` strips
-  `GT_*` and `BEADS_*` wholesale, so it must run *before* the guard; container
-  helpers such as `EnsureDoltContainerForTestMain` write their own mapped port,
-  so they must run *after* it.
-- **Testing the fallback itself.** A test whose subject is the unconfigured
-  default calls `testenv.WithoutDoltPortGuard(t)`, which drops the guard for
-  that test only. It is for tests that resolve a port without connecting.
-- **Deliberately talking to production** — an operational smoke check run by
-  hand — requires `GT_TEST_ALLOW_PRODUCTION_DOLT=1`. It is never set in CI or
-  in an agent sandbox.
-
-An orphan database appearing after a test run now means the guard was bypassed,
-not that a suite forgot to clean up. Treat it as a bug and capture it with the
-RCA checklist above.
-
 ## Simulated Incident Smoke Check
 
 For documentation-only RCA work, use this smoke check to verify the checklist is

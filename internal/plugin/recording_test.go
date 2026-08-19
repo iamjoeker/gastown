@@ -67,11 +67,6 @@ func TestRecordRunCreatesAndClosesReceipt(t *testing.T) {
 	}
 	log := string(data)
 	for _, want := range []string{
-		// No --wisp-type, and that is the assertion (gt-fqd5). Receipts are the
-		// cooldown ledger, read up to 168h later by tool-updater's gate; any
-		// wisp_type makes gt compact delete them at 24h. Pinned in the same
-		// literal as the rest of the create so adding one has to fail a test
-		// rather than quietly break a gate six days later.
 		"create --ephemeral --json -t chore --title=tool-updater: failed=brew",
 		"-l type:plugin-run",
 		"-l plugin:tool-updater",

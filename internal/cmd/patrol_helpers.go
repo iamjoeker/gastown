@@ -299,8 +299,6 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 		return "", fmt.Errorf("created wisp but could not parse ID from output")
 	}
 
-	stampPatrolWispType(cfg, resolvedBeadsDir, patrolID)
-
 	// Hook the wisp to the agent so gt mol status sees it
 	if err := BdCmd("update", patrolID, "--status=hooked", "--assignee="+cfg.Assignee).
 		WithAutoCommit().
@@ -318,23 +316,6 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 	}
 
 	return patrolID, nil
-}
-
-// stampPatrolWispType classifies a freshly spawned patrol wisp from the value
-// its formula declares in [vars.wisp_type] (gt-fqd5).
-//
-// The formula is resolved with the same (name, townRoot, rig) triple
-// renderPatrolWispDescription uses, so the type comes from the same copy of the
-// formula that produced the wisp's checklist — a rig-tier override changes both
-// together or neither.
-//
-// includeChildren is false because the spawn above passes --root-only: a patrol
-// wisp deliberately has no step rows.
-func stampPatrolWispType(cfg PatrolConfig, resolvedBeadsDir, patrolID string) {
-	stampMoleculeWispType(cfg.PatrolMolName, cfg.BeadsDir, patrolRigName(cfg), patrolID, false,
-		func(c *bdCmd) *bdCmd {
-			return c.WithAutoCommit().WithBeadsDir(resolvedBeadsDir).Dir(cfg.BeadsDir)
-		})
 }
 
 func renderPatrolWispDescription(cfg PatrolConfig) (string, error) {
