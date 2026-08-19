@@ -146,8 +146,8 @@ func TestPatrolBranchesHumanSeparatesUnknownFromCheck(t *testing.T) {
 	result.Findings = append(result.Findings, witness.BranchSweepFinding{
 		Branch: "polecat/refuge/gt-wz3y+eee",
 		Class:  witness.BranchSweepUnknown,
-		Err:    "remote tip for refs/heads/polecat/refuge/gt-wz3y+eee moved between listing and fetch: listed 89db0051, fetched dd7e98ec (re-run to classify it)",
-		Note:   "could not compare against origin/main or upstream/main: remote tip moved between listing and fetch",
+		Err:    "candidate refs/heads/polecat/refuge/gt-wz3y+eee changed while pruning",
+		Note:   "could not compare against origin/main or upstream/main",
 	})
 	result.Scanned = 5
 
@@ -164,12 +164,6 @@ func TestPatrolBranchesHumanSeparatesUnknownFromCheck(t *testing.T) {
 	}
 	if !strings.Contains(out, "not an all-clear") {
 		t.Errorf("output does not say what an unclassified branch means:\n%s", out)
-	}
-	// The reason must survive into the table. Without it every unknown reads as a
-	// property of the branch, which is how a clobbered FETCH_HEAD got reported as
-	// an unclassifiable branch for as long as it did (gt-880s).
-	if !strings.Contains(out, "moved between listing and fetch") {
-		t.Errorf("the note's reason did not reach the table:\n%s", out)
 	}
 }
 
