@@ -817,36 +817,17 @@ gt mq list <rig> --status open --worker <polecat-name>
 ```
 
 > ⚠️ **Do NOT look up MR beads with a `bd list` merge-request type filter.**
-> **The reason is the STORAGE TABLE, not the routing role. Do not re-enable this
-> form after checking `git config beads.role`.**
->
-> `gt mq submit` creates MR beads as EPHEMERAL beads — rows in the `wisps`
-> table (GH#2446). `bd list` reads the `issues` table. It therefore cannot
-> return an MR bead under ANY `beads.role`, on ANY rig, ever. It does not
-> error; it prints "No issues found", which reads exactly like a clean queue.
->
-> Measured on the gastown rig 2026-08-19, from `refinery/rig` where
-> `git config beads.role` prints **maintainer** — i.e. with routing already
-> correct:
->
-> - the `bd list` merge-request form → "No issues found"
-> - `gt mq list gastown --status all` → 20 MR beads, 9 of them open/ready
-> - control, same directory: `bd list --status=open` → rig issues (225 in
->   store), proving `bd list` WAS reaching the right database
->
-> The control is the point: routing was fine and the query still could not
-> see a single MR. Flipping the role does not arm this instrument.
->
-> Contributor routing is a SECOND, independent way to get the same empty
-> answer (measured on the beads rig 2026-08-17: 0 from the `bd list` form vs
-> 6 real MR beads from `gt mq list beads --status closed` — bd-wisp-bmg, dwo,
-> log, ppo, 9rt, 7m0). Either defect alone is sufficient; fixing one leaves
-> the other. Note also that `bd list`'s routing note goes to stderr, so piping
+> MR beads live in the RIG store, but on any rig with `beads.role=contributor`
+> (or a contributor role inferred from the origin URL) `bd list` routes to the
+> CONTRIBUTOR PLANNING store instead — a different database. It does not error;
+> it prints "No issues found". Measured on the beads rig 2026-08-17: for the
+> identical closed-MR query, the `bd list` form returned 0 while
+> `gt mq list beads --status closed` returned 6 real MR beads (bd-wisp-bmg,
+> dwo, log, ppo, 9rt, 7m0). So that form is structurally incapable of ever
+> finding an MR bead here, and its empty result reads exactly like a clean
+> queue. `gt mq` is the authoritative reader for the merge queue — use it
+> everywhere. Note also that `bd list`'s routing note goes to stderr, so piping
 > it to `grep` hides even that hint.
->
-> `gt mq` is the authoritative reader for the merge queue — use it everywhere.
-> If you need raw SQL, query the `wisps` table joined to `wisp_labels` on
-> `label='gt:merge-request'`, never `issues`.
 >
 > *The dangerous literal is deliberately not written out here — an audit
 > grepping for it must not match this warning.*
@@ -1223,19 +1204,12 @@ gt mq list <rig> --status open --verify
 condition this step is looking for.
 
 > ⚠️ **Do NOT substitute the `bd list` merge-request type filter here.**
-> See the warning in merge-push Step 2. That form reads the `issues` table
-> while MR beads are rows in `wisps`, so it returns "No issues found"
-> unconditionally — **at every `beads.role`, including maintainer.** This
-> orphan sweep would then report a clean result without having examined a
-> single MR bead — the same failure shape as the RSS gate in context-check
-> (hq-hwx4q): an instrument that cannot fire, whose silence is mistaken for
-> an all-clear.
->
-> **Reporting rule for this step:** a zero here is only reportable as "no
-> orphans" if `gt mq list <rig> --status all` returned a non-empty list in the
-> same cycle. That is your positive control — it proves the reader can see
-> this rig's MR beads at all. If both are empty, do not report "clean";
-> report **"orphan sweep: NOT MEASURED (no MR beads visible)"**.
+> See the warning in merge-push Step 2: on a contributor-routed rig that form
+> reads the contributor planning store, not the rig store, and returns "No issues
+> found" unconditionally. This orphan sweep would then report a clean result
+> without having examined a single MR bead — the same failure shape as the RSS
+> gate in context-check (hq-hwx4q): an instrument that cannot fire, whose silence
+> is mistaken for an all-clear.
 
 For each open MR bead:
 1. Check if branch exists: `git ls-remote origin refs/heads/<branch>`
