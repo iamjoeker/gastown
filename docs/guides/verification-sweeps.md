@@ -193,3 +193,6 @@ visited a non-zero number of files, and that its controls passed.
 - Deacon patrol formula (`mol-deacon-patrol`), "Verification Sweeps" — binds
   this rule to the Deacon's census
 - gt-emm — the originating bug, with the full 0-vs-16 reproduction
+- [False-Zero Queries](false-zero-queries.md) — the same "0 is not a result"
+  rule applied to database listings: name the store and the scope, or the zero
+  is unfalsifiable

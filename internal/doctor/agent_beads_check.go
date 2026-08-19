@@ -76,14 +76,23 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 
 	var missing []string
 	var missingLabel []string
+	var closedBeads []string
 	var checked int
 
 	// Build combined sets of known agent beads from both issues and wisps tables.
 	// Agent beads are ephemeral (stored in wisps), but we also check issues for
 	// backward compatibility. The wisps list doesn't include type/labels, so we
 	// track wisp IDs separately for existence checks.
+	//
+	// Two wisp sets, not one: ListWispIDs is open-only, so a CLOSED agent bead
+	// is absent from it. Classifying on that set alone reports an agent bead
+	// that exists-but-is-closed as "missing", which reads as data loss and
+	// prescribes the wrong remedy (create instead of reopen). Fix() has always
+	// known the difference — it Show()s and reopens — so check and fix
+	// disagreed on the same input (gt-kb63).
 	allAgentBeads := make(map[string]*beads.Issue) // from issues table (has labels)
-	allWispIDs := make(map[string]bool)            // from wisps table (ID only)
+	openWispIDs := make(map[string]bool)           // from wisps table, open only
+	anyWispIDs := make(map[string]bool)            // from wisps table, open + closed
 
 	// Load global agents from town beads
 	townBeadsPath := beads.GetTownBeadsPath(ctx.TownRoot)
@@ -93,11 +102,7 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 			allAgentBeads[id] = issue
 		}
 	}
-	if townWisps, _ := townBd.ListWispIDs(); townWisps != nil {
-		for id := range townWisps {
-			allWispIDs[id] = true
-		}
-	}
+	collectWispIDs(townBd, openWispIDs, anyWispIDs)
 
 	// Load rig-level agents
 	for _, info := range prefixToRig {
@@ -108,24 +113,19 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 				allAgentBeads[id] = issue
 			}
 		}
-		if rigWisps, _ := bd.ListWispIDs(); rigWisps != nil {
-			for id := range rigWisps {
-				allWispIDs[id] = true
-			}
-		}
+		collectWispIDs(bd, openWispIDs, anyWispIDs)
 	}
 
 	// checkAgentBead verifies an agent bead exists (in issues or wisps table).
 	// Label checking only applies to beads found in the issues table (wisps
 	// don't expose labels in their list output).
 	checkAgentBead := func(id string) {
-		if issue, exists := allAgentBeads[id]; exists {
-			// Found in issues table — check label
-			if !beads.HasLabel(issue, "gt:agent") {
-				missingLabel = append(missingLabel, id)
-			}
-		} else if !allWispIDs[id] {
-			// Not in issues or wisps
+		switch classifyAgentBead(id, allAgentBeads, openWispIDs, anyWispIDs) {
+		case agentBeadMissingLabel:
+			missingLabel = append(missingLabel, id)
+		case agentBeadClosed:
+			closedBeads = append(closedBeads, id)
+		case agentBeadMissing:
 			missing = append(missing, id)
 		}
 		checked++
@@ -140,21 +140,7 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 
 	if len(prefixToRig) == 0 {
 		// No rigs to check, but we still checked global agents
-		if len(missing) == 0 && len(missingLabel) == 0 {
-			return &CheckResult{
-				Name:    c.Name(),
-				Status:  StatusOK,
-				Message: fmt.Sprintf("All %d agent beads exist with gt:agent label", checked),
-			}
-		}
-		details := append(missing, missingLabel...)
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusError,
-			Message: fmt.Sprintf("%d agent bead(s) missing, %d missing gt:agent label", len(missing), len(missingLabel)),
-			Details: details,
-			FixHint: "Run 'gt doctor --fix' to create missing agent beads and add labels",
-		}
+		return c.agentBeadsResult(checked, missing, closedBeads, missingLabel)
 	}
 
 	// Check each rig for its agents
@@ -183,7 +169,64 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	if len(missing) == 0 && len(missingLabel) == 0 {
+	return c.agentBeadsResult(checked, missing, closedBeads, missingLabel)
+}
+
+// agentBeadState is how one agent bead looks across the three lookup sources.
+type agentBeadState int
+
+const (
+	agentBeadOK agentBeadState = iota
+	agentBeadMissingLabel
+	agentBeadClosed
+	agentBeadMissing
+)
+
+// classifyAgentBead decides what an agent bead's absence from each source means.
+//
+// openWisps is `bd mol wisp list` (open-only) and anyWisps is the same listing
+// with --all. Present in anyWisps but not openWisps means the bead EXISTS and
+// is closed — a different fault from "missing", with a different remedy
+// (reopen, not create), which is what Fix() already does. Reporting it as
+// missing is the false zero this distinction exists to prevent (gt-kb63).
+func classifyAgentBead(id string, issues map[string]*beads.Issue, openWisps, anyWisps map[string]bool) agentBeadState {
+	if issue, exists := issues[id]; exists {
+		// Found in issues table — check label
+		if !beads.HasLabel(issue, "gt:agent") {
+			return agentBeadMissingLabel
+		}
+		return agentBeadOK
+	}
+	if openWisps[id] {
+		return agentBeadOK
+	}
+	if anyWisps[id] {
+		return agentBeadClosed
+	}
+	return agentBeadMissing
+}
+
+// collectWispIDs merges one store's wisps into the open and all-status sets.
+// One bd call serves both, since the --all listing carries each wisp's status.
+// Errors are ignored: a store without a wisps table contributes nothing, which
+// is the pre-existing behavior.
+//
+// Both sets come from the SAME store, so neither can speak for another rig.
+// The caller unions across every store precisely because one store's silence
+// is not evidence (gt-kb63).
+func collectWispIDs(bd *beads.Beads, openWisps, anyWisps map[string]bool) {
+	statuses, _ := bd.ListWispStatuses()
+	for id, status := range statuses {
+		anyWisps[id] = true
+		if !strings.EqualFold(status, "closed") {
+			openWisps[id] = true
+		}
+	}
+}
+
+// agentBeadsResult renders the check's verdict from the three fault buckets.
+func (c *AgentBeadsCheck) agentBeadsResult(checked int, missing, closedBeads, missingLabel []string) *CheckResult {
+	if len(missing) == 0 && len(closedBeads) == 0 && len(missingLabel) == 0 {
 		return &CheckResult{
 			Name:    c.Name(),
 			Status:  StatusOK,
@@ -191,22 +234,45 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	if len(missing) > 0 {
+	// Label-only faults are a warning; a missing or closed agent bead is an error.
+	if len(missing) == 0 && len(closedBeads) == 0 {
 		return &CheckResult{
 			Name:    c.Name(),
-			Status:  StatusError,
-			Message: fmt.Sprintf("%d agent bead(s) missing", len(missing)),
-			Details: missing,
-			FixHint: "Run 'gt doctor --fix' to create missing agent beads",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("%d agent bead(s) missing gt:agent label", len(missingLabel)),
+			Details: missingLabel,
+			FixHint: "Run 'gt doctor --fix' to add missing labels",
 		}
+	}
+
+	var parts []string
+	details := make([]string, 0, len(missing)+len(closedBeads)+len(missingLabel))
+	if len(missing) > 0 {
+		parts = append(parts, fmt.Sprintf("%d agent bead(s) missing", len(missing)))
+		details = append(details, missing...)
+	}
+	if len(closedBeads) > 0 {
+		parts = append(parts, fmt.Sprintf("%d closed (exist, need reopen)", len(closedBeads)))
+		for _, id := range closedBeads {
+			details = append(details, id+" (closed — exists, not missing)")
+		}
+	}
+	if len(missingLabel) > 0 {
+		parts = append(parts, fmt.Sprintf("%d missing gt:agent label", len(missingLabel)))
+		details = append(details, missingLabel...)
+	}
+
+	fixHint := "Run 'gt doctor --fix' to create missing agent beads"
+	if len(closedBeads) > 0 {
+		fixHint = "Run 'gt doctor --fix' to create missing agent beads and reopen closed ones"
 	}
 
 	return &CheckResult{
 		Name:    c.Name(),
-		Status:  StatusWarning,
-		Message: fmt.Sprintf("%d agent bead(s) missing gt:agent label", len(missingLabel)),
-		Details: missingLabel,
-		FixHint: "Run 'gt doctor --fix' to add missing labels",
+		Status:  StatusError,
+		Message: strings.Join(parts, ", "),
+		Details: details,
+		FixHint: fixHint,
 	}
 }
 
