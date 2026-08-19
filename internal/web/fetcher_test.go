@@ -298,6 +298,9 @@ func TestGetRefineryStatusHint(t *testing.T) {
 		mergeQueueCount int
 		want            string
 	}{
+		// An unreadable queue must not read as an idle refinery: zero is a
+		// count, and a failed query has none (gt-egq9).
+		{"unreadable queue", mergeQueueCountUnknown, "Merge queue unreadable"},
 		{"idle when no PRs", 0, "Idle - Waiting for PRs"},
 		{"singular PR", 1, "Processing 1 PR"},
 		{"multiple PRs", 2, "Processing 2 PRs"},
@@ -614,8 +617,14 @@ exit 0
 				t.Fatal("expected first FetchConvoys call to fail")
 			}
 
-			if _, err := f.FetchConvoys(); err != nil {
-				t.Fatalf("expected immediate retry to be backed off silently, got: %v", err)
+			// Backed off means no process AND no data — the breaker suppresses
+			// the query, not the fact that the panel could not be read (gt-egq9).
+			_, err := f.FetchConvoys()
+			if err == nil {
+				t.Fatal("a backed-off retry must report that it read nothing, not return an empty list")
+			}
+			if !strings.Contains(err.Error(), "backing off") {
+				t.Fatalf("error should say the query was backed off, got: %v", err)
 			}
 
 			countBytes, err := os.ReadFile(bdPath + ".count")
@@ -663,14 +672,13 @@ exit 0
 	wg.Wait()
 	close(errCh)
 
-	errCount := 0
+	// The stampede the breaker prevents is one of PROCESSES, not of error
+	// returns: a caller that was refused ran no query, so it has nothing to
+	// report but the refusal.
 	for err := range errCh {
-		if err != nil {
-			errCount++
+		if err == nil {
+			t.Fatal("no caller may return an empty convoy list here — one query ran and it failed")
 		}
-	}
-	if errCount != 1 {
-		t.Fatalf("FetchConvoys errors = %d, want 1; backed-off callers should return nil", errCount)
 	}
 
 	countBytes, err := os.ReadFile(bdPath + ".count")
