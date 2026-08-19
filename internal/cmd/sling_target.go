@@ -18,27 +18,7 @@ var spawnPolecatForSling = SpawnPolecatForSling
 // resolveTargetAgentFn is a seam for tests. Production uses resolveTargetAgent.
 var resolveTargetAgentFn = resolveTargetAgent
 
-// resolveTargetAgentID converts a target spec to an agent ID without touching
-// tmux. Identity is a naming question — a session name maps to an agent ID
-// whether or not that session is alive.
-//
-// Commands that only read and write beads must resolve through this. Going via
-// resolveTargetAgent instead makes a live pane a precondition for work that
-// never needs one, which is how `gt unsling <rig>/<polecat>` came to fail with
-// "getting pane for gt-synth: exit status 1" — on exactly the dead agents that
-// check-recovery escalates for recovery, since a NEEDS_RECOVERY polecat has no
-// session by definition (gt-dh3d).
-func resolveTargetAgentID(target string) (string, error) {
-	sessionName, err := resolveRoleToSession(target)
-	if err != nil {
-		return "", err
-	}
-	return sessionToAgentID(sessionName), nil
-}
-
 // resolveTargetAgent converts a target spec to agent ID, pane, and hook root.
-// It requires a live session; callers that only need the identity should use
-// resolveTargetAgentID.
 func resolveTargetAgent(target string) (agentID string, pane string, hookRoot string, err error) {
 	// First resolve to session name
 	sessionName, err := resolveRoleToSession(target)

@@ -360,154 +360,29 @@ func TestCleanupStatusReconcileCandidateRequiresStrictPredicates(t *testing.T) {
 	}
 }
 
-func TestAssessHookBead(t *testing.T) {
-	const assignee = "gastown/polecats/synth"
-
+func TestHookBeadSafeForCleanup(t *testing.T) {
 	tests := []struct {
-		name           string
-		hookBead       string
-		bd             issueShower
-		wantSafe       bool
-		wantTerminal   bool
-		wantUnverified bool
-		wantBlocker    string
-		wantDiagnostic string
+		name         string
+		hookBead     string
+		bd           issueShower
+		wantSafe     bool
+		wantTerminal bool
+		wantBlocker  string
 	}{
 		{name: "empty hook", wantSafe: true},
-		{
-			name:           "terminal hook",
-			hookBead:       "gt-work",
-			bd:             fakeIssueShower{issue: &beads.Issue{Status: "closed"}},
-			wantSafe:       true,
-			wantTerminal:   true,
-			wantDiagnostic: "hook=released",
-		},
-		{
-			name:        "hooked bead held by this polecat blocks",
-			hookBead:    "gt-work",
-			bd:          fakeIssueShower{issue: &beads.Issue{Status: "hooked", Assignee: assignee}},
-			wantBlocker: "hook_bead=gt-work status=hooked",
-		},
-		{
-			name:        "in_progress bead held by this polecat blocks",
-			hookBead:    "gt-work",
-			bd:          fakeIssueShower{issue: &beads.Issue{Status: "in_progress", Assignee: assignee}},
-			wantBlocker: "hook_bead=gt-work status=in_progress",
-		},
-		{
-			// The normalized address form mail writes must still count as held,
-			// or a real hook silently stops blocking.
-			name:        "normalized assignee form still counts as held",
-			hookBead:    "gt-work",
-			bd:          fakeIssueShower{issue: &beads.Issue{Status: "hooked", Assignee: "gastown/synth"}},
-			wantBlocker: "hook_bead=gt-work status=hooked",
-		},
-		{
-			// The reopen-to-unstrand shape, and what gt unsling writes: the
-			// issue store says nobody holds it, so the slot is a stale copy.
-			name:           "open bead with no assignee is a stale association",
-			hookBead:       "gt-2uqy",
-			bd:             fakeIssueShower{issue: &beads.Issue{Status: "open"}},
-			wantSafe:       true,
-			wantDiagnostic: "store_status=open store_assignee=<none> hook=stale",
-		},
-		{
-			name:           "bead held by another polecat is not our hook",
-			hookBead:       "gt-work",
-			bd:             fakeIssueShower{issue: &beads.Issue{Status: "hooked", Assignee: "gastown/polecats/nitro"}},
-			wantSafe:       true,
-			wantDiagnostic: "store_assignee=gastown/polecats/nitro hook=stale",
-		},
-		{
-			// Ambiguous, not released: the status says somebody holds it while
-			// the assignee names nobody. Ambiguity keeps blocking.
-			name:        "hooked bead with no assignee still blocks",
-			hookBead:    "gt-work",
-			bd:          fakeIssueShower{issue: &beads.Issue{Status: "hooked"}},
-			wantBlocker: "hook_bead=gt-work status=hooked",
-		},
-		{
-			name:           "lookup error blocks",
-			hookBead:       "gt-work",
-			bd:             fakeIssueShower{err: errors.New("bd exploded")},
-			wantUnverified: true,
-			wantBlocker:    "lookup_error",
-		},
-		{
-			name:           "missing bead blocks",
-			hookBead:       "gt-work",
-			bd:             fakeIssueShower{},
-			wantUnverified: true,
-			wantBlocker:    "hook_bead=gt-work status=missing",
-		},
-		{
-			name:           "no store to read blocks",
-			hookBead:       "gt-work",
-			wantUnverified: true,
-			wantBlocker:    "hook_bead=gt-work status=unverified",
-		},
+		{name: "terminal hook", hookBead: "gt-work", bd: fakeIssueShower{issue: &beads.Issue{Status: "closed"}}, wantSafe: true, wantTerminal: true},
+		{name: "open hook blocks", hookBead: "gt-work", bd: fakeIssueShower{issue: &beads.Issue{Status: "open"}}, wantBlocker: "hook_bead=gt-work status=open"},
+		{name: "lookup error blocks", hookBead: "gt-work", bd: fakeIssueShower{err: errors.New("bd exploded")}, wantBlocker: "lookup_error"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := assessHookBead(tt.bd, tt.hookBead, assignee)
-			if got.Safe != tt.wantSafe || got.Terminal != tt.wantTerminal || got.Unverified != tt.wantUnverified {
-				t.Fatalf("assessHookBead() safe/terminal/unverified = (%v, %v, %v), want (%v, %v, %v)",
-					got.Safe, got.Terminal, got.Unverified, tt.wantSafe, tt.wantTerminal, tt.wantUnverified)
+			gotSafe, gotTerminal, blocker := hookBeadSafeForCleanup(tt.bd, tt.hookBead)
+			if gotSafe != tt.wantSafe || gotTerminal != tt.wantTerminal {
+				t.Fatalf("hookBeadSafeForCleanup() = (%v, %v), want (%v, %v)", gotSafe, gotTerminal, tt.wantSafe, tt.wantTerminal)
 			}
-			if tt.wantBlocker == "" && got.Blocker != "" {
-				t.Fatalf("blocker = %q, want none", got.Blocker)
-			}
-			if tt.wantBlocker != "" && !strings.Contains(got.Blocker, tt.wantBlocker) {
-				t.Fatalf("blocker = %q, want contains %q", got.Blocker, tt.wantBlocker)
-			}
-			if tt.wantDiagnostic != "" && !strings.Contains(got.Diagnostic, tt.wantDiagnostic) {
-				t.Fatalf("diagnostic = %q, want contains %q", got.Diagnostic, tt.wantDiagnostic)
-			}
-			// Whichever way it lands, a hook slot that was read against the
-			// store names the surfaces it read (gt-dh3d).
-			if tt.hookBead != "" && !tt.wantUnverified && got.Diagnostic == "" {
-				t.Fatalf("diagnostic = %q, want the surfaces named", got.Diagnostic)
-			}
-		})
-	}
-}
-
-// The stale-association case must stay distinguishable from a genuine hook all
-// the way through to the verdict: a slot the issue store contradicts produces
-// no blocker at all, while the same slot backed by an assignment does.
-func TestAssessHookBeadDrivesWorkstateBlocker(t *testing.T) {
-	const (
-		assignee = "gastown/polecats/synth"
-		hookBead = "gt-2uqy"
-	)
-
-	for _, tt := range []struct {
-		name        string
-		issue       *beads.Issue
-		wantBlocked bool
-	}{
-		{name: "reopened and unassigned", issue: &beads.Issue{Status: "open"}},
-		{name: "genuinely hooked", issue: &beads.Issue{Status: "hooked", Assignee: assignee}, wantBlocked: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			hook := assessHookBead(fakeIssueShower{issue: tt.issue}, hookBead, assignee)
-			input := polecat.WorkstateInput{
-				State:         polecat.StateIdle,
-				CleanupStatus: polecat.CleanupClean,
-			}
-			if hook.Blocker != "" {
-				input.HookBead = hookBead
-			}
-			got := polecat.DecideWorkstate(input)
-			blocked := false
-			for _, blocker := range got.Blockers {
-				if strings.Contains(blocker, "has work on hook") {
-					blocked = true
-				}
-			}
-			if blocked != tt.wantBlocked {
-				t.Fatalf("verdict %s blockers = %v, want hook blocker present = %v", got.Verdict, got.Blockers, tt.wantBlocked)
+			if tt.wantBlocker != "" && !strings.Contains(blocker, tt.wantBlocker) {
+				t.Fatalf("blocker = %q, want contains %q", blocker, tt.wantBlocker)
 			}
 		})
 	}
@@ -603,19 +478,12 @@ func TestRecoveryGitStateBlocker(t *testing.T) {
 }
 
 func TestRecoveryActionsForBlockers(t *testing.T) {
-	actions := recoveryActionsForBlockers([]string{"git_state=has_stash stash_count=1"}, "gastown", "synth")
+	actions := recoveryActionsForBlockers([]string{"git_state=has_stash stash_count=1"})
 	if len(actions) != 1 || !strings.Contains(actions[0], "preserve branch-owned stash") {
 		t.Fatalf("actions = %v, want branch stash preservation action", actions)
 	}
-	if actions := recoveryActionsForBlockers([]string{"cleanup_status=has_stash"}, "gastown", "synth"); len(actions) != 0 {
+	if actions := recoveryActionsForBlockers([]string{"cleanup_status=has_stash"}); len(actions) != 0 {
 		t.Fatalf("stale cleanup-only blocker actions = %v, want none", actions)
-	}
-
-	// A hook blocker must carry a command that can actually run against a dead
-	// agent, which is the only kind this verdict is ever about (gt-dh3d).
-	actions = recoveryActionsForBlockers([]string{"has work on hook (gt-2uqy)"}, "gastown", "synth")
-	if len(actions) != 1 || !strings.Contains(actions[0], "gt unsling gt-2uqy gastown/synth") {
-		t.Fatalf("actions = %v, want an unsling command naming the bead and agent", actions)
 	}
 }
 
