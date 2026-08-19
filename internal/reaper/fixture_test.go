@@ -74,52 +74,8 @@ func (l *doltCommitLog) matching(substr string) []doltCommitCall {
 	return out
 }
 
-// doltCommitFailer makes the DOLT_COMMIT stub fail for commits whose message
-// contains a registered substring. Tests register their own database name — the
-// reaper puts it in every commit message — so the fault is scoped to one fixture
-// even though the stub itself is process-wide.
-//
-// A failing DOLT_COMMIT is the only way to reach the anomaly branches from
-// outside: the SQL DELETE and COMMIT both succeed, so the rows and every other
-// observable are identical whether the commit landed or not. That
-// indistinguishability is what let the mail half go unreported (gt-u5c).
-type doltCommitFailer struct {
-	mu   sync.Mutex
-	subs []string
-}
-
-func (d *doltCommitFailer) failOn(substr string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.subs = append(d.subs, substr)
-}
-
-func (d *doltCommitFailer) clear(substr string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	kept := d.subs[:0]
-	for _, s := range d.subs {
-		if s != substr {
-			kept = append(kept, s)
-		}
-	}
-	d.subs = kept
-}
-
-func (d *doltCommitFailer) shouldFail(message string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for _, s := range d.subs {
-		if strings.Contains(message, s) {
-			return true
-		}
-	}
-	return false
-}
-
 var (
 	doltCommits          = &doltCommitLog{}
-	doltCommitFailures   = &doltCommitFailer{}
 	registerDoltCommitOn sync.Once
 	quietServerOn        sync.Once
 )
@@ -143,14 +99,10 @@ func registerDoltCommitStub() {
 				Name:   "dolt_commit",
 				Schema: gmssql.Schema{&gmssql.Column{Name: "hash", Type: gmstypes.LongText}},
 				Function: func(ctx *gmssql.Context, args ...string) (gmssql.RowIter, error) {
-					message := strings.Join(args, " ")
 					doltCommits.record(doltCommitCall{
-						message:    message,
+						message:    strings.Join(args, " "),
 						autocommit: sessionAutocommit(ctx),
 					})
-					if doltCommitFailures.shouldFail(message) {
-						return nil, fmt.Errorf("injected dolt commit failure")
-					}
 					return gmssql.RowsToRowIter(gmssql.Row{"0000000000000000000000000000000000000000"}), nil
 				},
 			})
@@ -191,14 +143,6 @@ func (f *fixture) doltCommitMessages() []string {
 // database, including the committing session's @@autocommit.
 func (f *fixture) doltCommitCalls() []doltCommitCall {
 	return doltCommits.matching(f.dbName)
-}
-
-// failDoltCommits makes every DOLT_COMMIT issued against this fixture's
-// database return an error, for as long as the test runs.
-func (f *fixture) failDoltCommits(t *testing.T) {
-	t.Helper()
-	doltCommitFailures.failOn(f.dbName)
-	t.Cleanup(func() { doltCommitFailures.clear(f.dbName) })
 }
 
 // newFixture starts an in-process SQL server, creates dbName, applies the
