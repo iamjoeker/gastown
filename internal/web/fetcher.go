@@ -1454,11 +1454,17 @@ func (f *LiveConvoyFetcher) FetchDogs() ([]DogRow, error) {
 }
 
 // FetchEscalations returns open escalations needing attention.
+//
+// A failed query is an error, never an empty list. This is the panel whose
+// whole purpose is to surface problems, so it is the one place where "I see
+// nothing" must not render as "there is nothing": bd being unreachable is
+// exactly when escalations are most likely to exist, and swallowing the failure
+// made the town look calmest at its worst moment (gt-edty).
 func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 	// List open escalations
 	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", "--json")
 	if err != nil {
-		return nil, nil // No escalations or bd not available
+		return nil, fmt.Errorf("listing escalations: %w", err)
 	}
 
 	var issues []struct {
