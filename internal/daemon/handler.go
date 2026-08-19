@@ -56,7 +56,6 @@ func (d *Daemon) handleDogs() {
 	d.detectStaleWorkingDogs(mgr, sm, opCfg)
 	d.reapIdleDogs(mgr, sm, opCfg)
 	d.dispatchPlugins(mgr, sm, rigsConfig)
-	d.prunePluginReceipts(rigsConfig)
 }
 
 // handleDogsCleanupOnly runs dog lifecycle cleanup (stuck, stale, idle) without
@@ -236,91 +235,18 @@ func (d *Daemon) reapIdleDogs(mgr *dog.Manager, sm *dog.SessionManager, daemonCf
 	}
 }
 
-// receiptPruneInterval bounds how often the daemon prunes plugin run receipts.
-//
-// The prune is maintenance, not dispatch: it reads every receipt in the town
-// database and issues batched deletes, which is far too much work for a
-// heartbeat tick that runs every few seconds.
-const receiptPruneInterval = 1 * time.Hour
-
-// receiptPruneBatch caps how many receipts one daemon prune deletes.
-//
-// The first prune on a town that has never had one has thousands of expired
-// receipts to clear (5,779 in hq on 2026-08-19, most of them past retention),
-// and clearing them all in one pass would block a heartbeat tick for minutes.
-// At 500/hour the backlog drains within a day and the steady state — a few
-// dozen expirations per hour across twelve plugins — is well inside one batch.
-// An operator who wants it gone now runs `gt plugin prune`, which is uncapped.
-const receiptPruneBatch = 500
-
-// prunePluginReceipts deletes plugin run receipts that have outlived every gate
-// that could read them (gt-0cja).
-//
-// It is here rather than in gt compact because compaction classifies a wisp by
-// wisp_type and these receipts deliberately have none: they are the cooldown
-// ledger, and any of bd's seven types would delete tool-updater's receipts at
-// 24h in the middle of its 168h cooldown. The window they actually need is a
-// function of the gate durations, which only the plugin layer knows.
-func (d *Daemon) prunePluginReceipts(rigsConfig *config.RigsConfig) {
-	if !d.lastReceiptPrune.IsZero() && time.Since(d.lastReceiptPrune) < receiptPruneInterval {
-		return
-	}
-
-	scanner := plugin.NewScanner(d.config.TownRoot, rigNamesFrom(rigsConfig))
-	plugins, err := scanner.DiscoverAll()
-	if err != nil {
-		d.logger.Printf("Handler: skipping receipt prune, plugin discovery failed: %v", err)
-		return
-	}
-	if len(plugins) == 0 {
-		// Retention is derived from the discovered gates. An empty set is not a
-		// licence to apply the floor: the plugin whose gate is longest is
-		// exactly the one whose receipts a short window would destroy, and a
-		// discovery that returns nothing cannot tell "no plugins" from "could
-		// not read the plugins directory".
-		return
-	}
-
-	// Stamped before the run, not after: a prune that fails must wait out the
-	// interval like any other, or a persistent failure retries every tick.
-	d.lastReceiptPrune = time.Now()
-
-	policy := plugin.NewRetentionPolicy(plugins)
-	result, err := plugin.NewRecorder(d.config.TownRoot).PruneReceipts(
-		policy, time.Now().UTC(), plugin.ReceiptPruneOptions{Limit: receiptPruneBatch})
-	if err != nil {
-		d.logger.Printf("Handler: plugin receipt prune failed: %v", err)
-		return
-	}
-
-	// Logged only when something happened, so the hourly no-op does not join the
-	// population of lines that drowns this log. Remaining is the post-run
-	// re-read, which is the number worth believing.
-	if len(result.Deleted) > 0 || result.Deferred > 0 {
-		d.logger.Printf("Handler: pruned %d plugin receipt(s) (kept %d, held %d, deferred %d, %d remaining)",
-			len(result.Deleted), result.Kept, len(result.Held), result.Deferred, result.Remaining)
-	}
-	for _, e := range result.Errors {
-		d.logger.Printf("Handler: receipt prune: %s", e)
-	}
-}
-
-// rigNamesFrom extracts rig names for the plugin scanner.
-func rigNamesFrom(rigsConfig *config.RigsConfig) []string {
-	if rigsConfig == nil {
-		return nil
-	}
-	names := make([]string, 0, len(rigsConfig.Rigs))
-	for name := range rigsConfig.Rigs {
-		names = append(names, name)
-	}
-	return names
-}
-
 // dispatchPlugins scans for plugins, evaluates cooldown gates, and dispatches
 // eligible plugins to idle dogs.
 func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsConfig *config.RigsConfig) {
-	scanner := plugin.NewScanner(d.config.TownRoot, rigNamesFrom(rigsConfig))
+	// Get rig names for scanner
+	var rigNames []string
+	if rigsConfig != nil {
+		for name := range rigsConfig.Rigs {
+			rigNames = append(rigNames, name)
+		}
+	}
+
+	scanner := plugin.NewScanner(d.config.TownRoot, rigNames)
 	plugins, err := scanner.DiscoverAll()
 	if err != nil {
 		d.logger.Printf("Handler: failed to discover plugins: %v", err)

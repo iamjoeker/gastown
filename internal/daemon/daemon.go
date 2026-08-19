@@ -130,12 +130,6 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastMaintenanceRun time.Time
 
-	// lastReceiptPrune tracks when plugin run receipts were last pruned
-	// (gt-0cja). The prune reads every receipt in the town database, so it runs
-	// on receiptPruneInterval rather than on every dog-handling tick.
-	// Only accessed from heartbeat loop goroutine - no sync needed.
-	lastReceiptPrune time.Time
-
 	// mayorZombieCount tracks consecutive patrol cycles where the Mayor tmux
 	// session exists but the agent process is not detected. A count >= 3
 	// triggers a zombie restart, debouncing transient gaps during handoffs.
