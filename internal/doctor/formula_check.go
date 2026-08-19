@@ -60,7 +60,11 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 			details = append(details, fmt.Sprintf("  %s: missing (will reinstall)", f.Name))
 			needsFix = true
 		case "modified":
-			details = append(details, fmt.Sprintf("  %s: locally modified (skipping)", f.Name))
+			if f.EmbeddedChanged {
+				details = append(details, fmt.Sprintf("  %s: locally modified AND the shipped default has changed since install — reconcile by hand (gt will keep skipping it)", f.Name))
+			} else {
+				details = append(details, fmt.Sprintf("  %s: locally modified (skipping)", f.Name))
+			}
 		case "new":
 			details = append(details, fmt.Sprintf("  %s: new formula available", f.Name))
 			needsFix = true
@@ -70,9 +74,12 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	// Determine status
+	// Determine status. Drifted local modifications are not auto-fixable —
+	// overwriting would discard the customization — but they must still warn:
+	// a formula fix shipped in the binary never reaches a town that customized
+	// that formula, and reporting OK is how such a fix goes unnoticed (gt-0sq).
 	status := StatusOK
-	if needsFix {
+	if needsFix || report.ModifiedDrift > 0 {
 		status = StatusWarning
 	}
 
@@ -91,7 +98,11 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 		parts = append(parts, fmt.Sprintf("%d untracked", report.Untracked))
 	}
 	if report.Modified > 0 {
-		parts = append(parts, fmt.Sprintf("%d modified", report.Modified))
+		if report.ModifiedDrift > 0 {
+			parts = append(parts, fmt.Sprintf("%d modified (%d shadowing a newer shipped default)", report.Modified, report.ModifiedDrift))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d modified", report.Modified))
+		}
 	}
 
 	message := fmt.Sprintf("Formulas: %s", strings.Join(parts, ", "))
@@ -103,8 +114,11 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 		Details: details,
 	}
 
-	if needsFix {
+	switch {
+	case needsFix:
 		result.FixHint = "Run 'gt doctor --fix' to update formulas"
+	case report.ModifiedDrift > 0:
+		result.FixHint = "Diff the listed formulas against the shipped defaults and merge by hand — --fix cannot touch locally modified formulas"
 	}
 
 	return result
