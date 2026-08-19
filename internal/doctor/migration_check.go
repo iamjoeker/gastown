@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -497,6 +498,14 @@ func (c *DoltServerReachableCheck) getServerAddr(beadsDir string, townRoot strin
 type DoltOrphanedDatabaseCheck struct {
 	FixableCheck
 	orphanNames []string // Cached during Run for use in Fix
+
+	// Cached during Run for use in Fix: Fix evaluates the same bulk-deletion
+	// balk `gt dolt cleanup` does, and the orphan ratio needs the town's total
+	// database count as well as the orphans. totalKnown is false when the count
+	// could not be taken, which Fix treats as a refusal rather than as a clean
+	// ratio. (gt-baj6)
+	totalDatabases int
+	totalKnown     bool
 }
 
 // NewDoltOrphanedDatabaseCheck creates a new orphaned database check.
@@ -515,6 +524,7 @@ func NewDoltOrphanedDatabaseCheck() *DoltOrphanedDatabaseCheck {
 // Run checks for orphaned databases.
 func (c *DoltOrphanedDatabaseCheck) Run(ctx *CheckContext) *CheckResult {
 	c.orphanNames = nil
+	c.totalDatabases, c.totalKnown = 0, false
 
 	orphans, err := doltserver.FindOrphanedDatabases(ctx.TownRoot)
 	if err != nil {
@@ -535,10 +545,22 @@ func (c *DoltOrphanedDatabaseCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	details := make([]string, len(orphans))
-	for i, o := range orphans {
-		details[i] = fmt.Sprintf("Orphaned: %s (%s)", o.Name, formatBytes(o.SizeBytes))
+	details := make([]string, 0, len(orphans)+1)
+	for _, o := range orphans {
+		details = append(details, fmt.Sprintf("Orphaned: %s (%s)", o.Name, formatBytes(o.SizeBytes)))
 		c.orphanNames = append(c.orphanNames, o.Name)
+	}
+
+	if allDBs, listErr := doltserver.ListDatabases(ctx.TownRoot); listErr == nil {
+		c.totalDatabases, c.totalKnown = len(allDBs), true
+	}
+
+	// Say up front when --fix will refuse these, from the same predicate Fix
+	// uses. A report that lists deletable databases while the fix refuses them
+	// is the divergence gt-ti84 removed from `gt dolt cleanup --dry-run`; this
+	// report is the rehearsal for `gt doctor --fix`. (gt-baj6)
+	if refusal := c.fixRefusal(); refusal != "" {
+		details = append(details, "gt doctor --fix will REFUSE these: "+refusal)
 	}
 
 	return &CheckResult{
@@ -556,14 +578,76 @@ func (c *DoltOrphanedDatabaseCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// Fix removes orphaned databases.
+// orphanInspectRemedy is what to do instead of the deletion this check refuses.
+// Every command it names is read-only, for the reason the FixHint gives. (gt-xhjb)
+const orphanInspectRemedy = "Inspect with 'gt dolt cleanup --dry-run' (deletes nothing) or 'gt dolt list'; " +
+	"keep one permanently by adding it to protected_dolt_databases in settings/config.json"
+
+// fixRefusal returns why a --fix run will not delete the orphans Run found, or
+// "" when it would proceed. Run prints it and Fix returns it, so the report
+// cannot promise a deletion the fix refuses, and neither re-derives the
+// thresholds. (gt-baj6)
+func (c *DoltOrphanedDatabaseCheck) fixRefusal() string {
+	if len(c.orphanNames) == 0 {
+		return ""
+	}
+
+	if !c.totalKnown {
+		return "the town's databases could not be counted, so the orphan-ratio safety check " +
+			"cannot be evaluated, and an unknown ratio is not an acceptable one. " + orphanInspectRemedy
+	}
+
+	switch doltserver.EvaluateCleanupBalk(len(c.orphanNames), c.totalDatabases, false) {
+	case doltserver.BalkOrphanRatio:
+		// Neither explanation is ranked: the ratio crosses its threshold both
+		// when detection is broken and when the town is simply small enough that
+		// real test fixtures are a majority. This check cannot tell them apart,
+		// so it stops and says so. (gt-xvh, gt-ti84)
+		return fmt.Sprintf("%d of %d databases is above the orphan ratio `gt dolt cleanup` stops at. "+
+			"Either detection is wrong (metadata.json files missing or unreadable) or it is right and "+
+			"the town is small enough that genuine test fixtures are a majority — this check cannot tell "+
+			"those apart, and at this ratio it would be deleting most of the town. %s",
+			len(c.orphanNames), c.totalDatabases, orphanInspectRemedy)
+
+	case doltserver.BalkTooManyOrphans:
+		return fmt.Sprintf("%d orphans is past the %d that DROP DATABASE can clear by SQL in reasonable "+
+			"time; the server is likely overloaded. 'gt dolt cleanup --dry-run' prints the filesystem "+
+			"procedure and deletes nothing.", len(c.orphanNames), doltserver.MaxSQLCleanup)
+	}
+
+	return ""
+}
+
+// Fix removes orphaned databases — or refuses, when the bulk-deletion balk that
+// stands in front of `gt dolt cleanup` trips.
+//
+// This path used to force-delete every orphan with no threshold check of any
+// kind: no ratio balk, no per-database user-tables check (force=true skips it),
+// no dry run, no confirmation. So the guard `gt dolt cleanup --force` at least
+// makes an operator type out by hand was simply absent from a command whose name
+// promises repair, and the six test fixtures that prompted gt-xhjb would have
+// been deleted by `gt doctor --fix` without a single warning. A fix that refuses
+// and explains is the correct behaviour here; silently doing the most
+// destructive thing available is not. (gt-baj6)
 func (c *DoltOrphanedDatabaseCheck) Fix(ctx *CheckContext) error {
+	if len(c.orphanNames) == 0 {
+		return nil
+	}
+	if refusal := c.fixRefusal(); refusal != "" {
+		return fmt.Errorf("refusing to remove %d orphaned database(s): %s", len(c.orphanNames), refusal)
+	}
+
+	// force=false, unlike the old call here: this keeps RemoveDatabase's
+	// per-database check for user tables, so an unreferenced database that still
+	// holds real data is reported rather than deleted. Every orphan is attempted
+	// so that one such refusal does not hide the others.
+	var errs []error
 	for _, name := range c.orphanNames {
-		if err := doltserver.RemoveDatabase(ctx.TownRoot, name, true); err != nil {
-			return fmt.Errorf("removing orphaned database %s: %w", name, err)
+		if err := doltserver.RemoveDatabase(ctx.TownRoot, name, false); err != nil {
+			errs = append(errs, fmt.Errorf("removing orphaned database %s: %w", name, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // formatBytes returns a human-readable size string.

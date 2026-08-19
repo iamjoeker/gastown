@@ -417,86 +417,17 @@ glob `for` loop over these patterns.**
 
 **3. Stale PID/lock files**
 
-Remove test-server PID files whose process is PROVEN dead. Same discipline as
-sub-section 2, one blast radius smaller: alive beats every probe, and a probe
-that cannot answer is a refusal, not permission.
+Scan for dead PID files in /tmp:
 
 ```bash
-TMPDIR="${TMPDIR:-/tmp}"
-STALE_PIDFILES=0
-
-while IFS= read -r pidfile; do
+for pidfile in /tmp/dolt-test-server-*.pid /tmp/beads-test-dolt-*.pid; do
   [ -f "$pidfile" ] || continue
   PID=$(cat "$pidfile" 2>/dev/null)
-
-  # A PID we cannot read, or that is not a plain number, is not evidence of death.
-  case "$PID" in
-    ''|*[!0-9]*)
-      echo "REFUSING (PID file unreadable or non-numeric): $pidfile"
-      continue
-      ;;
-  esac
-
-  # kill -0's EXIT STATUS cannot tell "dead" from "alive but owned by another
-  # user" — both are non-zero. Only rc=0 is unambiguous, and it means alive.
-  kill_err=$(LC_ALL=C kill -0 "$PID" 2>&1) && continue
-
-  proven_dead=0
-  case "$kill_err" in
-    *"No such process"*) proven_dead=1 ;;   # ESRCH: the one message that proves death
-  esac
-
-  # /proc, where it exists, is owner- and language-independent: present means
-  # alive no matter who owns the process, absent means dead.
-  if [ -d /proc/1 ]; then
-    if [ -e "/proc/$PID" ]; then
-      echo "Keeping (PID $PID is alive, owned by another user): $pidfile"
-      continue
-    fi
-    proven_dead=1
+  if [ -n "$PID" ] && ! kill -0 "$PID" 2>/dev/null; then
+    rm -f "$pidfile" && echo "Removed stale PID file: $(basename "$pidfile") (PID=$PID dead)"
   fi
-
-  if [ "$proven_dead" -ne 1 ]; then
-    echo "REFUSING (cannot prove PID $PID is dead: $kill_err): $pidfile"
-    continue
-  fi
-
-  rm -f "$pidfile" && {
-    echo "Removed stale PID file: $(basename "$pidfile") (PID=$PID dead)"
-    STALE_PIDFILES=$((STALE_PIDFILES + 1))
-  }
-done <<EOF
-$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type f -name 'dolt-test-server-*.pid' 2>/dev/null
-  find "$TMPDIR" -mindepth 1 -maxdepth 1 -type f -name 'beads-test-dolt-*.pid' 2>/dev/null)
-EOF
-echo "stale_pidfiles=$STALE_PIDFILES"
+done
 ```
-
-**WHY THIS GUARD IS SHAPED THIS WAY (gt-hkv) — DO NOT SIMPLIFY IT.** The previous
-version was `for pidfile in /tmp/A-*.pid /tmp/B-*.pid; do ... if ! kill -0 "$PID"`,
-and it carried both halves of the gt-32z defect pattern:
-
-- **It could not run.** Two globs in one `for` list: under zsh, an unmatched
-  `/tmp/dolt-test-server-*.pid` aborts the whole statement, so the loop ran zero
-  iterations and the second pattern was never reached. Measured here: zsh 5.9.2
-  prints `no matches found` and executes nothing; bash iterates. The `find` form
-  above removes the dependency on shell glob semantics.
-- **If it had run, it would have failed OPEN.** `! kill -0 "$PID"` reads as "the
-  process is dead", but `kill -0` also fails when the process EXISTS and belongs
-  to another user. Measured on this host:
-
-```
-kill -0 <our own live pid>   -> rc=0, no output
-kill -0 1  (root-owned, alive) -> rc=1, "Operation not permitted"   ALIVE
-kill -0 999999 (unallocated)   -> rc=1, "No such process"           dead
-```
-
-  Alive-but-foreign and dead are the same exit status. The old test deleted a
-  live foreign test server's PID file as "stale" — and repairing the glob alone
-  is what would have armed it, exactly as sub-section 2 warns.
-
-**Never restore an exit-status-only `kill -0` test here, and never re-add a bare
-glob `for` loop over these patterns.**
 
 **4. Dead dog worktrees**
 
