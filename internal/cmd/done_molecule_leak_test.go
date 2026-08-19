@@ -137,7 +137,7 @@ func TestDoneClosesMoleculeWhenHookedBeadAlreadyClosed(t *testing.T) {
 
 	closesLog, rigDir := moleculeLeakStub(t, "gt-base-123", "closed")
 
-	updateAgentStateOnDone(rigDir, filepath.Dir(rigDir), ExitCompleted, "gt-base-123")
+	updateAgentStateOnDone(rigDir, filepath.Dir(rigDir), ExitCompleted, "gt-base-123", "")
 
 	closed := closedBeads(t, closesLog)
 	assertClosed(t, closed, "gt-step-1")
@@ -156,7 +156,7 @@ func TestDoneClosesMoleculeForClosedWorkflowStepBead(t *testing.T) {
 
 	closesLog, rigDir := moleculeLeakStub(t, "gt-wfs-abc12", "closed")
 
-	updateAgentStateOnDone(rigDir, filepath.Dir(rigDir), ExitDeferred, "gt-wfs-abc12")
+	updateAgentStateOnDone(rigDir, filepath.Dir(rigDir), ExitDeferred, "gt-wfs-abc12", "")
 
 	closed := closedBeads(t, closesLog)
 	assertClosed(t, closed, "gt-step-1")
@@ -250,7 +250,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	updateAgentStateOnDone(rigDir, townRoot, ExitCompleted, "gt-rig-gastown")
+	updateAgentStateOnDone(rigDir, townRoot, ExitCompleted, "gt-rig-gastown", "")
 
 	closed := closedBeads(t, closesLog)
 	assertClosed(t, closed, "gt-step-1")
