@@ -3,6 +3,7 @@ package tmpgc
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,7 +32,18 @@ func mkWorkDir(t *testing.T, root, name string, size int, age time.Duration) str
 }
 
 // noRefs is the "nothing is running" answer from the process table.
-func noRefs([]string) (map[string]bool, error) { return map[string]bool{}, nil }
+func noRefs([]string) (Evidence, error) { return Evidence{Refs: map[string]bool{}}, nil }
+
+// refsTo is the "exactly these paths are in use" answer.
+func refsTo(paths ...string) func([]string) (Evidence, error) {
+	return func([]string) (Evidence, error) {
+		refs := make(map[string]bool, len(paths))
+		for _, p := range paths {
+			refs[p] = true
+		}
+		return Evidence{Refs: refs}, nil
+	}
+}
 
 func byPath(t *testing.T, res *Result, path string) Candidate {
 	t.Helper()
@@ -53,7 +65,7 @@ func TestScanClassifiesOrphansYoungAndLive(t *testing.T) {
 	res, err := Scan(Options{
 		Dir:      root,
 		MinAge:   time.Hour,
-		liveRefs: func([]string) (map[string]bool, error) { return map[string]bool{live: true}, nil },
+		liveRefs: refsTo(live),
 	})
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
@@ -85,13 +97,15 @@ func TestScanIgnoresNonWorkDirectories(t *testing.T) {
 	root := t.TempDir()
 	// Everything here is old enough to be swept if the name test were loose.
 	for _, name := range []string{
-		"beads-test-dolt-99",   // another cleanup path's territory
 		"claude-1000",          // live agent scratchpads
 		"go-buildcache",        // no digits: not a work directory
 		"go-build",             // bare prefix
 		"my-go-build123",       // work-directory name embedded in another
 		"go-build123.bak",      // trailing junk
 		"dolt-test-server-1.d", // unrelated
+		"beads-test-dolt",      // bare prefix, no run suffix
+		"beads-bd-tests",       // bare prefix, no run suffix
+		"my-beads-bd-tests-1",  // family name embedded in another
 	} {
 		mkWorkDir(t, root, name, 512, 9*time.Hour)
 	}
@@ -156,7 +170,7 @@ func TestSweepRemovesOnlyReclaimable(t *testing.T) {
 	res, err := Sweep(Options{
 		Dir:      root,
 		MinAge:   time.Hour,
-		liveRefs: func([]string) (map[string]bool, error) { return map[string]bool{live: true}, nil },
+		liveRefs: refsTo(live),
 	})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -207,7 +221,7 @@ func TestSweepFailsClosedWithoutProcessEvidence(t *testing.T) {
 	res, err := Sweep(Options{
 		Dir:      root,
 		MinAge:   time.Hour,
-		liveRefs: func([]string) (map[string]bool, error) { return nil, errors.New("permission denied") },
+		liveRefs: func([]string) (Evidence, error) { return Evidence{}, errors.New("permission denied") },
 	})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -358,17 +372,17 @@ func TestLiveReferencesSeesThisProcess(t *testing.T) {
 	}
 	absent := filepath.Join(t.TempDir(), "go-build0000000001")
 
-	refs, err := liveReferences([]string{self, absent})
+	ev, err := liveReferences([]string{self, absent})
 	if errors.Is(err, ErrNoProcEvidence) {
 		t.Skipf("no process table on this platform: %v", err)
 	}
 	if err != nil {
 		t.Fatalf("liveReferences: %v", err)
 	}
-	if !refs[self] {
+	if !ev.Refs[self] {
 		t.Errorf("liveReferences did not find this test binary (%s) in the process table", self)
 	}
-	if refs[absent] {
+	if ev.Refs[absent] {
 		t.Errorf("liveReferences reported a never-created path (%s) as live", absent)
 	}
 }
@@ -421,5 +435,265 @@ func TestSweepSkipsWorkDirOfARunningBuild(t *testing.T) {
 	}
 	if _, err := os.Stat(self); err != nil {
 		t.Errorf("running test binary was deleted: %v", err)
+	}
+}
+
+// mkBeadsFixture builds a beads-style Dolt fixture directory: a LOCK file
+// inside a .dolt subdirectory, the shape a running sql-server holds open. The
+// whole tree is back-dated so that age alone would make it reclaimable.
+func mkBeadsFixture(t *testing.T, root, name string, age time.Duration) (dir, lock string) {
+	t.Helper()
+	dir = filepath.Join(root, name)
+	nomsDir := filepath.Join(dir, ".dolt", "noms")
+	if err := os.MkdirAll(nomsDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", nomsDir, err)
+	}
+	lock = filepath.Join(nomsDir, "LOCK")
+	if err := os.WriteFile(lock, []byte("lock"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", lock, err)
+	}
+	stamp := time.Now().Add(-age)
+	for _, p := range []string{lock, nomsDir, filepath.Join(dir, ".dolt"), dir} {
+		if err := os.Chtimes(p, stamp, stamp); err != nil {
+			t.Fatalf("chtimes %s: %v", p, err)
+		}
+	}
+	return dir, lock
+}
+
+func TestBeadsTestDirPatternMatchesRealNames(t *testing.T) {
+	// Names measured under /tmp on the host that produced gt-1gdh, plus the
+	// two globs the deacon patrol's shell block used before this package took
+	// the job over.
+	for _, name := range []string{
+		"beads-bd-tests-159428258",
+		"beads-bd-tests-4288621347",
+		"beads-test-dolt-1",
+		"beads-test-dolt-abc123",
+	} {
+		if !beadsTestDirPattern.MatchString(name) {
+			t.Errorf("beadsTestDirPattern does not match real name %q", name)
+		}
+	}
+	// The control. These share a prefix with the family and must not be swept:
+	// beads-storage-dolt-tests and beads-test-env are separate families the
+	// shell block never covered, and widening silently is how an rm -rf path
+	// grows a blast radius nobody reviewed.
+	for _, name := range []string{
+		"beads-test-dolt", "beads-bd-tests", "beads-bd-test-1",
+		"my-beads-bd-tests-1", "beads-storage-dolt-tests-1063402",
+		"beads-test-env-0mgESr", "beads-circuit",
+		"go-build123", "claude-1000",
+	} {
+		if beadsTestDirPattern.MatchString(name) {
+			t.Errorf("beadsTestDirPattern matches %q, which is not a beads test fixture directory", name)
+		}
+	}
+}
+
+// TestScanClassifiesBeadsTestDirs is the swap this package took over from the
+// deacon patrol's inline shell block (gt-1gdh): the beads fixture family must
+// be classified by the same rules as the Go family, in the same run.
+func TestScanClassifiesBeadsTestDirs(t *testing.T) {
+	root := t.TempDir()
+	orphan, _ := mkBeadsFixture(t, root, "beads-bd-tests-159428258", 3*time.Hour)
+	young, _ := mkBeadsFixture(t, root, "beads-test-dolt-fresh", time.Minute)
+	goDir := mkWorkDir(t, root, "go-build2674671939", 4096, 3*time.Hour)
+
+	res, err := Scan(Options{Dir: root, MinAge: time.Hour, liveRefs: noRefs})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if got := byPath(t, res, orphan).Status; got != StatusReclaimable {
+		t.Errorf("orphan beads fixture status = %q, want %q", got, StatusReclaimable)
+	}
+	if got := byPath(t, res, orphan).Family; got != FamilyBeadsTest.Name {
+		t.Errorf("family = %q, want %q", got, FamilyBeadsTest.Name)
+	}
+	if got := byPath(t, res, young).Status; got != StatusYoung {
+		t.Errorf("young beads fixture status = %q, want %q", got, StatusYoung)
+	}
+	if got := byPath(t, res, goDir).Family; got != FamilyGoWork.Name {
+		t.Errorf("family = %q, want %q", got, FamilyGoWork.Name)
+	}
+	if len(res.Families) != 2 {
+		t.Errorf("Families = %v, want both default families named", res.Families)
+	}
+}
+
+// TestFamiliesRestrictWhatIsConsidered is the control for the test above: with
+// only one family selected, the other's directories must not appear at all. A
+// scan that returned everything regardless would pass the test above
+// vacuously.
+func TestFamiliesRestrictWhatIsConsidered(t *testing.T) {
+	root := t.TempDir()
+	beads, _ := mkBeadsFixture(t, root, "beads-bd-tests-159428258", 3*time.Hour)
+	goDir := mkWorkDir(t, root, "go-build2674671939", 4096, 3*time.Hour)
+
+	res, err := Scan(Options{
+		Dir: root, MinAge: time.Hour, liveRefs: noRefs,
+		Families: []Family{FamilyGoWork},
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.Candidates) != 1 || res.Candidates[0].Path != goDir {
+		t.Fatalf("go-work-only scan returned %+v, want only %s", res.Candidates, goDir)
+	}
+	if _, err := os.Stat(beads); err != nil {
+		t.Errorf("a family that was not selected was touched: %v", err)
+	}
+}
+
+// TestScanIgnoresPIDFilesSharingTheFamilyPrefix guards the seam between this
+// sweep and the deacon patrol's separate stale-PID-file cleanup. The PID files
+// sit in the same directory and share the prefix, but a PID file is proven
+// stale by its process being dead, not by a quiet period — and this sweep must
+// not take a position on them.
+func TestScanIgnoresPIDFilesSharingTheFamilyPrefix(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{
+		"beads-test-dolt-1234.pid",
+		"beads-test-dolt-1234",
+		"dolt-test-server-abc.pid",
+	} {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte("1234\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		stamp := time.Now().Add(-9 * time.Hour)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatalf("chtimes %s: %v", path, err)
+		}
+	}
+
+	res, err := Sweep(Options{Dir: root, MinAge: time.Hour, liveRefs: noRefs})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(res.Candidates) != 0 {
+		t.Fatalf("sweep considered plain files: %+v", res.Candidates)
+	}
+	for _, name := range []string{"beads-test-dolt-1234.pid", "beads-test-dolt-1234", "dolt-test-server-abc.pid"} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Errorf("sweep removed the file %s: %v", name, err)
+		}
+	}
+}
+
+// TestSweepRefusesADirWithAnOpenFileDescriptor is the case argv evidence alone
+// cannot see, and the reason the deacon patrol's shell block reached for lsof
+// in the first place: a dolt sql-server holds .dolt/noms/LOCK open and names
+// the fixture directory nowhere in its command line.
+//
+// The fixture is back-dated past the quiet period BEFORE the handle is opened
+// — reading a file does not change its mtime — so age offers no protection
+// here and the descriptor is the only thing standing between the directory and
+// rm -rf. This runs the real procfs scanner, not a stub.
+func TestSweepRefusesADirWithAnOpenFileDescriptor(t *testing.T) {
+	root := t.TempDir()
+	held, lock := mkBeadsFixture(t, root, "beads-test-dolt-busy", 9*time.Hour)
+
+	fd, err := os.Open(lock)
+	if err != nil {
+		t.Fatalf("opening %s: %v", lock, err)
+	}
+	defer fd.Close()
+
+	res, err := Sweep(Options{Dir: root, MinAge: time.Hour})
+	if errors.Is(err, ErrNoProcEvidence) {
+		t.Skipf("no process table on this platform: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.Inconclusive {
+		t.Skipf("liveness evidence unavailable on this host: %v", res.Errors)
+	}
+	c := byPath(t, res, held)
+	if c.Removed {
+		t.Fatalf("swept a directory holding an open file descriptor: %s", held)
+	}
+	if c.Status != StatusLive {
+		t.Errorf("status = %q (%s), want %q", c.Status, c.Reason, StatusLive)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Errorf("the held file was deleted: %v", err)
+	}
+}
+
+// TestSweepControlRemovesTheSameDirOnceReleased is the control for the test
+// above. Same fixture, same age, same code path, with the descriptor closed:
+// if this did not remove it, the refusal above would prove nothing — it would
+// be indistinguishable from a sweep that never removes beads fixtures at all.
+func TestSweepControlRemovesTheSameDirOnceReleased(t *testing.T) {
+	root := t.TempDir()
+	released, lock := mkBeadsFixture(t, root, "beads-test-dolt-busy", 9*time.Hour)
+
+	fd, err := os.Open(lock)
+	if err != nil {
+		t.Fatalf("opening %s: %v", lock, err)
+	}
+	if err := fd.Close(); err != nil {
+		t.Fatalf("closing %s: %v", lock, err)
+	}
+
+	res, err := Sweep(Options{Dir: root, MinAge: time.Hour})
+	if errors.Is(err, ErrNoProcEvidence) {
+		t.Skipf("no process table on this platform: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.Inconclusive {
+		t.Skipf("liveness evidence unavailable on this host: %v", res.Errors)
+	}
+	if res.Removed != 1 {
+		t.Fatalf("removed %d directories, want 1 (%+v)", res.Removed, res.Candidates)
+	}
+	if _, err := os.Stat(released); !os.IsNotExist(err) {
+		t.Errorf("directory survived a conclusive sweep (err=%v)", err)
+	}
+}
+
+// TestLiveReferencesSeesAWorkingDirectory covers the third kind of evidence: a
+// harness that chdirs into the fixture it created names it neither in argv nor
+// in any descriptor, and only /proc/<pid>/cwd reports it.
+func TestLiveReferencesSeesAWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	inhabited, _ := mkBeadsFixture(t, root, "beads-bd-tests-inhabited", time.Minute)
+	empty, _ := mkBeadsFixture(t, root, "beads-bd-tests-empty", time.Minute)
+
+	// `sh -c "sleep 60"` names no path at all in its command line, so argv
+	// evidence cannot see it. cwd is the only trace it leaves.
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("no sh: %v", err)
+	}
+	cmd := exec.Command(sh, "-c", "sleep 60")
+	cmd.Dir = inhabited
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fixture process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	ev, err := liveReferences([]string{inhabited, empty})
+	if errors.Is(err, ErrNoProcEvidence) {
+		t.Skipf("no process table on this platform: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("liveReferences: %v", err)
+	}
+	if !ev.Refs[inhabited] {
+		t.Errorf("liveReferences missed a process whose working directory is %s", inhabited)
+	}
+	// The control: an identical directory with nobody in it must come back
+	// clean, or "sees a cwd" would be indistinguishable from "reports
+	// everything live".
+	if ev.Refs[empty] {
+		t.Errorf("liveReferences reported %s live with no process using it", empty)
 	}
 }
