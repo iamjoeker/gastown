@@ -335,11 +335,13 @@ func outputDeaconPatrolContext(ctx RoleContext) {
 		return
 	}
 
+	// Assignee uses the canonical form: town-level roles are addressed with a
+	// trailing slash, which is the form every reader queries.
 	cfg := PatrolConfig{
 		RoleName:      "deacon",
 		PatrolMolName: constants.MolDeaconPatrol,
 		BeadsDir:      ctx.TownRoot, // Town-level role uses town root beads
-		Assignee:      "deacon",
+		Assignee:      beads.CanonicalAgentAddress("deacon"),
 		HeaderEmoji:   "🔄",
 		HeaderTitle:   "Patrol Status (Wisp-based)",
 		WorkLoopSteps: []string{

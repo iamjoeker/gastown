@@ -849,7 +849,7 @@ func detectActor() string {
 // townRoot is needed to look up the rig's configured prefix.
 func agentIDToBeadID(agentID, townRoot string) string {
 	// Normalize: strip trailing slash (resolveSelfTarget returns "mayor/" not "mayor")
-	agentID = strings.TrimSuffix(agentID, "/")
+	agentID = beads.BareAgentAddress(agentID)
 
 	// Handle simple cases (town-level agents with hq- prefix)
 	if agentID == "mayor" {
