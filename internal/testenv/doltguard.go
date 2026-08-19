@@ -58,23 +58,6 @@ const AllowProductionDoltEnv = testguard.AllowDoltEnv
 // any one of them unset leaves a path back to the 3307 default.
 var doltPortEnvVars = []string{"GT_DOLT_PORT", "BEADS_DOLT_PORT", "BEADS_DOLT_SERVER_PORT"}
 
-// DoltPortEnvVars returns the variables GuardProductionDolt points at the
-// guarded port.
-//
-// A helper that starts a Dolt server for a test has to overwrite every one of
-// them, not just the one its own caller reads: whatever it leaves untouched
-// still holds the dead guarded port, and a bd/gt subprocess reads that in
-// preference to the helper's. testutil's container helpers are the callers
-// this exists for; they keep their own copy of the list rather than importing
-// this package (testutil is imported by the test files of packages testenv
-// might one day want a helper from), and TestDoltPortEnvVarsMatchGuard there
-// fails if the two drift.
-func DoltPortEnvVars() []string {
-	out := make([]string, len(doltPortEnvVars))
-	copy(out, doltPortEnvVars)
-	return out
-}
-
 // ProductionDoltAllowed reports whether this process has explicitly opted in
 // to using the production Dolt server.
 //

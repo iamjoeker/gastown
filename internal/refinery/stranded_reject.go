@@ -114,8 +114,12 @@ func witnessAddress(rigName string) string {
 // strandedRejectTitle is deterministic in the MR and the source issue so that
 // CreateIfNoDuplicate collapses a repeated rejection onto the open report
 // rather than filing a second one. It is also the string a human greps for.
+//
+// The constructor lives in beads because the backward half — the branch sweep
+// that finds strandings already made — recognises these reports by title in
+// order not to re-report them. Two paths, one string.
 func strandedRejectTitle(mrID, sourceIssue string) string {
-	return fmt.Sprintf("Stranded by rejection: MR %s rejected, source issue %s left closed", mrID, sourceIssue)
+	return beads.StrandedRejectTitle(mrID, sourceIssue)
 }
 
 // reportStrandedReject files a report when an automatic rejection has left a
