@@ -160,6 +160,83 @@ func TestSpawnFormulaRootOnlyLinksWispToBead(t *testing.T) {
 	}
 }
 
+// installTypedFormula writes a formula that declares a wisp_type and no pour —
+// the shape every patrol formula and mol-session-gc already have on disk, and
+// the one the root-only branch has to classify.
+func installTypedFormula(t *testing.T, townRoot, formulaName, wispType string) {
+	t.Helper()
+	dir := filepath.Join(townRoot, ".beads", "formulas")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir formulas: %v", err)
+	}
+	content := "formula = \"" + formulaName + "\"\n" +
+		"description = \"Typed test formula.\"\n\n" +
+		"[[steps]]\n" +
+		"id = \"work\"\n" +
+		"title = \"Do the work\"\n" +
+		"description = \"Test step.\"\n\n" +
+		"[vars]\n" +
+		"[vars.wisp_type]\n" +
+		"description = \"Type of wisp created for this molecule\"\n" +
+		"default = \"" + wispType + "\"\n"
+	path := filepath.Join(dir, formulaName+".formula.toml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestSpawnFormulaRootOnlyStampsWispType is the gt-3gbt regression. Splitting
+// the pour = true path off to bondFormulaDirect left spawnFormulaRootOnly as
+// the only one of four molecule spawn sites that never classified its wisp, and
+// the formulas that declare a wisp_type are exactly the ones that declare no
+// pour — the five patrol/gc formulas — so every one of them takes this branch.
+// An unclassified wisp is SKIPPED by gt compact rather than collected, so the
+// omission leaks roots forever without an error to show for it.
+func TestSpawnFormulaRootOnlyStampsWispType(t *testing.T) {
+	t.Run("formula declares a wisp_type", func(t *testing.T) {
+		townRoot, logPath := newPourStubTown(t)
+		installTypedFormula(t, townRoot, "mol-polecat-work", "patrol")
+
+		if _, err := spawnFormulaRootOnly("mol-polecat-work", "mol-polecat-work", "gt-bead", townRoot, townRoot, nil); err != nil {
+			t.Fatalf("spawnFormulaRootOnly: %v", err)
+		}
+
+		logBytes, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("read log: %v", err)
+		}
+		// Only the root is stamped: --root-only means there are no children to
+		// ask bd for, the same reason the patrol spawner passes false.
+		want := "sql UPDATE wisps SET wisp_type = 'patrol' WHERE id IN ('gt-wisp-pour')"
+		if !strings.Contains(string(logBytes), want) {
+			t.Errorf("missing %q in bd log:\n%s", want, string(logBytes))
+		}
+		if strings.Contains(string(logBytes), "--children") {
+			t.Errorf("root-only spawn has no children to enumerate:\n%s", string(logBytes))
+		}
+	})
+
+	// Control: the stamp must stay a no-op for a formula that declares no
+	// wisp_type. mol-polecat-work is that formula, and bd's seven TTL buckets
+	// have no member meaning "a polecat implementing a bead" — unclassified is
+	// the deliberate answer there, not an oversight.
+	t.Run("formula declares no wisp_type", func(t *testing.T) {
+		townRoot, logPath := newPourStubTown(t)
+
+		if _, err := spawnFormulaRootOnly("mol-polecat-work", "mol-polecat-work", "gt-bead", townRoot, townRoot, nil); err != nil {
+			t.Fatalf("spawnFormulaRootOnly: %v", err)
+		}
+
+		logBytes, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("read log: %v", err)
+		}
+		if strings.Contains(string(logBytes), "wisp_type") {
+			t.Errorf("unclassified formula must not be stamped:\n%s", string(logBytes))
+		}
+	})
+}
+
 // TestFormulaWispArgsHonorsPour covers the standalone formula sling path, the
 // one that turned `gt sling mol-deacon-patrol deacon` into 26 step wisps per
 // invocation while autoSpawnPatrol created the same formula root-only.
