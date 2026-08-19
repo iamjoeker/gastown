@@ -583,6 +583,35 @@ func TestTownSettings_DisabledPatrols_OmitemptyWhenNil(t *testing.T) {
 	}
 }
 
+// TestTownSettings_ProtectedDoltDatabases_RoundTrip pins that the key an
+// operator writes to keep a database undeletable survives a load. A typo'd or
+// dropped field here reads as "nothing is protected", and the surfaces that
+// consult it delete. (gt-xhjb)
+func TestTownSettings_ProtectedDoltDatabases_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	ts := NewTownSettings()
+	if len(ts.ProtectedDoltDatabases) != 0 {
+		t.Fatal("a new town protects nothing by default")
+	}
+
+	data, err := json.MarshalIndent(ts, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "protected_dolt_databases") {
+		t.Error("JSON should not contain protected_dolt_databases when nil")
+	}
+
+	var loaded TownSettings
+	if err := json.Unmarshal([]byte(`{"protected_dolt_databases":["pc1","pc2"]}`), &loaded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got := loaded.ProtectedDoltDatabases; len(got) != 2 || got[0] != "pc1" || got[1] != "pc2" {
+		t.Errorf("ProtectedDoltDatabases = %v, want [pc1 pc2]", got)
+	}
+}
+
 // --- Edge cases for config values ---
 
 func TestParseDurationOrDefault_AllWebTimeoutDefaults(t *testing.T) {
