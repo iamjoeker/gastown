@@ -21,7 +21,6 @@ import (
 
 	"github.com/gofrs/flock"
 	beadsdk "github.com/steveyegge/beads"
-	"github.com/steveyegge/gastown/internal/awaitprobe"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
 	"github.com/steveyegge/gastown/internal/channelevents"
@@ -1372,12 +1371,11 @@ func (d *Daemon) ensureBootRunning() {
 	// point has a fresh heartbeat, no work in flight, and nothing waiting to wake
 	// it — the exact state this guard reads as "nothing to triage". Requiring a
 	// live await closes that: the skip now asserts something that was checked
-	// rather than assumed. See [awaitprobe.Probe]; an unreadable process table
-	// does not suppress the skip, so a host without one behaves as it did
-	// before.
+	// rather than assumed. See [awaitProbe]; awaitUnknown does not suppress the
+	// skip, so a host without a readable process table behaves as it did before.
 	hb := deacon.ReadHeartbeat(d.config.TownRoot)
 	if hb != nil && hb.IsFresh() && !d.hasActiveWork() {
-		if (&awaitprobe.Probe{}).State(beads.DeaconBeadIDTown()) == awaitprobe.StateAbsent {
+		if (&awaitProbe{}).state(beads.DeaconBeadIDTown()) == awaitAbsent {
 			d.logger.Println("Boot spawn: Deacon looks idle but has no await pending — parked, not waiting")
 		} else {
 			d.logger.Println("Boot spawn skipped: Deacon is healthy and no active work in flight")
@@ -1674,10 +1672,10 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		// work. For a Deacon that parked with its await gone, "no active work in
 		// flight" is precisely what being stuck looks like, and skipping on it
 		// strands the head of the wake chain silently (gt-ghw7). Only a live
-		// await justifies the skip; an unreadable process table still skips,
-		// preserving the pre-check behavior.
+		// await justifies the skip; awaitUnknown still skips, preserving the
+		// pre-check behavior where the process table cannot be read.
 		if !d.hasActiveWork() {
-			if (&awaitprobe.Probe{}).State(beads.DeaconBeadIDTown()) == awaitprobe.StateAbsent {
+			if (&awaitProbe{}).state(beads.DeaconBeadIDTown()) == awaitAbsent {
 				d.logger.Println("Deacon nudge: no active work in flight AND no await-signal pending — parked, nudging")
 			} else {
 				d.logger.Println("Deacon nudge skipped: no active work in flight, await-signal will fire naturally")

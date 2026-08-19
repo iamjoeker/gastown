@@ -55,6 +55,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gt mq list --verify` reports EMPTY for a branch that carries no commits**
+  (gt-d5u). `--verify` checked only that the branch *existed*, and existence is
+  not work: a branch that was never committed to still resolves — to its own
+  base. Live case on the beads rig, MR `bd-wisp-940`: branch
+  `polecat/slit/bd-6jp` pointed at `93af660a9`, which was main's head, and the
+  queue displayed `STATUS ready  GIT OK`. Three independent signals agreed the
+  branch was empty (`ls-remote` returned main's sha, `git log main..origin/<b>`
+  was empty, so was the diff), and the MR's recorded `commit_sha` was the base
+  commit itself. A refinery following the happy path from there merges a no-op,
+  pushes it, and `gt mq post-merge` closes the source issue — every gate green,
+  zero lines changed. `--verify` now runs a content check
+  (`git rev-list --count <target>..<branch>`) after the existence check and
+  surfaces the result as its own state rather than folding it into OK, because
+  the dispositions differ: an EMPTY MR is rejected, not merged and not retried.
+  The GIT column now reads OK / EMPTY / MISSING / ERR, `--json` gains
+  `git_state`, `branch_empty` and `commits_ahead` alongside the existing
+  `branch_exists`, and the summary line names the reject command. Refs are
+  resolved origin-first, so a stale local ref cannot vouch for a pushed branch
+  that is empty; when the target branch cannot be resolved the MR is reported
+  ERR rather than OK, since "does this contain work" went unanswered.
+
 - **Dispatch no longer sends a second polecat onto work that is already
   committed** (gt-79li). A bead can return to a dispatchable state while its work
   exists: gt-wlco was closed by its polecat, reopened nine minutes later, and had

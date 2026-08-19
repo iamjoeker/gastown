@@ -1,12 +1,4 @@
-// Package awaitprobe reports whether a patrol agent has a live await process
-// waiting on its behalf, read from the host process table.
-//
-// It lives in its own package because two very different callers need the same
-// answer: the daemon, which uses it to decide whether waking an agent would
-// interrupt a healthy wait, and `gt deacon status`, which uses it to tell a
-// Deacon parked in await-signal from one that stopped mid-patrol
-// (internal/deacon.EvaluateHealth).
-package awaitprobe
+package daemon
 
 import (
 	"os/exec"
@@ -34,36 +26,29 @@ import (
 //
 // What this deliberately does NOT claim: the ABSENCE of an await does not mean
 // an agent is stopped. A computing agent has no await process either, which is
-// why [tmux.TurnState] remains the stopped-vs-working discriminator. Presence is
-// the decisive half — an agent with a live await is waiting, whatever its pane
-// says — and on the daemon's paths absence only ever suppresses an action,
-// never triggers one.
-//
-// Absence carries weight in exactly one place, and only alongside the two
-// signals that cover what it cannot see: internal/deacon.EvaluateHealth reports
-// a Deacon wedged when its heartbeat has frozen past the stale threshold AND its
-// pane shows the turn has ended AND no await is pending. There the pane rules
-// out the computing agent this probe would otherwise mistake for a stopped one.
+// why [tmux.TurnState] remains the stopped-vs-working discriminator and why this
+// probe only ever suppresses an action, never triggers one. Presence is the
+// decisive half — an agent with a live await is waiting, whatever its pane says.
 
-// State is what the process table says about one agent's pending await.
-type State int
+// awaitState is what the process table says about one agent's pending await.
+type awaitState int
 
 const (
-	// StateUnknown means the process table could not be read (no ps, or the
+	// awaitUnknown means the process table could not be read (no ps, or the
 	// command failed). Every caller must treat this as "no information" and fall
 	// back to the behavior it had before this check existed.
-	StateUnknown State = iota
-	// StateAbsent means the table was read and holds no await for this agent.
-	StateAbsent
-	// StatePending means a live await process is waiting on this agent's behalf.
-	StatePending
+	awaitUnknown awaitState = iota
+	// awaitAbsent means the table was read and holds no await for this agent.
+	awaitAbsent
+	// awaitPending means a live await process is waiting on this agent's behalf.
+	awaitPending
 )
 
-func (s State) String() string {
+func (s awaitState) String() string {
 	switch s {
-	case StateAbsent:
+	case awaitAbsent:
 		return "absent"
-	case StatePending:
+	case awaitPending:
 		return "pending"
 	default:
 		return "unknown"
@@ -85,15 +70,13 @@ var awaitCommands = []string{"await-signal", "await-event"}
 // interrupts one backoff and then continues, which is the recoverable direction.
 const agentBeadFlag = "--agent-bead"
 
-// ListProcessArgs returns the full command line of every process on the host.
+// listProcessArgs returns the full command line of every process on the host.
 //
 // `-ww` disables the width truncation ps applies by default; without it a long
 // await command line is cut off before its --agent-bead argument and every
 // probe reads absent. `-axo args=` is the same portable spelling the rest of
 // the tree uses for process snapshots (see getAllDescendants).
-// A var, not a func, so tests here and in the daemon can substitute a
-// transcribed process table. Nothing in production reassigns it.
-var ListProcessArgs = func() ([]string, error) {
+var listProcessArgs = func() ([]string, error) {
 	out, err := exec.Command("ps", "-axwwo", "args=").Output()
 	if err != nil {
 		return nil, err
@@ -101,32 +84,32 @@ var ListProcessArgs = func() ([]string, error) {
 	return strings.Split(string(out), "\n"), nil
 }
 
-// Probe answers "is this agent's await alive" from a single snapshot of the
+// awaitProbe answers "is this agent's await alive" from a single snapshot of the
 // process table. The snapshot is taken once on first use and reused for the rest
 // of the probe's life, so a sweep over every patrol target costs one ps call
 // rather than one per target. Create a fresh probe per sweep — a cached table
 // goes stale the moment an await starts or exits.
-type Probe struct {
+type awaitProbe struct {
 	once  sync.Once
 	lines []string
 	err   error
 }
 
-// State reports whether an await is pending for the given agent bead.
-// An empty bead returns StateUnknown: without an ID there is nothing to
+// state reports whether an await is pending for the given agent bead.
+// An empty bead returns awaitUnknown: without an ID there is nothing to
 // attribute an await to, and any await on the host would match.
-func (p *Probe) State(agentBead string) State {
+func (p *awaitProbe) state(agentBead string) awaitState {
 	if agentBead == "" {
-		return StateUnknown
+		return awaitUnknown
 	}
-	p.once.Do(func() { p.lines, p.err = ListProcessArgs() })
+	p.once.Do(func() { p.lines, p.err = listProcessArgs() })
 	if p.err != nil {
-		return StateUnknown
+		return awaitUnknown
 	}
-	return stateFromProcesses(agentBead, p.lines)
+	return awaitStateFromProcesses(agentBead, p.lines)
 }
 
-// stateFromProcesses is the matching rule, split out so it can be exercised
+// awaitStateFromProcesses is the matching rule, split out so it can be exercised
 // against transcribed ps output without a live process table.
 //
 // A line matches when an await command name is followed, later on the same
@@ -135,13 +118,13 @@ func (p *Probe) State(agentBead string) State {
 // some other bead-scoped command from matching the wrong agent. The wrapper
 // process itself matching alongside its child is fine and expected: both are
 // evidence the same wait is in flight.
-func stateFromProcesses(agentBead string, lines []string) State {
+func awaitStateFromProcesses(agentBead string, lines []string) awaitState {
 	for _, line := range lines {
 		if commandLineAwaitsFor(agentBead, line) {
-			return StatePending
+			return awaitPending
 		}
 	}
-	return StateAbsent
+	return awaitAbsent
 }
 
 func commandLineAwaitsFor(agentBead, line string) bool {

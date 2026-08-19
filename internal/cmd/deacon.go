@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/awaitprobe"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -676,17 +675,10 @@ type HeartbeatStatus struct {
 	VeryStale  bool      `json:"very_stale"`
 
 	// Verdict is the health conclusion, which unlike the age flags above
-	// accounts for whether anything is left running to move the Deacon along.
-	// A Deacon stopped mid-patrol — the wedge gt-bvo reported — reads "wedged"
-	// here while every age flag still looks like an ordinary stale heartbeat.
+	// accounts for wake-cycle advancement. A Deacon wedged on unsubmitted
+	// composer input keeps writing heartbeats, so Fresh stays true while the
+	// Deacon makes no progress; Verdict reports "wedged" for that case.
 	Verdict string `json:"verdict"`
-
-	// Await and Turn are the two observations the verdict rests on, reported so
-	// a caller can see WHY rather than trusting the label: "pending"/"absent"/
-	// "unknown" for the Deacon's await process, and "active"/"ended"/"stranded"/
-	// "unknown" for its pane. Both must be conclusive for a wedged verdict.
-	Await string `json:"await"`
-	Turn  string `json:"turn"`
 
 	// Healthy is whether Verdict means no intervention is needed. Prefer this
 	// over Fresh for automated checks.
@@ -731,19 +723,7 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 			now := time.Now()
 			th := deacon.DefaultHealthThresholds()
 			obs := deacon.ObserveCycle(townRoot, hb, now)
-
-			// The two signals that separate a stopped Deacon from a sleeping or
-			// working one. Both are local and cheap — one ps, one capture-pane —
-			// and both are read here, at poll time, because neither survives in
-			// the heartbeat file. TurnState returns "unknown" for a session that
-			// does not exist, so a Deacon that is not running can never be
-			// reported wedged; it keeps its age verdict, which is the one that
-			// leads to a restart rather than to an inspection.
-			sig := deacon.LivenessSignals{
-				Await: (&awaitprobe.Probe{}).State(beads.DeaconBeadIDTown()),
-				Turn:  t.TurnState(sessionName),
-			}
-			verdict := deacon.EvaluateHealth(hb, now, th, sig)
+			verdict := deacon.EvaluateHealth(hb, obs, now, th)
 
 			hbStatus = &HeartbeatStatus{
 				Timestamp:  hb.Timestamp,
@@ -755,8 +735,6 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 				VeryStale:  hb.IsVeryStale(),
 				Verdict:    string(verdict),
 				Healthy:    verdict.Healthy(),
-				Await:      sig.Await.String(),
-				Turn:       sig.Turn.String(),
 			}
 			// Only surface the stall once it is long enough to be worth an
 			// operator's attention. A healthy Deacon between wake cycles always
@@ -839,18 +817,11 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Health: %s\n", hbStatus.Verdict)
 		if hbStatus.Verdict == string(deacon.VerdictWedged) {
 			// The failure this verdict exists to surface is invisible to every
-			// other probe the town has: tmux has-session passes and nothing
-			// reports an error. Say what was observed, not just the label, and
-			// name the recovery — it is deliberately not automated.
+			// other probe the town has: tmux has-session passes and the
+			// heartbeat reads fresh. Say what it means and what to do, because
+			// recovery is deliberately not automated.
 			fmt.Printf("    %s\n", style.Bold.Render(
-				"Deacon stopped mid-patrol: no turn running and no await pending, so nothing will wake it."))
-			if hbStatus.Turn == tmux.TurnStranded.String() {
-				// patrol-wake will not type into a stranded composer — appending
-				// to unsent text garbles it — so this case reaches nobody unless
-				// it is said here.
-				fmt.Printf("    %s\n", style.Bold.Render(
-					"Unsent text is sitting in its composer. The daemon will not wake it; recover by hand."))
-			}
+				"Deacon is alive but completing no wake cycles — likely unsubmitted input in its composer."))
 			fmt.Printf("    Inspect with: %s\n", style.Dim.Render("gt deacon attach"))
 		}
 	} else if townRoot != "" {
