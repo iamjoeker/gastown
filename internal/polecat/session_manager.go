@@ -641,7 +641,7 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 
 	// Try graceful shutdown first
 	if !force {
-		_ = m.tmux.SendKeysRaw(sessionID, "C-c")
+		_ = m.tmux.InterruptAgent(sessionID, tmux.KeyCtrlC)
 		session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout)
 	}
 
@@ -826,7 +826,9 @@ func (m *SessionManager) Inject(polecat, message string) error {
 		debounceMs = 1500
 	}
 
-	return m.tmux.SendKeysDebounced(sessionID, message, debounceMs)
+	// Guarded send: the recipient is a live polecat, so `gt session inject`
+	// reached from a test binary must not type into its pane (gt-7s8).
+	return m.tmux.SendKeysToAgentDebounced(sessionID, message, debounceMs)
 }
 
 // StopAll terminates all polecat sessions for this rig.
