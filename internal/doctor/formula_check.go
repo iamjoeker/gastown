@@ -61,7 +61,8 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 			needsFix = true
 		case "modified":
 			if f.EmbeddedChanged {
-				details = append(details, fmt.Sprintf("  %s: locally modified AND the shipped default has changed since install — reconcile by hand (gt will keep skipping it)", f.Name))
+				name := strings.TrimSuffix(f.Name, ".formula.toml")
+				details = append(details, fmt.Sprintf("  %s: locally modified AND the shipped default has changed since install — reconcile by hand (gt will keep skipping it): gt formula drift %s", f.Name, name))
 			} else {
 				details = append(details, fmt.Sprintf("  %s: locally modified (skipping)", f.Name))
 			}
@@ -118,7 +119,7 @@ func (c *FormulaCheck) Run(ctx *CheckContext) *CheckResult {
 	case needsFix:
 		result.FixHint = "Run 'gt doctor --fix' to update formulas"
 	case report.ModifiedDrift > 0:
-		result.FixHint = "Diff the listed formulas against the shipped defaults and merge by hand — --fix cannot touch locally modified formulas"
+		result.FixHint = "Run 'gt formula drift' to reconcile — --fix cannot touch locally modified formulas"
 	}
 
 	return result
