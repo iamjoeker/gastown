@@ -163,19 +163,6 @@ type TownSettings struct {
 	// "main_branch_test", "handler").
 	// Example: ["doctor_dog", "compactor_dog"]
 	DisabledPatrols []string `json:"disabled_patrols,omitempty"`
-
-	// ProtectedDoltDatabases names databases in .dolt-data/ that must never be
-	// deleted, even when no rig's metadata.json claims them and even under
-	// `gt dolt cleanup --force`. Orphan detection skips them and the reporting
-	// surfaces label them protected instead of listing them for deletion.
-	//
-	// This exists so a town can write down which unreferenced databases are
-	// deliberate. Before it, the only way to keep one was a ruling held in
-	// operators' heads and repeated in mail — which the tool could not honour,
-	// and which anyone who had not read the mail would never see. (gt-xhjb)
-	//
-	// Example: ["pc1", "pc2", "pc3"]
-	ProtectedDoltDatabases []string `json:"protected_dolt_databases,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.

@@ -2298,12 +2298,11 @@ func TestHasBusyIndicator(t *testing.T) {
 	}
 }
 
-// TestShouldSendEscapeFromLines guards against the regression where a nudge
+// TestShouldSendEscapeForLines guards against the regression where a nudge
 // sends the vim-mode Escape keystroke while the agent is actively generating,
 // interrupting its current turn (e.g. the Mayor). When the pane shows the busy
-// indicator ("esc to interrupt") in the status region, the Escape must be
-// suppressed — and when it shows it only in the transcript, it must not.
-func TestShouldSendEscapeFromLines(t *testing.T) {
+// indicator ("esc to interrupt"), the Escape must be suppressed.
+func TestShouldSendEscapeForLines(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -2313,49 +2312,28 @@ func TestShouldSendEscapeFromLines(t *testing.T) {
 	}{
 		{
 			name:  "claude generating - suppress escape",
-			lines: []string{plainBox, plainPrompt, plainBox, plainFooterBusy},
+			lines: []string{"✻ Cogitating… (12s · ↑ 2.1k tokens · esc to interrupt)"},
 			want:  false,
 		},
 		{
-			name:  "spinner above the composer - suppress escape",
-			lines: []string{plainSpinnerBusy, "", plainBox, plainPrompt, plainBox, plainFooterIdle},
+			name:  "codex working - suppress escape",
+			lines: []string{"• Working (2m 18s • esc to interrupt)"},
 			want:  false,
 		},
 		{
-			// The regression this call was left holding after gt-qye: an agent
-			// discussing pane-reading quotes the marker in its own transcript,
-			// and the whole-pane scan suppressed the Escape for as long as that
-			// text stayed on screen. A nudge into a vim-mode composer then
-			// strands instead of submitting.
-			name: "busy marker in transcript prose still allows escape",
-			lines: []string{
-				"  The status line reads 'esc to interrupt' while a turn is in flight;",
-				"  my whole-pane grep matched this very line.",
-				"",
-				plainSpinnerIdle,
-				"",
-				plainBox, plainPrompt, plainBox, plainFooterIdle,
-			},
-			want: true,
+			name:  "busy indicator among multiple lines - suppress escape",
+			lines: []string{"tool output", "more output", "⏵⏵ bypass permissions on · esc to interrupt"},
+			want:  false,
 		},
 		{
 			name:  "idle ready prompt - allow escape",
-			lines: []string{plainBox, plainPrompt, plainBox, plainFooterIdle},
+			lines: []string{"❯ "},
 			want:  true,
 		},
 		{
 			name:  "idle with typed nudge text - allow escape",
-			lines: []string{plainPrompt + "HEALTH_CHECK: heartbeat stale, respond to confirm"},
+			lines: []string{"❯ HEALTH_CHECK: heartbeat stale, respond to confirm"},
 			want:  true,
-		},
-		{
-			// No composer and no mode footer: nothing locates the status
-			// region, so the decision falls back to the pre-anchor whole-pane
-			// scan rather than to a guess. Suppressing is the direction this
-			// call already fails in.
-			name:  "unreadable pane with a busy marker - suppress escape",
-			lines: []string{"• Working (2m 18s • esc to interrupt)"},
-			want:  false,
 		},
 		{
 			name:  "no lines captured - allow escape (not busy)",
@@ -2366,8 +2344,8 @@ func TestShouldSendEscapeFromLines(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldSendEscapeFromLines(tt.lines, DefaultReadyPromptPrefix); got != tt.want {
-				t.Errorf("shouldSendEscapeFromLines(%q) = %v, want %v", tt.lines, got, tt.want)
+			if got := shouldSendEscapeForLines(tt.lines); got != tt.want {
+				t.Errorf("shouldSendEscapeForLines(%q) = %v, want %v", tt.lines, got, tt.want)
 			}
 		})
 	}

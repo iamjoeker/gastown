@@ -123,31 +123,13 @@ Four rules for read paths:
 Aggregates inherit the defect: a summary that counts an unreadable panel as 0
 will happily report "✓ All clear". Not being able to see is itself an alert.
 
-**The error has to survive every layer, not just the one that produced it.** A
-fetcher can return a perfectly good error and still change nothing: the handler
-above it logs the error and builds the panel from the zero value, so the same
-"could not look" arrives as "nothing there" one layer up. Four panels stayed
-blind this way for a full release after their fetchers were fixed (gt-xw1t).
-`var err error` next to `log.Printf` in a fan-out is the signature — the result
-variable is kept and the error is not.
-
-**A value that renders only when it is known hides instead of lying, which is
-harder to notice.** `{{if .Health}}` around the heartbeat stat meant a failed
-read did not show a wrong heartbeat — it removed the liveness indicator from the
-banner, and a warning light that is absent reads exactly like one that is off.
-A panel with no empty state to lie with is not therefore safe; check what the
-page looks like when the value is missing, not only when it is wrong.
-
 ## Reviewer checklist
 
 - Does any success path return `nil` without having confirmed the effect?
 - On a read path: can a failed query and an empty result return the same value?
   (`return nil, nil` on an error branch is the signature of this bug.)
 - Does the error reach the reader, or only `log.Printf`? A logged error and a
-  discarded one render identically to whoever is looking at the page. Check
-  every layer between the query and the template, not just the query.
-- Does the display element render conditionally on the value being present? Then
-  its failure mode is a missing indicator, not a wrong one.
+  discarded one render identically to whoever is looking at the page.
 - Does the error carry the fact the caller has to branch on, and the operator
   has to read? (`exit status 1` carries neither.)
 - Does any helper that mutates state return no error at all? (`func(x) `, not

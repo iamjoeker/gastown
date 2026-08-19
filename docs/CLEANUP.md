@@ -139,38 +139,9 @@ bd sql --json "select coalesce(wisp_type,'') t, count(*) c from wisps group by t
 
 | Command | What it does |
 |---------|-------------|
-| `gt dolt cleanup --dry-run` | Reports what cleanup would do, and any refusal it would raise. Deletes nothing. |
-| `gt dolt list` | Owner or protection label for every database, not just the flagged ones |
 | `gt dolt cleanup` | Removes orphaned databases from `.dolt-data/` |
 | `gt dolt stop` | Stops the Dolt SQL server |
 | `gt dolt rollback [backup-dir]` | Restores `.beads` from backup, resets metadata |
-
-`gt dolt cleanup` refuses when too large a share of the town's databases is
-flagged, and its refusal offers `--force`. `--force` deletes every flagged
-database without the per-database check for user tables — it is the
-highest-blast-radius command available against the live data plane, and it is
-not the recommended next step after a refusal. Read `--dry-run` first.
-
-Reporting surfaces — `gt dolt status`, `gt dolt init`, `gt doctor` — list
-orphans but deliberately name no deleting command. They report; the operator
-decides (gt-xhjb).
-
-### Keeping an unreferenced database
-
-A database with no rig `metadata.json` pointing at it is reported as an orphan
-even when it is deliberate. To keep one permanently, name it in
-`settings/config.json`:
-
-```json
-{
-  "protected_dolt_databases": ["pc1", "pc2", "pc3"]
-}
-```
-
-Orphan detection then skips it, `gt dolt list` labels it protected, and
-`gt dolt cleanup` refuses to remove it **with or without `--force`** — which
-also covers `gt doctor --fix`, since that path force-removes orphans too.
-Write the decision here rather than relying on operators remembering it.
 
 ## Bead / Hook Cleanup
 

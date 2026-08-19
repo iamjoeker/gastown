@@ -538,6 +538,12 @@ type State struct {
 
 	// Databases is the list of available databases (rig names).
 	Databases []string `json:"databases,omitempty"`
+
+	// Supervisor is the process supervisor that owned the server the last time
+	// gt saw one running, remembered so the unit is still identifiable once the
+	// server is stopped and its /proc/<pid>/cgroup is gone. See
+	// SupervisorRecord. (gt-cru5)
+	Supervisor *SupervisorRecord `json:"supervisor,omitempty"`
 }
 
 // SQLServerInfo is Dolt's own runtime metadata from .dolt/sql-server.info.
@@ -1835,6 +1841,11 @@ func Start(townRoot string) error {
 				} else if changed {
 					fmt.Printf("Refreshed stale Dolt PID state (actual %d)\n", pid)
 				}
+				// A running server is the only time the owning unit is
+				// discoverable. Record it now so the next start — when there is
+				// no PID and no cgroup to read it from — can hand the start to
+				// the supervisor instead of spawning behind its back. (gt-cru5)
+				ObserveSupervisor(townRoot, pid)
 				return nil // already running and legitimate — idempotent success
 			}
 		}
@@ -1900,43 +1911,96 @@ func Start(townRoot string) error {
 		logFile.Close()
 		return fmt.Errorf("writing Dolt config: %w", err)
 	}
-	cmd := NewSQLServerCommand("dolt", config.DataDir, configPath)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
 
-	// Detach from terminal and put dolt in its own process group so that
-	// signals sent to the parent process group (e.g. SIGHUP when the caller
-	// calls syscall.Exec to become tmux) don't reach the dolt server.
-	cmd.Stdin = nil
-	setProcessGroup(cmd)
+	// Bring the server up, through the supervisor when one owns this town's
+	// server. Spawning dolt directly while its unit is stopped leaves systemd
+	// reporting the unit inactive while a server serves on the port: nothing
+	// restarts that process if it dies, a later `systemctl start` finds the
+	// port occupied, and it dies with whatever shell started it. (gt-cru5)
+	//
+	// killProcess undoes a failed start on whichever path started the server;
+	// it is nil when nothing needs undoing.
+	var serverPID int
+	var killProcess func()
 
-	if err := cmd.Start(); err != nil {
+	if sup := supervisorForStart(townRoot); sup != nil {
+		// The unit's output goes to the journal, not to gt's log file.
 		if closeErr := logFile.Close(); closeErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
 		}
-		return fmt.Errorf("starting Dolt server: %w", err)
+		fmt.Fprintf(os.Stderr, "Dolt is supervised by %s — starting through the supervisor\n", sup.Describe())
+		supPID, startErr := sup.StartUnit()
+		if startErr != nil {
+			return fmt.Errorf(`starting Dolt through its supervisor failed: %w
+
+gt did not start a server directly instead: a process started outside %s is
+one systemd believes does not exist, so nothing would restart it and the next
+%s would find port %d occupied.
+
+What the unit did: %s
+To start a server outside the unit anyway: GT_DOLT_DIRECT_START=1 gt dolt start`,
+				startErr, sup.Unit, sup.StartCommand(), config.Port, sup.JournalCommand())
+		}
+		serverPID = supPID
+	} else {
+		cmd := NewSQLServerCommand("dolt", config.DataDir, configPath)
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+
+		// Detach from terminal and put dolt in its own process group so that
+		// signals sent to the parent process group (e.g. SIGHUP when the caller
+		// calls syscall.Exec to become tmux) don't reach the dolt server.
+		cmd.Stdin = nil
+		setProcessGroup(cmd)
+
+		if err := cmd.Start(); err != nil {
+			if closeErr := logFile.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
+			}
+			return fmt.Errorf("starting Dolt server: %w", err)
+		}
+
+		// Close log file in parent (child has its own handle)
+		if closeErr := logFile.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
+		}
+
+		serverPID = cmd.Process.Pid
+		killProcess = func() { _ = cmd.Process.Kill() }
 	}
 
-	// Close log file in parent (child has its own handle)
-	if closeErr := logFile.Close(); closeErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to close dolt log file: %v\n", closeErr)
+	// Write PID file. A supervised start may report no MainPID (older systemd,
+	// no bus); an unknown PID is left out rather than written as 0, which
+	// IsRunning would read as a real process.
+	if serverPID > 0 {
+		if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(serverPID)), 0644); err != nil {
+			// Try to kill the process we just started. Not on the supervised
+			// path: killing the unit's main process is the supervisor's call,
+			// and a PID file gt failed to write is not worth an outage for.
+			if killProcess != nil {
+				killProcess()
+			}
+			return fmt.Errorf("writing PID file: %w", err)
+		}
+	} else {
+		// No PID to record. A leftover file from the previous server would be
+		// read as this one's, and PIDs are reused.
+		_ = os.Remove(config.PidFile)
 	}
 
-	// Write PID file
-	if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
-		// Try to kill the process we just started
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("writing PID file: %w", err)
-	}
-
-	// Save state
+	// Save state, preserving the remembered supervisor: this is a fresh state
+	// value, and overwriting the record would forget the unit on the very path
+	// that most needs it next time.
 	state := &State{
 		Running:   true,
-		PID:       cmd.Process.Pid,
+		PID:       serverPID,
 		Port:      config.Port,
 		StartedAt: time.Now(),
 		DataDir:   config.DataDir,
 		Databases: databases,
+	}
+	if prior, loadErr := LoadState(townRoot); loadErr == nil && prior != nil {
+		state.Supervisor = prior.Supervisor
 	}
 	if err := SaveState(townRoot, state); err != nil {
 		// Non-fatal - server is still running
@@ -1965,8 +2029,10 @@ func Start(townRoot string) error {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		time.Sleep(500 * time.Millisecond)
 
-		// Check if the process we started is still alive.
-		if !processIsAlive(cmd.Process.Pid) {
+		// Check if the process we started is still alive. A PID of 0 means the
+		// supervisor gave none, so there is nothing to check liveness against
+		// and reachability below is the only evidence.
+		if serverPID > 0 && !processIsAlive(serverPID) {
 			return fmt.Errorf("Dolt server process died during startup (check logs with 'gt dolt logs')")
 		}
 
@@ -2007,9 +2073,9 @@ func Start(townRoot string) error {
 
 	totalTimeout := time.Duration(dbCount) * 5 * time.Second
 	if !tcpReachable {
-		return fmt.Errorf("Dolt server process started (PID %d) but not accepting connections after %v (%d databases × 5s): %w\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
+		return fmt.Errorf("Dolt server process started (PID %d) but not accepting connections after %v (%d databases × 5s): %w\nCheck logs with: gt dolt logs", serverPID, totalTimeout, dbCount, lastErr)
 	}
-	return fmt.Errorf("Dolt server process started (PID %d) and is reachable, but databases failed to load after %v (%d databases × 5s): %w\nRecovery: gt dolt stop && gt dolt start\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
+	return fmt.Errorf("Dolt server process started (PID %d) and is reachable, but databases failed to load after %v (%d databases × 5s): %w\nRecovery: gt dolt stop && gt dolt start\nCheck logs with: gt dolt logs", serverPID, totalTimeout, dbCount, lastErr)
 }
 
 // WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
@@ -3019,58 +3085,20 @@ type OrphanedDatabase struct {
 // CollectDatabaseOwners so `gt dolt list` / `gt dolt status` annotate them as
 // protected rather than reporting them as orphans.
 //
-// These are the ones gt knows about because they are part of gt. A town's own
-// deliberate unreferenced databases go in settings/config.json instead — see
-// ProtectedDatabases, which merges both.
+// Single source of truth for orphan-detection skipping (FindOrphanedDatabases,
+// RemoveDatabase) and owner-label reporting (CollectDatabaseOwners). Adding a
+// new protected database here automatically picks up all three surfaces.
 func protectedSharedServerDatabases() map[string]string {
 	return map[string]string{
 		"beads_global": "global shared beads database (protected)",
 	}
 }
 
-// ProtectedDatabaseSettingsLabel is the owner label reporting surfaces show for
-// a database the town protected in settings/config.json. It names the file so a
-// reader who did not write the entry can find and change it.
-const ProtectedDatabaseSettingsLabel = "protected by settings/config.json"
-
-// ProtectedDatabases returns every database that must not be deleted despite
-// having no rig metadata, mapped to the label reporting surfaces show for it:
-// gt's own built-in registry, plus whatever the town listed in
-// settings/config.json under protected_dolt_databases.
-//
-// Single source of truth for orphan-detection skipping (FindOrphanedDatabases),
-// the delete-time refusal (RemoveDatabase, which honours it even under --force)
-// and owner-label reporting (CollectDatabaseOwners). A guard installed on only
-// one of those is inert on the others, so all three read this.
-//
-// It returns an error rather than an empty map when the settings file exists
-// but cannot be read or parsed. Every delete path fails closed on that error:
-// a corrupt settings file must not silently mean "nothing is protected", which
-// is the one failure that turns this guard into a deletion. (gt-xhjb)
-func ProtectedDatabases(townRoot string) (map[string]string, error) {
-	protected := make(map[string]string)
-	for name, label := range protectedSharedServerDatabases() {
-		protected[name] = label
-	}
-	if townRoot == "" {
-		return protected, nil
-	}
-
-	settings, err := configpkg.LoadOrCreateTownSettings(configpkg.TownSettingsPath(townRoot))
-	if err != nil {
-		return nil, fmt.Errorf("reading protected databases from %s: %w", configpkg.TownSettingsPath(townRoot), err)
-	}
-	for _, name := range settings.ProtectedDoltDatabases {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		if _, already := protected[name]; already {
-			continue
-		}
-		protected[name] = ProtectedDatabaseSettingsLabel
-	}
-	return protected, nil
+// isProtectedSharedServerDatabase reports databases that are intentionally
+// hosted by the shared Dolt server but are not referenced by rig metadata.
+func isProtectedSharedServerDatabase(dbName string) bool {
+	_, ok := protectedSharedServerDatabases()[dbName]
+	return ok
 }
 
 // ReferencedDatabases returns the set of database names that orphan detection
@@ -3082,7 +3110,7 @@ func ReferencedDatabases(townRoot string) map[string]bool {
 }
 
 // IsOrphanDatabase reports whether dbName is an orphan, given the referenced
-// set from ReferencedDatabases and the protected set from ProtectedDatabases.
+// set from ReferencedDatabases.
 //
 // This is the single orphan predicate. `gt dolt list` and `gt dolt cleanup` are
 // the two surfaces an operator consults before deleting anything, so they must
@@ -3090,13 +3118,8 @@ func ReferencedDatabases(townRoot string) map[string]bool {
 // no metadata.json named it, while cleanup also honoured the rig-prefix safety
 // net in collectReferencedDatabases — which is how a real database ("gt") was
 // shown in a deletion list that cleanup would never have touched. (gt-ti84)
-//
-// Both sets are parameters rather than lookups so that a caller cannot answer
-// this question having loaded only one of them, and so that the error from
-// loading the protected set is handled where it can be reported. (gt-xhjb)
-func IsOrphanDatabase(protected map[string]string, referenced map[string]bool, dbName string) bool {
-	_, isProtected := protected[dbName]
-	return !referenced[dbName] && !isProtected
+func IsOrphanDatabase(referenced map[string]bool, dbName string) bool {
+	return !referenced[dbName] && !isProtectedSharedServerDatabase(dbName)
 }
 
 // IsRigPrefixDatabase reports whether dbName is named after a rig prefix in
@@ -3135,19 +3158,11 @@ func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 	// Collect all referenced database names from metadata.json files
 	referenced := ReferencedDatabases(townRoot)
 
-	// Fail rather than report orphans we cannot rule out: an unreadable
-	// protection list would otherwise flag every database the town deliberately
-	// kept, and the surfaces that print this list are read as deletion lists.
-	protected, err := ProtectedDatabases(townRoot)
-	if err != nil {
-		return nil, err
-	}
-
 	// Find databases that exist on disk but aren't referenced
 	config := DefaultConfig(townRoot)
 	var orphans []OrphanedDatabase
 	for _, dbName := range databases {
-		if !IsOrphanDatabase(protected, referenced, dbName) {
+		if !IsOrphanDatabase(referenced, dbName) {
 			continue
 		}
 		dbPath := filepath.Join(config.DataDir, dbName)
@@ -3353,17 +3368,8 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 	// them as orphans. Only labels protected DBs that actually exist on disk —
 	// otherwise we'd advertise a phantom owner. Never overwrites a rig-derived
 	// label if one is already present.
-	//
-	// On a load error this falls back to gt's built-in registry: labelling is
-	// the one consumer that can degrade safely, because understating protection
-	// only makes a database look more deletable in a report, while every path
-	// that actually deletes reads ProtectedDatabases directly and refuses.
 	config := DefaultConfig(townRoot)
-	protected, err := ProtectedDatabases(townRoot)
-	if err != nil {
-		protected = protectedSharedServerDatabases()
-	}
-	for dbName, label := range protected {
+	for dbName, label := range protectedSharedServerDatabases() {
 		if _, already := owners[dbName]; already {
 			continue
 		}
@@ -3380,15 +3386,8 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 // If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
-	// Deliberately before every other check and not gated on force: this is the
-	// only guard that covers `gt dolt cleanup --force`, `gt doctor --fix` and
-	// AddRig's orphan drop alike, all three of which pass force=true. (gt-xhjb)
-	protected, err := ProtectedDatabases(townRoot)
-	if err != nil {
-		return fmt.Errorf("refusing to remove %q: cannot determine which databases are protected: %w", dbName, err)
-	}
-	if label, ok := protected[dbName]; ok {
-		return fmt.Errorf("database %q is protected (%s) and will not be removed, with or without --force", dbName, label)
+	if isProtectedSharedServerDatabase(dbName) {
+		return fmt.Errorf("database %q is a protected shared-server database", dbName)
 	}
 
 	config := DefaultConfig(townRoot)
