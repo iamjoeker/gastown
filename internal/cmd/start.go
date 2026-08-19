@@ -669,9 +669,14 @@ func runGracefulShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) err
 
 	// Phase 8: Verify no Claude processes survived
 	fmt.Printf("\nPhase 8: Verifying shutdown...\n")
-	verifyNoOrphans()
+	orphanErr := verifyNoOrphans()
 
 	fmt.Println()
+	if orphanErr != nil {
+		// The town is not down while agents are still running, so do not say it
+		// is (gt-dr6t).
+		return fmt.Errorf("graceful shutdown incomplete (%d session(s) stopped): %w", stopped, orphanErr)
+	}
 	fmt.Printf("%s Graceful shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
 	return nil
 }
@@ -712,9 +717,14 @@ func runImmediateShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) er
 	// Verify no Claude processes survived
 	fmt.Println()
 	fmt.Println("Verifying shutdown...")
-	verifyNoOrphans()
+	orphanErr := verifyNoOrphans()
 
 	fmt.Println()
+	if orphanErr != nil {
+		// The town is not down while agents are still running, so do not say it
+		// is (gt-dr6t).
+		return fmt.Errorf("shutdown incomplete (%d session(s) stopped): %w", stopped, orphanErr)
+	}
 	fmt.Printf("%s Gas Town shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
 
 	return nil
