@@ -316,9 +316,13 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 		// Close ALL sling contexts for this specific work bead (there may be
 		// duplicates if concurrent scheduleBead calls raced past idempotency).
 		// Scan all rig dirs since contexts live in target rig beads. (GH#3468)
+		// Fail closed on ANY scan failure, partial included: closing "all"
+		// contexts from a view that missed a store would report success while
+		// live contexts sat in the store it skipped (gt-mji1). The error already
+		// names the operation and the skipped stores.
 		contexts, err := listAllSlingContextRecords(townRoot)
 		if err != nil {
-			return fmt.Errorf("scheduler clear: %w", err)
+			return err
 		}
 
 		closed := 0
@@ -345,7 +349,7 @@ func runSchedulerClear(cmd *cobra.Command, args []string) error {
 	// Close all open sling contexts across all dirs
 	allContexts, err := listAllSlingContextRecords(townRoot)
 	if err != nil {
-		return fmt.Errorf("scheduler clear: %w", err)
+		return err
 	}
 
 	if len(allContexts) == 0 {
