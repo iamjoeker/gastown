@@ -33,10 +33,7 @@ internal/events/*/
 config.toml
 !config.example.toml
 !internal/hooks/templates/vibe/config.toml
-# The gt binary built at the repo root. Anchored: unanchored "gt" also matches
-# the cmd/gt directory, which silently drops every new file added there from
-# git add.
-/gt
+gt
 
 # Runtime state (ignore contents, but allow setup-hooks to be tracked)
 state.json

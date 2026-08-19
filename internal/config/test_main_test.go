@@ -6,16 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
-
-	"github.com/steveyegge/gastown/internal/testenv"
 )
 
 func TestMain(m *testing.M) {
-	// Point this package at a dead Dolt port before anything else runs, so a
-	// test that reaches for Dolt without arranging a server of its own cannot
-	// land on the production one. See testenv.GuardProductionDolt.
-	testenv.GuardProductionDolt()
-
 	stubDir, err := os.MkdirTemp("", "gt-agent-bin-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create stub dir: %v\n", err)

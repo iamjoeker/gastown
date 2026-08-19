@@ -591,14 +591,8 @@ func createSwarmWisp(bd *BdCli, workDir string, payload *SwarmStartPayload) (str
 
 	labels := strings.Join(SwarmWispLabels(payload.SwarmID, payload.Total, 0, payload.StartedAt), ",")
 
-	// --wisp-type patrol matches what mol-witness-patrol's SWARM_START step has
-	// documented all along ("bd create --ephemeral --wisp-type patrol --title
-	// swarm:<id>"); the Go handler that superseded that snippet dropped the flag
-	// and has been landing untyped rows ever since (gt-fqd5). patrol's TTL is
-	// 24h, the same interval the untyped default already applied.
 	output, err := bd.Exec(workDir, "create",
 		"--ephemeral",
-		"--wisp-type", beads.WispTypePatrol,
 		"--json",
 		"--title", title,
 		"--description", description,
