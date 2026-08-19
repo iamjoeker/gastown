@@ -146,3 +146,19 @@ func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 		t.Fatal("errors.Is did not recognize wrapped ErrSubmitNotVerified")
 	}
 }
+
+// TestErrSubmitNotVerifiedTextIsBranchNeutral guards the shared sentinel's
+// wording (gt-lae6). It used to read "message stranded in composer", which is
+// false for the dirty-composer branch — the target held OTHER text there, and
+// the message may never have been stranded at all. Two agents diagnosed the
+// wrong failure from that wording, so each branch must state its own case.
+func TestErrSubmitNotVerifiedTextIsBranchNeutral(t *testing.T) {
+	t.Parallel()
+	text := ErrSubmitNotVerified.Error()
+	if strings.Contains(text, "stranded") {
+		t.Errorf("ErrSubmitNotVerified = %q, want no branch-specific 'stranded' claim in the shared sentinel", text)
+	}
+	if !strings.Contains(text, "submit not verified") {
+		t.Errorf("ErrSubmitNotVerified = %q, want it to still name the condition", text)
+	}
+}
