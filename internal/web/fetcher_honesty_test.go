@@ -330,6 +330,211 @@ func TestFetchActivity_EmptyEventLogIsNotAnError(t *testing.T) {
 	}
 }
 
+// --- Health -----------------------------------------------------------------
+//
+// The health panel fails differently from the rest: its stat renders only when
+// health is known, so a swallowed error did not show a wrong heartbeat — it
+// removed the liveness indicator from the banner, and an absent warning light
+// reads as a working one (gt-xw1t).
+
+func TestFetchHealth_UnreadableHeartbeatIsAnErrorNotAMissingOne(t *testing.T) {
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+
+	// A directory where the heartbeat should be: present, and unreadable as a file.
+	if err := os.MkdirAll(filepath.Join(f.townRoot, "deacon", "heartbeat.json"), 0o755); err != nil {
+		t.Fatalf("creating unreadable heartbeat: %v", err)
+	}
+
+	row, err := f.FetchHealth()
+	if err == nil {
+		t.Fatal("an unreadable heartbeat must return an error, not the claim that there is none")
+	}
+	if !strings.Contains(err.Error(), "reading deacon heartbeat") {
+		t.Errorf("error should say what failed, got: %v", err)
+	}
+	if row != nil {
+		t.Errorf("row = %+v, want nil: 'no heartbeat' is a claim this read cannot support", row)
+	}
+}
+
+func TestFetchHealth_MalformedHeartbeatIsAnErrorNotACycleOfZero(t *testing.T) {
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+	writeDeaconFile(t, f.townRoot, "heartbeat.json", "{not json")
+
+	row, err := f.FetchHealth()
+	if err == nil {
+		t.Fatal("a heartbeat that could not be parsed must return an error, not a zeroed HealthRow")
+	}
+	if !strings.Contains(err.Error(), "parsing deacon heartbeat") {
+		t.Errorf("error should say what failed, got: %v", err)
+	}
+	if row != nil {
+		t.Errorf("row = %+v, want nil", row)
+	}
+}
+
+func TestFetchHealth_AbsentHeartbeatIsARealNoHeartbeat(t *testing.T) {
+	// Control: a Deacon that has never beaten leaves no file, and that is a fact
+	// about the town rather than a failure to look. Without this, the panel would
+	// carry an "unreadable" caveat on every town whose Deacon has not started.
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+
+	row, err := f.FetchHealth()
+	if err != nil {
+		t.Fatalf("a town with no heartbeat yet must not error: %v", err)
+	}
+	if row == nil || row.DeaconHeartbeat != "no heartbeat" {
+		t.Errorf("row = %+v, want the stated absence 'no heartbeat'", row)
+	}
+}
+
+func TestFetchHealth_ReadableHeartbeatIsReported(t *testing.T) {
+	// The other control: a heartbeat that parses must reach the banner intact.
+	f := &LiveConvoyFetcher{
+		townRoot:                t.TempDir(),
+		heartbeatFreshThreshold: 5 * time.Minute,
+	}
+	beat := time.Now().Add(-1 * time.Minute).Format(time.RFC3339)
+	writeDeaconFile(t, f.townRoot, "heartbeat.json",
+		`{"timestamp":"`+beat+`","cycle":42,"healthy_agents":3,"unhealthy_agents":1}`)
+
+	row, err := f.FetchHealth()
+	if err != nil {
+		t.Fatalf("a readable heartbeat must not error: %v", err)
+	}
+	if row.DeaconCycle != 42 || row.HealthyAgents != 3 || row.UnhealthyAgents != 1 {
+		t.Errorf("row = %+v, want the heartbeat's own numbers", row)
+	}
+	if !row.HeartbeatFresh {
+		t.Error("a heartbeat one minute old is fresh")
+	}
+}
+
+func TestFetchHealth_UnreadablePauseStateIsAnErrorNotAnUnpausedTown(t *testing.T) {
+	// "Not paused" is what a false IsPaused renders as, so a pause file the
+	// dashboard could not read must not produce one.
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+	pauseDir := filepath.Join(f.townRoot, ".runtime", "deacon", "paused.json")
+	if err := os.MkdirAll(pauseDir, 0o755); err != nil {
+		t.Fatalf("creating unreadable pause state: %v", err)
+	}
+
+	row, err := f.FetchHealth()
+	if err == nil {
+		t.Fatal("an unreadable pause file must return an error, not an unpaused town")
+	}
+	if !strings.Contains(err.Error(), "deacon pause state") {
+		t.Errorf("error should say what failed, got: %v", err)
+	}
+	if row != nil {
+		t.Errorf("row = %+v, want nil", row)
+	}
+}
+
+func TestFetchHealth_AbsentPauseFileIsARunningTown(t *testing.T) {
+	// Control: no pause file is the ordinary state of a town that is running.
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+
+	row, err := f.FetchHealth()
+	if err != nil {
+		t.Fatalf("a town with no pause file must not error: %v", err)
+	}
+	if row.IsPaused {
+		t.Error("no pause file means the town is not paused")
+	}
+}
+
+// writeDeaconFile writes one of the Deacon's state files under the town root.
+func writeDeaconFile(t *testing.T, townRoot, name, contents string) {
+	t.Helper()
+
+	deaconDir := filepath.Join(townRoot, "deacon")
+	if err := os.MkdirAll(deaconDir, 0o755); err != nil {
+		t.Fatalf("creating deacon dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(deaconDir, name), []byte(contents), 0o600); err != nil {
+		t.Fatalf("writing %s: %v", name, err)
+	}
+}
+
+// --- Rigs -------------------------------------------------------------------
+//
+// The rig list is the town's roster, and it is also what the merge queue walks,
+// so an unreadable rigs.json empties two panels at once.
+
+func TestFetchRigs_UnreadableConfigIsAnErrorNotAnEmptyTown(t *testing.T) {
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+	writeRigsConfig(t, f.townRoot, `{"version": 1, "rigs": {`)
+
+	rows, err := f.FetchRigs()
+	if err == nil {
+		t.Fatal("an unreadable rigs config must return an error, not a town with no rigs")
+	}
+	if !strings.Contains(err.Error(), "loading rigs config") {
+		t.Errorf("error should say what failed, got: %v", err)
+	}
+	if rows != nil {
+		t.Errorf("rows = %v, want nil when the config could not be read", rows)
+	}
+}
+
+func TestFetchRigs_NoRegisteredRigsIsNotAnError(t *testing.T) {
+	// Control: `gt install` writes rigs.json before any rig is added, so an
+	// empty roster is a real zero and must render as one.
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+	writeRigsConfig(t, f.townRoot, `{"version": 1, "rigs": {}}`)
+
+	rows, err := f.FetchRigs()
+	if err != nil {
+		t.Fatalf("a town with no rigs registered must not error: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("rows = %v, want empty", rows)
+	}
+}
+
+// --- Mail -------------------------------------------------------------------
+
+func TestFetchMail_BdFailureIsAnErrorNotAQuietTown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	f := fakeBdFetcher(t, `#!/bin/sh
+echo "dial tcp 127.0.0.1:3307: connect: connection refused" >&2
+exit 1
+`)
+
+	rows, err := f.FetchMail()
+	if err == nil {
+		t.Fatal("a failed bd query must return an error, not an empty mail list")
+	}
+	if !strings.Contains(err.Error(), "listing mail") {
+		t.Errorf("error should say what failed, got: %v", err)
+	}
+	if rows != nil {
+		t.Errorf("rows = %v, want nil when the query failed", rows)
+	}
+}
+
+func TestFetchMail_NoMailIsNotAnError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	f := fakeBdFetcher(t, `#!/bin/sh
+echo "[]"
+`)
+
+	rows, err := f.FetchMail()
+	if err != nil {
+		t.Fatalf("a successful empty query must not error: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("rows = %v, want empty", rows)
+	}
+}
+
 // --- Convoys ----------------------------------------------------------------
 
 // The failure paths are covered by TestFetchConvoysBreakerBacksOffAfterBdFailures
