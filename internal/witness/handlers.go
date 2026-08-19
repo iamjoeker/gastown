@@ -1019,8 +1019,11 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 			issueID = fields.HookBead
 		}
 		if fields.HookBead != "" {
-			hookTerminal = witnessIssueTerminal(rigBeads, fields.HookBead)
-			hookSafe = hookTerminal
+			// The hook slot alone does not establish that this polecat holds
+			// the work: the reopen-to-unstrand remedy leaves the slot pointing
+			// at a bead the issue store has released, and blocking slot reuse
+			// on it keeps the slot shut forever (gt-dh3d).
+			hookTerminal, hookSafe = witnessHookSlotState(rigBeads, fields.HookBead, rigName+"/polecats/"+polecatName)
 			if !hookSafe {
 				input.HookBead = fields.HookBead
 			}
@@ -1206,6 +1209,32 @@ func witnessActiveMRBlocker(bd *beads.Beads, mrID string) string {
 		return ""
 	}
 	return fmt.Sprintf("active_mr=%s status=%s", mrID, mr.Status)
+}
+
+// witnessIssueShower is the slice of the beads store a hook-slot reconciliation
+// needs, so the rule can be exercised without one.
+type witnessIssueShower interface {
+	Show(issueID string) (*beads.Issue, error)
+}
+
+// witnessHookSlotState reconciles an agent bead's hook slot against the work
+// bead it names. terminal reports that the work itself finished; safe reports
+// that the slot does not block, which a released assignment also satisfies.
+//
+// A slot that cannot be read is neither terminal nor safe: an unreadable store
+// establishes nothing, and cleanup decisions must not treat silence as proof.
+func witnessHookSlotState(bd witnessIssueShower, hookBead, assignee string) (terminal bool, safe bool) {
+	if bd == nil || hookBead == "" {
+		return false, false
+	}
+	issue, err := bd.Show(hookBead)
+	if err != nil || issue == nil {
+		return false, false
+	}
+	if beads.IssueStatus(issue.Status).IsTerminal() {
+		return true, true
+	}
+	return false, beads.HookSlotReleased(issue, assignee)
 }
 
 func witnessIssueTerminal(bd *beads.Beads, issueID string) bool {
