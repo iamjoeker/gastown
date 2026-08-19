@@ -821,12 +821,17 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>🐕 Dogs</h2>
-                    <span class="count">{{len .Dogs}}</span>
+                    <span class="count">{{if .DogsUnavailable}}?{{else}}{{len .Dogs}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Dogs}}
+                    {{if .DogsUnavailable}}
+                    <div class="empty-state">
+                        <p class="truncation-notice">⚠️ Dogs unavailable: {{.DogsUnavailable}}</p>
+                        <p>This is NOT "no dogs" — the dashboard could not read the kennel.</p>
+                    </div>
+                    {{else if .Dogs}}
                     <table>
                         <thead>
                             <tr>

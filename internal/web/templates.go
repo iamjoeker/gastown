@@ -45,7 +45,11 @@ type ConvoyData struct {
 	Mail           []MailRow
 	Rigs           []RigRow
 	Dogs           []DogRow
-	Escalations    []EscalationRow
+	// DogsUnavailable holds the reason the kennel could not be read, or "" when
+	// it was read — including when there is no kennel at all, which is a real
+	// zero rather than an unknown one.
+	DogsUnavailable string
+	Escalations     []EscalationRow
 	// EscalationsUnavailable holds the reason the escalation query failed, or
 	// "" when it succeeded. Non-empty means the escalation count is unknown —
 	// which the panel must render differently from a count of zero.
