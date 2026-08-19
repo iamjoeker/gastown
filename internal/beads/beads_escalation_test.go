@@ -1276,3 +1276,44 @@ func TestListStaleEscalations_ReturnsOneEntryPerEscalation(t *testing.T) {
 		t.Errorf("ListStaleEscalations() = %v, want one entry per escalation record", ids)
 	}
 }
+
+// TestParseEscalationFields_FallsBackToMailFrom covers the provenance half of
+// gt-nhp's first defect. `gt escalate list` renders the delivered COPIES, and a
+// mail-delivered copy's description is the mail body — which spells the sender
+// "From: ...", not "escalated_by: ...". So the live queue printed "From:" with
+// nothing after it on every row (10 of 10 on hq, 2026-08-18).
+func TestParseEscalationFields_FallsBackToMailFrom(t *testing.T) {
+	mailBody := strings.Join([]string{
+		"Escalation ID: hq-wisp-rec1",
+		"Severity: high",
+		"From: gastown/witness",
+		"",
+		"Reason:",
+		"a live nuke hazard",
+	}, "\n")
+
+	fields := ParseEscalationFields(mailBody)
+	if fields.EscalatedBy != "gastown/witness" {
+		t.Errorf("EscalatedBy = %q, want gastown/witness — the mail body is what the "+
+			"delivered copy carries, and it is the copies the queue renders", fields.EscalatedBy)
+	}
+	if fields.Severity != "high" {
+		t.Errorf("Severity = %q, want high", fields.Severity)
+	}
+}
+
+// An explicit escalated_by always wins over a "From:" line, in either order: the
+// structured field is authored by the escalation machinery, "From:" is a
+// fallback read out of prose.
+func TestParseEscalationFields_ExplicitEscalatedByWinsOverFrom(t *testing.T) {
+	for name, description := range map[string]string{
+		"escalated_by first": "severity: high\nescalated_by: gastown/refinery\nFrom: someone-else\n",
+		"from first":         "severity: high\nFrom: someone-else\nescalated_by: gastown/refinery\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ParseEscalationFields(description).EscalatedBy; got != "gastown/refinery" {
+				t.Errorf("EscalatedBy = %q, want gastown/refinery", got)
+			}
+		})
+	}
+}
