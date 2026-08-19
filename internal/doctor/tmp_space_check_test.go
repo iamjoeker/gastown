@@ -76,16 +76,21 @@ func TestTmpSpaceCheckFixReclaimsOrphan(t *testing.T) {
 	}
 	dir := setTmpDir(t)
 	orphan := mkOrphanWorkDir(t, dir, "go-build2674671939", 4096, 6*time.Hour)
+	// The other family --fix now reclaims, so a check scoped to Go work
+	// directories alone would leave the beads fixtures behind (gt-1gdh).
+	beadsOrphan := mkOrphanWorkDir(t, dir, "beads-bd-tests-159428258", 4096, 6*time.Hour)
 	keep := mkOrphanWorkDir(t, dir, "claude-1000", 4096, 6*time.Hour)
 
 	if err := NewTmpSpaceCheck().Fix(&CheckContext{TownRoot: t.TempDir()}); err != nil {
 		t.Fatalf("Fix: %v", err)
 	}
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Errorf("orphan %s survived Fix (err=%v)", orphan, err)
+	for _, orphaned := range []string{orphan, beadsOrphan} {
+		if _, err := os.Stat(orphaned); !os.IsNotExist(err) {
+			t.Errorf("orphan %s survived Fix (err=%v)", orphaned, err)
+		}
 	}
 	if _, err := os.Stat(keep); err != nil {
-		t.Errorf("Fix removed a directory that is not a Go work directory: %v", err)
+		t.Errorf("Fix removed a directory that belongs to no swept family: %v", err)
 	}
 }
 
@@ -99,7 +104,7 @@ func TestTmpSpaceCheckFixReportsWhenNothingToReclaim(t *testing.T) {
 	if err == nil {
 		t.Fatal("Fix returned nil having reclaimed nothing")
 	}
-	if !strings.Contains(err.Error(), "no orphaned Go work directories") &&
+	if !strings.Contains(err.Error(), "no orphaned scratch directories") &&
 		!strings.Contains(err.Error(), "liveness evidence unavailable") {
 		t.Errorf("unexpected error: %v", err)
 	}
