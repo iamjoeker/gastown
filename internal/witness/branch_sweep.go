@@ -48,46 +48,6 @@ import (
 // no branches deleted. A sweep that cried stranding at every superseded branch
 // would be ignored within a day, and then it would catch nothing.
 
-// THIRD, added by gt-l65a: "landed" is two different situations wearing one
-// name, and the difference decides who — if anyone — can act on the branch.
-//
-// The git-hygiene plugin deletes a remote branch when
-// `git merge-base --is-ancestor origin/<branch> origin/main` succeeds. Ancestry
-// is the ONLY containment proof it acts on. This sweep proves containment three
-// ways: ancestry, an empty merge, and patch identity. So a branch that was
-// rebased before landing — its patch in the target, its commit never in the
-// target's history — is landed, is not an ancestor, and is therefore reachable
-// by nothing: hygiene will not delete it because it is not an ancestor, and the
-// short list will not raise it because it is not a check. It is reported as
-// landed on every future sweep, forever, by a tool whose value depends on its
-// output being short.
-//
-// And it is the SAFEST deletion candidate in the whole listing, which is the
-// part worth sitting with, because the classes imply the opposite priority:
-//
-//	landed by patch identity  `git cherry` '-'. Patch-id EQUALITY. The RELIABLE
-//	                          direction: the same patch is provably in the
-//	                          target. Positive evidence, cheap, and it scales.
-//
-//	the check rows            `git cherry` '+'. Patch-id INEQUALITY. The
-//	                          UNRELIABLE direction: could be unmerged, could be
-//	                          superseded by a different implementation. Settling
-//	                          it means inspecting content by hand.
-//
-// So the branch carrying the strongest evidence of redundancy got the least
-// attention. The fix is routing, not classification — the classification was
-// already right, and the distinction was already computed and thrown away.
-// HygieneUnreachable carries it to the output, and `gt patrol branches
-// --deletable` is the short list an operator can act on. Nothing here deletes:
-// these are shared remote refs, and emitting evidence rather than verdicts is
-// the whole design.
-
-// branchHygieneEvidence is the one containment proof the git-hygiene plugin
-// acts on (plugins/git-hygiene/run.sh, "Delete merged remote branches"). Keep
-// this in step with that check: containment proved any other way is invisible
-// to hygiene, and this constant is what says so.
-const branchHygieneEvidence = "ancestor"
-
 // BranchSweepClass is the verdict for one unmerged branch. The classes exist to
 // separate the cases that are cheaply explainable from the ones that need a
 // person, so the short list stays short.
@@ -95,10 +55,7 @@ type BranchSweepClass string
 
 const (
 	// BranchSweepLanded means the branch's content is in the target, by
-	// ancestry, by an empty merge, or by patch identity. No decision is
-	// needed — but "no decision" is not "nothing to do": only the ancestry
-	// case is collected by branch hygiene, so check HygieneUnreachable before
-	// reading a landed row as finished.
+	// ancestry, by an empty merge, or by patch identity. Nothing to do.
 	BranchSweepLanded BranchSweepClass = "landed"
 
 	// BranchSweepQueued means an open merge request is holding this branch.
@@ -162,17 +119,6 @@ type BranchSweepFinding struct {
 	// which trunk it landed on.
 	ContainedIn string `json:"contained_in,omitempty"`
 
-	// HygieneUnreachable marks landed content that branch hygiene will never
-	// delete: the branch is contained in the target, but not by ancestry, and
-	// ancestry is the only proof hygiene acts on. Nothing else routes it either
-	// — it is not on the short list, because it is not a check — so it is a
-	// permanent row in a listing whose worth is its shortness (gt-l65a).
-	//
-	// It is deliberately NOT omitempty. A false here means "landed, and hygiene
-	// has it", which is a measurement; an absent key would read the same as a
-	// row from a version that never looked.
-	HygieneUnreachable bool `json:"hygiene_unreachable"`
-
 	// UnpreservedPatches is the `git cherry` count of patches on the branch
 	// that are not on the target. It is a size hint for triage, not a verdict.
 	UnpreservedPatches int `json:"unpreserved_patches,omitempty"`
@@ -223,26 +169,6 @@ func (r *BranchSweepResult) AttentionCount() int {
 	n := 0
 	for _, f := range r.Findings {
 		if f.Class.NeedsAttention() {
-			n++
-		}
-	}
-	return n
-}
-
-// HygieneUnreachableCount is how many landed branches nothing will ever delete.
-//
-// It is counted apart from AttentionCount because the two ask for different
-// things. A check row asks for a DECISION — superseded or stranded, and the
-// sweep cannot tell. These rows need no decision: containment is already
-// proved. They ask for a DELETION, and they will keep asking on every sweep
-// until someone performs it.
-func (r *BranchSweepResult) HygieneUnreachableCount() int {
-	if r == nil {
-		return 0
-	}
-	n := 0
-	for _, f := range r.Findings {
-		if f.HygieneUnreachable {
 			n++
 		}
 	}
@@ -430,17 +356,7 @@ func classifyBranch(
 		if finding.ContainedIn == "" {
 			finding.ContainedIn = targets[0]
 		}
-		// How containment was proved decides who can act on the branch, so it
-		// is recorded as a routing fact and not only as a label. Anything that
-		// is not ancestry — an empty merge, patch identity, or an evidence
-		// string this build does not recognise — is out of hygiene's reach; the
-		// safe direction for an unrecognised value is to name the branch rather
-		// than assume something else will collect it.
-		finding.HygieneUnreachable = strings.TrimSpace(status.Evidence) != branchHygieneEvidence
 		finding.Note = "content is in " + finding.ContainedIn + " (" + evidenceLabel(status.Evidence) + ")"
-		if finding.HygieneUnreachable {
-			finding.Note += "; NOT an ancestor of " + finding.ContainedIn + " — branch hygiene cannot delete it"
-		}
 		if mr != nil && mr.Open() {
 			finding.Note += "; open MR " + mr.ID + " is still queued for content that already landed"
 		}
