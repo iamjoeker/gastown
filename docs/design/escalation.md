@@ -106,63 +106,11 @@ escalations closed before this reconciliation existed (gt-4xl).
 Closing a copy directly with `bd close` does not touch the record, and closing
 the record with `bd close` does not touch the copies. Use `gt escalate close`.
 
-### Severity reaches the priority column
-
-`-s <severity>` sets the bead **priority** as well as the `severity:<level>`
-label, on both halves: critical→P0, high→P1, medium→P2, low→P3. An unrecognised
-severity sets no priority at all rather than defaulting to P0.
-
-It is not cosmetic. Priority is what generic readers render and what the
-reaper's staleness sweep keys its P0/P1 exemption on, so a severity that never
-reached the column also forfeited that protection. Until gt-nhp only the
-delivered copy carried it (gt-3i4e); the record did not, so every escalation
-record read P2 whatever was filed — `hq-wisp-yro9` went in at HIGH about a live
-nuke hazard and rendered as an ordinary P2. A re-escalation moves the priority
-with the severity for the same reason: the bump exists to make an ignored
-escalation louder.
-
-### Escalations are not garbage
-
-Escalation beads are protected from every reaper path gt owns, which is a
-departure from how wisps normally work and is deliberate (gt-nhp):
-
-| Path | Guard |
-|---|---|
-| reaper age-close (`Reap`) | `reaper.ReapProtectedWispLabels` |
-| reaper delete (`Purge`) | `reaper.ProtectedWispLabels` |
-| `gt compact` | `reaper.ProtectedWispLabels` (shared variable) |
-| staleness auto-close (`AutoClose`) | `reaper.AutoCloseExemptLabels` |
-
-The reason is that age-eligibility inverts the selection for this one type.
-Every path above keys on age or last-update, and an escalation nobody touches is
-never updated — so an IGNORED escalation ages into the delete window BEFORE one
-being worked, and the escalations most likely to be destroyed are precisely the
-ones nobody acted on. Closing is protected as well as deleting, because
-`gt escalate list` hides copies whose record is closed: reaping the record alone
-removes a live escalation from the only surface an operator reads.
-
-**The cost is real and deliberate**: escalation rows now accumulate without
-bound, on the grounds that the growth is merely expensive while the deletion is
-final. Wisps are unversioned, unbacked and `dolt_ignore`'d, so there is no Dolt
-history to restore one from.
-
-**Residual gap — bd's own GC is NOT covered.** `bd purge` and
-`bd mol wisp gc --age` protect by label too, but from bd's `gc.protected_labels`
-config, whose default is merge-request and message records only. That key is
-unset in this town, so a manual `bd mol wisp gc` still deletes open escalation
-records — this is the path that reported "would clean 734 abandoned wisp(s)" in
-gt-nhp's evidence. Setting it needs the exact default value the deployed bd
-uses, so that adding `gt:escalation` extends the list instead of replacing it
-and silently dropping the two protections already there.
-
 ### The `bead` action, and why a route must deliver something
 
-The record is a wisp: unversioned, unbacked and `dolt_ignore`'d, with no restore
-path if it is ever deleted. gt's own reaper no longer age-GCs it (see
-"Escalations are not garbage" above), but bd's GC still can, and a wisp is the
-wrong substrate for a durable record either way. **The durable half of an
-escalation is the copy**, so a route that produces no copy stakes the whole
-escalation on the wisp surviving.
+The record is a wisp: unversioned, unbacked, `dolt_ignore`'d and age-GC'd with no
+restore path. **The durable half of an escalation is the copy**, so a route that
+produces no copy loses the escalation outright once the wisp ages out.
 
 That is what the `bead` action is for, and for a long time it did not exist. It
 was configured on all four routes, reported as `"created": true` on every

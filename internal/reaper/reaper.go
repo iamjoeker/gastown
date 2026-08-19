@@ -260,95 +260,9 @@ const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 // — filed separately. The "Protected (skipped): N" line the purge now prints is
 // what keeps the accumulation visible instead of silent.
 //
-// gt:escalation is here for the same reason and one more (gt-nhp). An
-// escalation record is a durable artifact by definition — it is the town's
-// "somebody must look at this" channel — but `gt escalate` creates it as a wisp,
-// so it landed in the age-delete set with no ownership filter and no digest on
-// delete. The record carries the structured severity/reason/escalated_by/
-// closed_by fields; the delivered copy carries the mail body. Deleting the
-// record destroys the only copy of the resolution rationale, and wisps are
-// unversioned and unbacked, so there is nothing to restore from.
-//
-// It compounds: reap keys eligibility on age, so an escalation nobody touches
-// ages into the window FIRST, and the escalations most likely to be deleted are
-// exactly the ones nobody acted on — the population escalation exists to
-// protect. See reapProtectWhere for the closing half of that.
-//
 // Anything added here must be a type whose closed rows are evidence, not
 // residue. It is not a place to park beads that are merely inconvenient to lose.
-var ProtectedWispLabels = []string{"gt:merge-request", "gt:escalation"}
-
-// ReapProtectedWispLabels lists labels whose OPEN wisps the age-based reap must
-// never close. It is a different question from ProtectedWispLabels, which is
-// about DELETING, and the two lists are deliberately not the same list.
-//
-// Reap closes any open wisp past max_age whose parent molecule is closed or
-// absent. An escalation record has no parent at all, so it is always eligible,
-// and reap closing it is not a harmless bookkeeping change: `gt escalate list`
-// renders the delivered copies and hides any copy whose RECORD is closed
-// (dropResolvedEscalations). So a reaped record silently removes a live,
-// unacknowledged escalation from the only surface an operator reads — the
-// escalation still exists and still needs attention, and now nothing shows it.
-// Purge protection alone does not cover this: the record survives as a row and
-// vanishes from the queue anyway (gt-nhp).
-//
-// gt:merge-request is NOT here. Its wisps are closed by the merge queue's own
-// lifecycle and gt-nmg's fix deliberately scoped MR protection to deletion;
-// changing when MR wisps close is a merge-queue decision, not this one.
-var ReapProtectedWispLabels = []string{"gt:escalation"}
-
-// AutoCloseExemptLabels lists labels whose OPEN issues staleness auto-close must
-// never touch.
-//
-// This is the ISSUES-table counterpart of the wisp lists above, and it is a var
-// rather than two hand-copied SQL literals because it was already inlined in two
-// places that drifted: Scan's candidate count omitted the filter entirely and
-// over-reported what AutoClose would close (gt-jbn). Both queries now render
-// this one list.
-//
-//   - gt:agent — the town's per-role identity rows. `gt agents resolve` answers
-//     "no agent bead found" once one is CLOSED, which halts mol-witness-patrol.
-//   - gt:message — unread mail. Reading a message closes its bead, so an OPEN
-//     one is by definition unread; auto-closing it stamps closed_at and
-//     purgeOldMail deletes it mailDeleteAge later (gt-jbn).
-//   - gt:escalation — the durable delivered copy of an escalation (gt-nhp).
-//     Same shape as gt:message: an open escalation is by definition one nobody
-//     has resolved, and the P0/P1 exclusion does not save it, because only
-//     critical and high map to P0/P1 — a medium or low escalation sits at P2/P3
-//     and is closed purely for having been ignored. Its updated_at never moves
-//     precisely BECAUSE nobody attended to it, so an unattended escalation
-//     reaches the window before an attended one.
-var AutoCloseExemptLabels = []string{
-	"gt:standing-orders", "gt:keep", "gt:role", "gt:rig", "gt:agent", "gt:message", "gt:escalation",
-}
-
-// sqlLabelList renders labels as a SQL IN(...) body: 'a', 'b', 'c'.
-//
-// The labels are compile-time constants from the lists above, never user input.
-func sqlLabelList(labels []string) string {
-	quoted := make([]string, len(labels))
-	for i, label := range labels {
-		quoted[i] = "'" + label + "'"
-	}
-	return strings.Join(quoted, ", ")
-}
-
-// reapProtectWhere returns a WHERE fragment, for queries that alias wisps as
-// "w", excluding wisps whose type must never be closed by age.
-//
-// Applied to every candidate query that feeds closeWispsInBatches — the stale
-// max-age path AND the closed-molecule-step path — so "no reap path closes an
-// escalation" holds without depending on which route a wisp arrives by.
-//
-// Excluding protected rows from SELECTION rather than declining them at UPDATE
-// time is deliberate, and matches purgeProtectWhere: closeWispsInBatches
-// re-runs its id query until it stops yielding work, so a row that is offered
-// and then declined makes no progress and is reported as a stall.
-func reapProtectWhere() string {
-	return fmt.Sprintf(
-		"w.id NOT IN (SELECT DISTINCT rl.issue_id FROM wisp_labels rl WHERE rl.label IN (%s))",
-		sqlLabelList(ReapProtectedWispLabels))
-}
+var ProtectedWispLabels = []string{"gt:merge-request"}
 
 // purgeProtectWhere returns a WHERE fragment, for queries that alias wisps as
 // "w", selecting only rows purge is permitted to delete.
@@ -374,9 +288,13 @@ func reapProtectWhere() string {
 // protected rows from selection — rather than declining them at DELETE time —
 // is what makes that impossible.
 func purgeProtectWhere() string {
+	quoted := make([]string, len(ProtectedWispLabels))
+	for i, label := range ProtectedWispLabels {
+		quoted[i] = "'" + label + "'"
+	}
 	return fmt.Sprintf(
 		"COALESCE(w.pinned, 0) = 0 AND w.id NOT IN (SELECT DISTINCT pl.issue_id FROM wisp_labels pl WHERE pl.label IN (%s))",
-		sqlLabelList(ProtectedWispLabels))
+		strings.Join(quoted, ", "))
 }
 
 // closedMoleculeStepSubquery selects step-wisps whose parent molecule has already closed.
@@ -531,8 +449,8 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 
 	moleculeStepQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent' AND %s",
-		moleculeStepJoin, openWispStatusWhere, reapProtectWhere())
+		"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent'",
+		moleculeStepJoin, openWispStatusWhere)
 	if err := db.QueryRowContext(ctx, moleculeStepQuery).Scan(&result.MoleculeStepCandidates); err != nil {
 		return nil, fmt.Errorf("count molecule step candidates: %w", err)
 	}
@@ -542,11 +460,9 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// agent beads, otherwise scan can report candidates that reap will never close.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	// Closed-molecule steps are counted separately above and excluded here so counts stay disjoint.
-	// reapProtectWhere must match Reap's whereClause exactly, for the same reason
-	// purgeProtectWhere must match purgeClosedWisps.
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
-		parentJoin, moleculeStepExcludeJoin, openWispStatusWhere, parentWhere, reapProtectWhere())
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND closed_molecule_step.issue_id IS NULL",
+		parentJoin, moleculeStepExcludeJoin, openWispStatusWhere, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
@@ -595,7 +511,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM labels l
-			WHERE l.label IN (` + sqlLabelList(AutoCloseExemptLabels) + `)
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent', 'gt:message')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
@@ -653,20 +569,15 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// identity and should not be closed by the wisp reaper regardless of age.
 	// Closed-molecule steps are closed immediately through a separate path, so stale
 	// max-age counts exclude them to keep dry-run and scan counts disjoint.
-	// reapProtectWhere excludes types that must never be closed by age at all —
-	// escalation records, whose whole purpose is to persist while unattended
-	// (gt-nhp). It is applied to BOTH candidate paths below, so no route into
-	// closeWispsInBatches can close one.
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
-		openWispStatusWhere, parentWhere, reapProtectWhere())
+		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
 	if dryRun {
 		moleculeStepCountQuery := fmt.Sprintf(
-			"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent' AND %s",
-			moleculeStepJoin, openWispStatusWhere, reapProtectWhere())
+			"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent'",
+			moleculeStepJoin, openWispStatusWhere)
 		if err := db.QueryRowContext(ctx, moleculeStepCountQuery).Scan(&result.MoleculeStepsClosed); err != nil {
 			return nil, fmt.Errorf("dry-run molecule step count: %w", err)
 		}
@@ -693,8 +604,8 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// the UPDATE declines makes no progress, which the batch loop reports as a
 	// stall (see closeWispsInBatches).
 	moleculeStepIDQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s WHERE %s AND w.issue_type != 'agent' AND %s LIMIT %d",
-		moleculeStepJoin, openWispStatusWhere, reapProtectWhere(), DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s WHERE %s AND w.issue_type != 'agent' LIMIT %d",
+		moleculeStepJoin, openWispStatusWhere, DefaultBatchSize)
 	moleculeStepsClosed, stepsStalled, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
 	if err != nil {
 		return nil, err
@@ -1017,12 +928,30 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.priority > 1
 		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
-			-- The list itself is AutoCloseExemptLabels, which documents why each
-			-- entry is there. It is rendered rather than inlined because Scan
-			-- needs the identical set: the two copies drifted once already and
-			-- Scan over-reported what AutoClose would close (gt-jbn).
+			-- gt:agent exempts AGENT BEADS: the town's per-role identity rows
+			-- (hq-mayor, bd-beads-witness, ...). gt agents resolve looks them up
+			-- by role and answers "no agent bead found" once one is CLOSED, which
+			-- halts mol-witness-patrol's loop-or-exit ("If it fails, STOP and
+			-- report") — so every witness/refinery respawning after a sweep walks
+			-- its own molecule into a halt.
+			--
+			-- Nothing else here catches them, which is why this recurred twice
+			-- (2026-08-10 and 2026-08-17, 7 of 8 both times): issue_type is
+			-- 'task', so the epic/convoy exclusion misses them and so does the
+			-- wisp-side "issue_type != 'agent'" guard; and role_type is EMPTY on
+			-- every agent bead, so keying on role_type would be equally inert.
+			-- The gt:agent LABEL is the only populated discriminator.
+			--
+			-- gt:message exempts UNREAD MAIL (gt-jbn). Reading a message closes
+			-- its bead, so an OPEN gt:message bead is by definition one nobody
+			-- has read. Auto-closing it stamps closed_at, and purgeOldMail then
+			-- deletes it mailDeleteAge later — so staleness closure was a silent
+			-- delete path for exactly the mail nobody had read yet, on a channel
+			-- documented as surviving session death. Mail that HAS been read is
+			-- already closed and is still purged on the normal retention window;
+			-- daemon plugin dispatches are closed by ClosePluginDispatches.
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN (%s)
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent', 'gt:message')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
@@ -1034,7 +963,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
-		)`, dbName, sqlLabelList(AutoCloseExemptLabels), dbName, dbName, dbName, dbName)
+		)`, dbName, dbName, dbName, dbName, dbName)
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
 	// which is not valid MySQL (Error 1093) and fragile in Dolt (dolthub/dolt#10600).

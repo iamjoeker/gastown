@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"reflect"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -846,30 +845,20 @@ func assertOpsContainInOrder(t *testing.T, ops []string, want ...string) {
 // hq-deacon survived both sweeps only because it is the most active agent and
 // its updated_at stays under the staleness cutoff — recency, not protection —
 // so "one survivor" is not evidence that any guard works.
-// The exemption list now lives in AutoCloseExemptLabels rather than inline in
-// the query, because Scan needs the identical set and the two hand-copied
-// literals drifted once already (gt-jbn). So this checks both halves: the label
-// is in the list, and the query is still rendered FROM the list — a query that
-// went back to an inline literal would keep passing the first check while the
-// list stopped meaning anything.
 func TestAutoCloseExemptsAgentBeads(t *testing.T) {
-	if !slices.Contains(AutoCloseExemptLabels, "gt:agent") {
-		t.Fatal("AutoCloseExemptLabels must contain gt:agent, or the reaper stale-closes " +
-			"every agent bead and gt agents resolve stops answering by role")
-	}
-	// The pre-existing exemptions must survive alongside it.
-	for _, label := range []string{"gt:standing-orders", "gt:keep", "gt:role", "gt:rig", "gt:message"} {
-		if !slices.Contains(AutoCloseExemptLabels, label) {
-			t.Errorf("exemption %q was dropped from AutoCloseExemptLabels", label)
-		}
-	}
-
 	data, err := os.ReadFile("reaper.go")
 	if err != nil {
 		t.Fatalf("read reaper.go: %v", err)
 	}
 	autoCloseBody := sourceBetween(t, string(data), "func AutoClose(", "// batchDeleteRows")
 
+	if !strings.Contains(autoCloseBody, "'gt:agent'") {
+		t.Fatal("AutoClose must exempt the gt:agent label, or the reaper stale-closes " +
+			"every agent bead and gt agents resolve stops answering by role")
+	}
+
+	// It must be exempted in the LABEL exclusion list specifically, not merely
+	// mentioned somewhere in the function.
 	idx := strings.Index(autoCloseBody, "l.label IN (")
 	if idx < 0 {
 		t.Fatal("AutoClose no longer has a label exclusion list")
@@ -879,29 +868,15 @@ func TestAutoCloseExemptsAgentBeads(t *testing.T) {
 	if end < 0 {
 		t.Fatal("label exclusion list is not terminated")
 	}
-	if list := rest[:end]; !strings.Contains(list, "%s") {
-		t.Errorf("AutoClose's label exclusion list must be rendered from AutoCloseExemptLabels, "+
-			"not inlined — an inline list drifts from Scan's copy.\nlist: %s", list)
+	list := rest[:end]
+	if !strings.Contains(list, "'gt:agent'") {
+		t.Errorf("gt:agent appears in AutoClose but not inside the label exclusion list; "+
+			"it must be exempted there.\nlist: %s", list)
 	}
-	if !strings.Contains(autoCloseBody, "AutoCloseExemptLabels") {
-		t.Error("AutoClose no longer references AutoCloseExemptLabels; its exclusion list " +
-			"is being fed from somewhere else")
-	}
-}
-
-// TestScanAndAutoCloseShareOneExemptList is the drift guard the gt-jbn incident
-// asked for: Scan's stale count and AutoClose's sweep must exempt the same set,
-// or the Dog reads a candidate count the sweep will not act on. Both queries are
-// built from AutoCloseExemptLabels, so the way to break this is to inline a
-// literal back into one of them.
-func TestScanAndAutoCloseShareOneExemptList(t *testing.T) {
-	data, err := os.ReadFile("reaper.go")
-	if err != nil {
-		t.Fatalf("read reaper.go: %v", err)
-	}
-	scanBody := sourceBetween(t, string(data), "func Scan(", "// Reap closes stale wisps")
-	if !strings.Contains(scanBody, "sqlLabelList(AutoCloseExemptLabels)") {
-		t.Error("Scan's stale-issue query must render AutoCloseExemptLabels; a second " +
-			"hand-written copy is what over-reported stale candidates in gt-jbn")
+	// The pre-existing exemptions must survive alongside it.
+	for _, label := range []string{"'gt:standing-orders'", "'gt:keep'", "'gt:role'", "'gt:rig'"} {
+		if !strings.Contains(list, label) {
+			t.Errorf("exemption %s was dropped from the label exclusion list", label)
+		}
 	}
 }
