@@ -29,6 +29,12 @@ type FormulaStatus struct {
 	EmbeddedHash  string // hash computed from embedded content
 	InstalledHash string // hash we installed (from .installed.json)
 	CurrentHash   string // hash of current file on disk
+	// EmbeddedChanged is set on a "modified" formula whose embedded copy has
+	// ALSO moved since install. UpdateFormulas skips modified files by design,
+	// so such a formula is pinned to its local edit forever — a fix shipped in
+	// the embedded corpus never reaches the town, and without this flag nothing
+	// says so. See gt-0sq.
+	EmbeddedChanged bool
 }
 
 // HealthReport contains the results of checking formula health.
@@ -42,6 +48,11 @@ type HealthReport struct {
 	New       int // new formula not yet installed
 	Untracked int // file exists but not in .installed.json (safe to update)
 	Error     int // file could not be read (e.g. permission denied)
+	// ModifiedDrift counts the subset of Modified whose embedded copy has also
+	// changed since install: local edits shadowing a newer shipped default.
+	// Not auto-fixable — overwriting would discard the local edit — so it is
+	// reported for manual reconciliation rather than repaired.
+	ModifiedDrift int
 }
 
 // ResolveFormulaContent resolves formula content using the three-tier precedence
@@ -300,6 +311,13 @@ func CheckFormulaHealth(beadsPath string) (*HealthReport, error) {
 				// File was tracked and user modified it - don't overwrite
 				status.Status = "modified"
 				report.Modified++
+				if installedHash != embeddedHash {
+					// The shipped default moved after this file was customized.
+					// UpdateFormulas will keep skipping it, so the town stays on
+					// the local edit until someone reconciles the two by hand.
+					status.EmbeddedChanged = true
+					report.ModifiedDrift++
+				}
 			} else {
 				// File exists but not tracked (e.g., from older gt version)
 				// Safe to update since we have no record of user modification

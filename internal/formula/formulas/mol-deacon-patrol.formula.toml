@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 15
+version = 16
 
 [vars]
 [vars.wisp_type]
@@ -157,16 +157,38 @@ id = "inbox-check"
 title = "Handle callbacks from agents"
 needs = ["heartbeat"]
 description = """
-First, clean up CLOSED wisps from previous cycles:
+🚨 **WISP GC IS SUSPENDED — run NO variant of `bd mol wisp gc`, and do not reconstruct one from memory.** There is deliberately no command in this step.
 ```bash
-bd mol wisp gc --closed --force
+# wisp GC SUSPENDED (bd-czf): --closed --force deletes closed wisps with no age threshold
 ```
+
+`--closed --force` purges ALL closed wisps with NO age threshold, and all agent mail is a
+wisp — verified 2026-08-02 by controlled experiment: of 80 closed beads, 71 were deleted
+and 9 kept, every deleted id containing `-wisp-` and no survivor doing so. Over half of a
+typical sweep is correspondence, so a bare gc silently destroys the citation record while
+reporting an accurate deletion count. Run from a RIG-scoped database it also reaches
+merge-request beads, and an MR CLOSED WITHOUT MERGING is the only record that work was
+pushed and never landed — nothing reconciles it afterwards.
+
+🚨 **NEVER run `bd mol wisp gc --age`.** It has NO ownership filter and deletes any OPEN
+wisp older than the age window, including other agents' merge requests. NEITHER variant is
+safe.
 
 > **Warning (hq-3pp):** Do not run unscoped age-based wisp GC from inside
 > this patrol. Active patrol step wisps can be older than 1h before they run;
 > age cleanup can reap this molecule's open steps and make the patrol appear
-> complete early. Use closed-only cleanup here; stale open-wisp cleanup belongs
+> complete early. **Closed-only cleanup is NOT the safe alternative** — this
+> warning previously read "use closed-only cleanup here", which endorsed
+> `bd mol wisp gc --closed --force`; that variant is destructive for the separate
+> reason above and is suspended (bd-czf). Wisp cleanup of either kind belongs
 > outside active patrol molecules.
+
+If your town provides `deacon/preserve-then-gc.sh`, that wrapper is the only sanctioned
+route: it dumps full content to `deacon/evidence/` and appends to `INDEX.tsv` BEFORE
+deleting, and aborts the gc if preservation fails. It still DELETES, and it is hq-scoped —
+it cannot protect `bd-`/`gt-` prefixed beads, so it is safe only from the hq-scoped Deacon
+context and must never be run against a rig database. A fresh town has no such wrapper and
+this step does not create one. Report stale wisps to the reaper Dog instead of GC-ing them.
 
 Then handle callbacks from agents.
 

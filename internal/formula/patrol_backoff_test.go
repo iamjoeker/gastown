@@ -122,14 +122,73 @@ func TestPatrolFormulasHaveReportCycle(t *testing.T) {
 	}
 }
 
-// TestPatrolFormulasHaveWispGC verifies that all three patrol formulas
-// include `bd mol wisp gc` in their inbox-check step for safe cleanup.
+// fencedCommands returns the runnable lines inside fenced code blocks of a
+// formula step description: non-blank, non-comment lines between ``` markers.
 //
-// Closed-wisp cleanup is safe inside active patrols. Stale open-wisp cleanup
-// belongs to reaper paths that are not running inside the active patrol molecule.
+// Prose that NAMES a command — including prose forbidding it — is not an
+// instruction to run it, so a substring search over the whole description
+// cannot distinguish "run this" from "never run this". A suspension notice
+// satisfies such a search just as well as the live command it replaced, which
+// is how both of this test's predecessors ended up asserting nothing.
+func fencedCommands(desc string) []string {
+	var cmds []string
+	inFence := false
+	for _, line := range strings.Split(desc, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if !inFence || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		cmds = append(cmds, trimmed)
+	}
+	return cmds
+}
+
+// TestFencedCommandsSeparatesProseFromCommands pins the distinction that
+// TestPatrolFormulasDoNotRunWispGC rests on: a suspension notice naming a
+// forbidden command must not read as that command, and a live command must
+// still be found.
+func TestFencedCommandsSeparatesProseFromCommands(t *testing.T) {
+	suspended := "Do not run `bd mol wisp gc --closed --force`.\n" +
+		"```bash\n" +
+		"# wisp GC SUSPENDED (bd-czf)\n" +
+		"```\n"
+	if got := fencedCommands(suspended); len(got) != 0 {
+		t.Errorf("prose and comments read as commands: %q", got)
+	}
+
+	live := "First, clean up CLOSED wisps:\n" +
+		"```bash\n" +
+		"bd mol wisp gc --closed --force\n" +
+		"```\n"
+	got := fencedCommands(live)
+	if len(got) != 1 || got[0] != "bd mol wisp gc --closed --force" {
+		t.Errorf("live command not detected: %q", got)
+	}
+}
+
+// TestPatrolFormulasDoNotRunWispGC verifies that no patrol formula's inbox-check
+// step carries a runnable `bd mol wisp gc` in a fenced command block.
 //
-// Regression test for steveyegge/gastown#1712.
-func TestPatrolFormulasHaveWispGC(t *testing.T) {
+// Neither variant is safe. `--age` has no ownership filter and deletes any OPEN
+// wisp past the window — other agents' merge requests, and this molecule's own
+// open steps, which makes the patrol appear complete early (hq-3pp).
+// `--closed --force` purges ALL closed wisps with no age threshold, and a merge
+// request CLOSED WITHOUT MERGING is the only record that work was pushed and
+// never landed (bd-czf).
+//
+// This replaces TestPatrolFormulasHaveWispGC (steveyegge/gastown#1712), which
+// required the opposite, and the closed-cleanup half of
+// TestDeaconPatrolDoesNotRunAgeBasedWispGC.
+//
+// Regression test for gt-0sq: c0f9e5e2 and d4795e83 suspended wisp GC in the
+// refinery and witness embedded defaults but left the deacon's live, so a fresh
+// town — which is provisioned from these embedded defaults (ProvisionFormulas)
+// — still got a patrol that ran it every cycle.
+func TestPatrolFormulasDoNotRunWispGC(t *testing.T) {
 	patrolFormulas := []string{
 		"mol-witness-patrol.formula.toml",
 		"mol-deacon-patrol.formula.toml",
@@ -160,48 +219,17 @@ func TestPatrolFormulasHaveWispGC(t *testing.T) {
 				t.Fatalf("%s: inbox-check step not found or has empty description", name)
 			}
 
-			if !strings.Contains(inboxDesc, "bd mol wisp gc") {
-				t.Errorf("%s inbox-check step missing \"bd mol wisp gc\"\n"+
-					"All patrol formulas must run wisp GC at the start of each cycle\n"+
-					"to clean up stale wisps from abnormal exits.\n"+
-					"See steveyegge/gastown#1712.",
-					name)
+			for _, cmd := range fencedCommands(inboxDesc) {
+				if strings.Contains(cmd, "bd mol wisp gc") {
+					t.Errorf("%s inbox-check step has a runnable wisp GC: %q\n"+
+						"Wisp GC is suspended in patrol formulas: --age destroys other\n"+
+						"agents' open merge requests and this molecule's own steps (hq-3pp),\n"+
+						"and --closed --force destroys closed-but-unmerged MR beads (bd-czf).\n"+
+						"Describe the prohibition in prose; leave no command to run.",
+						name, cmd)
+				}
 			}
 		})
-	}
-}
-
-// TestDeaconPatrolDoesNotRunAgeBasedWispGC verifies that the Deacon patrol
-// does not reap open step wisps from its own active patrol molecule.
-//
-// Regression test for hq-3pp.
-func TestDeaconPatrolDoesNotRunAgeBasedWispGC(t *testing.T) {
-	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
-	if err != nil {
-		t.Fatalf("reading deacon patrol formula: %v", err)
-	}
-
-	f, err := Parse(content)
-	if err != nil {
-		t.Fatalf("parsing deacon patrol formula: %v", err)
-	}
-
-	var inboxDesc string
-	for _, step := range f.Steps {
-		if step.ID == "inbox-check" {
-			inboxDesc = step.Description
-			break
-		}
-	}
-	if inboxDesc == "" {
-		t.Fatal("deacon patrol formula: inbox-check step not found or has empty description")
-	}
-
-	if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
-		t.Fatal("deacon inbox-check must keep closed-wisp cleanup")
-	}
-	if strings.Contains(inboxDesc, "bd mol wisp gc --age") {
-		t.Fatal("deacon inbox-check must not run age-based wisp GC inside the active patrol")
 	}
 }
 
