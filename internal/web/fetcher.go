@@ -1663,45 +1663,64 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 }
 
 // FetchHealth returns system health status.
+//
+// Only an absent file is a real answer here. A heartbeat that cannot be read or
+// parsed used to arrive at the banner as "no heartbeat" or as a zero cycle —
+// both of which are claims about the Deacon, made from a file this never
+// managed to look at (gt-xw1t).
 func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 	row := &HealthRow{}
 
 	// Read deacon heartbeat
 	heartbeatFile := filepath.Join(f.townRoot, "deacon", "heartbeat.json")
-	if data, err := os.ReadFile(heartbeatFile); err == nil {
+	data, err := os.ReadFile(heartbeatFile)
+	switch {
+	case err == nil:
 		var hb struct {
 			LastHeartbeat   time.Time `json:"timestamp"`
 			Cycle           int64     `json:"cycle"`
 			HealthyAgents   int       `json:"healthy_agents"`
 			UnhealthyAgents int       `json:"unhealthy_agents"`
 		}
-		if err := json.Unmarshal(data, &hb); err == nil {
-			row.DeaconCycle = hb.Cycle
-			row.HealthyAgents = hb.HealthyAgents
-			row.UnhealthyAgents = hb.UnhealthyAgents
-			if !hb.LastHeartbeat.IsZero() {
-				age := time.Since(hb.LastHeartbeat)
-				row.DeaconHeartbeat = formatTimestamp(hb.LastHeartbeat)
-				row.HeartbeatFresh = age < f.heartbeatFreshThreshold
-			} else {
-				row.DeaconHeartbeat = "no timestamp"
-			}
+		if err := json.Unmarshal(data, &hb); err != nil {
+			return nil, fmt.Errorf("parsing deacon heartbeat: %w", err)
 		}
-	} else {
+		row.DeaconCycle = hb.Cycle
+		row.HealthyAgents = hb.HealthyAgents
+		row.UnhealthyAgents = hb.UnhealthyAgents
+		if !hb.LastHeartbeat.IsZero() {
+			age := time.Since(hb.LastHeartbeat)
+			row.DeaconHeartbeat = formatTimestamp(hb.LastHeartbeat)
+			row.HeartbeatFresh = age < f.heartbeatFreshThreshold
+		} else {
+			row.DeaconHeartbeat = "no timestamp"
+		}
+	case os.IsNotExist(err):
+		// The Deacon has never beaten. That is a fact about the town.
 		row.DeaconHeartbeat = "no heartbeat"
+	default:
+		return nil, fmt.Errorf("reading deacon heartbeat: %w", err)
 	}
 
-	// Check pause state
+	// Check pause state. A pause file that cannot be read is not an unpaused
+	// town: "not paused" is what the banner shows when this field is false.
 	pauseFile := filepath.Join(f.townRoot, ".runtime", "deacon", "paused.json")
-	if data, err := os.ReadFile(pauseFile); err == nil {
+	pauseData, err := os.ReadFile(pauseFile)
+	switch {
+	case err == nil:
 		var pause struct {
 			Paused bool   `json:"paused"`
 			Reason string `json:"reason"`
 		}
-		if err := json.Unmarshal(data, &pause); err == nil {
-			row.IsPaused = pause.Paused
-			row.PauseReason = pause.Reason
+		if err := json.Unmarshal(pauseData, &pause); err != nil {
+			return nil, fmt.Errorf("parsing deacon pause state: %w", err)
 		}
+		row.IsPaused = pause.Paused
+		row.PauseReason = pause.Reason
+	case os.IsNotExist(err):
+		// No pause file is the ordinary running state.
+	default:
+		return nil, fmt.Errorf("reading deacon pause state: %w", err)
 	}
 
 	return row, nil
