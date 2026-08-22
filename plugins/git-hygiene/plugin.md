@@ -25,6 +25,52 @@ GitHub, stale stashes, and garbage collection.
 
 Requires: `gh` CLI installed and authenticated (`gh auth status`).
 
+## The recovery window (gt-x6ji)
+
+Step 2c force-deletes unmerged branches and Step 2f garbage collected in the
+**same pass**. `git branch -D` drops the branch and its reflog together, so a
+tip was unreachable the instant it returned, and `gc --prune=now` immediately
+after collected the objects with no grace period. The exposure window was
+**zero** — there was no moment in which a mistake could be noticed, let alone
+undone. Three rules now hold it open, and they are deliberately redundant
+because each covers what the others do not:
+
+1. **Backup before delete.** Every force-deleted tip is first copied to
+   `refs/gt-hygiene/deleted/<run-epoch>/<branch>` and read back. If the backup
+   cannot be written and verified, the branch is **not** deleted. Recovery is
+   `git branch <name> <backup-ref>` for `GIT_HYGIENE_BACKUP_TTL_SECONDS`
+   (default 14 days), after which a later run expires the ref.
+2. **`gc` does not pass `--prune=now`.** Anything else the run made unreachable
+   — amended commits, dropped stashes, expired reflogs — keeps git's default
+   two-week prune grace.
+3. **Every delete is auditable.** Both delete steps used to end in
+   `2>/dev/null && count++`, so a refusal was indistinguishable from having
+   nothing to do. stderr is now captured, logged, counted, and turned into a
+   `--result failure` receipt. This is the same defect that left the recycle
+   formula's `git branch -D polecat/<name>` inert for months: it named a branch
+   shape that never existed, failed on every invocation, and nothing said so.
+
+## Which remotes can vouch for a branch (gt-x6ji)
+
+Step 2c force-deletes anything "the remote" does not hold, so what counts as
+the remote decides what gets destroyed. It used to resolve exactly one ref,
+`refs/remotes/origin/<branch>`, which is blind in two ways:
+
+- **Non-origin remotes.** A branch pushed anywhere else has no `origin/`
+  tracking ref, so the guard never saw it.
+- **Split-URL origin.** A remote may fetch one URL and push another, which is
+  this town's shape. Tracking refs are built from *fetches*, so a branch pushed
+  to the push URL leaves no `refs/remotes/origin/` ref and read as an orphan —
+  blind to the very remote the work went to. Measured, not theoretical: three
+  pushed `bd-gq7` branches all read as deletable.
+
+So the guard consults **every** remote's tracking refs, and when a remote's
+push URL differs from its fetch URL it asks that URL directly with `ls-remote`,
+once per repo. If a push URL cannot be read, the orphan sweep for that repo is
+**skipped entirely** — "no remote holds it" must be a fact the run established,
+not a question it failed to ask. This is the only step that destroys unmerged
+work, so it is the only one that fails closed.
+
 ## Step 1: Enumerate rig repos
 
 A rig directory is not a git repo — it contains up to two clones, `mayor/rig`
@@ -84,6 +130,10 @@ TOTAL_LOCAL_ORPHAN=0
 TOTAL_REMOTE=0
 TOTAL_STASHES=0
 TOTAL_GC=0
+TOTAL_BACKUPS_WRITTEN=0
+TOTAL_BACKUPS_EXPIRED=0
+TOTAL_SKIPPED_REPOS=0
+DELETE_FAILURES=0
 ERRORS=()
 
 while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
@@ -111,6 +161,12 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   echo "  Pruning remote tracking refs..."
   git -C "$REPO_PATH" fetch --prune --all 2>/dev/null || true
 
+  # Close out backup refs from earlier runs whose recovery window has passed,
+  # then learn which remotes can vouch for a branch — both before anything is
+  # deleted.
+  TOTAL_BACKUPS_EXPIRED=$((TOTAL_BACKUPS_EXPIRED + $(expire_backups "$REPO_PATH")))
+  scan_remotes "$REPO_PATH"
+
   ### Step 2b: Delete merged local branches
   echo "  Deleting merged local branches..."
   MERGED_BRANCHES=$(git -C "$REPO_PATH" branch --merged "$DEFAULT_BRANCH" 2>/dev/null \
@@ -131,42 +187,73 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
       refinery-patrol|merge/*) continue ;;
     esac
     echo "    Deleting merged: $BRANCH"
-    git -C "$REPO_PATH" branch -d "$BRANCH" 2>/dev/null && LOCAL_MERGED=$((LOCAL_MERGED + 1))
+    # Refusal is routine here (protected branch, checked out elsewhere) and must
+    # not abort the run — but it is reported and counted, never swallowed.
+    if delete_branch "$REPO_PATH" "$BRANCH" -d; then
+      LOCAL_MERGED=$((LOCAL_MERGED + 1))
+    else
+      echo "    FAILED to delete merged $BRANCH: $DELETE_ERR"
+      DELETE_FAILURES=$((DELETE_FAILURES + 1))
+    fi
   done <<< "$MERGED_BRANCHES"
   TOTAL_LOCAL_MERGED=$((TOTAL_LOCAL_MERGED + LOCAL_MERGED))
 
   ### Step 2c: Delete stale unmerged orphan branches
   # Only delete branches matching known agent/temp patterns that:
   # - Have no active worktree (not + prefixed)
-  # - Have no corresponding remote tracking branch
-  echo "  Deleting stale orphan branches..."
-  STALE_PATTERNS="polecat/|dog/|fix/|pr-|integration/|worktree-agent-"
-  ALL_BRANCHES=$(git -C "$REPO_PATH" branch 2>/dev/null \
-    | grep -v "^\*" \
-    | grep -v "^+" \
-    | sed 's/^[[:space:]]*//')
-
+  # - Are held by NO remote (every remote's tracking refs, plus the heads read
+  #   from a split push URL — see "Which remotes can vouch for a branch")
+  # - Could be backed up first, verifiably
+  #
+  # Fails closed: if any remote's push URL could not be read, the sweep for this
+  # repo is skipped entirely rather than run on an answer nobody has.
   LOCAL_ORPHAN=0
-  while IFS= read -r BRANCH; do
-    [ -z "$BRANCH" ] && continue
-    # Must match one of the stale patterns
-    if ! echo "$BRANCH" | grep -qE "^($STALE_PATTERNS)"; then
-      continue
-    fi
-    # Never delete current, default, or infrastructure branches
-    if [ "$BRANCH" = "$CURRENT_BRANCH" ] || [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
-      continue
-    fi
-    case "$BRANCH" in
-      main|master|refinery-patrol|merge/*) continue ;;
-    esac
-    # Check if remote tracking branch exists
-    if git -C "$REPO_PATH" rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
-      continue  # Remote still exists, skip
-    fi
-    echo "    Deleting orphan: $BRANCH"
-    git -C "$REPO_PATH" branch -D "$BRANCH" 2>/dev/null && LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1))
-  done <<< "$ALL_BRANCHES"
+  if [ -n "$UNREADABLE_PUSH_REMOTES" ]; then
+    echo "  SKIPPING orphan sweep: could not read push URL for remote(s):$UNREADABLE_PUSH_REMOTES"
+    TOTAL_SKIPPED_REPOS=$((TOTAL_SKIPPED_REPOS + 1))
+  else
+    echo "  Deleting stale orphan branches..."
+    STALE_PATTERNS="polecat/|dog/|fix/|pr-|integration/|worktree-agent-"
+    ALL_BRANCHES=$(git -C "$REPO_PATH" branch 2>/dev/null \
+      | grep -v "^\*" \
+      | grep -v "^+" \
+      | sed 's/^[[:space:]]*//')
+
+    while IFS= read -r BRANCH; do
+      [ -z "$BRANCH" ] && continue
+      # Must match one of the stale patterns
+      if ! echo "$BRANCH" | grep -qE "^($STALE_PATTERNS)"; then
+        continue
+      fi
+      # Never delete current, default, or infrastructure branches
+      if [ "$BRANCH" = "$CURRENT_BRANCH" ] || [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+        continue
+      fi
+      case "$BRANCH" in
+        main|master|refinery-patrol|merge/*) continue ;;
+      esac
+      # Held by any remote at all? Then it is not an orphan.
+      if branch_on_any_remote "$REPO_PATH" "$BRANCH"; then
+        continue
+      fi
+      # Backup BEFORE delete, and only delete if the backup reads back.
+      if ! BACKUP_REF=$(backup_branch "$REPO_PATH" "$BRANCH"); then
+        echo "    SKIPPING orphan $BRANCH: could not write a recovery backup ref"
+        DELETE_FAILURES=$((DELETE_FAILURES + 1))
+        continue
+      fi
+      echo "    Deleting orphan: $BRANCH (recoverable for ${BACKUP_TTL_SECONDS}s: git -C $REPO_PATH branch $BRANCH $BACKUP_REF)"
+      if delete_branch "$REPO_PATH" "$BRANCH" -D; then
+        LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1))
+        TOTAL_BACKUPS_WRITTEN=$((TOTAL_BACKUPS_WRITTEN + 1))
+      else
+        echo "    FAILED to delete orphan $BRANCH: $DELETE_ERR"
+        DELETE_FAILURES=$((DELETE_FAILURES + 1))
+        # The branch survived, so its backup is noise.
+        git -C "$REPO_PATH" update-ref -d "$BACKUP_REF" 2>/dev/null || true
+      fi
+    done <<< "$ALL_BRANCHES"
+  fi
   TOTAL_LOCAL_ORPHAN=$((TOTAL_LOCAL_ORPHAN + LOCAL_ORPHAN))
 
   ### Step 2d: Delete merged remote branches on GitHub
@@ -225,8 +312,12 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   fi
 
   ### Step 2f: Garbage collect
+  # NOT --prune=now. This runs in the same pass as the deletions above, and
+  # --prune=now collected everything they had just made unreachable with no
+  # grace period at all. git's default (prune objects older than two weeks) is
+  # the recovery window for anything the backup refs do not cover.
   echo "  Running git gc..."
-  git -C "$REPO_PATH" gc --prune=now --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1))
+  git -C "$REPO_PATH" gc --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1))
 
   echo "  Done: $LOCAL_MERGED merged, $LOCAL_ORPHAN orphan, $REMOTE_DELETED remote, $STASH_COUNT stash(es)"
 done <<< "$RIG_REPOS"
@@ -236,14 +327,24 @@ done <<< "$RIG_REPOS"
 
 ```bash
 SUMMARY="$RIG_COUNT rig(s): $TOTAL_LOCAL_MERGED merged branch(es), $TOTAL_LOCAL_ORPHAN orphan branch(es), $TOTAL_REMOTE remote branch(es), $TOTAL_STASHES stash(es) cleared, $TOTAL_GC gc run(s)"
+SUMMARY="$SUMMARY, $TOTAL_BACKUPS_WRITTEN backup(s) written, $TOTAL_BACKUPS_EXPIRED expired"
+[ "$TOTAL_SKIPPED_REPOS" -gt 0 ] && SUMMARY="$SUMMARY, $TOTAL_SKIPPED_REPOS repo(s) skipped (unreadable push remote)"
+[ "$DELETE_FAILURES" -gt 0 ] && SUMMARY="$SUMMARY, $DELETE_FAILURES delete failure(s)"
 echo ""
 echo "=== Git Hygiene Summary ==="
 echo "$SUMMARY"
 ```
 
-On success:
+A delete that failed is a real result, not a footnote — reporting success while
+a deletion step silently refused every branch is exactly how the recycle
+formula's inert `branch -D` went unnoticed for months. So the receipt's result
+follows the delete counters:
+
 ```bash
-gt plugin record-run --plugin git-hygiene --result success \
+RESULT=success
+[ "$DELETE_FAILURES" -gt 0 ] && RESULT=failure
+
+gt plugin record-run --plugin git-hygiene --result "$RESULT" \
   --title "git-hygiene: $SUMMARY" --description "$SUMMARY" >/dev/null 2>&1 || true
 ```
 
