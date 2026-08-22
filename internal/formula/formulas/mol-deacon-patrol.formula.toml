@@ -340,10 +340,12 @@ gt dolt kill-imposters 2>/dev/null || true
 **2. Stranded build and test scratch dirs**
 
 Reclaim orphaned scratch directories from TMPDIR: Go toolchain work directories
-(`go-build<n>`, `go-link-<n>`) and beads test fixtures (`beads-test-dolt-*`,
-`beads-bd-tests-*`). Both are created per invocation and removed on normal
-exit; a KILLED run — OOM killer, test timeout, polecat recycle — strands them,
-at 100-300MB a time for the Go ones.
+(`go-build<n>`, `go-link-<n>`), beads test fixtures (`beads-test-dolt-*`,
+`beads-bd-tests-*`), and beads hermetic environment roots (`beads-test-env-*`).
+All are created per invocation and removed on normal exit; a KILLED run — OOM
+killer, test timeout, polecat recycle — strands them, at 100-300MB a time for
+the Go ones and about 201MB for each environment root, which carries a private
+build of the bd binary.
 
 Where TMPDIR is a RAM-backed tmpfs this exhausts the filesystem: 34 stranded
 work directories held 5.35GB of a 31GB tmpfs on 2026-08-19, and gastown's own
