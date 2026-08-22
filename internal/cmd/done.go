@@ -1310,6 +1310,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
+		// Fold away checkpoint auto-commits before the branch is pushed (gt-eob).
+		// checkpoint_dog commits "WIP: checkpoint (auto)" mid-session, and nothing
+		// removed them, so they reached main carrying no issue id and no rationale —
+		// git log and git blame both stop dead at one. Refinery merges branches
+		// --no-ff, so every commit here lands as-is.
+		//
+		// Skipped once the branch is pushed: the push below is then skipped too
+		// (resume path), so a rewrite would either be silently dropped or need a
+		// force-push. Same reasoning as autoRebaseOnTarget.
+		//
+		// Runs before the overlay strip so that cleanup commit is not swallowed.
+		alreadyPushedForSquash := checkpoints[CheckpointPushed] != "" && checkpoints[CheckpointPushed] == branch
+		squashWIPCheckpoints(cwd, baseRef, issueID, alreadyPushedForSquash, &aheadCount, g)
+
 		// Strip Gas Town overlay from CLAUDE.md / CLAUDE.local.md (gt-p35).
 		// Polecats commit the overlay (polecat lifecycle boilerplate) into repos,
 		// overwriting project-specific CLAUDE.md content. Detect and revert before push.

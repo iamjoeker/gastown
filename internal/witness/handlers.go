@@ -1542,37 +1542,6 @@ func _verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 	return false, nil
 }
 
-// verifyWorkAlreadyLanded answers "is this bead's work already on the default
-// branch?" from whatever state still exists, in that order of cost.
-//
-// The polecat's worktree is tried first because it is local, free and exact when
-// it is there. It is NOT relied on, because the callers that most need this
-// answer — the orphaned-bead and orphaned-molecule sweeps — only reach it once
-// that directory has been proved gone (gt-e7dd). The durable fallback resolves
-// the bead's pushed branch from the rig's own clone, which no polecat nuke
-// touches.
-//
-// Returns an error only when nothing could be measured. A nil error with
-// Landed false is a real "no".
-//
-// Package-level var so tests can override it.
-var verifyWorkAlreadyLanded = _verifyWorkAlreadyLanded
-
-func _verifyWorkAlreadyLanded(workDir, rigName, polecatName, hookBead string) (LandedEvidence, error) {
-	// Fast path: the polecat's worktree, when it still exists. Its error is
-	// discarded rather than returned — a missing worktree is the ordinary case
-	// here, not a failure to measure, and the durable check is what answers.
-	if onMain, err := verifyCommitOnMain(workDir, rigName, polecatName); err == nil && onMain {
-		return LandedEvidence{
-			Landed:   true,
-			Polecat:  polecatName,
-			Evidence: "worktree-ancestor",
-			Reason:   fmt.Sprintf("polecat %s's worktree HEAD is an ancestor of the default branch", polecatName),
-		}, nil
-	}
-	return verifyWorkLandedFromDurableState(workDir, rigName, polecatName, hookBead)
-}
-
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has
 // already landed on the default branch — including via SQUASH merge, which
 // rewrites commit SHAs and therefore escapes a plain ancestor check.
@@ -2886,29 +2855,13 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 	}
 	maxRespawns := config.LoadOperationalConfig(trRoot).GetWitnessConfig().MaxBeadRespawnsV()
 
-	// Guard: if this bead's work is already on the default branch, the work is
-	// done — close the bead instead of resetting for re-dispatch. This prevents
-	// the spawn-storm / duplicate-work loop described in #2036.
-	//
-	// The check must not depend on the polecat's worktree (gt-e7dd). Both
-	// callers that reach this function have already proved that directory is
-	// gone, so a worktree-only lookup cannot succeed here: it errors, the guard
-	// is skipped, and the bead is re-dispatched onto work that may already be in
-	// main. verifyWorkAlreadyLanded keeps the worktree as a fast path and falls
-	// back to the rig's clone and the pushed branch, both of which outlive the
-	// nuke.
-	landed, landedErr := verifyWorkAlreadyLanded(workDir, rigName, polecatName, hookBead)
-	switch {
-	case landedErr != nil:
-		// "Not landed" and "could not tell" share a boolean, and only the first
-		// justifies closing a bead — so this falls through to recovery, which is
-		// the pre-existing behaviour. It is logged because a silent fall-through
-		// reads afterwards as a measured all-clear.
-		fmt.Fprintf(os.Stderr, "witness: could not verify whether %s's work already landed: %v (recovering the bead as before)\n", hookBead, landedErr)
-	case landed.Landed:
-		reason := landed.CloseReason()
+	// Guard: if the polecat's commit is already on the default branch,
+	// the work is done — close the bead instead of resetting for re-dispatch.
+	// This prevents the spawn-storm / duplicate-work loop described in #2036.
+	if onMain, err := verifyCommitOnMain(workDir, rigName, polecatName); err == nil && onMain {
+		reason := fmt.Sprintf("Work already on main (verified by witness, polecat %s)", polecatName)
 		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
-			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (%s): %v\n", hookBead, reason, err)
+			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
 		}
 		return false
 	}
