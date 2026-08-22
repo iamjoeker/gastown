@@ -25,14 +25,22 @@ var deaconSweepTmpCmd = &cobra.Command{
 	Short: "Reclaim orphaned build and test scratch directories from TMPDIR",
 	Long: `Reclaim orphaned build and test scratch directories from TMPDIR.
 
-Two families strand directories under TMPDIR on a gastown host:
+Three families strand directories under TMPDIR on a gastown host:
 
-  go-work     Go toolchain work directories (go-build<n>, go-link-<n>). The
-              toolchain creates one for every build, test and vet run and
-              removes it on normal exit; a KILLED run — OOM killer, test
-              timeout, session recycle — leaves it behind at 100-300 MB each.
-  beads-test  beads test fixtures (beads-test-dolt-*, beads-bd-tests-*). A
-              suite killed mid-flight leaves its Dolt data directory behind.
+  go-work         Go toolchain work directories (go-build<n>, go-link-<n>). The
+                  toolchain creates one for every build, test and vet run and
+                  removes it on normal exit; a KILLED run — OOM killer, test
+                  timeout, session recycle — leaves it behind at 100-300 MB
+                  each.
+  beads-test      beads test fixtures (beads-test-dolt-*, beads-bd-tests-*). A
+                  suite killed mid-flight leaves its Dolt data directory behind.
+  beads-test-env  beads hermetic environment roots (beads-test-env-*). The
+                  suite points $HOME, $XDG_CONFIG_HOME and $DOLT_ROOT_PATH into
+                  one per run and builds itself a private copy of the bd binary
+                  inside it, so each costs about 201 MB. It is removed from a
+                  bash EXIT trap, which does not run when the suite is
+                  SIGKILLed. On the host that produced gt-ilea, 63 of these
+                  held 5.5 GB.
 
 Where TMPDIR is a RAM-backed tmpfs, this is not a cosmetic leak. On the host
 that produced gt-yb33, 34 stranded work directories held 5.35 GB of a 31 GB
@@ -54,7 +62,10 @@ whenever a check cannot be answered:
   - no running process is using it: naming it in its argv (how a live build
     identifies its work directory), having it as its working directory, or
     holding an open file descriptor inside it (how a live dolt sql-server
-    holds a fixture)
+    holds a fixture, and the ONLY trace a running beads suite leaves on its
+    environment root — that root is passed through the environment, so it
+    appears in no command line, and the suite chdirs to the repo rather than
+    into it)
 
 If the process table cannot be read, NOTHING is removed however old the
 directories are. Absence of evidence is not permission to delete.

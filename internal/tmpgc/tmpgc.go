@@ -1,7 +1,7 @@
 // Package tmpgc reclaims orphaned build and test scratch directories from a
 // temporary directory.
 //
-// Two families strand directories under TMPDIR on a gastown host:
+// Three families strand directories under TMPDIR on a gastown host:
 //
 //   - Go toolchain work directories. The toolchain creates one ($WORK) for
 //     every build, test, and vet invocation and removes it on normal exit. A
@@ -10,6 +10,10 @@
 //   - beads test fixture directories. The beads suite creates a Dolt data
 //     directory per run; a suite killed mid-flight leaves it, LOCK file and
 //     all.
+//   - beads hermetic test environment roots. The beads suite creates one per
+//     wrapper invocation to hold a private $HOME, $XDG_CONFIG_HOME and Dolt
+//     root, and — because the run also builds itself a private copy of the bd
+//     binary — each one costs about 201MB.
 //
 // Where TMPDIR is a RAM-backed tmpfs, a few dozen strandings exhaust it, and
 // the first symptom is unrelated to either: gastown's own disk-space guard
@@ -101,6 +105,22 @@ var workDirPattern = regexp.MustCompile(`^go-(build|link)-?[0-9]+$`)
 // might create by hand — are not candidates.
 var beadsTestDirPattern = regexp.MustCompile(`^beads-(test-dolt|bd-tests)-.+$`)
 
+// beadsTestEnvDirPattern matches the beads suite's hermetic environment roots:
+// "beads-test-env-<suffix>", created by
+//
+//	mktemp -d "${TMPDIR:-/tmp}/beads-test-env-XXXXXX"
+//
+// in the beads repo's scripts/ci/lib/test-env.sh. The suffix is restricted to
+// mktemp's own substitution alphabet rather than the ".+" the families above
+// use, because these roots are the ones an operator is most likely to keep a
+// copy of while debugging a failed run: every real name is exactly six
+// alphanumerics, so "beads-test-env-zX8yTM.bak" and "beads-test-env-zX8yTM-keep"
+// are outside the family and a copy someone parked under TMPDIR is not
+// swept. Measured on this host on 2026-08-19, all 63 stranded roots matched
+// `[A-Za-z0-9]{6}` exactly; the length itself is not pinned, so a wrapper that
+// widens XXXXXX keeps working.
+var beadsTestEnvDirPattern = regexp.MustCompile(`^beads-test-env-[A-Za-z0-9]+$`)
+
 // A Family is a class of temporary directory the sweep knows how to identify
 // by name. Membership is the FIRST safety check and the narrowest one: a
 // directory whose name is not exactly a member of some family is never
@@ -135,9 +155,47 @@ var FamilyBeadsTest = Family{
 	Summary: "beads test fixture directories (beads-test-dolt-*, beads-bd-tests-*)",
 }
 
+// FamilyBeadsTestEnv is the beads suite's per-invocation hermetic environment
+// root.
+//
+// beads_test_env_enter() in the beads repo's scripts/ci/lib/test-env.sh points
+// $HOME, $XDG_CONFIG_HOME, $DOLT_ROOT_PATH and $GIT_CONFIG_GLOBAL inside a
+// fresh mktemp directory, and scripts/test.sh then go-builds a private copy of
+// cmd/bd into $BEADS_TEST_ENV_ROOT/prebuilt-bd/bd. That binary is why each root
+// costs about 201MB. Nothing reuses one: every invocation mktemps its own and
+// rebuilds, so a stranded root is dead weight and not a warm cache. The
+// wrapper removes it from a bash `trap ... EXIT`, which does not run when the
+// run is SIGKILLed — the usual end of a long suite on a loaded host.
+//
+// # Only an open descriptor proves this family is live
+//
+// A run in flight is invisible to the other two kinds of evidence. Measured on
+// this host on 2026-08-19 with a beads suite running, a full sweep of /proc
+// found:
+//
+//   - 0 processes naming any beads-test-env path in argv. The wrapper exports
+//     the root through the ENVIRONMENT, so the command line is a plain
+//     `go test -p 4 -parallel 4 -timeout 25m ./cmd/bd`.
+//   - 0 processes with one as their working directory. The suite chdirs to the
+//     repo, not into its environment root.
+//   - 1 process holding a descriptor inside one — /proc/2698443/fd/4, on
+//     xdg-config/go/telemetry/local/go@....v1.count, a counter file the Go
+//     toolchain keeps mapped for the life of the command because
+//     $XDG_CONFIG_HOME points into the root.
+//
+// So for this family the descriptor scan is not one signal among three, it is
+// the only one that fires, and a sweep that judged liveness from argv or cwd
+// would have deleted a running suite's $HOME. That is the whole argument for
+// adding the family here rather than to any check that cannot read /proc.
+var FamilyBeadsTestEnv = Family{
+	Name:    "beads-test-env",
+	Pattern: beadsTestEnvDirPattern,
+	Summary: "beads hermetic test environment roots (beads-test-env-*, ~201 MB each)",
+}
+
 // DefaultFamilies is what a sweep considers when Options.Families is empty.
 func DefaultFamilies() []Family {
-	return []Family{FamilyGoWork, FamilyBeadsTest}
+	return []Family{FamilyGoWork, FamilyBeadsTest, FamilyBeadsTestEnv}
 }
 
 // matchFamily returns the family a base name belongs to, and whether it
