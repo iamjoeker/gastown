@@ -176,7 +176,7 @@ func runMoleculeProgress(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(children) == 0 {
-		return fmt.Errorf("no steps found for %s (not a molecule root?)", rootID)
+		return noStepsError(rootID, root)
 	}
 
 	// Build progress info
@@ -563,7 +563,14 @@ func getMoleculeProgressInfo(b *beads.Beads, moleculeRootID string) (*MoleculePr
 	}
 
 	if len(children) == 0 {
-		// No children - might be a simple issue, not a molecule
+		// No children — either a simple issue that is not a molecule at all, or
+		// (since gt-pzx, and for every formula but beads-release) a root-only
+		// molecule whose steps were never materialized. Both get a nil progress:
+		// there is nothing to show, and there is no honest bar to draw for zero
+		// steps. Reporting 0/0 instead would read as 100% and trip
+		// determineNextAction into "Molecule complete! Close the bead" for work
+		// that has not started (gt-ba4h). The checklist lives inline in the
+		// formula; outputMoleculeStatus already prints it as 📐 Formula.
 		return nil, nil
 	}
 
