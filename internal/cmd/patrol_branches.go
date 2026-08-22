@@ -258,102 +258,18 @@ func ensureRigRepoUsable(rigName, rigPath, source string, repoGit *git.Git) erro
 		rigName, rigPath, source, bare, worktree)
 }
 
-// branchSweepRefResolver is the slice of git that target selection needs.
-type branchSweepRefResolver interface {
-	RemoteDefaultBranch() string
-	CleanBaseRef(remote, defaultBranch, target string) string
-	RefExists(ref string) (bool, error)
-	IsAncestor(ancestor, descendant string) (bool, error)
-}
-
 // branchSweepTargets picks the refs a branch must be absent from before it is
-// worth anyone's attention.
-//
-// One trunk is the normal case and two is the fork case, and picking the wrong
-// one of two is not a rounding error: on gastown, origin/main is 289 commits
-// ahead of upstream/main, and comparing against upstream alone put six branches
-// on the short list of which three had demonstrably landed. So when both refs
-// exist, both are checked, and containment in either counts.
-//
-// A fully qualified --target is honoured exactly — an operator naming
-// upstream/main is asking about upstream/main. A bare --target names a BRANCH,
-// so it expands the same way the default does.
-//
-// Candidates are ordered most-advanced first, so the ref quoted back in the
-// guidance is the one work actually lands on rather than whichever the
-// fork-detection heuristic happens to prefer.
-func branchSweepTargets(g branchSweepRefResolver, remote, explicit string) []string {
-	explicit = strings.TrimSpace(explicit)
-	if explicit != "" && (strings.HasPrefix(explicit, "refs/") || git.RemoteForRef(explicit) != "") {
-		return []string{explicit}
-	}
-
-	branch := strings.TrimSpace(g.RemoteDefaultBranch())
-	if explicit != "" {
-		branch = explicit
-	}
-	if branch == "" {
-		branch = "main"
-	}
-
-	var candidates []string
-	for _, candidate := range []string{remote + "/" + branch, "upstream/" + branch} {
-		if slicesContains(candidates, candidate) {
-			continue
-		}
-		if ok, err := g.RefExists(candidate); err == nil && ok {
-			candidates = append(candidates, candidate)
-		}
-	}
-	if len(candidates) == 0 {
-		// Nothing resolved. Fall back to the repo's own notion of a base
-		// rather than inventing one, and let the sweep report against it.
-		if fallback := strings.TrimSpace(g.CleanBaseRef(remote, branch, "")); fallback != "" {
-			return []string{fallback}
-		}
-		return nil
-	}
-	return orderTargetsByReach(g, candidates)
-}
-
-// orderTargetsByReach sorts candidates so that a ref containing another comes
-// first. The count of other candidates a ref contains is a stable sort key, so
-// this stays well-defined however many trunks a rig grows.
-func orderTargetsByReach(g branchSweepRefResolver, candidates []string) []string {
-	if len(candidates) < 2 {
-		return candidates
-	}
-	reach := make(map[string]int, len(candidates))
-	for _, a := range candidates {
-		for _, b := range candidates {
-			if a == b {
-				continue
-			}
-			if contained, err := g.IsAncestor(b, a); err == nil && contained {
-				reach[a]++
-			}
-		}
-	}
-	ordered := append([]string(nil), candidates...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return reach[ordered[i]] > reach[ordered[j]]
-	})
-	return ordered
+// worth anyone's attention. The logic lives in the witness package because the
+// orphan-bead landed-check asks the same containment question and must pick the
+// same trunks (gt-e7dd); getting different answers from the two would be worse
+// than either answer alone.
+func branchSweepTargets(g witness.BranchSweepRefResolver, remote, explicit string) []string {
+	return witness.ResolveComparisonTargets(g, remote, explicit)
 }
 
 // targetRemotes lists the remotes that must be refreshed for these targets.
 func targetRemotes(targets []string, fallback string) []string {
-	var remotes []string
-	for _, target := range targets {
-		name := git.RemoteForRef(target)
-		if name == "" {
-			name = fallback
-		}
-		if name != "" && !slicesContains(remotes, name) {
-			remotes = append(remotes, name)
-		}
-	}
-	return remotes
+	return witness.TargetRemotes(targets, fallback)
 }
 
 func slicesContains(haystack []string, needle string) bool {
