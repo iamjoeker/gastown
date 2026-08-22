@@ -304,6 +304,34 @@ func TestSweepReportsUnknownRatherThanClean(t *testing.T) {
 	})
 }
 
+// Every route into `unknown` shares one class, and the human table shows the NOTE
+// and not Err — so a note that says only "could not compare" leaves a fetch-level
+// fault looking like a property of the branch. That is the whole of gt-880s: a
+// clobbered FETCH_HEAD was reported as a branch nobody could classify, and the
+// count moved run to run with nothing about the branches changing. The reason has
+// to reach the column a reader actually sees.
+func TestSweepUnknownNoteCarriesTheReason(t *testing.T) {
+	g := &fakeSweepGit{
+		refs: []git.RemoteRef{remoteRef("polecat/x/gt-a+aaa", "sha")},
+		statusErr: map[string]error{
+			"polecat/x/gt-a+aaa": errors.New("remote tip for refs/heads/polecat/x/gt-a+aaa moved between listing and fetch: listed 89db0051, fetched dd7e98ec (re-run to classify it)"),
+		},
+	}
+	result, err := SweepUnmergedPolecatBranches(g, &fakeSweepBeads{}, BranchSweepOptions{Targets: []string{"origin/main", "upstream/main"}})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	f := findingFor(t, result, "polecat/x/gt-a+aaa")
+	if f.Class != BranchSweepUnknown {
+		t.Fatalf("class = %q, want unknown", f.Class)
+	}
+	for _, want := range []string{"origin/main or upstream/main", "moved between listing and fetch", "89db0051"} {
+		if !strings.Contains(f.Note, want) {
+			t.Errorf("note %q does not contain %q", f.Note, want)
+		}
+	}
+}
+
 // A missing bead is a finding; an unreadable store is not. The two must not
 // collapse into the same answer.
 func TestSweepFlagsMissingBeadAsCheck(t *testing.T) {
