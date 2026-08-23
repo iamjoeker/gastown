@@ -153,6 +153,30 @@ case "${1:-}" in
       exit 0
     fi
     ;;
+  mq)
+    if [ "${2:-}" = "list" ]; then
+      rig="${3:-}"
+      printf '%s\n' "$*" >> "$TEST_STATE/mq_calls.log"
+      if [ -f "$TEST_STATE/mq_list_fail" ]; then
+        exit 1
+      fi
+      if [ -f "$TEST_STATE/mq_list_raw" ]; then
+        cat "$TEST_STATE/mq_list_raw"
+        exit 0
+      fi
+      printf '['
+      sep=""
+      while IFS='|' read -r mr_rig source_issue mr_status; do
+        [ -n "$mr_rig" ] || continue
+        [ "$mr_rig" = "$rig" ] || continue
+        printf '%s{"id":"%s-mr-%s","title":"Merge: %s","status":"%s","description":"branch: polecat/x/%s@abc\\ntarget: main\\nsource_issue: %s\\nrig: %s\\n"}' \
+          "$sep" "$mr_rig" "$source_issue" "$source_issue" "$mr_status" "$source_issue" "$source_issue" "$mr_rig"
+        sep=","
+      done < "$TEST_STATE/mr.list"
+      printf ']\n'
+      exit 0
+    fi
+    ;;
   rig)
     if [ "${2:-}" = "list" ] && [ "${3:-}" = "--json" ]; then
       if [ -f "$TEST_STATE/rig_list_fail" ]; then
@@ -308,6 +332,7 @@ setup_case() {
   CLEANUP_DIRS+=("$TEST_TMP")
   export TEST_STATE="$TEST_TMP/state"
   export GT_TOWN_ROOT="$TEST_TMP/town"
+  export GT_STUCK_AGENT_DOG_STATE_DIR="$TEST_TMP/dogstate"
   local bin_dir="$TEST_TMP/bin"
 
   mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$bin_dir"
@@ -320,6 +345,8 @@ setup_case() {
   : > "$TEST_STATE/hook_calls.log"
   : > "$TEST_STATE/bd.log"
   : > "$TEST_STATE/capacity.list"
+  : > "$TEST_STATE/mr.list"
+  : > "$TEST_STATE/mq_calls.log"
   printf '%s\n' "$GT_TOWN_ROOT" > "$TEST_STATE/town_root_value"
   touch "$TEST_STATE/sessions/hq-deacon"
 
@@ -327,6 +354,29 @@ setup_case() {
   export PATH="$bin_dir:$ORIGINAL_PATH"
   export GT_STUCK_AGENT_DOG_MAX_INACTIVITY=0s
   unset GT_STUCK_AGENT_DOG_MASS_DEATH_THRESHOLD
+  unset GT_STUCK_AGENT_DOG_CRASH_PERSIST_SECONDS
+  unset GT_STUCK_AGENT_DOG_MASS_DEATH_FRACTION_PCT
+}
+
+# add_mr puts a merge request in the queue for a source issue. status defaults
+# to open; "closed" is what a MERGED MR looks like, which is the fury case.
+add_mr() {
+  local rig="$1" source_issue="$2" status="${3:-open}"
+
+  printf '%s|%s|%s\n' "$rig" "$source_issue" "$status" >> "$TEST_STATE/mr.list"
+}
+
+# seed_crash_candidate fakes a PRIOR observation of a crash candidate, aged by
+# `age` seconds. Without one, a candidate is on its first observation and the
+# persistence gate holds it in PENDING — which is the point of the gate, so
+# every test that expects a restart has to say out loud that the condition
+# already persisted.
+seed_crash_candidate() {
+  local rig="$1" pcat="$2" bead="$3" age="$4"
+
+  mkdir -p "$GT_STUCK_AGENT_DOG_STATE_DIR"
+  printf '%s/%s/%s\t%s\n' "$rig" "$pcat" "$bead" "$(( $(date +%s) - age ))" \
+    >> "$GT_STUCK_AGENT_DOG_STATE_DIR/crash-candidates.tsv"
 }
 
 add_polecat() {
@@ -609,6 +659,7 @@ test_in_progress_hook_restarts_one() {
 test_dead_session_restarts_one() {
   setup_case
   add_polecat beta session-dead
+  seed_crash_candidate gastown beta gt-hook-beta 3600
   run_script
 
   assert_file_empty "$TEST_STATE/kill.log" "dead session: no session kill"
@@ -778,6 +829,7 @@ test_mass_death_recheck_reclassifies_dead_statuses() {
   add_polecat alpha agent-dead
   add_polecat beta session-dead
   add_polecat gamma agent-dead
+  seed_crash_candidate gastown beta gt-hook-beta 3600
   printf 'agent-dead\nsession-dead\n' > "$TEST_STATE/health/gt-alpha"
   printf 'session-dead\nagent-dead\n' > "$TEST_STATE/health/gt-beta"
   printf 'agent-dead\nagent-dead\n' > "$TEST_STATE/health/gt-gamma"
@@ -786,7 +838,7 @@ test_mass_death_recheck_reclassifies_dead_statuses() {
   assert_file_empty "$TEST_STATE/kill.log" "reclassified mass: no session kills"
   assert_file_empty "$TEST_STATE/mail.log" "reclassified mass: no restart mail"
   assert_line_count "$TEST_STATE/escalate.log" 1 "reclassified mass: one escalation"
-  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 agents down" "reclassified mass: confirmed all dead"
+  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 of 3 live polecats down" "reclassified mass: confirmed all dead"
   assert_file_contains "$TEST_STATE/escalate.log" "--fingerprint stuck-agent-dog:mass-death" "reclassified mass: fingerprint set"
 }
 
@@ -803,6 +855,266 @@ test_mass_death_skips_actions() {
   assert_file_contains "$TEST_STATE/escalate.log" "--source plugin:stuck-agent-dog" "mass death: source set"
   assert_file_contains "$TEST_STATE/escalate.log" "--fingerprint stuck-agent-dog:mass-death" "mass death: fingerprint set"
   assert_file_contains "$TEST_STATE/output.log" "Skipping per-agent restart/kill actions" "mass death: action loops skipped"
+}
+
+# --- Throughput is not mortality (gt-0g5r) ------------------------------------
+# Two false CRITICAL "mass agent death" escalations fired within fifteen minutes
+# on 2026-08-22 with nobody dead, and the count ROSE from 3 to 6 as the merge
+# queue CLEARED. A polecat that finishes its work submits an MR and exits, but
+# its hook bead cannot close until that MR merges — so "succeeded and exited" is
+# byte-for-byte identical to "crashed" at the session probe.
+#
+# The two cases below are the named evidence this fix has to satisfy. A rule
+# that cannot separate them is not ready, and neither may be reported as an
+# aggregate.
+
+# NAMED CASE (a) — fury, measured live 2026-08-22: hook=gt-7k76 HOOKED with
+# open_MR=0, which reads CRASHED under an open-MR rule. It was NOT crashed: its
+# MR had merged 29 SECONDS earlier and the bead had not closed yet. Every
+# successful merge traverses that window, which is why the false-positive rate
+# tracked merge throughput. MUST NOT read as crashed.
+test_fury_merged_mr_with_open_hook_is_not_crashed() {
+  setup_case
+  add_polecat fury session-dead
+  add_mr gastown gt-hook-fury closed
+  seed_crash_candidate gastown fury gt-hook-fury 3600
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "fury: no restart mail for a merged polecat"
+  assert_file_empty "$TEST_STATE/kill.log" "fury: no session kill"
+  assert_file_empty "$TEST_STATE/escalate.log" "fury: no escalation"
+  assert_file_contains "$TEST_STATE/output.log" "POST-SUBMISSION: gt-fury" "fury: named as post-submission"
+  assert_file_not_contains "$TEST_STATE/output.log" "CRASHED: gt-fury" "fury: not classified crashed"
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 0 uncounted, 0 terminal, 1 post-submission" "fury: counted in its own bucket"
+}
+
+# The same case with the MR still OPEN. An open-MR rule gets this one right; it
+# is here so a later change cannot fix the merged case by breaking this one.
+test_open_mr_also_reads_as_post_submission() {
+  setup_case
+  add_polecat guzzle session-dead
+  add_mr gastown gt-hook-guzzle open
+  seed_crash_candidate gastown guzzle gt-hook-guzzle 3600
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "open MR: no restart mail"
+  assert_file_contains "$TEST_STATE/output.log" "POST-SUBMISSION: gt-guzzle" "open MR: named as post-submission"
+}
+
+# NAMED CASE (b) — chrome@19:50, the ONE genuine zombie in the 2026-08-22
+# dataset: session dead, bead non-terminal, no MR in ANY state, and git-state
+# CLEAN. It required a restart and then completed. MUST read as crashed.
+#
+# The clean git state is why this fix does not use a "work at risk" clause: the
+# proposed four-clause rule added `git-state not CLEAN` and thereby produced a
+# false negative on the only true positive there was. Nothing here reads git.
+test_chrome_real_zombie_with_clean_git_is_crashed() {
+  setup_case
+  add_polecat chrome session-dead
+  seed_crash_candidate gastown chrome gt-hook-chrome 3600
+  run_script
+
+  assert_line_count "$TEST_STATE/mail.log" 1 "chrome zombie: restart requested"
+  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/chrome" "chrome zombie: correct target"
+  assert_file_contains "$TEST_STATE/output.log" "CRASHED: gt-chrome" "chrome zombie: classified crashed"
+  assert_file_contains "$TEST_STATE/output.log" "no MR in any state" "chrome zombie: stated the discriminator"
+}
+
+# The persistence gate: any point-in-time predicate is racing the
+# merge -> bead-terminal transition, so a candidate has to look crashed TWICE,
+# more than one window apart, before anything acts on it.
+test_crash_candidate_pends_on_first_observation() {
+  setup_case
+  add_polecat chrome session-dead
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "first observation: no restart mail"
+  assert_file_contains "$TEST_STATE/output.log" "PENDING: gt-chrome" "first observation: held pending"
+  assert_file_contains "$TEST_STATE/output.log" "0 terminal, 0 post-submission, 1 pending" "first observation: counted pending"
+}
+
+# ...and the second observation, once the window has elapsed, does act. Run the
+# script twice against a persistence window of zero-plus-one-second so the
+# recorded first observation is real rather than seeded.
+test_crash_candidate_acts_on_second_observation() {
+  setup_case
+  export GT_STUCK_AGENT_DOG_CRASH_PERSIST_SECONDS=0
+  add_polecat chrome session-dead
+  run_script
+  assert_line_count "$TEST_STATE/mail.log" 1 "zero window: acts immediately"
+
+  setup_case
+  export GT_STUCK_AGENT_DOG_CRASH_PERSIST_SECONDS=600
+  add_polecat chrome session-dead
+  run_script
+  assert_file_empty "$TEST_STATE/mail.log" "second observation: first run held"
+  run_script
+  assert_file_empty "$TEST_STATE/mail.log" "second observation: still inside the window"
+  assert_file_contains "$GT_STUCK_AGENT_DOG_STATE_DIR/crash-candidates.tsv" "gastown/chrome/gt-hook-chrome" "second observation: candidate recorded"
+}
+
+# A candidate that recovers, merges, or is reassigned must DROP OUT of the store
+# so its clock restarts. A store that only ever grows would eventually age every
+# polecat past the window.
+test_recovered_candidate_drops_out_of_the_store() {
+  setup_case
+  add_polecat chrome session-dead
+  printf 'session-dead\nhealthy\n' > "$TEST_STATE/health/gt-chrome"
+  run_script
+  run_script
+
+  assert_file_not_contains "$GT_STUCK_AGENT_DOG_STATE_DIR/crash-candidates.tsv" "gastown/chrome" "recovered candidate: cleared from the store"
+}
+
+# Ordering matters: the MR join runs BEFORE the persistence gate, so a polecat
+# that submitted after being seen as a candidate is released rather than acted
+# on once its clock expires.
+test_mr_appearing_later_releases_an_aged_candidate() {
+  setup_case
+  add_polecat crater session-dead
+  seed_crash_candidate gastown crater gt-hook-crater 3600
+  add_mr gastown gt-hook-crater open
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "late MR: aged candidate released, no restart"
+  assert_file_contains "$TEST_STATE/output.log" "POST-SUBMISSION: gt-crater" "late MR: reclassified"
+}
+
+# The agent-dead arm KILLS the session before requesting a restart, so a live MR
+# there costs the same orphaned work. No persistence gate on this arm — a dead
+# runtime inside a live session is not the merge/terminal race.
+test_agent_dead_with_an_mr_is_not_killed() {
+  setup_case
+  add_polecat foundation agent-dead
+  add_mr gastown gt-hook-foundation open
+  run_script
+
+  assert_file_empty "$TEST_STATE/kill.log" "agent-dead with MR: session not killed"
+  assert_file_empty "$TEST_STATE/mail.log" "agent-dead with MR: no restart mail"
+  assert_file_contains "$TEST_STATE/output.log" "POST-SUBMISSION: gt-foundation" "agent-dead with MR: named"
+}
+
+# The literal 2026-08-22 alarm: five polecats flagged, every one holding a live
+# MR, and `deacon/` stated the consequence — RECOVERY ACTION ON THESE WOULD
+# ORPHAN LIVE WORK. It must produce no CRITICAL and no action at all.
+test_post_submission_polecats_do_not_mass_death() {
+  setup_case
+  for name in crater fury guzzle foundation deathclaw; do
+    add_polecat "$name" session-dead
+    add_mr gastown "gt-hook-$name" open
+    seed_crash_candidate gastown "$name" "gt-hook-$name" 3600
+  done
+  run_script
+
+  assert_file_empty "$TEST_STATE/escalate.log" "post-submission five: no escalation"
+  assert_file_empty "$TEST_STATE/mail.log" "post-submission five: no restart mail"
+  assert_file_empty "$TEST_STATE/kill.log" "post-submission five: no kills"
+  assert_file_not_contains "$TEST_STATE/output.log" "MASS DEATH" "post-submission five: no mass death"
+  assert_file_contains "$TEST_STATE/output.log" "5 post-submission" "post-submission five: visible, not silently dropped"
+}
+
+# An unreachable merge queue must fail TOWARDS detection. Silencing the dog
+# would cost real zombie detection, and the one true positive proves the
+# session-death heuristic finds genuine P0 zombies.
+test_mr_query_unavailable_does_not_silence_the_dog() {
+  setup_case
+  add_polecat chrome session-dead
+  seed_crash_candidate gastown chrome gt-hook-chrome 3600
+  touch "$TEST_STATE/mq_list_fail"
+  run_script
+
+  assert_line_count "$TEST_STATE/mail.log" 1 "mq unavailable: still restarts a real zombie"
+  assert_file_contains "$TEST_STATE/output.log" "cannot separate post-submission from crashed" "mq unavailable: said so out loud"
+}
+
+# An unwritable state directory must not turn the dog off either — it degrades
+# to the single-observation behaviour and says so.
+test_unwritable_state_dir_fails_open() {
+  setup_case
+  add_polecat chrome session-dead
+  export GT_STUCK_AGENT_DOG_STATE_DIR="$TEST_STATE/mail.log/nested"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "crash persistence gate disabled" "unwritable state: degradation announced"
+  assert_file_contains "$TEST_STATE/output.log" "CRASHED: gt-chrome" "unwritable state: still detects"
+}
+
+# --- Mass-death threshold is a fraction, not a raw count (gt-0g5r) ------------
+# Firing CRITICAL on a raw count is what produced two false CRITICALs in a
+# quarter-hour. Three of thirty polecats down is a bad night the restart path
+# handles; three of four is the town dying.
+
+test_minority_deaths_escalate_high_and_still_restart() {
+  setup_case
+  local name=""
+  for name in alpha beta gamma; do
+    add_polecat "$name" session-dead
+    seed_crash_candidate gastown "$name" "gt-hook-$name" 3600
+  done
+  for name in h1 h2 h3 h4 h5 h6 h7; do
+    add_polecat "$name" healthy
+  done
+  run_script
+
+  assert_line_count "$TEST_STATE/escalate.log" 1 "minority deaths: one escalation"
+  assert_file_contains "$TEST_STATE/escalate.log" "Elevated polecat deaths: 3 of 10 live polecats down" "minority deaths: named the denominator"
+  assert_file_contains "$TEST_STATE/escalate.log" "-s HIGH" "minority deaths: HIGH, not CRITICAL"
+  assert_file_not_contains "$TEST_STATE/escalate.log" "stuck-agent-dog:mass-death" "minority deaths: not the mass-death fingerprint"
+  assert_line_count "$TEST_STATE/mail.log" 3 "minority deaths: restarts still requested"
+  assert_file_not_contains "$TEST_STATE/output.log" "Skipping per-agent restart/kill actions" "minority deaths: actions not suppressed"
+}
+
+test_majority_deaths_escalate_critical_and_suppress_actions() {
+  setup_case
+  local name=""
+  for name in alpha beta gamma; do
+    add_polecat "$name" session-dead
+    seed_crash_candidate gastown "$name" "gt-hook-$name" 3600
+  done
+  add_polecat h1 healthy
+  run_script
+
+  assert_line_count "$TEST_STATE/escalate.log" 1 "majority deaths: one escalation"
+  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 of 4 live polecats down" "majority deaths: named the denominator"
+  assert_file_contains "$TEST_STATE/escalate.log" "-s CRITICAL" "majority deaths: CRITICAL"
+  assert_file_empty "$TEST_STATE/mail.log" "majority deaths: actions suppressed"
+}
+
+# TERMINAL polecats are finished and cannot die. Counting them in the
+# denominator would dilute a genuine mass death behind a wall of successful
+# exits — the same "throughput reads as health" error, inverted.
+test_terminal_polecats_are_not_in_the_live_denominator() {
+  setup_case
+  local name=""
+  for name in alpha beta gamma; do
+    add_polecat "$name" session-dead
+    seed_crash_candidate gastown "$name" "gt-hook-$name" 3600
+  done
+  for name in spent1 spent2 spent3 spent4 spent5 spent6 spent7; do
+    add_polecat "$name" session-dead false
+    touch "$TEST_STATE/nohook/$name"
+  done
+  run_script
+
+  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 of 3 live polecats down" "terminal exclusion: denominator is the live population"
+  assert_file_contains "$TEST_STATE/escalate.log" "-s CRITICAL" "terminal exclusion: CRITICAL"
+}
+
+test_zero_fraction_restores_raw_count_escalation() {
+  setup_case
+  export GT_STUCK_AGENT_DOG_MASS_DEATH_FRACTION_PCT=0
+  local name=""
+  for name in alpha beta gamma; do
+    add_polecat "$name" session-dead
+    seed_crash_candidate gastown "$name" "gt-hook-$name" 3600
+  done
+  for name in h1 h2 h3 h4 h5 h6 h7; do
+    add_polecat "$name" healthy
+  done
+  run_script
+
+  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 of 10 live polecats down" "zero fraction: raw-count CRITICAL restored"
+  assert_file_contains "$TEST_STATE/escalate.log" "-s CRITICAL" "zero fraction: CRITICAL"
 }
 
 # --- Town root resolution (gt-cr2) -------------------------------------------
@@ -892,6 +1204,21 @@ test_mass_death_recheck_hook_cleared
 test_mass_death_recheck_one_remaining_restarts
 test_mass_death_recheck_reclassifies_dead_statuses
 test_mass_death_skips_actions
+test_fury_merged_mr_with_open_hook_is_not_crashed
+test_open_mr_also_reads_as_post_submission
+test_chrome_real_zombie_with_clean_git_is_crashed
+test_crash_candidate_pends_on_first_observation
+test_crash_candidate_acts_on_second_observation
+test_recovered_candidate_drops_out_of_the_store
+test_mr_appearing_later_releases_an_aged_candidate
+test_agent_dead_with_an_mr_is_not_killed
+test_post_submission_polecats_do_not_mass_death
+test_mr_query_unavailable_does_not_silence_the_dog
+test_unwritable_state_dir_fails_open
+test_minority_deaths_escalate_high_and_still_restart
+test_majority_deaths_escalate_critical_and_suppress_actions
+test_terminal_polecats_are_not_in_the_live_denominator
+test_zero_fraction_restores_raw_count_escalation
 test_town_root_resolved_from_gt_when_env_unset
 test_town_root_unresolvable_fails_loudly
 test_town_root_help_text_fails_loudly

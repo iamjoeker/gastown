@@ -117,6 +117,67 @@ correctly have no session and no hook — the normal terminal state. Those go to
 Unknown fails open to `UNCOUNTED`: an inventory that will not load, or a polecat
 absent from it, is exactly the unknown the bucket exists to surface.
 
+### Session death is not death: the merge-queue join (gt-0g5r)
+
+**A dead session plus a hooked bead is not evidence of a crash.** A polecat that
+finishes its work submits an MR and exits, but its hook bead cannot close until
+that MR *merges*. So "submitted successfully and exited" is byte-for-byte
+indistinguishable from "crashed" at the session probe — and because the bead
+stays hooked precisely *because* the MR has not merged yet, **the alarm count
+rises as the queue clears.** A detector whose level tracks throughput alarms
+hardest exactly when things are going best. On 2026-08-22 that produced two
+false CRITICAL "mass agent death" escalations in fifteen minutes, counting
+3 → 6 → 5 as the queue drained, and all five flagged polecats held live MRs.
+Recovery action on them would have orphaned live work, including the relands
+that were unjamming the queue.
+
+Two independent gates now sit in front of the `CRASHED` bucket:
+
+**1. The merge-queue join, at `--status=all`.** `gt mq list <rig> --status=all
+--json`, matched on `source_issue: <hook_bead>`. A hit means `POST_SUBMISSION`:
+submitted, not crashed, and excluded from both the crashed bucket and the
+mass-death count.
+
+`--status=all` is not optional. **An open-MR-only rule is refuted by
+measurement**: polecat fury read `hook=gt-7k76 HOOKED` with `open_MR=0`, which
+is CRASHED under that rule. It was not — its MR had merged *29 seconds* earlier
+and the bead had not closed yet. A merged MR is still proof of submission; it is
+proof the work is already safe.
+
+**2. The persistence gate.** There is a window between an MR closing as merged
+and its source bead going terminal, and **every successful merge traverses it**.
+Inside that window a healthy just-succeeded polecat is indistinguishable from a
+zombie, so *any* point-in-time predicate is racing a state transition. A crash
+candidate must therefore still look crashed on a **later** observation more than
+`GT_STUCK_AGENT_DOG_CRASH_PERSIST_SECONDS` (default 600s, two cooldown cycles)
+after the first. Until then it is `PENDING`: counted, logged, not acted on. The
+store is keyed `rig/polecat/hook_bead`, so a reassignment restarts the clock,
+and it is rewritten each run from what was observed *this* run, so a candidate
+that recovers or merges drops out.
+
+Cost: a real crash is recovered up to one window later. That is deliberate — a
+false restart can orphan a live MR, a late restart cannot.
+
+**What is deliberately NOT used: git state.** A proposed rule added
+`AND git-state not CLEAN` as a "work at risk" clause. It produces a **false
+negative on the only true positive in the dataset**: chrome@19:50 was a genuine
+zombie that needed a restart and then completed — session dead, bead
+non-terminal, no MR in any state, and git-state **CLEAN**. A genuine zombie can
+have a clean tree. Nothing in this plugin reads git state, and
+`run_test.sh` pins both named cases by name.
+
+**Known gap, not closed here.** When a polecat's work lands under *another*
+polecat's branch (cross-branch conflict resolution — the ghoul case), no MR
+joins to its own hook bead and it still reads as a crash candidate. That costs a
+wasted restart; it does not orphan work. It is not worth reaching for the git
+clause to cover, for the reason above.
+
+Both gates fail **towards detection**, never towards silence. An unreachable
+merge queue, or an unwritable state directory, degrades the affected gate and
+says so in the log rather than quietly reclassifying every crash as a success —
+a dog that cannot bark costs real zombie detection, and the session-death
+heuristic does catch genuine P0 zombies.
+
 ```bash
 CRASHED=()
 STUCK=()
@@ -133,11 +194,23 @@ UNCOUNTED=0
 # with no session and no hook. The ordinary end state, kept as its own bucket
 # so the denominator still balances.
 TERMINAL=0
+# POST_SUBMISSION: session gone, hook bead still open, and an MR references that
+# bead. This polecat SUCCEEDED. Its own bucket, not folded into TERMINAL: a
+# silent exclusion is how a discriminator stops being auditable.
+POST_SUBMISSION=0
+# PENDING: a crash candidate on its FIRST observation. Not acted on and not
+# counted toward mass death until it survives CRASH_PERSIST_SECONDS.
+PENDING=0
 ENUMERATED=0
 
 # One inventory call for the town, keyed "<rig>/<name>". holds_capacity_slot
 # returns true for anything this map does not answer for.
 load_capacity_map
+# One merge-queue call per rig at --status=all, keyed "<rig>|<source_issue>".
+# has_submitted_mr answers "did this assignment reach the queue, in any state?"
+load_mr_sources
+# Prior crash-candidate observations, keyed "<rig>/<pcat>/<hook_bead>".
+load_crash_candidates
 
 while IFS='|' read -r RIG PREFIX; do
   [ -z "$RIG" ] && continue
@@ -316,27 +389,58 @@ For DEACON stuck (stale heartbeat):
 
 If multiple active polecats crash in the same cycle, this may indicate a
 systemic issue (Dolt outage, OOM, etc.). The executable script re-checks live
-health and active hook state before CRITICAL escalation. If the confirmed count
-drops below threshold, normal per-agent action proceeds for the remaining
-confirmed outages.
+health, active hook state, **and the merge queue** before escalating. The
+merge-queue re-read matters as much as the health one: the gap between
+enumeration and escalation is exactly where a batch of MRs lands, and that is
+precisely when this alarm used to fire hardest.
+
+**A raw count is not a mass-death signal (gt-0g5r).** CRITICAL now requires the
+confirmed count to reach both `MASS_DEATH_THRESHOLD` *and*
+`MASS_DEATH_FRACTION_PCT` (default 50%) of the **live** polecat population —
+enumerated minus `TERMINAL`, because finished polecats cannot die and counting
+them would dilute a genuine mass death behind a wall of successful exits. Three
+of thirty down is a bad night the restart path handles; three of four is the
+town dying. Firing CRITICAL on the raw count is what produced two false
+CRITICALs in a quarter-hour, and a CRITICAL that is wrong twice in fifteen
+minutes trains everyone to ignore the next one, which may be real.
+
+Above the count but below the fraction, the plugin escalates **HIGH** under a
+separate fingerprint and **does not suppress the restarts** — restarting is the
+correct response to a handful of genuine crashes, and suppression is what leaves
+them lying there. Only the CRITICAL path skips per-agent action. Every
+escalation names its denominator, so an operator can falsify it.
+
+`GT_STUCK_AGENT_DOG_MASS_DEATH_FRACTION_PCT=0` disables the fraction gate and
+restores raw-count CRITICAL.
 
 ```bash
+# The live population: finished polecats cannot die.
+LIVE_POPULATION=$(( ENUMERATED - TERMINAL ))
+
 TOTAL_ISSUES=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
 MASS_DEATH=0
 if [ "$TOTAL_ISSUES" -ge "$MASS_DEATH_THRESHOLD" ]; then
-  confirm_polecat_outages
+  confirm_polecat_outages   # re-reads session health AND the merge queue
   CRASHED=("${CONFIRMED_CRASHED[@]}")
   STUCK=("${CONFIRMED_STUCK[@]}")
   CONFIRMED_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
+  [ "$LIVE_POPULATION" -lt "$CONFIRMED_TOTAL" ] && LIVE_POPULATION="$CONFIRMED_TOTAL"
 
-  if [ "$CONFIRMED_TOTAL" -ge "$MASS_DEATH_THRESHOLD" ]; then
+  if [ "$CONFIRMED_TOTAL" -lt "$MASS_DEATH_THRESHOLD" ]; then
+    echo "NOTICE: dropped to $CONFIRMED_TOTAL after live re-check; no escalation"
+  elif [ $(( CONFIRMED_TOTAL * 100 )) -ge $(( LIVE_POPULATION * MASS_DEATH_FRACTION_PCT )) ]; then
     MASS_DEATH=1
-    echo "MASS DEATH: $CONFIRMED_TOTAL agents down confirmed — escalating"
-    gt escalate "Mass agent death: $CONFIRMED_TOTAL agents down" \
+    gt escalate "Mass agent death: $CONFIRMED_TOTAL of $LIVE_POPULATION live polecats down" \
       -s CRITICAL \
       --source "plugin:stuck-agent-dog" \
       --fingerprint "stuck-agent-dog:mass-death"
     echo "Skipping per-agent restart/kill actions during mass-death escalation"
+  else
+    # Report it, but keep recovering: restarts are correct for a few crashes.
+    gt escalate "Elevated polecat deaths: $CONFIRMED_TOTAL of $LIVE_POPULATION live polecats down" \
+      -s HIGH \
+      --source "plugin:stuck-agent-dog" \
+      --fingerprint "stuck-agent-dog:elevated-deaths"
   fi
 fi
 ```
