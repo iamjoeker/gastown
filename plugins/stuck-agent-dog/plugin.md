@@ -105,6 +105,14 @@ observe-only for polecats; quiet OpenCode research can be legitimate live work.
 CRASHED=()
 STUCK=()
 HEALTHY=0
+# OBSERVED: probe says healthy:false but policy is deliberately not to act.
+# These are NOT healthy — counting them as such makes the receipt assert
+# something its own probe denied.
+OBSERVED=0
+# UNCOUNTED: enumerated but classified into no bucket, so the denominator
+# would otherwise silently shrink. A polecat that never finished spawning
+# holds no hook, which is exactly the condition that makes it invisible here.
+UNCOUNTED=0
 
 while IFS='|' read -r RIG PREFIX; do
   [ -z "$RIG" ] && continue
@@ -133,6 +141,11 @@ while IFS='|' read -r RIG PREFIX; do
         if hook_restartable "$SESSION_NAME" "$HOOK_BEAD" "$HOOK_STATUS"; then
           CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
           echo "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
+        else
+          # A polecat that never finished spawning holds no hook, so the
+          # restartable gate is false. Report it rather than drop it.
+          UNCOUNTED=$((UNCOUNTED + 1))
+          echo "  UNCOUNTED: $SESSION_NAME session-dead, no restartable hook (still holds a capacity slot)"
         fi
         ;;
       agent-dead)
@@ -141,13 +154,19 @@ while IFS='|' read -r RIG PREFIX; do
         if hook_restartable "$SESSION_NAME" "$HOOK_BEAD" "$HOOK_STATUS"; then
           STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
           echo "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
+        else
+          UNCOUNTED=$((UNCOUNTED + 1))
         fi
         ;;
       agent-hung)
-        HEALTHY=$((HEALTHY + 1))
+        # Observe-only is the correct policy, but the accounting must not
+        # launder it into a clean bill of health: the health API reports
+        # healthy:false, zombie:true for this status.
+        OBSERVED=$((OBSERVED + 1))
         echo "  OBSERVE: $SESSION_NAME runtime alive but inactive; not restarting"
         ;;
       *)
+        UNCOUNTED=$((UNCOUNTED + 1))
         echo "  SKIP $SESSION_NAME: central liveness probe inconclusive"
         ;;
     esac
@@ -155,7 +174,7 @@ while IFS='|' read -r RIG PREFIX; do
 done <<< "$RIG_PREFIX_MAP"
 
 echo ""
-echo "Health summary: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
+echo "Health summary: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
 ```
 
 ## Step 3: Check deacon health
@@ -354,7 +373,7 @@ fi
 ## Record Result
 
 ```bash
-SUMMARY="Agent health check: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
+SUMMARY="Agent health check: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
 if [ -n "$DEACON_ISSUE" ]; then
   SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 fi
