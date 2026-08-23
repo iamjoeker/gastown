@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gt mol await-signal` filters the activity feed by rig** (gt-p54t). The feed
+  is one town-wide file, and await-signal returned on the first new line
+  whatever produced it — so an idle rig's witness woke on every event every rig
+  emitted. That is the exact inverse of what the exponential backoff behind
+  `--backoff-base`/`--backoff-max` is for: the busier the town, the more often
+  the idlest rig was woken, and its wait never got to grow. Waits are now scoped
+  to the caller's own rig, from `--rig`, else `GT_RIG`, else the working
+  directory. `--all-rigs` asks for the old town-wide behaviour, which is what
+  the Deacon and Mayor legitimately want and what the Deacon patrol formula now
+  passes explicitly.
+
+  Measured over the live feed at the time of the change (6,254 events, same
+  volume for every row): town-wide 6,254 wakes; gastown 3,983 (36.3% fewer);
+  beads 3,012 (51.8% fewer); duly_noted — one polecat, near-idle — 2,403 (61.6%
+  fewer). await-signal now reports the suppressed count on every return, so the
+  saving stays a measurement rather than an assumption.
+
+  Suppression applies to exactly one case: the event names one or more rigs and
+  none of them is yours. Three paths deliberately fail open, because a wake that
+  was not needed costs a turn while a wake that was dropped loses work.
+  Attribution is a set and includes addressees, so **cross-rig mail still wakes
+  the addressee** — a filter that swallowed it would trade a cost defect for a
+  correctness one. Town-scoped events (Mayor↔Deacon traffic, boot sessions,
+  escalation closes) name no rig and so wake everyone. And a line that cannot be
+  parsed wakes rather than being discarded.
+
+  Two attribution traps are handled explicitly because both fail closed, which
+  is the dangerous direction: `gt nudge` writes `channel:<name>` into
+  `payload.target`, and `gt escalate` writes a bead ID where the payload helper
+  expects a rig. Neither is a rig name, and reading either as one would have
+  suppressed the event for every rig in town.
+
 - **`gt patrol branches` finds strandings that already exist** (gt-by1e). The
   refinery reports a stranding at the moment it makes one (gt-h1cw); nothing
   found the ones already made. On 2026-08-19 a single session produced six, each

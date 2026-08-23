@@ -40,6 +40,16 @@ refreshed its session heartbeat while the file store aged past threshold).
 - **Gotcha:** a session that never reaches `await-signal` (handoff churn,
   session limits, one very long patrol turn) leaves this label stale for
   hours even though the agent is healthy.
+- **Gotcha (gt-p54t):** for a rig agent this label now tracks ITS RIG's
+  activity, not the town's. `await-signal` waits scoped to the caller's rig, so
+  a witness on a busy town whose own rig is quiet refreshes this label on its
+  backoff timeouts (≤5m for witnesses, ≤15m for the Deacon) rather than on the
+  town's constant churn. A label that looks less fresh than it used to is
+  therefore not evidence of an unhealthy agent — it is the backoff finally
+  working. The action threshold is unaffected: `HeartbeatVeryStaleThreshold`
+  (20m) is deliberately larger than any backoff-max, and the verdict in
+  `deacon.EvaluateHealth` additionally requires a pending-await probe. The
+  Deacon itself waits `--all-rigs`, so its label is unchanged.
 
 ## Rules of thumb
 
