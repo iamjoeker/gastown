@@ -32,6 +32,13 @@ type polecatActiveWorkEvidence struct {
 	CountsTowardCapacity bool
 	Blocker              string
 	AssignedIssue        string
+
+	// PausedAgentState carries a deliberate pause (stuck, awaiting-gate, paused,
+	// escalated) separately from Blocker. It blocks cleanup like active work does,
+	// but it is not work: nothing is running and nothing is at risk, so it routes
+	// to WorkstateInput.PausedAgentState — whose remedy is `gt polecat clear-state`
+	// — instead of ActiveWorkBlocker, whose remedy is escalation (gt-fbgq).
+	PausedAgentState string
 }
 
 func newPolecatSessionSet(sessionNames []string) polecatSessionSet {
@@ -261,11 +268,15 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		}
 		input.ActiveWorkBlocker = activeWorkEvidence.Blocker
 		input.ActiveWorkCountsTowardCapacity = activeWorkEvidence.CountsTowardCapacity
+		input.PausedAgentState = activeWorkEvidence.PausedAgentState
 	} else if item.State == polecat.StateIdle && running && !polecat.CleanupStatus(item.CleanupStatus).IsSafe() {
 		item.State = polecat.StateReviewNeeded
 	}
 
-	if fields != nil && !activeWorkEvidence.BlocksCleanup {
+	// Keyed on the blocker being empty rather than on BlocksCleanup: a pause
+	// blocks cleanup without accounting for the hook, and the hook outranks it.
+	// Under the old condition a stuck polecat's unaccounted hook went unreported.
+	if fields != nil && input.ActiveWorkBlocker == "" {
 		if hookBead := strings.TrimSpace(fields.HookBead); hookBead != "" {
 			input.ActiveWorkBlocker = fmt.Sprintf("hook_bead=%s status=unverified", hookBead)
 		}
@@ -401,10 +412,10 @@ func assessPolecatAgentStateWork(state beads.AgentState) polecatActiveWorkEviden
 			Blocker:              fmt.Sprintf("agent_state=%s", state),
 		}
 	}
-	if state.ProtectsFromCleanup() || state == beads.AgentStateEscalated {
+	if state.IsPaused() {
 		return polecatActiveWorkEvidence{
-			BlocksCleanup: true,
-			Blocker:       fmt.Sprintf("agent_state=%s", state),
+			BlocksCleanup:    true,
+			PausedAgentState: string(state),
 		}
 	}
 	return polecatActiveWorkEvidence{}

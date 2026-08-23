@@ -9,6 +9,18 @@ const (
 	WorkstateVerdictNeedsRecovery = "NEEDS_RECOVERY"
 	WorkstateVerdictNeedsMQSubmit = "NEEDS_MQ_SUBMIT"
 
+	// WorkstateVerdictNeedsStateClear is the answer for a polecat whose only
+	// blocker is a deliberate paused agent_state (stuck, awaiting-gate, paused,
+	// escalated). Nothing is at risk — git is clean, the hook is clear, the queue
+	// is settled — but the pause is real and outlives every session restart,
+	// because no restart path writes agent_state at all.
+	//
+	// It is deliberately NOT NeedsRecovery: there is nothing to recover, only a
+	// field to clear, and routing it to "escalate" was half of what stranded the
+	// slot. It is deliberately not SAFE_TO_NUKE either: reusing the slot silently
+	// would discard a pause somebody set on purpose (gt-fbgq).
+	WorkstateVerdictNeedsStateClear = "NEEDS_STATE_CLEAR"
+
 	// WorkstateVerdictUnverified is the answer for a caller that never gathered
 	// the git and merge-queue facts (ReuseFactsMeasured false). It is not a
 	// claim that anything is wrong — it is the refusal to make a claim at all.
@@ -45,6 +57,19 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
+
+	// PausedAgentState is the agent bead's agent_state when that state is a
+	// deliberate pause (beads.AgentState.IsPaused: stuck, awaiting-gate, paused,
+	// escalated). Empty otherwise.
+	//
+	// It is its own field rather than another ActiveWorkBlocker string because a
+	// pause is not active work and must not be reported as such: it counts
+	// against nothing, and its remedy is `gt polecat clear-state`, not recovery.
+	// Only the inventory surface used to read agent_state at all, which is how
+	// one polecat answered SAFE_TO_NUKE / witness_action=restart to
+	// check-recovery and NEEDS_RECOVERY / agent_state=stuck to `gt polecat list`
+	// in the same instant (gt-fbgq).
+	PausedAgentState string
 
 	// MRRefused is the agent bead's record that gt done deliberately created no
 	// merge request because the source issue was already closed, leaving a
@@ -85,6 +110,7 @@ type WorkstateDisposition struct {
 	SafeToNuke           bool     `json:"safe_to_nuke"`
 	NeedsRecovery        bool     `json:"needs_recovery"`
 	NeedsMQSubmit        bool     `json:"needs_mq_submit"`
+	NeedsStateClear      bool     `json:"needs_state_clear,omitempty"`
 	MQStatus             string   `json:"mq_status,omitempty"`
 	CountsTowardCapacity bool     `json:"counts_toward_capacity"`
 	ReuseStatus          string   `json:"reuse_status,omitempty"`
@@ -210,9 +236,26 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if activeMRBlocks {
 		block("active-mr-open", in.ActiveMRBlocker, false)
 	}
+	// A deliberate pause is the LOWEST-priority blocker, so it is not fed through
+	// block() with the rest: work at risk outranks it, an open MR outranks it,
+	// and — the part that matters — the merge-queue tail below outranks it too.
+	// Blocking here would return before that tail ever ran, and a stuck polecat
+	// with work still outside the queue would be reported as a field to clear
+	// rather than as work to rescue. It is reported alongside whatever does
+	// block, and decides the verdict only when nothing else does.
+	pausedBlocker := ""
+	if in.PausedAgentState != "" {
+		pausedBlocker = "agent_state=" + in.PausedAgentState
+	}
 
 	if len(d.Blockers) > 0 {
-		if activeMRBlocks && len(d.Blockers) == 1 {
+		// Counted before the pause is appended: the pause must not turn a
+		// leave-alone PENDING_MR into a NEEDS_RECOVERY escalation.
+		mrOnly := activeMRBlocks && len(d.Blockers) == 1
+		if pausedBlocker != "" {
+			d.Blockers = append(d.Blockers, pausedBlocker)
+		}
+		if mrOnly {
 			d.Verdict = WorkstateVerdictPendingMR
 			d.ReuseStatus = "idle-pr-open"
 			return d
@@ -278,6 +321,26 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
+	// Nothing at risk and nothing queued — so the pause is genuinely all that
+	// stands between this polecat and reuse. Say so, and name the one action that
+	// changes it. `gt session restart` is not that action: no restart path writes
+	// agent_state, so prescribing it here produced a remedy that provably could
+	// not work and a slot whose disposition never moved (gt-fbgq).
+	//
+	// Gated on ReuseFactsMeasured for the same reason SAFE_TO_NUKE is: the pause
+	// itself is a bead fact any surface can read, but "nothing else blocks" is a
+	// claim only a caller that ran git and the merge-queue lookup has earned. An
+	// unmeasured caller falls through to UNVERIFIED below, carrying the pause in
+	// its blockers so the fact still surfaces.
+	if pausedBlocker != "" && in.ReuseFactsMeasured {
+		d.Verdict = WorkstateVerdictNeedsStateClear
+		d.Reason = "agent-state-paused"
+		d.NeedsStateClear = true
+		d.ReuseStatus = "idle-state-paused"
+		d.Blockers = append(d.Blockers, pausedBlocker)
+		return d
+	}
+
 	// Nothing above blocked. That is only an answer if the blockers above were
 	// ever evaluated against gathered facts: eleven of this input's fields are
 	// git and merge-queue facts, and a bead-only surface leaves every one of
@@ -294,6 +357,9 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		d.Verdict = WorkstateVerdictUnverified
 		d.Reason = "reuse-facts-unmeasured"
 		d.ReuseStatus = "idle-unverified"
+		if pausedBlocker != "" {
+			d.Blockers = append(d.Blockers, pausedBlocker)
+		}
 		d.Blockers = append(d.Blockers, "reuse_facts=unmeasured (no git or merge-queue check was run for this polecat)")
 		return d
 	}

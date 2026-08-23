@@ -226,9 +226,14 @@ func TestWitnessActionFor(t *testing.T) {
 		// A mid-turn agent is not a slot to reclaim: restart preserves the
 		// worktree but throws away the context of a polecat that is very likely
 		// running `gt done` right now (gt-5tg).
-		"WORKING":        "leave-alone",
-		"":               "restart",
-		"SOME_NEW_STATE": "restart",
+		"WORKING": "leave-alone",
+		// Not "restart": no restart path writes agent_state, so restarting a
+		// paused polecat leaves it paused and the slot's disposition never moves.
+		// Not "escalate" either: nothing is at risk and there is nothing for the
+		// Mayor to recover — only a field the witness may clear itself (gt-fbgq).
+		"NEEDS_STATE_CLEAR": "clear-state",
+		"":                  "restart",
+		"SOME_NEW_STATE":    "restart",
 	}
 
 	for verdict, want := range tests {

@@ -24,7 +24,8 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 | `gt polecat gc <rig>` | GC stale polecat branches (orphaned, old timestamped) |
 | `gt polecat stale <rig>` | Detects stale polecats; `--cleanup` auto-nukes them (same identity restriction) |
 | `gt polecat check-recovery` | Reports whether work is at risk (SAFE_TO_NUKE vs NEEDS_RECOVERY) and what the witness may do about it (`witness_action`) |
-| `gt session restart <rig>/<polecat>` | How the **witness** reclaims a slot — preserves worktree and branch |
+| `gt polecat clear-state <rig>/<polecat>` | Lifts a deliberate `agent_state` pause (stuck, awaiting-gate, paused, escalated) back to idle. **Witness-runnable** — writes one agent-bead field, touches no worktree/branch/session. Refuses unless the pause is the only blocker (gt-fbgq) |
+| `gt session restart <rig>/<polecat>` | How the **witness** reclaims a slot — preserves worktree and branch. Writes **no** `agent_state`, so it does not lift a pause; use `clear-state` for that |
 | `gt polecat identity remove <rig> <name>` | Removes a polecat identity |
 | `gt done` | Polecat self-cleaning: pushes branch, submits MR/PR path as configured, preserves handoff metadata, kills own session. MR skipped for `--status ESCALATED\|DEFERRED` or `no_merge` paths |
 
