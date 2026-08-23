@@ -101,6 +101,22 @@ and `GT_PANE_ID`, so opencode/node/bun detection stays in the shared runtime
 configuration instead of a plugin-local process regex. Treat `agent-hung` as
 observe-only for polecats; quiet OpenCode research can be legitimate live work.
 
+**The activity threshold must be non-zero.** `--max-inactivity 0s` disables
+level 3 of `CheckSessionHealth` outright, which makes `agent-hung` unreturnable
+and the `OBSERVED` arm below dead code (gt-ucj8). The default is `30m`:
+observe-only detection means a late report costs a delayed log line, while an
+early one teaches operators that `OBSERVE` means nothing.
+`GT_STUCK_AGENT_DOG_MAX_INACTIVITY` overrides it; `0s` is an explicit opt-out.
+Enabling the check can only move a session from `HEALTHY` to `OBSERVED` —
+process liveness is checked first, so it never reclassifies a crash.
+
+`UNCOUNTED` is gated on `counts_toward_capacity` from `gt polecat list --all
+--json`. Ungated it was noise: 34 of 36 rows were ordinary `done` polecats that
+correctly have no session and no hook — the normal terminal state. Those go to
+`TERMINAL`, which keeps them in the denominator without diluting the signal.
+Unknown fails open to `UNCOUNTED`: an inventory that will not load, or a polecat
+absent from it, is exactly the unknown the bucket exists to surface.
+
 ```bash
 CRASHED=()
 STUCK=()
@@ -109,10 +125,19 @@ HEALTHY=0
 # These are NOT healthy — counting them as such makes the receipt assert
 # something its own probe denied.
 OBSERVED=0
-# UNCOUNTED: enumerated but classified into no bucket, so the denominator
-# would otherwise silently shrink. A polecat that never finished spawning
-# holds no hook, which is exactly the condition that makes it invisible here.
+# UNCOUNTED: enumerated, classified into no bucket, and STILL HOLDING A
+# CAPACITY SLOT. A polecat that never finished spawning holds no hook, which is
+# exactly the condition that makes it invisible here.
 UNCOUNTED=0
+# TERMINAL: enumerated, classified nowhere, holding no slot — a done polecat
+# with no session and no hook. The ordinary end state, kept as its own bucket
+# so the denominator still balances.
+TERMINAL=0
+ENUMERATED=0
+
+# One inventory call for the town, keyed "<rig>/<name>". holds_capacity_slot
+# returns true for anything this map does not answer for.
+load_capacity_map
 
 while IFS='|' read -r RIG PREFIX; do
   [ -z "$RIG" ] && continue
@@ -125,8 +150,9 @@ while IFS='|' read -r RIG PREFIX; do
     PCAT_NAME=$(basename "$PCAT_PATH")
     # Use beads prefix (not rig name) for tmux session name
     SESSION_NAME="${PREFIX}-${PCAT_NAME}"
+    ENUMERATED=$((ENUMERATED + 1))
 
-    HEALTH_STATUS=$(gt session health "$SESSION_NAME" --json --max-inactivity "${GT_STUCK_AGENT_DOG_MAX_INACTIVITY:-0s}" 2>/dev/null \
+    HEALTH_STATUS=$(gt session health "$SESSION_NAME" --json --max-inactivity "${GT_STUCK_AGENT_DOG_MAX_INACTIVITY:-30m}" 2>/dev/null \
       | jq -r '.status // empty' 2>/dev/null || true)
 
     case "$HEALTH_STATUS" in
@@ -142,10 +168,11 @@ while IFS='|' read -r RIG PREFIX; do
           CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
           echo "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
         else
-          # A polecat that never finished spawning holds no hook, so the
-          # restartable gate is false. Report it rather than drop it.
-          UNCOUNTED=$((UNCOUNTED + 1))
-          echo "  UNCOUNTED: $SESSION_NAME session-dead, no restartable hook (still holds a capacity slot)"
+          # Two very different things land here: a polecat that never finished
+          # spawning (no hook, so the restartable gate is false), and an
+          # ordinary done polecat that has released its slot.
+          # counts_toward_capacity is what tells them apart.
+          classify_unbucketed "$RIG" "$PCAT_NAME" "$SESSION_NAME" "session-dead, no restartable hook"
         fi
         ;;
       agent-dead)
@@ -155,7 +182,7 @@ while IFS='|' read -r RIG PREFIX; do
           STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
           echo "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
         else
-          UNCOUNTED=$((UNCOUNTED + 1))
+          classify_unbucketed "$RIG" "$PCAT_NAME" "$SESSION_NAME" "agent-dead, no restartable hook"
         fi
         ;;
       agent-hung)
@@ -166,6 +193,9 @@ while IFS='|' read -r RIG PREFIX; do
         echo "  OBSERVE: $SESSION_NAME runtime alive but inactive; not restarting"
         ;;
       *)
+        # An inconclusive probe is never terminal-by-inference: we do not know
+        # what this polecat is doing, so it stays UNCOUNTED whatever the
+        # capacity verdict says.
         UNCOUNTED=$((UNCOUNTED + 1))
         echo "  SKIP $SESSION_NAME: central liveness probe inconclusive"
         ;;
@@ -174,7 +204,17 @@ while IFS='|' read -r RIG PREFIX; do
 done <<< "$RIG_PREFIX_MAP"
 
 echo ""
-echo "Health summary: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
+echo "Health summary: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal"
+
+# Conservation guard. The defect this plugin keeps re-acquiring is a bucket that
+# silently drops rows, and a shrinking denominator reads exactly like an
+# all-clear. State the identity instead of assuming it.
+BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL ))
+if [ "$BUCKET_TOTAL" -eq "$ENUMERATED" ]; then
+  echo "Denominator: $BUCKET_TOTAL bucketed == $ENUMERATED polecat directories enumerated"
+else
+  echo "WARN: $BUCKET_TOTAL bucketed != $ENUMERATED polecat directories enumerated — a classification arm is dropping rows"
+fi
 ```
 
 ## Step 3: Check deacon health
@@ -373,7 +413,7 @@ fi
 ## Record Result
 
 ```bash
-SUMMARY="Agent health check: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
+SUMMARY="Agent health check: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal"
 if [ -n "$DEACON_ISSUE" ]; then
   SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 fi

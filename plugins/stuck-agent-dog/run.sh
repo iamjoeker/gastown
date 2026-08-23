@@ -52,7 +52,20 @@ positive_integer_or_default() {
   esac
 }
 
-POLECAT_MAX_INACTIVITY="${GT_STUCK_AGENT_DOG_MAX_INACTIVITY:-0s}"
+# The activity check is ON by default. `gt session health --max-inactivity 0s`
+# DISABLES level 3 of tmux.CheckSessionHealth entirely, so with a 0s default the
+# agent-hung branch below was unreachable: the only probe call site is
+# session_health_status, it passes this value, and agent-hung can therefore
+# never be returned. The OBSERVED bucket was fed by dead code (gt-ucj8).
+#
+# 30m, not the 10-15m the CheckSessionHealth doc suggests: this plugin never
+# kills or restarts on agent-hung, it only reports, so the cost of a late
+# detection is a delayed log line while the cost of an early one is teaching
+# operators that OBSERVE means nothing. 30m clears a long research turn and
+# still surfaces a wedged runtime within one patrol cycle of the daemon's own
+# thresholds. GT_STUCK_AGENT_DOG_MAX_INACTIVITY overrides it; 0s remains an
+# explicit opt-out.
+POLECAT_MAX_INACTIVITY="${GT_STUCK_AGENT_DOG_MAX_INACTIVITY:-30m}"
 [ "$POLECAT_MAX_INACTIVITY" = "0" ] && POLECAT_MAX_INACTIVITY="0s"
 DEACON_STALE_SECONDS=$(integer_or_default "${GT_STUCK_AGENT_DOG_DEACON_STALE_SECONDS:-}" 1200)
 ACTIVITY_GRACE_SECONDS=$(integer_or_default "${GT_STUCK_AGENT_DOG_ACTIVITY_GRACE_SECONDS:-}" "$DEACON_STALE_SECONDS")
@@ -184,6 +197,69 @@ operational_rig_prefix_map() {
   printf '%s\n' "$rows" | awk -F'|' 'NF >= 2 && $1 != "" && $2 != ""'
 }
 
+# --- Capacity map -------------------------------------------------------------
+# counts_toward_capacity is the capacity system's own verdict on whether a
+# polecat still occupies a slot (internal/polecat/workstate.go). A terminal
+# `done` polecat correctly has no session and no hook — that is the normal end
+# state, not an anomaly. Reporting those as UNCOUNTED buried the one real
+# instance in 35 benign rows, which trains operators to ignore the field.
+#
+# One call for the whole town; the map is keyed "<rig>/<name>".
+CAPACITY_MAP=""
+
+load_capacity_map() {
+  local json=""
+
+  if ! json=$(cd "$TOWN_ROOT" 2>/dev/null && gt polecat list --all --json 2>/dev/null); then
+    log "NOTICE: gt polecat list --all --json unavailable; every polecat will be treated as capacity-holding"
+    return 0
+  fi
+
+  if ! CAPACITY_MAP=$(printf '%s' "$json" | jq -r '
+    if type == "array" then .[] else empty end
+    | select((.rig // "") != "" and (.name // "") != "")
+    | "\(.rig)/\(.name)|\(.counts_toward_capacity)"
+  ' 2>/dev/null); then
+    log "NOTICE: gt polecat list --all --json not parseable; every polecat will be treated as capacity-holding"
+    CAPACITY_MAP=""
+  fi
+}
+
+# holds_capacity_slot fails OPEN (true) for anything the map does not answer for.
+# A polecat missing from the inventory, or an inventory that would not load, is
+# precisely the unknown this bucket exists to surface — resolving it to "no slot"
+# would let the denominator shrink again through a different door.
+holds_capacity_slot() {
+  local rig="$1" pcat="$2" value=""
+
+  if [ -z "$CAPACITY_MAP" ]; then
+    return 0
+  fi
+
+  value=$(printf '%s\n' "$CAPACITY_MAP" | awk -F'|' -v key="$rig/$pcat" '$1 == key { print $2; exit }')
+  if [ "$value" = "false" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# classify_unbucketed routes an enumerated polecat that matched no actionable
+# arm. UNCOUNTED means "classified nowhere and STILL HOLDS A CAPACITY SLOT";
+# TERMINAL means "classified nowhere because it is finished". Both stay in the
+# denominator — the point is to separate the signal from the steady state, not
+# to drop rows.
+classify_unbucketed() {
+  local rig="$1" pcat="$2" session="$3" reason="$4"
+
+  if holds_capacity_slot "$rig" "$pcat"; then
+    UNCOUNTED=$((UNCOUNTED + 1))
+    log "  UNCOUNTED: $session $reason (still holds a capacity slot)"
+  else
+    TERMINAL=$((TERMINAL + 1))
+    log "  TERMINAL: $session $reason, holds no capacity slot"
+  fi
+}
+
 confirm_current_polecat_outage() {
   local session="$1" rig="$2" pcat="$3"
   local health_status="" hook_assignment="" hook_bead="" hook_status=""
@@ -258,7 +334,17 @@ OBSERVED=0
 # would otherwise silently shrink. A polecat that never finished spawning
 # holds no hook, which is exactly the condition that used to make it
 # invisible here — the failure mode produced its own concealment.
+# Gated on counts_toward_capacity: only slot-holders land here.
 UNCOUNTED=0
+# TERMINAL: enumerated, classified into no actionable bucket, and holding no
+# capacity slot — a done polecat with no session and no hook. The ordinary end
+# state. Kept as its own bucket so the denominator still balances.
+TERMINAL=0
+# ENUMERATED: polecat directories walked. Every one of them must land in exactly
+# one bucket; the guard after the loop says so out loud rather than trusting it.
+ENUMERATED=0
+
+load_capacity_map
 
 while IFS='|' read -r RIG PREFIX; do
   [ -z "$RIG" ] && continue
@@ -269,6 +355,7 @@ while IFS='|' read -r RIG PREFIX; do
     [ -d "$PCAT_PATH" ] || continue
     PCAT_NAME=$(basename "$PCAT_PATH")
     SESSION_NAME="${PREFIX}-${PCAT_NAME}"
+    ENUMERATED=$((ENUMERATED + 1))
 
     HEALTH_STATUS=$(session_health_status "$SESSION_NAME" || true)
     case "$HEALTH_STATUS" in
@@ -282,7 +369,7 @@ while IFS='|' read -r RIG PREFIX; do
           STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
           log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
         else
-          UNCOUNTED=$((UNCOUNTED + 1))
+          classify_unbucketed "$RIG" "$PCAT_NAME" "$SESSION_NAME" "agent-dead, no restartable hook"
         fi
         ;;
       agent-hung|agent_hung)
@@ -301,15 +388,19 @@ while IFS='|' read -r RIG PREFIX; do
           CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
           log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
         else
-          # Dead session with no restartable hook. This is where a polecat that
-          # never finished spawning lands: agent_state=spawning never took a
-          # hook, so the restartable gate is false and it used to vanish from
-          # the counts entirely. Report it rather than drop it.
-          UNCOUNTED=$((UNCOUNTED + 1))
-          log "  UNCOUNTED: $SESSION_NAME session-dead, no restartable hook (still holds a capacity slot)"
+          # Dead session with no restartable hook. Two very different things
+          # land here: a polecat that never finished spawning (agent_state=
+          # spawning never took a hook, so the restartable gate is false — it
+          # used to vanish from the counts entirely), and an ordinary done
+          # polecat that has released its slot. counts_toward_capacity is what
+          # tells them apart.
+          classify_unbucketed "$RIG" "$PCAT_NAME" "$SESSION_NAME" "session-dead, no restartable hook"
         fi
         ;;
       *)
+        # An inconclusive probe is never terminal-by-inference: we do not know
+        # what this polecat is doing, so it stays in UNCOUNTED regardless of the
+        # capacity verdict.
         UNCOUNTED=$((UNCOUNTED + 1))
         log "  SKIP $SESSION_NAME: central liveness probe inconclusive"
         ;;
@@ -318,7 +409,17 @@ while IFS='|' read -r RIG PREFIX; do
 done <<< "$RIG_PREFIX_MAP"
 
 log ""
-log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
+log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal"
+
+# Conservation guard. The defect this plugin keeps re-acquiring is a bucket that
+# silently drops rows, and a shrinking denominator reads exactly like an
+# all-clear. State the identity instead of assuming it.
+BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL ))
+if [ "$BUCKET_TOTAL" -eq "$ENUMERATED" ]; then
+  log "Denominator: $BUCKET_TOTAL bucketed == $ENUMERATED polecat directories enumerated"
+else
+  log "WARN: $BUCKET_TOTAL bucketed != $ENUMERATED polecat directories enumerated — a classification arm is dropping rows"
+fi
 
 # --- Check deacon health -----------------------------------------------------
 
@@ -452,7 +553,7 @@ fi
 
 # --- Report -------------------------------------------------------------------
 
-SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
+SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal"
 [ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 [ -n "$DEACON_DIVERGENCE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_DIVERGENCE (not escalated)"
 log ""

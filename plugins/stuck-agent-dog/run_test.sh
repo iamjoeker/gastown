@@ -133,6 +133,26 @@ case "${1:-}" in
       exit 0
     fi
     ;;
+  polecat)
+    if [ "${2:-}" = "list" ]; then
+      if [ -f "$TEST_STATE/polecat_list_fail" ]; then
+        exit 1
+      fi
+      if [ -f "$TEST_STATE/polecat_list_raw" ]; then
+        cat "$TEST_STATE/polecat_list_raw"
+        exit 0
+      fi
+      printf '['
+      sep=""
+      while IFS='|' read -r rig name ctc; do
+        [ -n "$rig" ] || continue
+        printf '%s{"rig":"%s","name":"%s","state":"done","counts_toward_capacity":%s}' "$sep" "$rig" "$name" "$ctc"
+        sep=","
+      done < "$TEST_STATE/capacity.list"
+      printf ']\n'
+      exit 0
+    fi
+    ;;
   rig)
     if [ "${2:-}" = "list" ] && [ "${3:-}" = "--json" ]; then
       if [ -f "$TEST_STATE/rig_list_fail" ]; then
@@ -299,6 +319,7 @@ setup_case() {
   : > "$TEST_STATE/health_calls.log"
   : > "$TEST_STATE/hook_calls.log"
   : > "$TEST_STATE/bd.log"
+  : > "$TEST_STATE/capacity.list"
   printf '%s\n' "$GT_TOWN_ROOT" > "$TEST_STATE/town_root_value"
   touch "$TEST_STATE/sessions/hq-deacon"
 
@@ -311,8 +332,9 @@ setup_case() {
 add_polecat() {
   local name="$1"
   local status="$2"
+  local capacity="${3:-true}"
 
-  add_polecat_in_rig gastown gt "$name" "$status"
+  add_polecat_in_rig gastown gt "$name" "$status" "$capacity"
 }
 
 add_polecat_in_rig() {
@@ -320,11 +342,17 @@ add_polecat_in_rig() {
   local prefix="$2"
   local name="$3"
   local status="$4"
+  local capacity="${5:-true}"
   local session="$prefix-$name"
 
   mkdir -p "$GT_TOWN_ROOT/$rig/polecats/$name"
   touch "$TEST_STATE/sessions/$session"
   printf '%s\n' "$status" > "$TEST_STATE/health/$session"
+  # capacity=absent means the polecat exists on disk but not in the capacity
+  # inventory — the unknown case, which must fail open into UNCOUNTED.
+  if [ "$capacity" != "absent" ]; then
+    printf '%s|%s|%s\n' "$rig" "$name" "$capacity" >> "$TEST_STATE/capacity.list"
+  fi
 }
 
 run_script() {
@@ -408,6 +436,143 @@ test_summary_denominator_covers_every_polecat() {
   run_script
 
   assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 2 healthy, 1 observed, 1 uncounted" "four polecats: denominator is 4, not 3"
+}
+
+# --- Probe reachability (gt-ucj8 Part 2) --------------------------------------
+# `--max-inactivity 0s` DISABLES level 3 of tmux.CheckSessionHealth, so with a
+# 0s default the agent-hung arm above was unreachable and OBSERVED was fed by
+# dead code. Every other case in this file pins the env override, which is
+# exactly why the defect survived a green suite: no case ever exercised the
+# default. These three do.
+
+test_default_probe_threshold_enables_activity_check() {
+  setup_case
+  unset GT_STUCK_AGENT_DOG_MAX_INACTIVITY
+  add_polecat alpha healthy
+  run_script
+
+  assert_file_contains "$TEST_STATE/health_calls.log" "gt-alpha --max-inactivity 30m" "default threshold: activity check enabled"
+  assert_file_not_contains "$TEST_STATE/health_calls.log" "--max-inactivity 0s" "default threshold: not the disabling 0s"
+}
+
+test_zero_max_inactivity_remains_an_explicit_opt_out() {
+  setup_case
+  export GT_STUCK_AGENT_DOG_MAX_INACTIVITY=0s
+  add_polecat alpha healthy
+  run_script
+
+  assert_file_contains "$TEST_STATE/health_calls.log" "gt-alpha --max-inactivity 0s" "explicit 0s: opt-out honoured"
+}
+
+test_max_inactivity_env_override_wins() {
+  setup_case
+  export GT_STUCK_AGENT_DOG_MAX_INACTIVITY=45m
+  add_polecat alpha healthy
+  run_script
+
+  assert_file_contains "$TEST_STATE/health_calls.log" "gt-alpha --max-inactivity 45m" "env override: threshold passed through"
+}
+
+# --- UNCOUNTED capacity gate (gt-ucj8 Part 3) ---------------------------------
+# Measured before the gate: 36 uncounted, of which 34 were ordinary done
+# polecats that correctly have no session and no hook. One genuine instance in
+# 36 rows is a field an operator learns to ignore.
+
+test_terminal_done_polecat_is_not_uncounted() {
+  setup_case
+  add_polecat retired session-dead false
+  touch "$TEST_STATE/nohook/retired"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "TERMINAL: gt-retired session-dead, no restartable hook, holds no capacity slot" "terminal done: named as terminal"
+  assert_file_not_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-retired" "terminal done: not reported as uncounted"
+  assert_file_contains "$TEST_STATE/output.log" "0 observed, 0 uncounted, 1 terminal" "terminal done: excluded from uncounted"
+}
+
+test_capacity_holder_is_still_uncounted() {
+  setup_case
+  add_polecat spawnfail session-dead true
+  touch "$TEST_STATE/nohook/spawnfail"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-spawnfail session-dead, no restartable hook (still holds a capacity slot)" "capacity holder: still surfaced"
+  assert_file_contains "$TEST_STATE/output.log" "0 observed, 1 uncounted, 0 terminal" "capacity holder: counted as uncounted"
+}
+
+# A loaded, non-empty inventory that simply has no row for this polecat. This is
+# the arm an empty-map test cannot reach: the map exists and the lookup misses.
+test_polecat_absent_from_inventory_fails_open() {
+  setup_case
+  add_polecat retired session-dead false
+  add_polecat ghost session-dead absent
+  touch "$TEST_STATE/nohook/retired" "$TEST_STATE/nohook/ghost"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-ghost" "absent from inventory: fails open to uncounted"
+  assert_file_contains "$TEST_STATE/output.log" "TERMINAL: gt-retired" "absent from inventory: map was loaded and did discriminate"
+  assert_file_contains "$TEST_STATE/output.log" "1 uncounted, 1 terminal" "absent from inventory: no bucket collapse"
+}
+
+test_capacity_lookup_unavailable_fails_open() {
+  setup_case
+  add_polecat retired session-dead false
+  touch "$TEST_STATE/nohook/retired"
+  touch "$TEST_STATE/polecat_list_fail"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "gt polecat list --all --json unavailable" "capacity lookup down: logged"
+  assert_file_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-retired" "capacity lookup down: fails open to uncounted"
+}
+
+test_capacity_lookup_unparseable_fails_open() {
+  setup_case
+  add_polecat retired session-dead false
+  touch "$TEST_STATE/nohook/retired"
+  printf 'not-json\n' > "$TEST_STATE/polecat_list_raw"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "gt polecat list --all --json not parseable" "capacity lookup unparseable: logged"
+  assert_file_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-retired" "capacity lookup unparseable: fails open to uncounted"
+}
+
+test_agent_dead_without_hook_gated_on_capacity() {
+  setup_case
+  add_polecat retired agent-dead false
+  add_polecat wedged agent-dead true
+  touch "$TEST_STATE/nohook/retired" "$TEST_STATE/nohook/wedged"
+  run_script
+
+  assert_file_empty "$TEST_STATE/kill.log" "agent-dead no hook: no kills"
+  assert_file_contains "$TEST_STATE/output.log" "TERMINAL: gt-retired agent-dead, no restartable hook" "agent-dead no hook: terminal named"
+  assert_file_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-wedged agent-dead, no restartable hook" "agent-dead no hook: slot holder named"
+  assert_file_contains "$TEST_STATE/output.log" "1 uncounted, 1 terminal" "agent-dead no hook: split by capacity"
+}
+
+# An inconclusive probe is an unknown, not a terminal state. Resolving it with
+# the capacity verdict would let "we could not tell" quietly become "finished".
+test_inconclusive_probe_stays_uncounted_regardless_of_capacity() {
+  setup_case
+  add_polecat murky unknown-status false
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "SKIP gt-murky: central liveness probe inconclusive" "inconclusive probe: logged"
+  assert_file_contains "$TEST_STATE/output.log" "1 uncounted, 0 terminal" "inconclusive probe: not laundered into terminal"
+}
+
+test_denominator_conservation_is_stated() {
+  setup_case
+  unset GT_STUCK_AGENT_DOG_MAX_INACTIVITY
+  add_polecat chrome healthy
+  add_polecat ace agent-hung
+  add_polecat synth session-dead true
+  add_polecat retired session-dead false
+  add_polecat spent session-dead false
+  touch "$TEST_STATE/nohook/synth" "$TEST_STATE/nohook/retired" "$TEST_STATE/nohook/spent"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 1 healthy, 1 observed, 1 uncounted, 2 terminal" "mixed population: buckets split"
+  assert_file_contains "$TEST_STATE/output.log" "Denominator: 5 bucketed == 5 polecat directories enumerated" "mixed population: denominator balances"
+  assert_file_not_contains "$TEST_STATE/output.log" "WARN:" "mixed population: no dropped rows"
 }
 
 test_hook_show_uses_json_and_rig_workdir() {
@@ -700,6 +865,17 @@ test_healthy_runtime claude
 test_agent_hung_observe_only
 test_session_dead_without_hook_is_uncounted
 test_summary_denominator_covers_every_polecat
+test_default_probe_threshold_enables_activity_check
+test_zero_max_inactivity_remains_an_explicit_opt_out
+test_max_inactivity_env_override_wins
+test_terminal_done_polecat_is_not_uncounted
+test_capacity_holder_is_still_uncounted
+test_polecat_absent_from_inventory_fails_open
+test_capacity_lookup_unavailable_fails_open
+test_capacity_lookup_unparseable_fails_open
+test_agent_dead_without_hook_gated_on_capacity
+test_inconclusive_probe_stays_uncounted_regardless_of_capacity
+test_denominator_conservation_is_stated
 test_hook_show_uses_json_and_rig_workdir
 test_dead_agent_restarts_one
 test_in_progress_hook_restarts_one
