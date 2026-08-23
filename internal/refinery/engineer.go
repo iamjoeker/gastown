@@ -1827,6 +1827,28 @@ func normalizedMRCloseReason(closeReason string) string {
 	return closeReason
 }
 
+// conflictTaskCreateOptions assembles the bead the refinery files when an MR
+// hits a merge conflict.
+//
+// Split out of createConflictResolutionTaskForMR to give the priority
+// derivation a test seam that does not need a live town layout. gt-ofb0 was a
+// wiring defect — a literal priority where a derivation belonged — so a rule
+// that is correct in isolation but never reaches CreateOptions is precisely the
+// failure being fixed, and it has to be checked at this boundary.
+func conflictTaskCreateOptions(mr *MRInfo, rigName, title, description string) beads.CreateOptions {
+	return beads.CreateOptions{
+		Title:  title,
+		Labels: []string{"gt:task"},
+		// This task BLOCKS the MR, so it has to outrank it. Inheriting the MR's
+		// own priority — or worse, a fixed P1 — leaves the blocker queued behind
+		// the very item it is holding up, and the queue deadlocks (gt-ofb0).
+		Priority:    BlockerPriority(mr.Priority),
+		Description: description,
+		Actor:       rigName + "/refinery",
+		Rig:         rigName, // Ensure task lands in the rig's database (gt-7y7)
+	}
+}
+
 // createConflictResolutionTaskForMR creates a dispatchable task for resolving merge conflicts.
 // This task will be picked up by bd ready and can be slung to a fresh polecat (spawned on demand).
 // Returns the created task's ID for blocking the MR until resolution.
@@ -1835,7 +1857,7 @@ func normalizedMRCloseReason(closeReason string) string {
 //
 //	Title: Resolve merge conflicts: <original-issue-title>
 //	Type: task
-//	Priority: inherit from original (ZFC: agent decides boost strategy)
+//	Priority: BlockerPriority(MR priority) — must outrank the MR it blocks (gt-ofb0)
 //	Parent: original MR bead
 //	Description: metadata including branch, conflict SHA, etc.
 //
@@ -1894,8 +1916,6 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 		}
 	}
 
-	// ZFC: pass raw priority. Agent decides boost strategy.
-
 	// Increment retry count for tracking
 	retryCount := mr.RetryCount + 1
 
@@ -1931,14 +1951,7 @@ The Refinery will automatically retry the merge after you push.`,
 
 	// Create the conflict resolution task
 	taskTitle := fmt.Sprintf("Resolve merge conflicts: %s", originalTitle)
-	task, err := e.beads.Create(beads.CreateOptions{
-		Title:       taskTitle,
-		Labels:      []string{"gt:task"},
-		Priority:    mr.Priority,
-		Description: description,
-		Actor:       e.rig.Name + "/refinery",
-		Rig:         e.rig.Name, // Ensure task lands in the rig's database (gt-7y7)
-	})
+	task, err := e.beads.Create(conflictTaskCreateOptions(mr, e.rig.Name, taskTitle, description))
 	if err != nil {
 		releaseSlotOnError()
 		return "", fmt.Errorf("creating conflict resolution task: %w", err)
@@ -1953,7 +1966,11 @@ The Refinery will automatically retry the merge after you push.`,
 	// The conflict task's ID is returned so the MR can be blocked on it.
 	// When the task closes, the MR unblocks and re-enters the ready queue.
 
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d)\n", task.ID, task.Priority)
+	// Print both sides of the relation: a blocker's priority only means anything
+	// relative to what it blocks, and that is the pair that has to be checked
+	// when this deadlocks again.
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d, blocking MR %s at P%d)\n",
+		task.ID, task.Priority, mr.ID, mr.Priority)
 
 	return task.ID, nil
 }

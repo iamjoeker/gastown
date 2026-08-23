@@ -401,6 +401,9 @@ func init() {
 	// Post-merge flags
 	mqPostMergeCmd.Flags().BoolVar(&mqPostMergeSkipBranchDelete, "skip-branch-delete", false, "Skip remote branch deletion")
 
+	// Blocker-priority flags
+	mqBlockerPriorityCmd.Flags().BoolVar(&mqBlockerPriorityJSON, "json", false, "Show the derivation as JSON")
+
 	// Add subcommands
 	mqCmd.AddCommand(mqSubmitCmd)
 	mqCmd.AddCommand(mqRetryCmd)
@@ -408,6 +411,7 @@ func init() {
 	mqCmd.AddCommand(mqRejectCmd)
 	mqCmd.AddCommand(mqStatusCmd)
 	mqCmd.AddCommand(mqPostMergeCmd)
+	mqCmd.AddCommand(mqBlockerPriorityCmd)
 
 	// Integration branch subcommands
 	mqIntegrationCreateCmd.Flags().StringVar(&mqIntegrationCreateBranch, "branch", "", "Override branch name template (supports {title}, {epic}, {prefix}, {user})")
