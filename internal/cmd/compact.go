@@ -60,9 +60,21 @@ type compactResult struct {
 	// currently every wisp, and a 700-element list would bloat the daily digest
 	// that embeds this struct. A non-zero value here is a defect report about
 	// whatever wrote those wisps, not a normal steady state.
-	Unclassified     int      `json:"unclassified"`
-	OrphanedWispDeps int      `json:"orphaned_wisp_deps"` // stale wisp_dependencies removed
-	Errors           []string `json:"errors,omitempty"`
+	Unclassified     int `json:"unclassified"`
+	OrphanedWispDeps int `json:"orphaned_wisp_deps"` // stale wisp_dependencies removed
+	// Archived counts the records written and fsynced BEFORE the delete pass
+	// ran, and ArchivedTo names where they went. They are part of the result
+	// because "N deleted" is only an auditable claim next to the place the N
+	// records can be read back from (gt-hv3p; see compact_archive.go).
+	Archived   int    `json:"archived,omitempty"`
+	ArchivedTo string `json:"archived_to,omitempty"`
+	// Failed counts wisps that fell out of the run because an operation on THAT
+	// wisp failed. It is what the summary's accounting check uses, because
+	// Errors also carries run-level failures — an unwritable archive, an
+	// orphaned-dependency sweep that errored — which belong in the operator's
+	// error list but describe no particular scanned row.
+	Failed int      `json:"failed,omitempty"`
+	Errors []string `json:"errors,omitempty"`
 }
 
 type compactAction struct {
@@ -81,6 +93,13 @@ var compactCmd = &cobra.Command{
 For non-closed wisps past TTL: promotes to permanent beads (something is stuck).
 For closed wisps past TTL: deletes them PERMANENTLY. Wisp tables are dolt-ignored,
 so there is no history to read AS OF and no backup to restore from.
+
+Every wisp is written and fsynced to the wisp archive that "gt reaper archive"
+reads BEFORE the delete pass starts, so an interrupted run leaves records with
+no deletion and never the reverse — the ids it removed are the archived ids
+minus the ids still in the wisps table. A run that cannot write its archive
+deletes nothing and reports those wisps as held.
+
 Wisps with comments or keep labels are always promoted.
 Pinned wisps, and wisps carrying a protected label (merge-request records),
 are never deleted.
@@ -250,7 +269,8 @@ func runCompact(cmd *cobra.Command, args []string) error {
 	// Role directories (<town>/deacon, <town>/mayor) have no .beads of their
 	// own, so cwd alone resolves to a database that does not exist — which is
 	// why gt compact used to work only from the town root.
-	bd := beads.New(beads.BeadsWorkDirWithTownFallback(workDir, townRoot))
+	beadsWorkDir := beads.BeadsWorkDirWithTownFallback(workDir, townRoot)
+	bd := beads.New(beadsWorkDir)
 	allWisps, err := listWisps(bd)
 	if err != nil {
 		return fmt.Errorf("listing wisps: %w", err)
@@ -262,18 +282,57 @@ func runCompact(cmd *cobra.Command, args []string) error {
 
 	result := &compactResult{Scanned: len(allWisps)}
 
+	// Pass 1 decides and writes nothing. The delete set has to be known in FULL
+	// before the first row goes, because the record that makes an interrupted
+	// run enumerable is written from it (gt-hv3p; see compact_archive.go).
+	decisions := make([]wispDecision, 0, len(allWisps))
+	var pendingDeletes []*compactIssue
 	for _, w := range allWisps {
 		age, err := wispAge(w, now)
 		if err != nil {
+			result.Failed++
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", w.ID, err))
 			continue
 		}
 
 		verdict := decideWisp(w, age, ttls)
+		decisions = append(decisions, wispDecision{wisp: w, verdict: verdict, age: age})
+		// wispProtection is consulted here as well as inside deleteWisp so the
+		// archive names only rows that will actually be deleted. deleteWisp
+		// keeps its own copy of the guard as the last line of defence for call
+		// sites added later — gt-6dp's post-mortem names reading the callee
+		// instead of the caller as the whole lesson.
+		if verdict.action == actionDelete && wispProtection(w) == "" {
+			pendingDeletes = append(pendingDeletes, w)
+		}
+	}
+
+	// The record goes to durable storage before the first deletion, or nothing
+	// is deleted this run.
+	deleteAllowed := true
+	if !compactDryRun && len(pendingDeletes) > 0 {
+		dbName := beads.DatabaseNameFromMetadata(beadsWorkDir)
+		deleteAllowed = archiveDeletions(bd, dbName, pendingDeletes, now, result)
+	}
+
+	// Pass 2 acts, in scan order.
+	for _, d := range decisions {
+		w, verdict := d.wisp, d.verdict
 		switch verdict.action {
 		case actionPromote:
 			promoteWisp(bd, w, verdict.reason, result)
 		case actionDelete:
+			if !deleteAllowed {
+				// Held, not skipped: reported through the same bucket as a
+				// pinned or labelled wisp so the summary still accounts for
+				// every scanned row and says why this one survived.
+				guard := wispProtection(w)
+				if guard == "" {
+					guard = "no durable record (wisp archive unavailable)"
+				}
+				holdWisp(w, guard, verdict.reason, result)
+				continue
+			}
 			deleteWisp(bd, w, verdict.reason, result)
 		case actionUnclassified:
 			result.Unclassified++
@@ -285,7 +344,7 @@ func runCompact(cmd *cobra.Command, args []string) error {
 			result.Skipped++
 			if compactVerbose && !compactJSON {
 				fmt.Printf("  skip  %s %s (age: %s, ttl: %s)\n",
-					w.ID, compactTruncate(w.Title, 40), age.Round(time.Minute), verdict.ttl)
+					w.ID, compactTruncate(w.Title, 40), d.age.Round(time.Minute), verdict.ttl)
 			}
 		}
 	}
@@ -325,6 +384,15 @@ type wispVerdict struct {
 	action wispAction
 	reason string
 	ttl    time.Duration
+}
+
+// wispDecision is one wisp and what compaction decided about it, held between
+// the decision pass and the pass that acts. The two passes exist so the delete
+// set is complete before anything is written — see compact_archive.go.
+type wispDecision struct {
+	wisp    *compactIssue
+	verdict wispVerdict
+	age     time.Duration
 }
 
 // decideWisp is the whole compaction policy, as a pure function.
@@ -587,6 +655,7 @@ func promoteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compac
 	// bd update --persistent sets ephemeral=false
 	_, err := bd.Run("update", w.ID, "--persistent")
 	if err != nil {
+		result.Failed++
 		result.Errors = append(result.Errors, fmt.Sprintf("promote %s: %v", w.ID, err))
 		return
 	}
@@ -611,17 +680,7 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 	// later inherits this check for free; it would not inherit a copy of the
 	// check written above each existing call.
 	if guard := wispProtection(w); guard != "" {
-		protected := compactAction{
-			ID:       w.ID,
-			Title:    w.Title,
-			Reason:   fmt.Sprintf("%s (would have been: %s)", guard, reason),
-			WispType: w.WispType,
-		}
-		result.Protected = append(result.Protected, protected)
-		if compactVerbose && !compactJSON {
-			fmt.Printf("  %s %s %s (%s)\n",
-				style.Dim.Render("protect"), w.ID, compactTruncate(w.Title, 40), protected.Reason)
-		}
+		holdWisp(w, guard, reason, result)
 		return
 	}
 
@@ -643,6 +702,7 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 	// protectedWispLabel above rather than inheriting bd's protection.
 	_, err := bd.Run("delete", w.ID, "--force")
 	if err != nil {
+		result.Failed++
 		result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", w.ID, err))
 		return
 	}
@@ -653,6 +713,36 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 		fmt.Printf("  %s %s %s (%s)\n",
 			style.Warning.Render("delete "), w.ID, compactTruncate(w.Title, 40), reason)
 	}
+}
+
+// holdWisp records a wisp that was past TTL and was NOT deleted, naming the
+// guard that held it and the action it would otherwise have received.
+//
+// Every hold goes through here rather than being counted, because gt-6dp's
+// recurring shape is a number that cannot distinguish "held N" from "there was
+// less to do".
+func holdWisp(w *compactIssue, guard, wouldHaveBeen string, result *compactResult) {
+	protected := compactAction{
+		ID:       w.ID,
+		Title:    w.Title,
+		Reason:   fmt.Sprintf("%s (would have been: %s)", guard, wouldHaveBeen),
+		WispType: w.WispType,
+	}
+	result.Protected = append(result.Protected, protected)
+	if compactVerbose && !compactJSON {
+		fmt.Printf("  %s %s %s (%s)\n",
+			style.Dim.Render("protect"), w.ID, compactTruncate(w.Title, 40), protected.Reason)
+	}
+}
+
+// compactAccounted is how many of the scanned wisps the summary can place in a
+// bucket. It counts Failed rather than len(Errors) because Errors also carries
+// run-level failures — an unwritable archive holds every pending deletion with
+// ONE message — and counting those as wisps makes a correct summary report
+// itself as incomplete.
+func compactAccounted(result *compactResult) int {
+	return len(result.Promoted) + len(result.Deleted) + len(result.Protected) +
+		result.Skipped + result.Unclassified + result.Failed
 }
 
 func printCompactSummary(result *compactResult) {
@@ -679,9 +769,16 @@ func printCompactSummary(result *compactResult) {
 			style.Warning.Render("Unclassified:"), result.Unclassified)
 	}
 	if protected > 0 {
-		fmt.Printf("  Protected: %d (past TTL, held by pin or label)\n", protected)
+		fmt.Printf("  Protected: %d (past TTL, held by pin, label, or a missing archive)\n", protected)
 	}
-	if accounted := promoted + deleted + protected + result.Skipped + result.Unclassified + len(result.Errors); accounted != result.Scanned {
+	// Printed next to Deleted, and only ever together with it: a deletion count
+	// is an auditable claim only alongside the place its records can be read
+	// back from (`gt reaper archive`).
+	if result.Archived > 0 {
+		fmt.Printf("  Archived: %d record(s) written to %s BEFORE deleting\n",
+			result.Archived, result.ArchivedTo)
+	}
+	if accounted := compactAccounted(result); accounted != result.Scanned {
 		// Every scanned wisp must land in exactly one bucket. If it does not,
 		// the summary is under-reporting and the counts above cannot be trusted
 		// as a description of what the run did.
@@ -782,20 +879,22 @@ func hasKeepLabel(w *compactIssue) bool {
 	return false
 }
 
+// wispTimeLayouts are the layouts a wisp timestamp may arrive in.
+//
+// The space-separated form is not hypothetical: bd renders a datetime column as
+// RFC3339 when it is selected bare and as "2006-01-02 15:04:05" once an
+// expression wraps it, so the format depends on how the query was written.
+// wispSelectColumns selects timestamps bare, and accepting the other form means
+// a later edit to the projection cannot turn every wisp into a parse error.
+var wispTimeLayouts = []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05"}
+
 // wispAge returns the age of a compactIssue.
 func wispAge(w *compactIssue, now time.Time) (time.Duration, error) {
 	ts := w.UpdatedAt
 	if ts == "" {
 		ts = w.CreatedAt
 	}
-	// The space-separated layout is not hypothetical: bd renders a datetime
-	// column as RFC3339 when it is selected bare and as "2006-01-02 15:04:05"
-	// once an expression wraps it, so the format depends on how the query was
-	// written. wispSelectColumns selects timestamps bare, and this accepts the
-	// other form so that a later edit to the projection cannot turn every wisp
-	// into a parse error.
-	layouts := []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05"}
-	for _, layout := range layouts {
+	for _, layout := range wispTimeLayouts {
 		if t, err := time.Parse(layout, ts); err == nil {
 			return now.Sub(t), nil
 		}

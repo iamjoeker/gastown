@@ -85,12 +85,18 @@ type compactReport struct {
 	// the digest reports the size of the input alongside the outcome. Without
 	// them a digest of all-zeroes describes a tidy town and a compaction pass
 	// that saw nothing identically — the shape of gt-ktvs.
-	Scanned      int                       `json:"scanned"`
-	Unclassified int                       `json:"unclassified"`
-	Categories   map[string]*categoryStats `json:"categories"`
-	Promotions   []compactAction           `json:"promotions,omitempty"`
-	Anomalies    []string                  `json:"anomalies,omitempty"`
-	Errors       []string                  `json:"errors,omitempty"`
+	Scanned      int `json:"scanned"`
+	Unclassified int `json:"unclassified"`
+	// Archived and ArchivedTo carry the pre-delete record forward from the
+	// compaction run. The digest is the audit artifact for what a run deleted,
+	// and the one question the 2026-08-22 incident could not answer was where
+	// the deleted wisps could be read back from (gt-hv3p).
+	Archived   int                       `json:"archived,omitempty"`
+	ArchivedTo string                    `json:"archived_to,omitempty"`
+	Categories map[string]*categoryStats `json:"categories"`
+	Promotions []compactAction           `json:"promotions,omitempty"`
+	Anomalies  []string                  `json:"anomalies,omitempty"`
+	Errors     []string                  `json:"errors,omitempty"`
 }
 
 // weeklyRollup aggregates daily reports for trend data.
@@ -111,25 +117,59 @@ var compactReportCmd = &cobra.Command{
 The daily digest shows per-category breakdown of deleted, promoted, and active
 wisps, plus any promotions with reasons and detected anomalies.
 
+THIS COMMAND RUNS A REAL COMPACTION to produce the digest: closed wisps past
+their TTL are deleted permanently, and wisp tables are dolt-ignored, so there is
+no history to read AS OF and no backup to restore from. --dry-run is the only
+flag that makes it a query — it now runs the compaction in dry-run mode too.
+--json is an output format and deletes exactly as much as the bare command;
+combine it with --dry-run to preview.
+
 The weekly rollup (--weekly) aggregates the past 7 days of compaction event
 beads and sends trend data to mayor/.
 
 Examples:
-  gt compact report              # Run compaction + send daily digest
-  gt compact report --dry-run    # Preview the report without sending
-  gt compact report --weekly     # Send weekly rollup to mayor/
-  gt compact report --json       # Output report as JSON`,
+  gt compact report                   # Run compaction + send daily digest
+  gt compact report --dry-run         # Preview: deletes nothing, sends nothing
+  gt compact report --weekly          # Send weekly rollup to mayor/
+  gt compact report --json            # Run compaction, print report as JSON
+  gt compact report --dry-run --json  # Preview as JSON`,
 	RunE: runCompactReport,
 }
 
 func init() {
-	compactReportCmd.Flags().BoolVar(&compactReportDryRun, "dry-run", false, "Preview report without sending")
+	compactReportCmd.Flags().BoolVar(&compactReportDryRun, "dry-run", false, "Preview: run compaction in dry-run mode, delete nothing, send nothing")
 	compactReportCmd.Flags().BoolVar(&compactReportWeekly, "weekly", false, "Generate weekly rollup instead of daily digest")
 	compactReportCmd.Flags().BoolVarP(&compactReportVerbose, "verbose", "v", false, "Verbose output")
 	compactReportCmd.Flags().StringVar(&compactReportDate, "date", "", "Report for specific date (YYYY-MM-DD); default: today")
-	compactReportCmd.Flags().BoolVar(&compactReportJSON, "json", false, "Output report as JSON")
+	compactReportCmd.Flags().BoolVar(&compactReportJSON, "json", false, "Output report as JSON (still runs a real compaction; add --dry-run to preview)")
 
 	compactCmd.AddCommand(compactReportCmd)
+}
+
+// compactSubprocessArgs returns the argv this command runs compaction with.
+//
+// --dry-run is passed THROUGH, and that pass-through is the whole of gt-hv3p.
+// This command used to exec `gt compact --json` unconditionally and consult its
+// own --dry-run flag 38 lines further down, by which point the subprocess had
+// already deleted. The flag suppressed the audit bead and the digest mail — the
+// two artifacts that would have left a trace — and nothing else, so the safest-
+// looking form of the command was the one that deleted without a record.
+//
+// It fired on 2026-08-22: `gt compact report --dry-run`, run verbatim from step
+// 19 of mol-deacon-patrol, destroyed 454 wisps and printed nothing at all. The
+// step had been harmless only by accident until the day before, because
+// compaction sourced its wisp list from `bd list`, which does not return the
+// wisps table (hq-xlwa); repairing that blindness armed this.
+//
+// Do not reintroduce a caller that builds this argv by hand. The reason the
+// defect survived review is that `exec.Command("gt", "compact", "--json")` reads
+// as a query at the call site, and only the flag it omits makes it one.
+func compactSubprocessArgs(dryRun bool) []string {
+	args := []string{"compact", "--json"}
+	if dryRun {
+		args = append(args, "--dry-run")
+	}
+	return args
 }
 
 func runCompactReport(cmd *cobra.Command, args []string) error {
@@ -163,7 +203,7 @@ func runDailyDigest() error {
 	}
 
 	// Run compaction with --json to get results
-	compactOut, err := exec.Command("gt", "compact", "--json").Output()
+	compactOut, err := exec.Command("gt", compactSubprocessArgs(compactReportDryRun)...).Output() //nolint:gosec // G204: argv is built from a bool, not user input
 	if err != nil {
 		return fmt.Errorf("running compaction: %w", err)
 	}
@@ -248,6 +288,8 @@ func buildReport(dateStr string, result *compactResult, activeWisps []*compactIs
 		Date:         dateStr,
 		Scanned:      result.Scanned,
 		Unclassified: result.Unclassified,
+		Archived:     result.Archived,
+		ArchivedTo:   result.ArchivedTo,
 		Categories:   make(map[string]*categoryStats),
 		Errors:       result.Errors,
 	}
@@ -361,6 +403,15 @@ func formatDailyDigest(report *compactReport) string {
 		sb.WriteString(fmt.Sprintf(", %d left untouched for having no wisp_type", report.Unclassified))
 	}
 	sb.WriteString(".\n")
+
+	// Where the deleted records can be read back from. Wisps are unversioned
+	// and unbacked, so a digest that reports a deletion count without naming
+	// the archive is describing an unrecoverable event (gt-hv3p).
+	if report.Archived > 0 {
+		sb.WriteString(fmt.Sprintf(
+			"\n%d record(s) were written to `%s` before deletion — read them back with `gt reaper archive`.\n",
+			report.Archived, report.ArchivedTo))
+	}
 
 	// Promotions
 	if len(report.Promotions) > 0 {
