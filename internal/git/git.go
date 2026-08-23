@@ -1044,6 +1044,15 @@ func (g *Git) ForkBackedRemote(remote string) bool {
 // for default-branch work. In split push-url setups origin still fetches from
 // upstream, so origin/<default> is clean. When origin itself is a fork and a
 // distinct upstream remote is present, upstream/<default> is the clean base.
+//
+// This is the CONSERVATIVE base: the furthest-downstream ref work has to reach
+// before it is safe to consider it gone for good. Deletion paths want it — a
+// branch whose commits have only reached the fork has not landed anywhere
+// permanent, so pruning it would destroy the only copy.
+//
+// It is NOT the ref a polecat branch merges into on a fork-backed rig. Use
+// MergeTargetDefaultBranchBaseRef for that; the two answers differ exactly where
+// the fork's default branch is authoritative (gt-lj2n).
 func (g *Git) CleanDefaultBranchBaseRef(remote, defaultBranch string) string {
 	if defaultBranch == "" {
 		defaultBranch = "main"
@@ -1056,13 +1065,64 @@ func (g *Git) CleanDefaultBranchBaseRef(remote, defaultBranch string) string {
 	return remote + "/" + defaultBranch
 }
 
+// MergeTargetDefaultBranchBaseRef returns the ref that default-branch work on
+// this rig is actually merged into — the base to measure a branch against, to
+// rebase it onto, and to record as its pre-verified base.
+//
+// gt-lj2n: CleanDefaultBranchBaseRef's premise is that a fork's default branch
+// is a stale subset of upstream's, so upstream is the truer base. That is false
+// under the Refinery topology, where every MR is merged into the rig's OWN
+// origin/<default> and upstream is a public repo carrying none of it (measured
+// on the beads rig: origin/main 112 ahead, upstream/main 57 ahead). Measuring
+// polecat work against upstream/<default> there inflated commits-ahead by the
+// whole divergence, so gt done's zero-commit no-MR early return was never
+// entered, and control fell through to an auto-rebase onto a foreign base that
+// could only conflict — failing before any MR was created. Every polecat on such
+// a rig was blocked, including one with nothing to submit, which is also how the
+// no-changes escape hatch that bounds spawn storms got blocked.
+//
+// So a fork whose default branch carries commits upstream does not have is
+// authoritative for this rig's work and is its own merge target. Only a fork
+// that is behind-or-equal is stale enough for upstream to be the base. The check
+// is self-evidencing from git state and needs no new config; where the
+// comparison cannot be made — crew checkouts configure upstream but never fetch
+// it, so the ref does not resolve — the answer is unknown, not diverged, and the
+// conservative base is kept.
+func (g *Git) MergeTargetDefaultBranchBaseRef(remote, defaultBranch string) string {
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	base := g.CleanDefaultBranchBaseRef(remote, defaultBranch)
+	if base != "upstream/"+defaultBranch {
+		return base
+	}
+	if ahead, err := g.CommitsAhead("upstream/"+defaultBranch, remote+"/"+defaultBranch); err == nil && ahead > 0 {
+		return remote + "/" + defaultBranch
+	}
+	return base
+}
+
 // CleanBaseRef returns a fully qualified base ref for a target branch. Explicit
 // origin/ or upstream/ refs are preserved; default-branch targets use the clean
 // fork-aware base.
 func (g *Git) CleanBaseRef(remote, defaultBranch, target string) string {
+	return baseRefForTarget(remote, defaultBranch, target, g.CleanDefaultBranchBaseRef)
+}
+
+// MergeTargetBaseRef is CleanBaseRef for merge-bound work: an explicit target is
+// still honoured verbatim, and only the default-branch case consults the rig's
+// real merge target.
+func (g *Git) MergeTargetBaseRef(remote, defaultBranch, target string) string {
+	return baseRefForTarget(remote, defaultBranch, target, g.MergeTargetDefaultBranchBaseRef)
+}
+
+// baseRefForTarget holds the target-qualification rules the two base-ref
+// resolvers share, so an explicit target can never be interpreted differently
+// depending on which of them the caller reached for.
+func baseRefForTarget(remote, defaultBranch, target string, defaultBase func(string, string) string) string {
 	target = strings.TrimSpace(target)
 	if target == "" || target == defaultBranch {
-		return g.CleanDefaultBranchBaseRef(remote, defaultBranch)
+		return defaultBase(remote, defaultBranch)
 	}
 	if strings.HasPrefix(target, "origin/") || strings.HasPrefix(target, "upstream/") {
 		return target

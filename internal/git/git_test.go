@@ -2846,6 +2846,173 @@ func TestForkBackedDefaultPushGuard_OriginForkWithUpstream(t *testing.T) {
 	}
 }
 
+// initTestRepoWithForkAndUpstream mirrors a Refinery-topology rig: origin is the
+// rig's own fork (fetch AND push) and upstream is the public repo, and BOTH are
+// fetched so refs/remotes/upstream/<default> actually resolves. Crew checkouts
+// configure upstream without ever fetching it; that case is covered separately
+// because a non-resolving ref must read as unknown, never as diverged.
+func initTestRepoWithForkAndUpstream(t *testing.T) (string, string, string, string) {
+	t.Helper()
+	localDir, upstream, fork, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Fatalf("ClearPushURL: %v", err)
+	}
+	if _, err := g.SetRemoteURL("origin", fork); err != nil {
+		t.Fatalf("SetRemoteURL origin fork: %v", err)
+	}
+	if err := g.AddUpstreamRemote(upstream); err != nil {
+		t.Fatalf("AddUpstreamRemote: %v", err)
+	}
+	runGitTestCmd(t, localDir, "fetch", "origin")
+	runGitTestCmd(t, localDir, "fetch", "upstream")
+	return localDir, upstream, fork, mainBranch
+}
+
+// commitInTestRepo writes a file and commits it on the current branch.
+func commitInTestRepo(t *testing.T, dir, name, message string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(name+"\n"), 0644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	runGitTestCmd(t, dir, "add", name)
+	runGitTestCmd(t, dir, "commit", "-m", message)
+}
+
+// TestMergeTargetDefaultBranchBaseRef_ForkAheadOfUpstreamUsesOrigin covers
+// gt-lj2n: the Refinery merges MRs into the rig's own origin/<default>, so once
+// the fork carries commits upstream has never seen it is authoritative and is
+// its own merge target. Basing on upstream/<default> there measured polecat
+// branches against a foreign base and blocked every MQ submission.
+func TestMergeTargetDefaultBranchBaseRef_ForkAheadOfUpstreamUsesOrigin(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+	g := NewGit(localDir)
+
+	// A Refinery merge lands on the fork's default branch only.
+	commitInTestRepo(t, localDir, "refinery.txt", "Merge polecat/crater/gt-lj2n into "+mainBranch)
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "fetch", "origin")
+
+	if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "origin/"+mainBranch {
+		t.Fatalf("MergeTargetDefaultBranchBaseRef fork-ahead = %q, want origin/%s", got, mainBranch)
+	}
+	// The conservative base is unchanged: work that has only reached the fork
+	// has not landed anywhere permanent, so deletion paths must still wait for
+	// upstream.
+	if got := g.CleanDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+		t.Fatalf("CleanDefaultBranchBaseRef fork-ahead = %q, want upstream/%s", got, mainBranch)
+	}
+
+	// The zero-commit half of the bug: a polecat branch with nothing of its own
+	// must measure as zero commits ahead, so gt done takes the no-MR early
+	// return instead of falling through to the auto-rebase. The upstream count
+	// is the control — it proves the fixture really reproduces the divergence,
+	// so a passing assertion above cannot be a vacuous zero.
+	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/crater/gt-lj2n")
+	ahead, err := g.CommitsAhead(g.MergeTargetDefaultBranchBaseRef("origin", mainBranch), "HEAD")
+	if err != nil {
+		t.Fatalf("CommitsAhead against clean base: %v", err)
+	}
+	if ahead != 0 {
+		t.Fatalf("zero-commit branch is %d commits ahead of the clean base, want 0", ahead)
+	}
+	staleAhead, err := g.CommitsAhead("upstream/"+mainBranch, "HEAD")
+	if err != nil {
+		t.Fatalf("CommitsAhead against upstream: %v", err)
+	}
+	if staleAhead == 0 {
+		t.Fatal("control failed: upstream base also reports 0 ahead, so this fixture does not reproduce the divergence")
+	}
+}
+
+// TestMergeTargetBaseRef_ExplicitTargetMatchesCleanBaseRef pins the two
+// resolvers to the same answer everywhere except the default-branch case. An
+// explicit target that meant different things depending on which helper the
+// caller reached for would be a worse bug than the one gt-lj2n fixed.
+func TestMergeTargetBaseRef_ExplicitTargetMatchesCleanBaseRef(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+	g := NewGit(localDir)
+
+	// Put the rig in the state where the default-branch answers diverge, so a
+	// match on the explicit targets below is not a coincidence of both helpers
+	// agreeing about everything.
+	commitInTestRepo(t, localDir, "refinery.txt", "Merge polecat/crater/gt-lj2n into "+mainBranch)
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "fetch", "origin")
+	if g.MergeTargetDefaultBranchBaseRef("origin", mainBranch) == g.CleanDefaultBranchBaseRef("origin", mainBranch) {
+		t.Fatal("control failed: the two default-branch bases agree, so this fixture proves nothing")
+	}
+
+	for _, target := range []string{"release-1.0", "origin/release-1.0", "upstream/" + mainBranch, "  release-1.0  "} {
+		clean := g.CleanBaseRef("origin", mainBranch, target)
+		merge := g.MergeTargetBaseRef("origin", mainBranch, target)
+		if clean != merge {
+			t.Fatalf("target %q: CleanBaseRef = %q but MergeTargetBaseRef = %q", target, clean, merge)
+		}
+	}
+}
+
+// TestMergeTargetDefaultBranchBaseRef_ForkNotAheadKeepsUpstream is the
+// regression guard: where the fork is a stale subset of upstream, the base is
+// unchanged.
+func TestMergeTargetDefaultBranchBaseRef_ForkNotAheadKeepsUpstream(t *testing.T) {
+	t.Run("mains identical", func(t *testing.T) {
+		localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+		g := NewGit(localDir)
+		if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+			t.Fatalf("MergeTargetDefaultBranchBaseRef equal = %q, want upstream/%s", got, mainBranch)
+		}
+	})
+
+	t.Run("fork behind upstream", func(t *testing.T) {
+		localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+		g := NewGit(localDir)
+
+		runGitTestCmd(t, localDir, "checkout", "-b", "upstream-work")
+		commitInTestRepo(t, localDir, "upstream.txt", "upstream-only commit")
+		runGitTestCmd(t, localDir, "push", "upstream", "HEAD:"+mainBranch)
+		runGitTestCmd(t, localDir, "checkout", mainBranch)
+		runGitTestCmd(t, localDir, "fetch", "upstream")
+
+		behind, err := g.CommitsAhead("origin/"+mainBranch, "upstream/"+mainBranch)
+		if err != nil {
+			t.Fatalf("CommitsAhead: %v", err)
+		}
+		if behind == 0 {
+			t.Fatal("control failed: upstream is not ahead of the fork, so this fixture does not exercise the stale-fork case")
+		}
+		if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+			t.Fatalf("MergeTargetDefaultBranchBaseRef fork-behind = %q, want upstream/%s", got, mainBranch)
+		}
+	})
+}
+
+// TestMergeTargetDefaultBranchBaseRef_UnfetchedUpstreamIsUnknownNotDiverged
+// covers the crew-checkout shape: upstream is configured but never fetched, so
+// the comparison cannot be made. An unresolvable ref must not be read as
+// divergence — behaviour there is left exactly as it was.
+func TestMergeTargetDefaultBranchBaseRef_UnfetchedUpstreamIsUnknownNotDiverged(t *testing.T) {
+	localDir, upstream, fork, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Fatalf("ClearPushURL: %v", err)
+	}
+	if _, err := g.SetRemoteURL("origin", fork); err != nil {
+		t.Fatalf("SetRemoteURL origin fork: %v", err)
+	}
+	if err := g.AddUpstreamRemote(upstream); err != nil {
+		t.Fatalf("AddUpstreamRemote: %v", err)
+	}
+	runGitTestCmd(t, localDir, "fetch", "origin")
+
+	// Control: the upstream ref genuinely does not resolve here.
+	runGitTestCmdWantFailure(t, localDir, "rev-parse", "--verify", "refs/remotes/upstream/"+mainBranch)
+
+	if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+		t.Fatalf("MergeTargetDefaultBranchBaseRef unfetched = %q, want upstream/%s", got, mainBranch)
+	}
+}
+
 func TestForkBackedDefaultPushGuard_AllowsNormalDefaultPush(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)

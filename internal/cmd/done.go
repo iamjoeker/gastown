@@ -1036,7 +1036,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 	// defaultBranch was resolved before the branch lookup above — the branch
 	// resolver needs it to rule out the default branch as a work branch.
-	baseRef := g.CleanBaseRef("origin", defaultBranch, doneTarget)
+	// The MR-bound base: what this rig's work actually merges into. On a
+	// fork-backed rig whose own default branch carries the Refinery's merges,
+	// that is origin/<default>, not upstream/<default> (gt-lj2n).
+	baseRef := g.MergeTargetBaseRef("origin", defaultBranch, doneTarget)
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
@@ -1299,7 +1302,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			alreadyPushed := checkpoints[CheckpointPushed] == branch
 			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed)
 			if rebaseErr != nil {
-				return rebaseErr
+				// gt-lj2n: returning here creates no MR and tells nobody. Make
+				// it loud — escalate and nudge the Witness — but still exit
+				// non-zero, so a blocked polecat is never mistaken for idle.
+				return escalateDoneRebaseFailure(townRoot, rigName, sender, issueID, branch, contaminationBase, contam.Behind, rebaseErr)
 			}
 			if rebased {
 				fmt.Printf("%s Branch rebased onto %s\n", style.Bold.Render("✓"), contaminationBase)
@@ -1927,7 +1933,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			strandReq := strandedDoneRequest{
 				IssueID:   issueID,
 				Branch:    branch,
-				BaseRef:   g.CleanBaseRef("origin", defaultBranch, target),
+				BaseRef:   g.MergeTargetBaseRef("origin", defaultBranch, target),
 				CommitSHA: commitSHA,
 				Worker:    worker,
 				Rig:       rigName,
@@ -1968,7 +1974,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				description += fmt.Sprintf("\npre_verified_at: %s", time.Now().UTC().Format(time.RFC3339))
 				// Capture current clean target HEAD as the verified base.
 				// The polecat rebased onto this SHA before running gates.
-				verifiedBaseRef := g.CleanBaseRef("origin", defaultBranch, target)
+				verifiedBaseRef := g.MergeTargetBaseRef("origin", defaultBranch, target)
 				if verifiedBase, baseErr := g.Rev(verifiedBaseRef); baseErr == nil {
 					description += fmt.Sprintf("\npre_verified_base: %s", verifiedBase)
 				} else {

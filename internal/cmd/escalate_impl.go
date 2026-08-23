@@ -97,156 +97,58 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Create escalation bead
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	// Create and route the escalation. The record + routing lives in
+	// raiseEscalation so gt done can raise one too (gt-lj2n) without
+	// reimplementing the durable-twin rules.
 	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
-	if fingerprintLabel != "" {
-		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
-		if err != nil {
-			return fmt.Errorf("checking escalation fingerprint: %w", err)
-		}
-		if len(matches) > 0 {
-			existing := matches[0]
-			if escalateJSON {
-				result := map[string]interface{}{
-					"id":          existing.ID,
-					"status":      "duplicate_suppressed",
-					"fingerprint": fingerprintLabel,
-				}
-				out, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
-				fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
-			}
-			return nil
-		}
-	}
-	fields := &beads.EscalationFields{
+	outcome, err := raiseEscalation(escalationRequest{
+		TownRoot:    townRoot,
+		AgentID:     agentID,
+		Description: description,
 		Severity:    severity,
 		Reason:      escalateReason,
 		Source:      escalateSource,
-		EscalatedBy: agentID,
-		EscalatedAt: time.Now().Format(time.RFC3339),
 		RelatedBead: escalateRelatedBead,
 		Fingerprint: fingerprintLabel,
-	}
-
-	issue, err := bd.CreateEscalationBead(description, fields)
+		Config:      escalationConfig,
+	})
 	if err != nil {
-		return fmt.Errorf("creating escalation bead: %w", err)
+		return err
 	}
 
-	// Get routing actions for this severity
-	actions := escalationConfig.GetRouteForSeverity(severity)
-	targets := extractMailTargetsFromActions(actions)
-
-	// Send mail to each target (actions with "mail:" prefix)
-	router := mail.NewRouter(townRoot)
-	defer router.WaitPendingNotifications()
-	// Statuses start EMPTY. A status is appended only once its channel has been
-	// attempted, and its success flags are set only from a real result. Seeding
-	// this slice with a hardcoded {Channel: "bead", Created: true} was the whole
-	// of the "bead" action's implementation (gt-3i4e): a claim that could never
-	// report failure, printed on every escalation at every severity.
-	var statuses []deliveryStatus
-	for _, target := range targets {
-		status := deliveryStatus{Target: target, Channel: "mail", Severity: severity, NotificationRoute: "mail+nudge"}
-		msg := &mail.Message{
-			From:     agentID,
-			To:       target,
-			Subject:  fmt.Sprintf("[%s] %s", strings.ToUpper(severity), description),
-			Body:     formatEscalationMailBody(issue.ID, severity, escalateReason, agentID, escalateRelatedBead),
-			Type:     mail.TypeEscalation,
-			ThreadID: issue.ID,
-		}
-
-		// Set priority based on severity
-		switch severity {
-		case config.SeverityCritical:
-			msg.Priority = mail.PriorityUrgent
-		case config.SeverityHigh:
-			msg.Priority = mail.PriorityHigh
-		case config.SeverityMedium:
-			msg.Priority = mail.PriorityNormal
-		default:
-			msg.Priority = mail.PriorityLow
-		}
-
-		if err := router.Send(msg); err != nil {
-			status.Error = err.Error()
-			statuses = append(statuses, status)
-			style.PrintWarning("failed to send to %s: %v", target, err)
-			continue
-		}
-		status.Persisted = true
-		status.RuntimeNotified = true
-
-		mailBeads := beads.New(beads.ResolveBeadsDir(townRoot))
-		mailIssue, err := mailBeads.FindLatestIssueByTitleAndAssignee(msg.Subject, mail.AddressToIdentity(target))
-		if err != nil {
-			status.Warning = fmt.Sprintf("annotation lookup failed: %v", err)
-			statuses = append(statuses, status)
-			style.PrintWarning("failed to annotate escalation mail for %s: %v", target, err)
-			continue
-		}
-		status.BeadID = mailIssue.ID
-
-		addLabels := []string{
-			fmt.Sprintf("severity:%s", severity),
-			fmt.Sprintf("escalation:%s", issue.ID),
-		}
-		if err := mailBeads.Update(mailIssue.ID, beads.UpdateOptions{AddLabels: addLabels}); err != nil {
-			status.Warning = fmt.Sprintf("annotation update failed: %v", err)
-			style.PrintWarning("failed to annotate escalation mail labels for %s: %v", target, err)
+	if outcome.Duplicate {
+		if escalateJSON {
+			result := map[string]interface{}{
+				"id":          outcome.RecordID,
+				"status":      "duplicate_suppressed",
+				"fingerprint": fingerprintLabel,
+			}
+			out, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(out))
 		} else {
-			status.Annotated = true
+			fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), outcome.RecordID)
+			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		statuses = append(statuses, status)
+		return nil
 	}
-
-	// Execute the "bead" routing action. It runs after the mail loop on purpose:
-	// a successfully annotated mail copy already IS the durable delivery bead, so
-	// this only creates one when nothing else has (see deliverEscalationBead).
-	beadStatus := deliverEscalationBead(bd, actions, statuses, issue.ID, severity,
-		fmt.Sprintf("[%s] %s", strings.ToUpper(severity), description),
-		formatEscalationDeliveryBody(issue.ID, description, fields))
-	if beadStatus != nil {
-		// Prepend: "bead" is listed first in every configured route, and the
-		// durable record reads before the notifications about it.
-		statuses = append([]deliveryStatus{*beadStatus}, statuses...)
-	}
-
-	// Process external notification actions (email:, sms:, slack, log)
-	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
-
-	// Log to activity feed
-	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
-	payload["severity"] = severity
-	payload["actions"] = strings.Join(actions, ",")
-	if escalateSource != "" {
-		payload["source"] = escalateSource
-	}
-	_ = events.LogFeed(events.TypeEscalationSent, agentID, payload)
 
 	// Output
-	delivered := escalationWasDelivered(statuses)
 	if escalateJSON {
 		hasFailure := false
-		for _, status := range statuses {
+		for _, status := range outcome.Statuses {
 			if status.Error != "" {
 				hasFailure = true
 				break
 			}
 		}
 		result := map[string]interface{}{
-			"id":        issue.ID,
+			"id":        outcome.RecordID,
 			"severity":  severity,
-			"actions":   actions,
-			"targets":   targets,
-			"delivery":  statuses,
-			"status":    escalationDeliveryStatus(delivered, hasFailure),
-			"delivered": delivered,
+			"actions":   outcome.Actions,
+			"targets":   outcome.Targets,
+			"delivery":  outcome.Statuses,
+			"status":    escalationDeliveryStatus(outcome.Delivered, hasFailure),
+			"delivered": outcome.Delivered,
 		}
 		if escalateSource != "" {
 			result["source"] = escalateSource
@@ -258,7 +160,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		fmt.Println(string(out))
 	} else {
 		emoji := severityEmoji(severity)
-		fmt.Printf("%s Escalation created: %s\n", emoji, issue.ID)
+		fmt.Printf("%s Escalation created: %s\n", emoji, outcome.RecordID)
 		fmt.Printf("  Severity: %s\n", severity)
 		if escalateSource != "" {
 			fmt.Printf("  Source: %s\n", escalateSource)
@@ -266,34 +168,28 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if fingerprintLabel != "" {
 			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		if beadStatus != nil && beadStatus.BeadID != "" {
+		if outcome.DurableBeadID != "" {
 			// The record itself is an ephemeral wisp; this is the bead that
 			// outlives it and that `gt escalate list` renders.
-			fmt.Printf("  Recorded as: %s\n", beadStatus.BeadID)
+			fmt.Printf("  Recorded as: %s\n", outcome.DurableBeadID)
 		}
-		if len(targets) > 0 {
-			fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
+		if len(outcome.Targets) > 0 {
+			fmt.Printf("  Routed to: %s\n", strings.Join(outcome.Targets, ", "))
 		} else {
 			// An empty "Routed to:" is how this bug hid for so long — it reads
 			// as a rendering glitch rather than as "nobody was told".
-			fmt.Printf("  Routed to: no mail targets (%s route: %s)\n", severity, strings.Join(actions, ", "))
+			fmt.Printf("  Routed to: no mail targets (%s route: %s)\n", severity, strings.Join(outcome.Actions, ", "))
 		}
-		for _, status := range statuses {
+		for _, status := range outcome.Statuses {
 			if status.Error != "" {
 				fmt.Printf("  Delivery issue [%s:%s]: %s\n", status.Channel, status.Target, status.Error)
 			}
 		}
 	}
 
-	// A routing no-op must never print a success banner and exit 0. The record
-	// exists, but it is an ephemeral wisp with nothing durable referencing it, so
-	// it will be garbage-collected unread — which is exactly how the dn-qpk
-	// disposition was lost for 16 days (gt-3i4e).
-	if !delivered {
-		return fmt.Errorf("escalation %s was recorded but NOT delivered: the %q route (%s) produced no delivery, "+
-			"and the record is an ephemeral wisp that will be garbage-collected with no trace. "+
-			"Fix the route in %s, or re-file at a higher severity",
-			issue.ID, severity, strings.Join(actions, ", "), config.EscalationConfigPath(townRoot))
+	// A routing no-op must never print a success banner and exit 0.
+	if !outcome.Delivered {
+		return undeliveredEscalationError(townRoot, outcome.RecordID, severity, outcome.Actions)
 	}
 
 	return nil
