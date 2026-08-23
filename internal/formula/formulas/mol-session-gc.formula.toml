@@ -25,12 +25,24 @@ This is infrastructure work. You:
 
 ## Safety
 
-GC is destructive. This formula errs on the side of caution:
-- Conservative mode: Only obviously dead things
-- Aggressive mode: Includes old but possibly-recoverable state
+🚨 **THIS FORMULA IS HELD AT STEP `execute-gc`. (Mayor ruling 2026-08-22, hq-5dj0d, P0)**
+**Slinging it is also prohibited.** See that step and hq-5dj0d for the reasons.
 
-Running `gt doctor --fix` handles most of this. This formula wraps it with
-reporting and multi-rig scope."""
+GC is destructive, and the reassurances that used to be in this section were
+FALSE. Corrected:
+
+- **`mode` does NOT bound the blast radius.** The `gt doctor --fix` call in
+  `execute-gc` sits ABOVE the mode branch, so `mode=conservative` runs it in
+  full. `mode` only gates the aggressive extras below it.
+- **"Only obviously dead things" was wrong.** Unfiltered `gt doctor --fix` runs
+  ~90 checks and mutates tracked config: it deletes tracked `settings.json`,
+  rewrites `daemon.json`, and re-appends the Dolt section to the town
+  `CLAUDE.md` (found duplicated and committed — hq-tiwt3).
+- **It is not a session-GC tool.** Treating it as one is what made this formula
+  look safe to dispatch every patrol cycle.
+
+Steps 1 and 2 (detect/preview) are safe and may still be run for reporting.
+Deleting is held."""
 formula = "mol-session-gc"
 version = 1
 
@@ -114,15 +126,36 @@ id = "execute-gc"
 title = "Execute garbage collection"
 needs = ["preview-cleanup"]
 description = """
-Actually remove the garbage.
+🚨 **THIS STEP IS HELD IN EVERY MODE. DO NOT EXECUTE IT.**
+**(Mayor ruling, re-issued 2026-08-22 as hq-5dj0d, P0. Supersedes the lost hq-6yx.)**
 
-**1. Run doctor with fix:**
+**1. PROHIBITED — do NOT run bare `gt doctor --fix`:**
 ```bash
-gt doctor --fix
-# This handles sessions, processes, and wisps
+# PROHIBITED — unfiltered, full-workspace, ~90 checks.
+# Shown commented out ON PURPOSE so it is inert if copied verbatim.
+# Do NOT uncomment. Do NOT reconstruct it by hand.
+# gt doctor --fix
 ```
 
-**2. For aggressive mode, additional cleanup:**
+`mode` does NOT gate this line — it is above the mode branch, so
+`mode=conservative` runs it in full. Unfiltered `gt doctor --fix` deletes tracked
+`settings.json`, rewrites `daemon.json`, and re-appends the Dolt section to the
+town `CLAUDE.md`, which is injected into every agent context — so the duplication
+compounds on every run. That damage is already present and committed.
+
+The comment "this handles sessions, processes, and wisps" understates the blast
+radius: it also handles ~87 other checks, several of them destructive to tracked
+config. It is not a session-GC tool.
+
+**Until this step is scoped to specific checks, report the preview from
+`preview-cleanup` and delete nothing.** Do not substitute another sweeping
+command for it. If a dog reaches this step, it stops here and reports HELD.
+
+The patrol formula's `session-gc` step no longer dispatches this molecule
+(mol-deacon-patrol, step `session-gc`). If you were slung here, say so in your
+report — that dispatch is itself prohibited.
+
+**2. For aggressive mode, additional cleanup (ALSO HELD — the step is held as a whole):**
 ```bash
 # Old branches (if aggressive mode)
 git branch -D <old-branch>
@@ -139,7 +172,7 @@ Record each item actually removed for the report.
 - Never delete branches with uncommitted polecat work
 - Never delete wisps < 1 hour old
 
-**Exit criteria:** Garbage collected."""
+**Exit criteria:** Step reported as HELD. Nothing deleted."""
 
 [[steps]]
 id = "verify-cleanup"
