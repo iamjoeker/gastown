@@ -373,7 +373,41 @@ test_agent_hung_observe_only() {
   assert_file_empty "$TEST_STATE/mail.log" "active research: no restart mail"
   assert_file_empty "$TEST_STATE/escalate.log" "active research: no mass-death escalation"
   assert_file_contains "$TEST_STATE/output.log" "OBSERVE: gt-research runtime alive" "active research: observed live runtime"
-  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 1 healthy" "active research: counted healthy"
+  # NOT healthy: the health API reports healthy:false, zombie:true for
+  # agent-hung. The restraint above (no kill) is policy; the summary must not
+  # launder it into a clean bill of health.
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 1 observed, 0 uncounted" "active research: counted observed, not healthy"
+}
+
+# A polecat that never finished spawning holds no hook, so the restartable
+# gate is false and it used to fall through to no bucket at all — shrinking the
+# denominator and reading as an all-clear. The failure mode produces exactly the
+# condition that hides it, so this arm needs its own guard.
+test_session_dead_without_hook_is_uncounted() {
+  setup_case
+  add_polecat spawnfail session-dead
+  touch "$TEST_STATE/nohook/spawnfail"
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "spawn-failed: no restart mail"
+  assert_file_contains "$TEST_STATE/output.log" "UNCOUNTED: gt-spawnfail session-dead, no restartable hook" "spawn-failed: named the held capacity slot"
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 1 uncounted" "spawn-failed: kept in the denominator"
+}
+
+# The measured population from gt-vj63: four non-terminal polecats, two of them
+# NEEDS_RECOVERY. The defective accounting reported "0 crashed, 0 stuck, 3
+# healthy" — denominator 3, asserting health the probe denied.
+test_summary_denominator_covers_every_polecat() {
+  setup_case
+  export GT_STUCK_AGENT_DOG_MAX_INACTIVITY=30m
+  add_polecat chrome healthy
+  add_polecat crater healthy
+  add_polecat ace agent-hung
+  add_polecat synth session-dead
+  touch "$TEST_STATE/nohook/synth"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 2 healthy, 1 observed, 1 uncounted" "four polecats: denominator is 4, not 3"
 }
 
 test_hook_show_uses_json_and_rig_workdir() {
@@ -664,6 +698,8 @@ test_healthy_runtime bun
 test_healthy_runtime node
 test_healthy_runtime claude
 test_agent_hung_observe_only
+test_session_dead_without_hook_is_uncounted
+test_summary_denominator_covers_every_polecat
 test_hook_show_uses_json_and_rig_workdir
 test_dead_agent_restarts_one
 test_in_progress_hook_restarts_one

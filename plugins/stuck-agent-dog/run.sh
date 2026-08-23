@@ -249,6 +249,16 @@ fi
 CRASHED=()
 STUCK=()
 HEALTHY=0
+# OBSERVED: probe says healthy:false but policy is deliberately not to act
+# (e.g. agent-hung: a quiet live runtime may be a long research turn).
+# These are NOT healthy — counting them as such made the receipt assert
+# something its own probe denied.
+OBSERVED=0
+# UNCOUNTED: enumerated but classified into no bucket, so the denominator
+# would otherwise silently shrink. A polecat that never finished spawning
+# holds no hook, which is exactly the condition that used to make it
+# invisible here — the failure mode produced its own concealment.
+UNCOUNTED=0
 
 while IFS='|' read -r RIG PREFIX; do
   [ -z "$RIG" ] && continue
@@ -271,12 +281,17 @@ while IFS='|' read -r RIG PREFIX; do
         if hook_restartable "$SESSION_NAME" "$HOOK_BEAD" "$HOOK_STATUS"; then
           STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
           log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
+        else
+          UNCOUNTED=$((UNCOUNTED + 1))
         fi
         ;;
       agent-hung|agent_hung)
         # A live runtime with quiet output can be a long research turn. Do not
         # kill it here; operators can tune the threshold and inspect manually.
-        HEALTHY=$((HEALTHY + 1))
+        # NOT counted healthy: the health API reports healthy:false, zombie:true
+        # for this status. The restraint is policy; the accounting must not
+        # launder it into a clean bill of health.
+        OBSERVED=$((OBSERVED + 1))
         log "  OBSERVE: $SESSION_NAME runtime alive but inactive beyond $POLECAT_MAX_INACTIVITY; not restarting"
         ;;
       session-dead|session_dead)
@@ -285,9 +300,17 @@ while IFS='|' read -r RIG PREFIX; do
         if hook_restartable "$SESSION_NAME" "$HOOK_BEAD" "$HOOK_STATUS"; then
           CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
           log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
+        else
+          # Dead session with no restartable hook. This is where a polecat that
+          # never finished spawning lands: agent_state=spawning never took a
+          # hook, so the restartable gate is false and it used to vanish from
+          # the counts entirely. Report it rather than drop it.
+          UNCOUNTED=$((UNCOUNTED + 1))
+          log "  UNCOUNTED: $SESSION_NAME session-dead, no restartable hook (still holds a capacity slot)"
         fi
         ;;
       *)
+        UNCOUNTED=$((UNCOUNTED + 1))
         log "  SKIP $SESSION_NAME: central liveness probe inconclusive"
         ;;
     esac
@@ -295,7 +318,7 @@ while IFS='|' read -r RIG PREFIX; do
 done <<< "$RIG_PREFIX_MAP"
 
 log ""
-log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
+log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
 
 # --- Check deacon health -----------------------------------------------------
 
@@ -429,7 +452,7 @@ fi
 
 # --- Report -------------------------------------------------------------------
 
-SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
+SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted"
 [ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 [ -n "$DEACON_DIVERGENCE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_DIVERGENCE (not escalated)"
 log ""
