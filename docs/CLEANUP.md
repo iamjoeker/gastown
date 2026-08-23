@@ -78,6 +78,22 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 | `gt krc config reset` | Resets KRC TTL configuration to defaults |
 | `gt krc decay` | Shows forensic value decay report (pruning guidance) |
 
+> **`gt compact report` is not a query.** It runs a real compaction to produce
+> its digest, so the bare command and `--json` both delete. Only `--dry-run`
+> previews — and until gt-hv3p it did not: the flag never reached the compaction
+> subprocess, so `gt compact report --dry-run` deleted 454 wisps on 2026-08-22
+> while suppressing the audit bead and the digest mail that would have recorded
+> it. Verify a change to this path by measuring the delete-pool count either
+> side of the command, never by reading its output.
+
+> **Deletions are archived first.** Every wisp `gt compact` is about to delete is
+> written and fsynced to the wisp archive — the same one the reaper writes and
+> `gt reaper archive` reads — BEFORE the delete pass starts, so an interrupted
+> run leaves records with no deletion and never the reverse. A run that cannot
+> write its archive deletes nothing and reports the wisps as held. To enumerate
+> what a run removed, take the archived ids and subtract the ids still in
+> `wisps`. Relocate the archive with `GT_WISP_ARCHIVE_DIR`.
+
 > `gt compact` acts only on wisps whose `wisp_type` is set. Rows with an empty
 > `wisp_type` are counted as **Unclassified** and left untouched — no TTL policy
 > can be chosen for them, and defaulting them to 24h would delete 7d escalation,

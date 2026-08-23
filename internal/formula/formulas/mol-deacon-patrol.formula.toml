@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 19
+version = 20
 
 [vars]
 [vars.wisp_type]
@@ -1249,66 +1249,72 @@ id = "wisp-compact"
 title = "Compact expired wisps"
 needs = ["session-gc"]
 description = """
-Run TTL-based wisp compaction to manage storage growth.
+🚨 **ON HOLD (gt-hv3p) — run NO form of `gt compact` from this patrol, and do not
+reconstruct one from memory.** There is deliberately no command in this step.
 
-**Step 1: Preview compaction scope**
-```bash
-gt compact --dry-run --json
-```
+On 2026-08-22 the next step ran `gt compact report --dry-run` verbatim from this
+patrol and destroyed 454 wisps. `--dry-run` was never passed to the compaction
+subprocess the report command exec'd, so the flag suppressed the audit bead and
+the digest mail — the two artifacts that would have left a trace — and nothing
+else. The run was then killed mid-pass by the operator's own `timeout 90`, and
+because no table records a wisp deletion, NOTHING anywhere names which 454 went.
 
-Parse the JSON output:
-- If promoted + deleted == 0, skip (nothing to compact)
-- If errors present, log and continue
+Wisps are dolt-ignored: no AS OF history, no backup, no restore. This step's
+text used to tell the Deacon that Dolt kept a readable history of exactly this
+deletion. It does not, and believing it is what made a bulk-delete path read as
+a routine hygiene step.
 
-**Step 2: Execute compaction (if needed)**
-```bash
-gt compact --verbose
-```
+The step was safe only by ACCIDENT until 2026-08-21: `gt compact` sourced its
+wisp list from `bd list`, which does not query the wisps table, so it scanned 0
+(hq-xlwa). Fixing that blindness converted a no-op into a live bulk-deletion
+path overnight.
 
-This runs the compaction algorithm:
-- Closed wisps past TTL → deleted (Dolt AS OF preserves history)
-- Non-closed wisps past TTL → promoted (stuck detection)
-- Wisps with comments/references/keep labels → promoted (proven value)
+**Two code fixes have landed (gt-hv3p):** `--dry-run` is passed through to the
+compaction subprocess, and every wisp is written and fsynced to the durable
+archive `gt reaper archive` reads BEFORE it is deleted — so an interrupted pass
+is enumerable, and a run that cannot write its archive deletes nothing.
 
-**Step 3: Log results**
-Note promoted/deleted/skipped counts for the patrol digest.
+**Restore condition — BOTH, measured on a live rig, before this step runs again:**
 
-**Performance:**
-Compaction runs every patrol cycle. The query is fast (single bd list + filter).
-If performance becomes an issue, add a cooldown gate (e.g., run once per hour).
+1. Count the delete-pool either side of a dry-run report and get the SAME
+   number. Measure the COUNT; do not read the command's output — the output is
+   exactly what lied here (the destructive run printed nothing at all).
+2. Interrupt a real compaction mid-pass and confirm every id it deleted is
+   present in `gt reaper archive`.
 
-**Exit criteria:** Wisps compacted (or nothing to compact)."""
+Until the Mayor records that verification on gt-hv3p, this step is a no-op.
+Report the wisp population to the reaper Dog instead of compacting it.
+
+**Exit criteria:** Nothing was compacted from this patrol; the hold was honoured."""
 
 [[steps]]
 id = "compact-report"
 title = "Send compaction digest report"
 needs = ["wisp-compact"]
 description = """
-Generate and send the daily compaction digest.
+🚨 **ON HOLD (gt-hv3p) — run NO form of `gt compact report`, including
+`--dry-run` and `--json`.** There is deliberately no command in this step.
 
-**Step 1: Send daily digest (idempotent — safe to run every cycle)**
-```bash
-gt compact report
-```
+THIS is the command that destroyed 454 wisps on 2026-08-22, in its `--dry-run`
+form, run verbatim from this step. Every flag form of it performs a real
+compaction: the report command exec's the compaction FIRST and consults its own
+flags afterwards, so `--dry-run` and `--json` were both queries in name only.
+The flag a careful operator picks BECAUSE it is the safe one was not safe, and
+it was the only one whose name promised safety.
 
-This runs compaction (capturing JSON results), queries active wisps,
-builds a per-category breakdown (Heartbeats, Patrols, Errors, Untyped),
-detects anomalies, and sends the digest to deacon/ (cc mayor/).
+`gt compact report` is not a query at all. It runs a real compaction to produce
+its digest — deleting closed wisps past TTL, permanently, from tables that are
+dolt-ignored and have no AS OF history and no backup.
 
-A permanent event bead (wisp.compaction) is created for audit trail.
-Skips automatically if today's digest was already sent.
+The pass-through is fixed and deletions are now archived before they happen
+(gt-hv3p). The hold stands until that is VERIFIED on a live rig — see the
+restore condition on the `wisp-compact` step above; both conditions cover this
+step too, because both steps reach the same deletion path.
 
-**Step 2: Weekly rollup (Mondays only, idempotent)**
-If today is Monday, also send the weekly rollup:
-```bash
-gt compact report --weekly
-```
+Until the Mayor records that verification on gt-hv3p, this step is a no-op. No
+digest is sent, and its absence is expected rather than a fault to chase.
 
-This aggregates the past 7 days of compaction event beads and sends
-trend data (totals, promotion rate, avg deleted/day) to mayor/.
-Skips automatically if this week's rollup was already sent.
-
-**Exit criteria:** Compaction digest sent (or nothing to report)."""
+**Exit criteria:** No compaction digest was run or sent; the hold was honoured."""
 
 [[steps]]
 id = "costs-digest"

@@ -602,11 +602,109 @@ func TestExtractBeadID(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// gt-hv3p: --dry-run reaches the compaction that does the deleting
+// ---------------------------------------------------------------------------
+
+// TestCompactSubprocessArgsCarriesDryRun pins the one-line defect. The argv
+// this builds is the only place the report command can express "do not delete";
+// everything it checks afterwards runs 38 lines too late.
+func TestCompactSubprocessArgsCarriesDryRun(t *testing.T) {
+	t.Parallel()
+
+	dry := strings.Join(compactSubprocessArgs(true), " ")
+	if dry != "compact --json --dry-run" {
+		t.Errorf("compactSubprocessArgs(true) = %q, want %q — without --dry-run the "+
+			"subprocess performs a REAL compaction and the report's own dry-run branch "+
+			"only suppresses the audit bead and the mail", dry, "compact --json --dry-run")
+	}
+
+	// Control: the flag must not appear when it was not asked for, or the
+	// digest would stop compacting anything and report zeroes forever.
+	wet := strings.Join(compactSubprocessArgs(false), " ")
+	if wet != "compact --json" {
+		t.Errorf("compactSubprocessArgs(false) = %q, want %q", wet, "compact --json")
+	}
+}
+
+// TestRunDailyDigestDryRunDoesNotCompactForReal asserts at the seam that lied:
+// the ARGV of the subprocess, not the text the command printed. On 2026-08-22
+// `gt compact report --dry-run` printed nothing at all and deleted 454 wisps,
+// so any assertion on output would have passed against the defect.
+func TestRunDailyDigestDryRunDoesNotCompactForReal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	stubs := setupCompactReportCommandStubs(t)
+	resetCompactReportFlags(t)
+	compactReportDryRun = true
+	compactReportDate = "2026-05-15"
+
+	if err := runDailyDigest(); err != nil {
+		t.Fatalf("runDailyDigest() = %v, want nil", err)
+	}
+
+	invocations := readStubLog(t, stubs.compactLog)
+	if len(invocations) != 1 {
+		t.Fatalf("gt compact invocations = %v, want exactly 1", invocations)
+	}
+	if !strings.Contains(invocations[0], "--dry-run") {
+		t.Errorf("gt was invoked as %q — a dry-run report ran a REAL compaction, "+
+			"which is gt-hv3p", invocations[0])
+	}
+	// The dry-run branch must still hold: no audit bead, no digest mail.
+	assertNoMailSent(t, stubs.mailLog)
+}
+
+// TestRunDailyDigestRealRunStillCompacts is the control. A fix that simply
+// stopped passing --json, or that always passed --dry-run, would make the
+// digest permanently report a town where nothing ever expires.
+func TestRunDailyDigestRealRunStillCompacts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	stubs := setupCompactReportCommandStubs(t)
+	resetCompactReportFlags(t)
+	compactReportJSON = true // stops before the audit bead the stub fails to close
+	compactReportDate = "2026-05-15"
+
+	if err := runDailyDigest(); err != nil {
+		t.Fatalf("runDailyDigest() = %v, want nil", err)
+	}
+
+	invocations := readStubLog(t, stubs.compactLog)
+	if len(invocations) != 1 {
+		t.Fatalf("gt compact invocations = %v, want exactly 1", invocations)
+	}
+	if strings.Contains(invocations[0], "--dry-run") {
+		t.Errorf("gt was invoked as %q — a real digest must run a real compaction, "+
+			"or the report describes a town that is never compacted", invocations[0])
+	}
+}
+
+func readStubLog(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read stub log %s: %v", path, err)
+	}
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func TestRunDailyDigestStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script command stubs not supported on Windows")
 	}
-	mailLog := setupCompactReportCommandStubs(t)
+	stubs := setupCompactReportCommandStubs(t)
 	resetCompactReportFlags(t)
 	compactReportDate = "2026-05-15"
 
@@ -617,14 +715,14 @@ func TestRunDailyDigestStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "auto-closing report bead h25-mrd") {
 		t.Fatalf("error = %v, want auto-close failure", err)
 	}
-	assertNoMailSent(t, mailLog)
+	assertNoMailSent(t, stubs.mailLog)
 }
 
 func TestRunWeeklyRollupStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script command stubs not supported on Windows")
 	}
-	mailLog := setupCompactReportCommandStubs(t)
+	stubs := setupCompactReportCommandStubs(t)
 	resetCompactReportFlags(t)
 
 	err := runWeeklyRollup()
@@ -634,7 +732,7 @@ func TestRunWeeklyRollupStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "auto-closing rollup bead h25-mrd") {
 		t.Fatalf("error = %v, want auto-close failure", err)
 	}
-	assertNoMailSent(t, mailLog)
+	assertNoMailSent(t, stubs.mailLog)
 }
 
 func resetCompactReportFlags(t *testing.T) {
@@ -659,10 +757,22 @@ func resetCompactReportFlags(t *testing.T) {
 	})
 }
 
-func setupCompactReportCommandStubs(t *testing.T) string {
+// compactReportStubs are the logs the fake gt/bd binaries write, so a test can
+// assert on the ARGV a subprocess was invoked with rather than on the output the
+// command printed. gt-hv3p is precisely a case where the output was the thing
+// that lied: `gt compact report --dry-run` printed a preview and deleted 454
+// wisps, because the flag never reached the subprocess that does the deleting.
+type compactReportStubs struct {
+	mailLog    string
+	compactLog string
+}
+
+func setupCompactReportCommandStubs(t *testing.T) compactReportStubs {
 	t.Helper()
 	binDir := t.TempDir()
-	mailLog := filepath.Join(t.TempDir(), "mail.log")
+	logDir := t.TempDir()
+	mailLog := filepath.Join(logDir, "mail.log")
+	compactLog := filepath.Join(logDir, "compact.log")
 
 	bdScript := `#!/bin/sh
 case "$1" in
@@ -691,6 +801,7 @@ esac
 
 	gtScript := `#!/bin/sh
 if [ "$1" = "compact" ]; then
+  echo "$*" >> "$COMPACT_LOG"
   printf '{"promoted":[],"deleted":[],"skipped":0}\n'
   exit 0
 fi
@@ -707,7 +818,8 @@ exit 1
 
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("MAIL_LOG", mailLog)
-	return mailLog
+	t.Setenv("COMPACT_LOG", compactLog)
+	return compactReportStubs{mailLog: mailLog, compactLog: compactLog}
 }
 
 func assertNoMailSent(t *testing.T, mailLog string) {
