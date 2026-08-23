@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 20
+version = 21
 
 [vars]
 [vars.wisp_type]
@@ -1488,9 +1488,15 @@ gt deacon heartbeat "pre-await checkpoint"
 Use await-signal with exponential backoff to wait for activity:
 
 ```bash
-gt mol step await-signal --agent-bead hq-deacon \
+gt mol step await-signal --agent-bead hq-deacon --all-rigs \
   --backoff-base 60s --backoff-mult 2 --backoff-max 15m
 ```
+
+`--all-rigs` is load-bearing. await-signal defaults to the caller's own rig so
+that an idle rig's witness stops waking on other rigs' events (gt-p54t). You
+are town-scoped and legitimately want every rig's events, so you ask for that
+explicitly rather than relying on the Deacon directory happening to infer no
+rig.
 
 This command:
 1. Subscribes to `bd activity --follow` (beads activity feed)

@@ -147,7 +147,7 @@ func TestWaitForEventsFile_MissingFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	result, err := waitForEventsFile(ctx, filepath.Join(t.TempDir(), "nonexistent.jsonl"))
+	result, err := waitForEventsFile(ctx, filepath.Join(t.TempDir(), "nonexistent.jsonl"), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestWaitForEventsFile_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	result, err := waitForEventsFile(ctx, eventsPath)
+	result, err := waitForEventsFile(ctx, eventsPath, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestWaitForEventsFile_Signal(t *testing.T) {
 		_, _ = f.WriteString(`{"ts":"new","type":"sling","actor":"test"}` + "\n")
 	}()
 
-	result, err := waitForEventsFile(ctx, eventsPath)
+	result, err := waitForEventsFile(ctx, eventsPath, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestWaitForActivitySignal_PathWiring(t *testing.T) {
 		_, _ = f.WriteString(`{"ts":"new","type":"sling"}` + "\n")
 	}()
 
-	result, err := waitForActivitySignal(ctx, townRoot)
+	result, err := waitForActivitySignal(ctx, townRoot, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -721,6 +721,355 @@ func TestBackoffAtCap(t *testing.T) {
 			awaitSignalBackoffMax = tt.max
 			if got := backoffAtCap(tt.fullTimeout); got != tt.want {
 				t.Errorf("backoffAtCap(%v) = %v, want %v", tt.fullTimeout, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- rig scoping (gt-p54t) ---
+//
+// The events feed is town-wide. Before scoping, an idle rig's patrol agent
+// returned from await-signal on every event any rig produced, so the
+// exponential backoff could never grow. These tests exercise the real tailing
+// loop, and they pin BOTH halves: an event confined to another rig must stop
+// waking, and a cross-rig mail addressed to this rig must keep waking. A test
+// that only asserted the suppression would pass just as well if the filter had
+// gone deaf.
+
+// appendEvents writes lines to an events file the way the feed does.
+func appendEvents(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatalf("opening events file: %v", err)
+	}
+	defer f.Close()
+	for _, l := range lines {
+		if _, err := f.WriteString(l + "\n"); err != nil {
+			t.Fatalf("appending event: %v", err)
+		}
+	}
+}
+
+const (
+	// An event wholly confined to the beads rig.
+	evtBeadsSpawn = `{"ts":"2026-08-23T01:45:06Z","source":"gt","type":"spawn","actor":"gt","payload":{"polecat":"ace","rig":"beads"},"visibility":"feed"}`
+	// Mail sent from beads to gastown. Mail wakes are town-wide by design.
+	evtBeadsMailToGastown = `{"ts":"2026-08-23T01:45:07Z","source":"gt","type":"mail","actor":"beads/polecats/ace","payload":{"subject":"cross-rig","to":"gastown/witness"},"visibility":"feed"}`
+	// Deacon-to-mayor traffic: town-scoped, confined to no rig.
+	evtTownMail = `{"ts":"2026-08-23T01:45:08Z","source":"gt","type":"mail","actor":"deacon/","payload":{"subject":"digest","to":"mayor/"},"visibility":"feed"}`
+	// Gastown's own dispatch.
+	evtGastownSling = `{"ts":"2026-08-23T01:45:09Z","source":"gt","type":"sling","actor":"unknown","payload":{"bead":"gt-p54t","target":"gastown/polecats/dust"},"visibility":"feed"}`
+)
+
+// newEventsFile returns the path to an empty events file with one historical
+// line, matching the live file's state when a wait begins (the wait seeks to
+// end, so the historical line must never be read).
+func newEventsFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".events.jsonl")
+	if err := os.WriteFile(path, []byte(`{"ts":"old","type":"ignore"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestWaitForEventsFile_ForeignRigEventDoesNotWake(t *testing.T) {
+	// The defect: this event, confined to the beads rig, used to wake gastown.
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		appendEvents(t, eventsPath, evtBeadsSpawn)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gastown")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Errorf("reason = %q, want %q: an event confined to beads must not wake gastown",
+			result.Reason, "timeout")
+	}
+	if result.Suppressed != 1 {
+		t.Errorf("Suppressed = %d, want 1: the wake that did not happen must be counted, "+
+			"or a filter that never saw the event is indistinguishable from one that dropped it",
+			result.Suppressed)
+	}
+}
+
+func TestWaitForEventsFile_ForeignRigEventStillWakesItsOwnRig(t *testing.T) {
+	// Positive control for the test above: the same line, the same tailing
+	// loop, a watcher on the rig the event belongs to. Without this, a filter
+	// that woke nobody at all would pass the suppression test.
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		appendEvents(t, eventsPath, evtBeadsSpawn)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "beads")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Fatalf("reason = %q, want %q: beads must still wake on its own event",
+			result.Reason, "signal")
+	}
+	if result.Suppressed != 0 {
+		t.Errorf("Suppressed = %d, want 0", result.Suppressed)
+	}
+}
+
+func TestWaitForEventsFile_CrossRigMailStillWakesAddressee(t *testing.T) {
+	// The half a rig filter is most likely to break: mail from another rig
+	// addressed to this one. It must keep waking, or the fix trades a cost
+	// defect for a correctness one.
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		appendEvents(t, eventsPath, evtBeadsMailToGastown)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gastown")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Fatalf("reason = %q, want %q: mail from beads addressed to gastown/witness "+
+			"must wake gastown", result.Reason, "signal")
+	}
+	if !strings.Contains(result.Signal, "gastown/witness") {
+		t.Errorf("Signal = %q, want the cross-rig mail line", result.Signal)
+	}
+}
+
+func TestWaitForEventsFile_TownScopedEventWakesEveryRig(t *testing.T) {
+	// Deacon-to-mayor traffic is not "confined to another rig", so it is not
+	// suppressed. This is the deliberate fail-open path.
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		appendEvents(t, eventsPath, evtTownMail)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "duly_noted")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Errorf("reason = %q, want %q: town-scoped events wake every rig",
+			result.Reason, "signal")
+	}
+}
+
+// TestWaitForEventsFile_BurstMeasuresWakes replays one burst through the same
+// tailing loop at three scopes and reports the wake count for each. This is the
+// before/after measurement over identical event volume: town-wide is the
+// "before", the rig scopes are the "after".
+func TestWaitForEventsFile_BurstMeasuresWakes(t *testing.T) {
+	// Three beads events then one gastown event. No town-scoped line here on
+	// purpose: those wake every rig, so including one would end the wait early
+	// and the burst would measure the fail-open path instead of the filter.
+	burst := []string{
+		evtBeadsSpawn,
+		evtBeadsSpawn,
+		evtBeadsSpawn,
+		evtGastownSling,
+	}
+
+	// A burst arriving inside one 200ms poll tick must not cost one tick per
+	// foreign line before the matching line is seen.
+	t.Run("gastown wakes on its own line after skipping the foreign ones", func(t *testing.T) {
+		eventsPath := newEventsFile(t)
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			appendEvents(t, eventsPath, burst...)
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		result, err := waitForEventsFile(ctx, eventsPath, "gastown")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Reason != "signal" {
+			t.Fatalf("reason = %q, want %q", result.Reason, "signal")
+		}
+		if !strings.Contains(result.Signal, "gt-p54t") {
+			t.Errorf("Signal = %q, want the gastown sling", result.Signal)
+		}
+		t.Logf("gastown: suppressed %d of %d burst events before waking",
+			result.Suppressed, len(burst))
+		if result.Suppressed != 3 {
+			t.Errorf("Suppressed = %d, want 3 (the three leading beads events, all "+
+				"drained inside one poll tick)", result.Suppressed)
+		}
+	})
+
+	t.Run("an idle rig sleeps through the whole burst", func(t *testing.T) {
+		eventsPath := newEventsFile(t)
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			appendEvents(t, eventsPath, burst...)
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		result, err := waitForEventsFile(ctx, eventsPath, "duly_noted")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		t.Logf("duly_noted: reason=%s suppressed=%d of %d", result.Reason, result.Suppressed, len(burst))
+		if result.Reason != "timeout" {
+			t.Errorf("reason = %q, want %q: none of these events concerns duly_noted",
+				result.Reason, "timeout")
+		}
+		if result.Suppressed != len(burst) {
+			t.Errorf("Suppressed = %d, want %d: every one is a wake an idle rig used to pay for",
+				result.Suppressed, len(burst))
+		}
+	})
+
+	t.Run("town-wide is the unfiltered before-state", func(t *testing.T) {
+		eventsPath := newEventsFile(t)
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			appendEvents(t, eventsPath, burst[0])
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		result, err := waitForEventsFile(ctx, eventsPath, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Reason != "signal" {
+			t.Errorf("reason = %q, want %q: --all-rigs must behave exactly as before",
+				result.Reason, "signal")
+		}
+		if result.Suppressed != 0 {
+			t.Errorf("Suppressed = %d, want 0: a town-wide wait filters nothing", result.Suppressed)
+		}
+	})
+}
+
+func TestWaitForEventsFile_PartialLineIsNotAWake(t *testing.T) {
+	// A line that has not landed whole yet is a JSON fragment. Evaluating it
+	// would fail to parse and fail open into exactly the spurious wake this
+	// filter exists to prevent, so fragments are held until complete.
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = f.WriteString(evtBeadsSpawn[:40]) // no newline: torn write
+		time.Sleep(500 * time.Millisecond)
+		_, _ = f.WriteString(evtBeadsSpawn[40:] + "\n")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gastown")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Errorf("reason = %q, want %q: a torn beads event must not wake gastown "+
+			"once its halves are rejoined", result.Reason, "timeout")
+	}
+	if result.Suppressed != 1 {
+		t.Errorf("Suppressed = %d, want 1: the rejoined line should be evaluated exactly once",
+			result.Suppressed)
+	}
+}
+
+func TestResolveAwaitSignalRig(t *testing.T) {
+	oldRig, oldAll := awaitSignalRig, awaitSignalAllRigs
+	t.Cleanup(func() {
+		awaitSignalRig, awaitSignalAllRigs = oldRig, oldAll
+	})
+
+	// A town with one real rig, so cwd inference has something to find.
+	townRoot := t.TempDir()
+	rigDir := filepath.Join(townRoot, "gastown", "witness")
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "gastown", "config.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	deaconDir := filepath.Join(townRoot, "deacon", "dogs", "boot")
+	if err := os.MkdirAll(deaconDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		rig     string
+		allRigs bool
+		envRig  string
+		chdir   string
+		want    string
+		wantErr bool
+		why     string
+	}{
+		{name: "explicit --rig wins", rig: "beads", envRig: "gastown", chdir: rigDir,
+			want: "beads", why: "the most explicit source"},
+		{name: "--all-rigs is town-wide", allRigs: true, envRig: "gastown", chdir: rigDir,
+			want: "", why: "Deacon and Mayor opt in explicitly"},
+		{name: "--rig with --all-rigs is a contradiction", rig: "beads", allRigs: true,
+			chdir: rigDir, wantErr: true, why: "silently picking one would hide the mistake"},
+		{name: "GT_RIG when no flag", envRig: "beads", chdir: rigDir,
+			want: "beads", why: "the session harness sets it"},
+		{name: "cwd inference inside a rig", chdir: rigDir,
+			want: "gastown", why: "a witness in its own rig defaults to that rig"},
+		{name: "deacon dir infers no rig", chdir: deaconDir,
+			want: "", why: "the Deacon is town-scoped and must keep waking town-wide"},
+		{name: "town root infers no rig", chdir: townRoot,
+			want: "", why: "not inside any rig"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			awaitSignalRig, awaitSignalAllRigs = tt.rig, tt.allRigs
+			t.Setenv("GT_RIG", tt.envRig)
+			if tt.chdir != "" {
+				t.Chdir(tt.chdir)
+			}
+
+			got, err := resolveAwaitSignalRig(townRoot)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error (%s)", tt.why)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("resolveAwaitSignalRig() = %q, want %q (%s)", got, tt.want, tt.why)
 			}
 		})
 	}
