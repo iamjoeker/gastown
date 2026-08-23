@@ -52,6 +52,20 @@ func (s AgentState) ProtectsFromCleanup() bool {
 	}
 }
 
+// IsPaused returns true if this agent state is a deliberate pause that survives
+// a session restart and must be cleared explicitly.
+//
+// It is ProtectsFromCleanup plus "escalated", which is the grouping every caller
+// already used by hand. The distinction matters because `gt session restart`
+// writes no agent_state at all: it recreates the tmux session and leaves the
+// field exactly as it found it, so a paused polecat reads paused forever unless
+// something clears it. `gt polecat clear-state` is that something — a witness may
+// run it, and it is the action check-recovery prescribes for these states rather
+// than a restart that provably cannot change them (gt-fbgq).
+func (s AgentState) IsPaused() bool {
+	return s.ProtectsFromCleanup() || s == AgentStateEscalated
+}
+
 // IsActive returns true if the agent is actively doing work.
 func (s AgentState) IsActive() bool {
 	switch s {

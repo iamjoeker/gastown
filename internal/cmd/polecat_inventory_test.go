@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,6 +44,7 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 		wantReusable bool
 		wantRecovery bool
 		wantCapacity bool
+		wantBlocker  string // substring that must appear in some blocker
 	}{
 		{
 			// Nothing blocks and nothing was checked. This constructor reads
@@ -97,12 +99,20 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			wantRecovery: true,
 		},
 		{
-			name:         "paused agent state protects without capacity",
-			polecatName:  "paused",
-			fields:       &beads.AgentFields{AgentState: string(beads.AgentStatePaused), CleanupStatus: string(polecat.CleanupClean)},
-			wantState:    polecat.StateIdle,
-			wantVerdict:  polecat.WorkstateVerdictNeedsRecovery,
-			wantRecovery: true,
+			// A pause blocks reuse but is NOT a recovery condition, and this
+			// surface runs no git — so it reports UNVERIFIED rather than the
+			// NEEDS_RECOVERY it used to assert without measuring. The blocker
+			// assertion is the load-bearing half: the whole defect in gt-fbgq was
+			// agent_state going unreported by the surfaces that classify, and a
+			// build that dropped the field entirely would also answer UNVERIFIED
+			// here. Only check-recovery, which measures, upgrades this to
+			// NEEDS_STATE_CLEAR.
+			name:        "paused agent state blocks reuse and stays named",
+			polecatName: "paused",
+			fields:      &beads.AgentFields{AgentState: string(beads.AgentStatePaused), CleanupStatus: string(polecat.CleanupClean)},
+			wantState:   polecat.StateIdle,
+			wantVerdict: polecat.WorkstateVerdictUnverified,
+			wantBlocker: "agent_state=paused",
 		},
 		{
 			name:        "active mr is pending non capacity",
@@ -142,6 +152,11 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			item := buildPolecatInventoryItem("gastown", tt.polecatName, tt.fields, tt.activeWork, sessions, nil)
 			if item.State != tt.wantState || item.Issue != tt.wantIssue || item.Disposition.Verdict != tt.wantVerdict || item.Disposition.Reusable != tt.wantReusable || item.Disposition.NeedsRecovery != tt.wantRecovery || item.Disposition.CountsTowardCapacity != tt.wantCapacity {
 				t.Fatalf("item = %+v disposition=%+v", item, item.Disposition)
+			}
+			if tt.wantBlocker != "" && !slices.ContainsFunc(item.Disposition.Blockers, func(b string) bool {
+				return strings.Contains(b, tt.wantBlocker)
+			}) {
+				t.Fatalf("blockers %q do not name %q", item.Disposition.Blockers, tt.wantBlocker)
 			}
 		})
 	}

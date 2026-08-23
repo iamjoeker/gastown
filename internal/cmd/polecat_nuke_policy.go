@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -41,6 +42,18 @@ const (
 	// policy permits a witness to take. Surfaced in check-recovery JSON as
 	// witness_action so the policy is machine-readable, not just prose.
 	witnessActionRestart = "restart"
+
+	// witnessActionClearState is the second permitted action, and it exists
+	// because restart could not do this job: no restart path writes agent_state,
+	// so a polecat parked at a paused state (stuck, awaiting-gate, paused,
+	// escalated) read paused again the moment its new session came up. Every
+	// action a witness is permitted to take left the state untouched and nuking
+	// is forbidden, so the prescribed remedy and the permitted actions did not
+	// intersect and the slot's disposition never moved (gt-fbgq).
+	//
+	// Like restart, it is non-destructive: it writes one field on the agent bead
+	// and touches neither the worktree nor the session.
+	witnessActionClearState = "clear-state"
 )
 
 // nukeCallerIdentity resolves the identity of whoever is invoking a destructive
@@ -104,6 +117,10 @@ func witnessActionFor(verdict string) string {
 	switch verdict {
 	case "NEEDS_MQ_SUBMIT", "NEEDS_RECOVERY":
 		return "escalate"
+	case polecat.WorkstateVerdictNeedsStateClear:
+		// Not "escalate": nothing is at risk and there is nothing for the Mayor
+		// to recover — only a field the witness is permitted to clear itself.
+		return witnessActionClearState
 	case "PENDING_MR":
 		return "leave-alone"
 	case "UNVERIFIED":

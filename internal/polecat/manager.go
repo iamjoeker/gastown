@@ -2494,6 +2494,14 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		if !hookSafe {
 			input.HookBead = fields.HookBead
 		}
+		// The reuse gate was blind to agent_state the same way check-recovery was:
+		// loadFromBeads maps it onto State for "done" only, so a polecat parked at
+		// stuck arrived here as StateIdle and FindIdlePolecat would hand its slot
+		// to the next sling — silently discarding a pause somebody set on purpose.
+		// Now it refuses, and `gt polecat clear-state` is the way back (gt-fbgq).
+		if state := beads.AgentState(strings.TrimSpace(fields.AgentState)); state.IsPaused() {
+			input.PausedAgentState = string(state)
+		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		input.MRRefused = fields.MRRefused

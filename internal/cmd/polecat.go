@@ -247,6 +247,8 @@ Reports whether any work is at risk. It does NOT authorize destroying the poleca
   - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
   - NEEDS_RECOVERY: cleanup_status, active_mr, or fallback git predicates require recovery
   - PENDING_MR: work is waiting on an active merge request
+  - NEEDS_STATE_CLEAR: nothing is at risk, but agent_state names a deliberate pause
+    (stuck, awaiting-gate, paused, escalated) that no restart can clear
 
 Every predicate except WORKING is read from the agent bead and from git, both of
 which 'gt done' writes BEFORE it pushes, submits the MR, and exits. WORKING is
@@ -256,10 +258,15 @@ cannot be read is not reported as working.
 
 The verdict names a work-at-risk state, not an action for the caller. The
 witness_action field names what a witness may do about it: 'restart' to reclaim
-the slot (worktree and branch preserved), 'escalate' when work is at risk, or
-'leave-alone' while an MR is in flight or the agent is mid-turn. Nuking is never
-among them — under the restart-first policy (gt-dsgp) that requires a human or
-Mayor identity.
+the slot (worktree and branch preserved), 'clear-state' to lift a deliberate
+pause, 'escalate' when work is at risk, or 'leave-alone' while an MR is in flight
+or the agent is mid-turn. Nuking is never among them — under the restart-first
+policy (gt-dsgp) that requires a human or Mayor identity.
+
+'restart' and 'clear-state' are not interchangeable. No restart path writes
+agent_state, so restarting a paused polecat leaves it paused; that is why the
+paused case gets its own verdict and its own action rather than being folded into
+the restart arm (gt-fbgq).
 
 Examples:
   gt polecat check-recovery greenplace/Toast
@@ -1194,6 +1201,14 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		input.MRRefused = fields.MRRefused
+		// This command builds its input from mgr.Get(), and loadFromBeads maps
+		// agent_state onto State for "done" and nothing else — so every paused
+		// state arrived here as StateIdle and this surface, the one documented as
+		// the one that measures, never saw the pause at all. That is why it
+		// answered SAFE_TO_NUKE / witness_action=restart for a polecat `gt polecat
+		// list` was simultaneously calling NEEDS_RECOVERY on agent_state=stuck
+		// (gt-fbgq). Read straight from the agent bead instead.
+		input.PausedAgentState = pausedAgentState(fields)
 		partialSpawn, diagnostic := partialSpawnWithoutDurableHook(bd, fields, assignee, status.Issue)
 		if diagnostic != "" {
 			status.Diagnostics = append(status.Diagnostics, diagnostic)
@@ -1334,6 +1349,20 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
 		}
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
+	case polecat.WorkstateVerdictNeedsStateClear:
+		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_STATE_CLEAR"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
+		fmt.Println()
+		for _, blocker := range status.Blockers {
+			fmt.Printf("    - %s\n", blocker)
+		}
+		fmt.Println()
+		fmt.Println("  No work is at risk. The polecat is parked at a deliberate agent_state that")
+		fmt.Println("  outlives every session restart — no restart path writes agent_state at all.")
+		fmt.Println("  Lift the pause (agent bead only; worktree and branch untouched):")
+		fmt.Printf("    gt polecat clear-state %s/%s\n", rigName, polecatName)
+		fmt.Println()
+		fmt.Printf("  %s\n", style.Dim.Render("Restarting will NOT change this state — check-recovery used to say it would (gt-fbgq)"))
 	case "UNVERIFIED":
 		// Unreachable from this command — it measures, so its input carries
 		// ReuseFactsMeasured. Listed anyway because the default arm below prints
@@ -1606,6 +1635,21 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 		return previous, false
 	}
 	return previous, true
+}
+
+// pausedAgentState returns the agent bead's agent_state when it names a
+// deliberate pause, and "" otherwise. It is the single reader every surface
+// that classifies a polecat should use, so none of them can go blind to the
+// field again the way check-recovery and the reuse gate both had (gt-fbgq).
+func pausedAgentState(fields *beads.AgentFields) string {
+	if fields == nil {
+		return ""
+	}
+	state := beads.AgentState(strings.TrimSpace(fields.AgentState))
+	if !state.IsPaused() {
+		return ""
+	}
+	return string(state)
 }
 
 func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string {

@@ -1,6 +1,9 @@
 package polecat
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDecideWorkstateCanonicalFields(t *testing.T) {
 	tests := []struct {
@@ -335,4 +338,148 @@ func TestDecideWorkstateUnmeasuredSurfaceCannotClaimReusable(t *testing.T) {
 	if d := DecideWorkstate(cleared); !d.Reusable || d.ReuseStatus != "idle-preserved" {
 		t.Fatalf("a measured, cleared polecat must still be reusable: %+v", d)
 	}
+}
+
+// A deliberate agent_state pause is its own verdict with its own remedy, and it
+// is the LOWEST-priority blocker. Both halves matter:
+//
+//   - Its own verdict, because check-recovery never read agent_state at all and
+//     so answered SAFE_TO_NUKE / witness_action=restart for the same polecat
+//     `gt polecat list` was calling NEEDS_RECOVERY on agent_state=stuck. Restart
+//     writes no agent_state, so that prescription could not move the state.
+//
+//   - Lowest priority, because the pause is evaluated after the merge-queue tail.
+//     A stuck polecat with work still outside the queue must read NEEDS_MQ_SUBMIT.
+//     "Just clear the field" would talk a witness straight past work at risk.
+//
+// gt-fbgq.
+func TestDecideWorkstatePausedAgentState(t *testing.T) {
+	base := WorkstateInput{
+		State:              StateIdle,
+		CleanupStatus:      CleanupClean,
+		Branch:             "polecat/ace/bd-4l6",
+		ReuseFactsMeasured: true,
+	}
+
+	t.Run("pause alone is its own verdict", func(t *testing.T) {
+		in := base
+		in.PausedAgentState = "stuck"
+		d := DecideWorkstate(in)
+		if d.Verdict != WorkstateVerdictNeedsStateClear || !d.NeedsStateClear {
+			t.Fatalf("verdict = %+v, want NEEDS_STATE_CLEAR", d)
+		}
+		// Not a recovery condition: there is nothing to recover, only a field to
+		// clear. Routing it to "escalate" was half of what stranded the slot.
+		if d.NeedsRecovery || d.NeedsMQSubmit {
+			t.Fatalf("a pause is not a recovery condition: %+v", d)
+		}
+		// And not a reuse either: silently reusing the slot discards a pause
+		// somebody set on purpose.
+		if d.Reusable || d.SafeToNuke {
+			t.Fatalf("a pause must still block reuse: %+v", d)
+		}
+		if d.CountsTowardCapacity {
+			t.Fatalf("a pause occupies no slot: %+v", d)
+		}
+		if !containsBlocker(d.Blockers, "agent_state=stuck") {
+			t.Fatalf("blockers %q must name the state", d.Blockers)
+		}
+	})
+
+	t.Run("work at risk outranks the pause", func(t *testing.T) {
+		in := base
+		in.PausedAgentState = "stuck"
+		in.UnpushedCommits = 1
+		d := DecideWorkstate(in)
+		if d.Verdict != WorkstateVerdictNeedsRecovery || !d.NeedsRecovery {
+			t.Fatalf("verdict = %+v, want NEEDS_RECOVERY", d)
+		}
+		// Reported alongside, not swallowed: the witness needs to know both that
+		// there is work to rescue and that a pause is waiting behind it.
+		if !containsBlocker(d.Blockers, "git_state=has_unpushed") || !containsBlocker(d.Blockers, "agent_state=stuck") {
+			t.Fatalf("blockers %q must name both the work and the pause", d.Blockers)
+		}
+	})
+
+	t.Run("unsubmitted merge queue work outranks the pause", func(t *testing.T) {
+		// The ordering hazard in one case. The merge-queue tail runs AFTER the
+		// blocker loop, so a pause that blocked in that loop would return before
+		// the tail ever executed and this would read NEEDS_STATE_CLEAR.
+		in := base
+		in.PausedAgentState = "stuck"
+		in.MQCheckRequired = true
+		in.HasSubmittableWork = true
+		d := DecideWorkstate(in)
+		if d.Verdict != WorkstateVerdictNeedsMQSubmit || !d.NeedsMQSubmit {
+			t.Fatalf("verdict = %+v, want NEEDS_MQ_SUBMIT — the pause must not preempt the queue check", d)
+		}
+	})
+
+	t.Run("a refused merge request outranks the pause", func(t *testing.T) {
+		in := base
+		in.PausedAgentState = "stuck"
+		in.MRRefused = true
+		d := DecideWorkstate(in)
+		if d.Verdict != WorkstateVerdictNeedsMQSubmit {
+			t.Fatalf("verdict = %+v, want NEEDS_MQ_SUBMIT", d)
+		}
+	})
+
+	t.Run("an open merge request stays leave-alone", func(t *testing.T) {
+		// PENDING_MR means "preserve this until it lands". The pause must not
+		// convert that into an escalation, so it is appended to the blockers only
+		// after the single-blocker MR test has been decided.
+		in := base
+		in.PausedAgentState = "stuck"
+		in.ActiveMRBlocker = "active_mr=gt-mr status=open"
+		d := DecideWorkstate(in)
+		if d.Verdict != WorkstateVerdictPendingMR {
+			t.Fatalf("verdict = %+v, want PENDING_MR", d)
+		}
+		if !containsBlocker(d.Blockers, "agent_state=stuck") {
+			t.Fatalf("blockers %q must still name the pause", d.Blockers)
+		}
+	})
+
+	t.Run("a busy session outranks everything", func(t *testing.T) {
+		in := base
+		in.PausedAgentState = "stuck"
+		in.SessionBusy = true
+		if d := DecideWorkstate(in); d.Verdict != WorkstateVerdictWorking {
+			t.Fatalf("verdict = %+v, want WORKING", d)
+		}
+	})
+
+	t.Run("an unmeasured surface still names the pause", func(t *testing.T) {
+		// The list surface runs no git, so it has not earned NEEDS_STATE_CLEAR.
+		// But agent_state is a bead fact it read directly, and dropping it would
+		// reproduce the original defect from the other side.
+		in := base
+		in.PausedAgentState = "stuck"
+		in.ReuseFactsMeasured = false
+		d := DecideWorkstate(in)
+		if d.Verdict != WorkstateVerdictUnverified {
+			t.Fatalf("verdict = %+v, want UNVERIFIED", d)
+		}
+		if !containsBlocker(d.Blockers, "agent_state=stuck") {
+			t.Fatalf("blockers %q must name the pause even when nothing was measured", d.Blockers)
+		}
+	})
+
+	t.Run("no pause is unchanged", func(t *testing.T) {
+		// The control. If this ever fails, the arms above are passing because
+		// everything is blocked, not because the pause is being detected.
+		if d := DecideWorkstate(base); !d.Reusable || d.Verdict != WorkstateVerdictSafeToNuke {
+			t.Fatalf("an unpaused clean polecat must still be reusable: %+v", d)
+		}
+	})
+}
+
+func containsBlocker(blockers []string, want string) bool {
+	for _, blocker := range blockers {
+		if strings.Contains(blocker, want) {
+			return true
+		}
+	}
+	return false
 }

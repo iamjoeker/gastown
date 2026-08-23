@@ -51,6 +51,13 @@ const (
 	// (gt-7i07). These mark the transitions so the episode survives the moment.
 	EventNeedsMQSubmit        EventType = "needs_mq_submit"
 	EventNeedsMQSubmitCleared EventType = "needs_mq_submit_cleared"
+
+	// EventAgentStateCleared records `gt polecat clear-state` lifting a deliberate
+	// agent_state pause (stuck, awaiting-gate, paused, escalated) back to idle.
+	// The bead keeps no memory of the prior value — it simply reads idle
+	// afterwards — so without this line the fact that a polecat was ever parked,
+	// and who lifted it, leaves no trace at all (gt-fbgq).
+	EventAgentStateCleared EventType = "agent_state_cleared"
 )
 
 // Event represents a single agent lifecycle event.

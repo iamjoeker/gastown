@@ -62,12 +62,34 @@ Read the `witness_action` field for what *you* may do:
 | Verdict | Meaning | `witness_action` |
 |---------|---------|------------------|
 | SAFE_TO_NUKE | No work at risk | `restart` — `gt session restart {{RIG}}/<name>` |
+| NEEDS_STATE_CLEAR | No work at risk, but `agent_state` is a deliberate pause | `clear-state` — `gt polecat clear-state {{RIG}}/<name>` |
 | NEEDS_MQ_SUBMIT | Pushed but never submitted to MQ | `escalate` |
 | NEEDS_RECOVERY | Unpushed/uncommitted work exists | `escalate` |
 | PENDING_MR | MR in flight; refinery needs the branch | `leave-alone` |
 
 The verdict name `SAFE_TO_NUKE` is legacy vocabulary describing git state, not
 an instruction to you. Treat it as `restart`.
+
+### NEEDS_STATE_CLEAR — restart will not fix this one
+
+`gt done` writes `agent_state=stuck` for escalated and deferred exits. It means
+"paused on purpose", and it is durable: **no restart path writes `agent_state`
+at all**, so `gt session restart` leaves a paused polecat paused. Restarting it
+is not wrong, it is inert.
+
+```bash
+gt polecat clear-state {{RIG}}/<name>
+```
+
+You may run this. It writes one field on the agent bead — the worktree, branch,
+session, and hook are untouched — and it refuses unless the pause is the only
+thing standing, so it cannot talk you past work at risk. If it refuses, the
+blockers it prints are the real problem: escalate.
+
+This verdict exists because `check-recovery` never read `agent_state` and so
+answered `SAFE_TO_NUKE` / `restart` for polecats `gt polecat list` was
+simultaneously calling `NEEDS_RECOVERY` on `agent_state=stuck` — a remedy that
+provably could not move the state, and a slot nothing could reclaim (gt-fbgq).
 
 ### UNVERIFIED — only from `gt polecat list`
 
@@ -115,6 +137,10 @@ Before restarting ANY polecat session:
 
 **If witness_action is `escalate`:** Escalate to Mayor and stop. Do not nuke.
 
+**If witness_action is `clear-state`:** Run `gt polecat clear-state {{RIG}}/<name>`,
+then re-run check-recovery. Do not restart first — restart writes no `agent_state`
+and the verdict will come back unchanged.
+
 **If git state dirty but polecat still alive:**
 1. Nudge the worker to clean up
 2. Wait 5 minutes for response
@@ -150,6 +176,7 @@ ONLY mail Mayor for:
 # Polecat management
 gt polecat list {{RIG}}
 gt polecat check-recovery {{RIG}}/<name>
+gt polecat clear-state {{RIG}}/<name>   # Lift a paused agent_state (restart cannot)
 gt polecat git-state {{RIG}}/<name>
 gt polecat nuke {{RIG}}/<name>         # Blocks on unpushed work
 gt polecat nuke --force {{RIG}}/<name> # Force nuke (LOSES WORK)
