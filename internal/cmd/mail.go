@@ -33,6 +33,7 @@ var (
 	mailReplySubject  string
 	mailReplyMessage  string
 	mailStdin         bool // Read message body from stdin
+	mailAllowEmpty    bool // Permit a subject-only message (gt-gxxm)
 
 	// Search flags
 	mailSearchFrom    string
@@ -126,6 +127,12 @@ Priority levels:
   4 - backlog
 
 Use --urgent as shortcut for --priority 0.
+
+A message with an empty (or whitespace-only) body is refused, whatever the
+source: a harness that does not attach stdin used to deliver a subject with
+nothing under it while printing the same success line as a real send, and the
+recipient could not tell that from a body that was never written. Pass
+--allow-empty when a subject-only message is genuinely what you want.
 
 Examples:
   gt mail send greenplace/Toast -s "Status check" -m "How's that bug fix going?"
@@ -469,6 +476,9 @@ func init() {
 	mailSendCmd.Flags().StringVarP(&mailBody, "message", "m", "", "Message body")
 	mailSendCmd.Flags().StringVar(&mailBody, "body", "", "Alias for --message")
 	mailSendCmd.Flags().BoolVar(&mailStdin, "stdin", false, "Read message body from stdin (avoids shell quoting issues)")
+	// An empty body is refused by default (gt-gxxm): it delivers a subject with
+	// nothing under it and neither end can tell that from a real send.
+	mailSendCmd.Flags().BoolVar(&mailAllowEmpty, "allow-empty", false, "Send even when the body is empty (subject-only message)")
 	mailSendCmd.Flags().IntVar(&mailPriority, "priority", 2, "Message priority (0=urgent, 1=high, 2=normal, 3=low, 4=backlog)")
 	mailSendCmd.Flags().BoolVar(&mailUrgent, "urgent", false, "Set priority=0 (urgent)")
 	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type (task, scavenge, notification, reply)")
