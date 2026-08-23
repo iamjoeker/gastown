@@ -19,6 +19,162 @@ fail() {
   exit 1
 }
 
+# --- Recovery window (gt-x6ji) -----------------------------------------------
+#
+# This plugin force-deletes unmerged branches and then garbage collects in the
+# same pass. `git branch -D` drops the branch AND its reflog, so the commits are
+# unreachable the instant it returns; `gc --prune=now` right after it collected
+# them with no grace period at all. The exposure window was ZERO — there was no
+# moment in which a mistake could be noticed, let alone undone.
+#
+# Two independent changes give the window back, and they are deliberately
+# redundant because each covers what the other does not:
+#
+#   1. Every force-deleted tip is first copied to
+#      refs/gt-hygiene/deleted/<run-epoch>/<branch>. A ref keeps the objects
+#      reachable through `gc --prune=now`, so recovery is `git branch <name>
+#      <backup-ref>` for BACKUP_TTL_SECONDS afterwards. If the backup cannot be
+#      written and read back, the branch is NOT deleted.
+#   2. `gc` no longer passes --prune=now, so anything else that became
+#      unreachable during the run (amended commits, dropped stashes, expired
+#      reflogs) keeps git's default two-week prune grace.
+#
+# The stamp lives in the ref name rather than in a reflog: reflogs are not
+# written for refs outside the default set, and %(committerdate) is the commit's
+# date, not the deletion's. A path component is readable, greppable, and makes
+# expiry a plain integer comparison.
+RUN_STAMP=$(date +%s)
+BACKUP_TTL_SECONDS=${GIT_HYGIENE_BACKUP_TTL_SECONDS:-1209600} # 14 days
+BACKUP_NS="refs/gt-hygiene/deleted"
+
+# expire_backups drops backup refs older than the TTL. Deleting the ref is all
+# that is needed: the objects then age out under gc's normal prune grace.
+expire_backups() {
+  local repo="$1" cutoff=$((RUN_STAMP - BACKUP_TTL_SECONDS))
+  local ref stamp expired=0
+  while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    stamp=${ref#"$BACKUP_NS"/}
+    stamp=${stamp%%/*}
+    # A ref that does not carry an integer stamp was not written by this
+    # plugin. Leave it alone rather than guessing at its age.
+    case "$stamp" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    # age >= TTL, so a TTL of 0 means "expire on the next run" rather than
+    # "expire on the run after the next one".
+    if [ "$stamp" -le "$cutoff" ]; then
+      git -C "$repo" update-ref -d "$ref" 2>/dev/null && expired=$((expired + 1)) || true
+    fi
+  done <<< "$(git -C "$repo" for-each-ref --format='%(refname)' "$BACKUP_NS" 2>/dev/null || true)"
+  printf '%s\n' "$expired"
+}
+
+# backup_branch copies a branch tip into the backup namespace and reads it back.
+# Prints the backup refname on success; returns nonzero if the tip could not be
+# resolved, written, or verified — in which case the caller MUST NOT delete.
+backup_branch() {
+  local repo="$1" branch="$2"
+  local sha backup_ref readback
+  sha=$(git -C "$repo" rev-parse --verify --quiet "refs/heads/$branch^{commit}") || return 1
+  backup_ref="$BACKUP_NS/$RUN_STAMP/$branch"
+  git -C "$repo" update-ref "$backup_ref" "$sha" || return 1
+  # Read back rather than trusting the exit status: a backup that is not
+  # independently resolvable is not a recovery window.
+  readback=$(git -C "$repo" rev-parse --verify --quiet "$backup_ref^{commit}") || return 1
+  [ "$readback" = "$sha" ] || return 1
+  printf '%s\n' "$backup_ref"
+}
+
+# --- Auditable deletes (gt-x6ji) ---------------------------------------------
+#
+# Both delete steps used to end in `2>/dev/null && count++ || true`, so a
+# deletion that failed was indistinguishable from one that never had anything to
+# do: no message, no count, and a success receipt either way. The recycle
+# formula's own `branch -D polecat/<name>` has failed on every invocation for
+# exactly this reason — the name shape is wrong and nothing has ever said so.
+#
+# delete_branch keeps the "one refusal must not abort the run" property that the
+# `|| true` was there for, while making the refusal visible: stderr is captured
+# and logged, and the caller counts it. A delete step that cannot report failure
+# is unauditable, and an unauditable delete step is how a no-op survives months.
+DELETE_ERR=""
+delete_branch() {
+  local repo="$1" branch="$2" flag="$3"
+  DELETE_ERR=""
+  if DELETE_ERR=$(git -C "$repo" branch "$flag" "$branch" 2>&1 >/dev/null); then
+    return 0
+  fi
+  # Collapse to one line: this lands in a plugin receipt, not a terminal.
+  DELETE_ERR=$(printf '%s' "$DELETE_ERR" | tr '\n' ' ' | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')
+  [ -n "$DELETE_ERR" ] || DELETE_ERR="git branch $flag failed with no message"
+  return 1
+}
+
+# --- Which remotes can vouch for a branch? (gt-x6ji) --------------------------
+#
+# The orphan sweep force-deletes anything "the remote" does not hold, so what
+# counts as the remote decides what gets destroyed. It used to be a single ref,
+# refs/remotes/origin/<branch>, which is blind in two ways.
+#
+# Non-origin remotes: a branch pushed anywhere else has no origin/ tracking ref,
+# so the guard never sees it.
+#
+# Split-URL origin: a remote may fetch one URL and push another, which is this
+# town's shape. Tracking refs are built from FETCHES, so a branch pushed to the
+# push URL leaves no refs/remotes/origin/ ref and reads as an orphan — the guard
+# is blind to the very remote the work went to. Measured, not theoretical: three
+# pushed bd-gq7 branches all read as deletable.
+#
+# REMOTES and PUSH_HEADS are rebuilt per repo by scan_remotes below; this reads
+# them as globals rather than re-deriving per branch, since ls-remote is network
+# work and the answer cannot change mid-repo.
+REMOTES=""
+PUSH_HEADS=""
+UNREADABLE_PUSH_REMOTES=""
+
+# scan_remotes populates REMOTES, PUSH_HEADS and UNREADABLE_PUSH_REMOTES for one
+# repo. A push URL that cannot be read leaves the repo's orphan sweep disabled
+# (fail closed) rather than treating "cannot ask" as "not there".
+scan_remotes() {
+  local repo="$1"
+  local remote fetch_url push_url ls
+  REMOTES=$(git -C "$repo" remote 2>/dev/null || true)
+  PUSH_HEADS=""
+  UNREADABLE_PUSH_REMOTES=""
+  while IFS= read -r remote; do
+    [ -z "$remote" ] && continue
+    fetch_url=$(git -C "$repo" remote get-url "$remote" 2>/dev/null || true)
+    push_url=$(git -C "$repo" remote get-url --push "$remote" 2>/dev/null || true)
+    [ -n "$push_url" ] || continue
+    # Same URL both ways: the tracking refs already answer for this remote.
+    [ "$push_url" = "$fetch_url" ] && continue
+    log "  Remote '$remote' pushes to a different URL than it fetches; asking it directly"
+    if ls=$(git -C "$repo" ls-remote --heads "$push_url" 2>/dev/null); then
+      PUSH_HEADS="$PUSH_HEADS
+$(printf '%s\n' "$ls" | sed -n 's|.*[[:space:]]refs/heads/||p')"
+    else
+      UNREADABLE_PUSH_REMOTES="$UNREADABLE_PUSH_REMOTES $remote"
+    fi
+  done <<< "$REMOTES"
+}
+
+# branch_on_any_remote answers "does any remote hold this branch?" across every
+# remote's tracking refs plus the heads read from split push URLs.
+branch_on_any_remote() {
+  local repo="$1" branch="$2" remote
+  while IFS= read -r remote; do
+    [ -z "$remote" ] && continue
+    if git -C "$repo" rev-parse --verify --quiet "refs/remotes/$remote/$branch" >/dev/null 2>&1; then
+      return 0
+    fi
+  done <<< "$REMOTES"
+  if [ -n "$PUSH_HEADS" ] && printf '%s\n' "$PUSH_HEADS" | grep -Fxq -- "$branch"; then
+    return 0
+  fi
+  return 1
+}
+
 # --- Enumerate rig repos -----------------------------------------------------
 #
 # `gt rig list --json` publishes a "repos" array per rig: the git clones inside
@@ -65,6 +221,10 @@ TOTAL_LOCAL_ORPHAN=0
 TOTAL_REMOTE=0
 TOTAL_STASHES=0
 TOTAL_GC=0
+TOTAL_BACKUPS_WRITTEN=0
+TOTAL_BACKUPS_EXPIRED=0
+TOTAL_SKIPPED_REPOS=0
+DELETE_FAILURES=0
 
 while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   [ -z "$REPO_PATH" ] && continue
@@ -90,6 +250,16 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   log "  Pruning remote tracking refs..."
   git -C "$REPO_PATH" fetch --prune --all 2>/dev/null || true
 
+  # Expire backup refs from earlier runs whose recovery window has closed.
+  EXPIRED=$(expire_backups "$REPO_PATH")
+  if [ "$EXPIRED" -gt 0 ]; then
+    log "  Expired $EXPIRED recovery backup(s) older than ${BACKUP_TTL_SECONDS}s"
+    TOTAL_BACKUPS_EXPIRED=$((TOTAL_BACKUPS_EXPIRED + EXPIRED))
+  fi
+
+  # Learn which remotes can vouch for a branch before anything is deleted.
+  scan_remotes "$REPO_PATH"
+
   # Step 2: Delete merged local branches
   log "  Deleting merged local branches..."
   MERGED_BRANCHES=$(git -C "$REPO_PATH" branch --merged "$DEFAULT_BRANCH" 2>/dev/null \
@@ -108,38 +278,72 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
       refinery-patrol|merge/*) continue ;;
     esac
     log "    Deleting merged: $BRANCH"
-    # A refused delete is routine (checked out elsewhere, protected); it must
-    # not abort the run for every remaining branch and repo.
-    git -C "$REPO_PATH" branch -d "$BRANCH" 2>/dev/null && LOCAL_MERGED=$((LOCAL_MERGED + 1)) || true
+    # A refused delete is routine (checked out elsewhere, protected) and must
+    # not abort the run for every remaining branch and repo — but it is reported
+    # and counted rather than swallowed.
+    if delete_branch "$REPO_PATH" "$BRANCH" -d; then
+      LOCAL_MERGED=$((LOCAL_MERGED + 1))
+    else
+      log "    FAILED to delete merged $BRANCH: $DELETE_ERR"
+      DELETE_FAILURES=$((DELETE_FAILURES + 1))
+    fi
   done <<< "$MERGED_BRANCHES"
   TOTAL_LOCAL_MERGED=$((TOTAL_LOCAL_MERGED + LOCAL_MERGED))
 
   # Step 3: Delete stale unmerged orphan branches
-  log "  Deleting stale orphan branches..."
-  STALE_PATTERNS="polecat/|dog/|fix/|pr-|integration/|worktree-agent-"
-  ALL_BRANCHES=$(git -C "$REPO_PATH" branch 2>/dev/null \
-    | grep -v "^\*" \
-    | grep -v "^+" \
-    | sed 's/^[[:space:]]*//' || true)
-
+  #
+  # This is the only step that destroys unmerged work, so it is the only one
+  # that fails closed. If a remote could not be consulted, "no remote holds it"
+  # is not a fact this run established — it is a question it failed to ask —
+  # and the branch keeps its benefit of the doubt.
   LOCAL_ORPHAN=0
-  while IFS= read -r BRANCH; do
-    [ -z "$BRANCH" ] && continue
-    if ! echo "$BRANCH" | grep -qE "^($STALE_PATTERNS)"; then
-      continue
-    fi
-    if [ "$BRANCH" = "$CURRENT_BRANCH" ] || [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
-      continue
-    fi
-    case "$BRANCH" in
-      main|master|refinery-patrol|merge/*) continue ;;
-    esac
-    if git -C "$REPO_PATH" rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
-      continue
-    fi
-    log "    Deleting orphan: $BRANCH"
-    git -C "$REPO_PATH" branch -D "$BRANCH" 2>/dev/null && LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1)) || true
-  done <<< "$ALL_BRANCHES"
+  if [ -n "$UNREADABLE_PUSH_REMOTES" ]; then
+    log "  SKIPPING orphan sweep: could not read push URL for remote(s):$UNREADABLE_PUSH_REMOTES"
+    log "    Branches pushed there would read as orphans; refusing to force-delete on an unread remote."
+    TOTAL_SKIPPED_REPOS=$((TOTAL_SKIPPED_REPOS + 1))
+  else
+    log "  Deleting stale orphan branches..."
+    STALE_PATTERNS="polecat/|dog/|fix/|pr-|integration/|worktree-agent-"
+    ALL_BRANCHES=$(git -C "$REPO_PATH" branch 2>/dev/null \
+      | grep -v "^\*" \
+      | grep -v "^+" \
+      | sed 's/^[[:space:]]*//' || true)
+
+    while IFS= read -r BRANCH; do
+      [ -z "$BRANCH" ] && continue
+      if ! echo "$BRANCH" | grep -qE "^($STALE_PATTERNS)"; then
+        continue
+      fi
+      if [ "$BRANCH" = "$CURRENT_BRANCH" ] || [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+        continue
+      fi
+      case "$BRANCH" in
+        main|master|refinery-patrol|merge/*) continue ;;
+      esac
+      if branch_on_any_remote "$REPO_PATH" "$BRANCH"; then
+        continue
+      fi
+      # Backup BEFORE delete, and only delete if the backup reads back. This is
+      # the recovery window: without it, `branch -D` drops the branch and its
+      # reflog together and the tip is unreachable the instant it returns.
+      if ! BACKUP_REF=$(backup_branch "$REPO_PATH" "$BRANCH"); then
+        log "    SKIPPING orphan $BRANCH: could not write a recovery backup ref"
+        DELETE_FAILURES=$((DELETE_FAILURES + 1))
+        continue
+      fi
+      log "    Deleting orphan: $BRANCH (recoverable for ${BACKUP_TTL_SECONDS}s: git -C $REPO_PATH branch $BRANCH $BACKUP_REF)"
+      if delete_branch "$REPO_PATH" "$BRANCH" -D; then
+        LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1))
+        TOTAL_BACKUPS_WRITTEN=$((TOTAL_BACKUPS_WRITTEN + 1))
+      else
+        log "    FAILED to delete orphan $BRANCH: $DELETE_ERR"
+        DELETE_FAILURES=$((DELETE_FAILURES + 1))
+        # The branch survived, so its backup is noise. Dropping it keeps the
+        # namespace a record of deletions rather than of attempts.
+        git -C "$REPO_PATH" update-ref -d "$BACKUP_REF" 2>/dev/null || true
+      fi
+    done <<< "$ALL_BRANCHES"
+  fi
   TOTAL_LOCAL_ORPHAN=$((TOTAL_LOCAL_ORPHAN + LOCAL_ORPHAN))
 
   # Step 4: Delete merged remote branches on GitHub
@@ -195,8 +399,15 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   fi
 
   # Step 6: Garbage collect
+  #
+  # NOT --prune=now. This gc runs in the same pass as the deletions above, and
+  # --prune=now collected everything they had just made unreachable with no
+  # grace period at all — branch tips, their reflogs, dropped stashes, amended
+  # commits. git's default (prune objects older than two weeks) is the whole
+  # recovery window for anything the backup refs above do not cover, and this
+  # plugin's job is housekeeping, not reclaiming bytes on a deadline.
   log "  Running git gc..."
-  git -C "$REPO_PATH" gc --prune=now --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1)) || true
+  git -C "$REPO_PATH" gc --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1)) || true
 
   log "  Done: $LOCAL_MERGED merged, $LOCAL_ORPHAN orphan, $REMOTE_DELETED remote, $STASH_COUNT stash(es)"
 done <<< "$RIG_REPOS"
@@ -204,9 +415,28 @@ done <<< "$RIG_REPOS"
 # --- Report -------------------------------------------------------------------
 
 SUMMARY="$RIG_COUNT repo(s) across $RIG_TOTAL rig(s): $TOTAL_LOCAL_MERGED merged, $TOTAL_LOCAL_ORPHAN orphan, $TOTAL_REMOTE remote, $TOTAL_STASHES stash(es), $TOTAL_GC gc"
+SUMMARY="$SUMMARY, $TOTAL_BACKUPS_WRITTEN backup(s) written, $TOTAL_BACKUPS_EXPIRED expired"
+if [ "$TOTAL_SKIPPED_REPOS" -gt 0 ]; then
+  SUMMARY="$SUMMARY, $TOTAL_SKIPPED_REPOS repo(s) skipped (unreadable push remote)"
+fi
+if [ "$DELETE_FAILURES" -gt 0 ]; then
+  SUMMARY="$SUMMARY, $DELETE_FAILURES delete failure(s)"
+fi
+
 log ""
 log "=== Git Hygiene Summary ==="
 log "$SUMMARY"
+if [ "$TOTAL_BACKUPS_WRITTEN" -gt 0 ]; then
+  log "Force-deleted tips are recoverable from $BACKUP_NS/$RUN_STAMP/<branch> for ${BACKUP_TTL_SECONDS}s"
+fi
 
-gt plugin record-run --plugin git-hygiene --result success \
+# A delete that failed is a real result, not a footnote. Reporting success while
+# a deletion step silently refused every branch is exactly how this plugin's
+# sibling in the recycle formula stayed inert and unnoticed.
+RESULT=success
+if [ "$DELETE_FAILURES" -gt 0 ]; then
+  RESULT=failure
+fi
+
+gt plugin record-run --plugin git-hygiene --result "$RESULT" \
   --title "git-hygiene: $SUMMARY" --description "$SUMMARY" >/dev/null 2>&1 || true
