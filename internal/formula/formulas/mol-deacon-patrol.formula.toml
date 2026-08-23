@@ -124,7 +124,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 21
+version = 22
 
 [vars]
 [vars.wisp_type]
@@ -189,6 +189,22 @@ deleting, and aborts the gc if preservation fails. It still DELETES, and it is h
 it cannot protect `bd-`/`gt-` prefixed beads, so it is safe only from the hq-scoped Deacon
 context and must never be run against a rig database. A fresh town has no such wrapper and
 this step does not create one. Report stale wisps to the reaper Dog instead of GC-ing them.
+
+**Where that wrapper exists, run it ONLY in its preserve half, with the flag spelled out:**
+```bash
+bash $GT_ROOT/deacon/preserve-then-gc.sh --preserve-only
+```
+
+**Pass `--preserve-only` explicitly. Do NOT rely on the script default.** The
+default was inverted to preserve-only on 2026-08-18; a bare run happens to print
+HELD today only because of that. If the default ever regresses, a bare invocation
+silently re-arms the patrol-2682 breach and this step still reads as correct. The
+flag must be on the dangerous side of the call, not in the operator's memory.
+The gc half of this script is HELD under the bd-czf hold (hq-6y9dp, P0).
+
+Dead wisp citations resolve via `bash $GT_ROOT/deacon/evidence/resolve.sh <id>`. Note this
+preserves the EVIDENCE but does not restore the CITATION MECHANISM — `bd show` still fails,
+so prefer citing non-wisp bead ids, which are never deleted.
 
 Then handle callbacks from agents.
 
@@ -1214,7 +1230,7 @@ id = "session-gc"
 title = "Detect cleanup needs"
 needs = ["orphan-check"]
 description = """
-**DETECT ONLY** - Check if cleanup is needed and dispatch to dog.
+**DETECT ONLY** - Check if cleanup is needed. The dispatch is HELD; see Step 2.
 
 **Step 1: Quick cleanup check (avoid gt doctor -v — takes 60s, blocks patrol)**
 ```bash
@@ -1224,25 +1240,47 @@ tmux list-sessions 2>/dev/null | wc -l
 bd list --status=open --json 2>/dev/null | jq length
 ```
 
-**Step 2: If cleanup needed, dispatch to dog**
+**Step 2: DISPATCH IS PROHIBITED — DO NOT SLING mol-session-gc**
+
+🚨 **THIS DISPATCH IS HELD. (Mayor ruling, re-issued 2026-08-22 as hq-5dj0d, P0)**
+
+Do NOT run, in any mode:
+
 ```bash
-# Sling session-gc formula to an idle dog
-gt sling mol-session-gc deacon/dogs --var mode=conservative
+# PROHIBITED — shown commented out ON PURPOSE so it is inert if copied verbatim.
+# Do NOT uncomment. Do NOT reconstruct it by hand.
+# gt sling mol-session-gc deacon/dogs --var mode=conservative
 ```
 
-**Important:** Do NOT run `gt doctor -v` or `gt doctor --fix` inline.
-`gt doctor -v` takes 60+ seconds and blocks the patrol loop.
-Dogs handle cleanup. The Deacon stays lightweight - detection only.
+`mol-session-gc` step `execute-gc` runs a bare, unfiltered `gt doctor --fix`.
+The `mode` var does NOT gate it — `mode` only branches the aggressive extras
+BELOW that line, so `mode=conservative` still runs a full-workspace fix across
+~90 checks: it deletes tracked `settings.json`, rewrites `daemon.json`, and
+re-appends the Dolt section to the town `CLAUDE.md`, which is injected into
+every agent context, so the duplication compounds on every run. That damage is
+already present and committed (town `CLAUDE.md` carries the section twice).
 
-**Step 3: If nothing to clean**
-Skip dispatch - system is healthy.
+**The prohibition is on the DISPATCH, not only on the inline call.** The
+paragraph below is about latency, not safety; do not read it as the whole rule.
+Handing the held command to a dog does not make it someone else's ruling to
+disregard — the hold binds the work, not the worker.
+
+**Important (latency, separate concern):** Do NOT run `gt doctor -v` or
+`gt doctor --fix` inline either. `gt doctor -v` takes 60+ seconds and blocks the
+patrol loop. The Deacon stays lightweight - detection only.
+
+**Step 3: Detection only**
+Report the counts from Step 1 in the patrol report and dispatch nothing. Say in
+the patrol report that this step was HELD with the reason, so a missing dispatch
+is never read as "system healthy".
 
 **Cleanup types (for reference):**
 - orphan-sessions: Dead tmux sessions
 - orphan-processes: Orphaned Claude processes
 - wisp-gc: Old wisps past retention
 
-**Exit criteria:** Session GC dispatched to dog (if needed)."""
+**Exit criteria:** Cleanup counts reported. Nothing dispatched, nothing deleted.
+Step reported as HELD."""
 
 [[steps]]
 id = "wisp-compact"
@@ -1251,6 +1289,20 @@ needs = ["session-gc"]
 description = """
 🚨 **ON HOLD (gt-hv3p) — run NO form of `gt compact` from this patrol, and do not
 reconstruct one from memory.** There is deliberately no command in this step.
+
+🚨 **THIS STEP IS HELD. DO NOT EXECUTE COMPACTION. (bd-czf hold; hq-6y9dp, P0)**
+
+**TWO independent holds cover this step, and lifting one does not lift the other.**
+
+The MAYOR RULING of 2026-08-11 (hq-wisp-g698w) held bulk wisp destruction. That
+ruling named `preserve-then-gc.sh`. **It binds `gt compact` too, in every form.**
+The hold is about the DESTRUCTION, not about which binary performs it. Under that
+ruling `gt compact --verbose` and bare `gt compact` are HELD — they delete.
+
+gt-hv3p then closed the remaining gap: the preview forms are not previews either.
+So `--dry-run` and `--json` are held as well, and there is no flag combination
+left that is permitted here. Do not read the bd-czf hold's enumeration of the
+obviously-destructive forms as a licence for the rest.
 
 On 2026-08-22 the next step ran `gt compact report --dry-run` verbatim from this
 patrol and destroyed 454 wisps. `--dry-run` was never passed to the compaction
@@ -1295,6 +1347,13 @@ description = """
 🚨 **ON HOLD (gt-hv3p) — run NO form of `gt compact report`, including
 `--dry-run` and `--json`.** There is deliberately no command in this step.
 
+🚨 **THIS STEP IS HELD IN EVERY FLAG FORM. (hq-6y9dp, P0)**
+
+Both holds reach this step. The bd-czf ruling carried on `wisp-compact` above
+holds the destruction whichever binary performs it, and this command performs it;
+gt-hv3p holds every flag form of the command itself. Closing one leaves the other
+standing.
+
 THIS is the command that destroyed 454 wisps on 2026-08-22, in its `--dry-run`
 form, run verbatim from this step. Every flag form of it performs a real
 compaction: the report command exec's the compaction FIRST and consults its own
@@ -1313,6 +1372,11 @@ step too, because both steps reach the same deletion path.
 
 Until the Mayor records that verification on gt-hv3p, this step is a no-op. No
 digest is sent, and its absence is expected rather than a fault to chase.
+
+KNOWN CONSEQUENCE, accepted deliberately: no compaction digest is produced while this
+holds. Digests have already been silently absent since 2026-08-19. Losing the digest is
+cheap; the wisps are not recoverable. Say in your patrol report that the step was HELD,
+so a missing digest is never mistaken for a clean cycle.
 
 **Exit criteria:** No compaction digest was run or sent; the hold was honoured."""
 
