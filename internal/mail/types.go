@@ -27,6 +27,10 @@ const (
 )
 
 // MessageType indicates the purpose of a message.
+//
+// The question the type must answer is "does the recipient still owe something
+// back after reading this?" — that is what makes close-on-read and any future
+// mail GC safe (gt-do5c). It is NOT a record of how the mail was sent.
 type MessageType string
 
 const (
@@ -40,11 +44,82 @@ const (
 	TypeScavenge MessageType = "scavenge"
 
 	// TypeNotification is an informational message (default).
+	// No reply is possible or expected: reading it consumes it.
 	TypeNotification MessageType = "notification"
 
-	// TypeReply is a response to another message.
+	// TypeReply is a response to another message. A reply answers a question
+	// and owes nothing back, so it is consumed by being read.
 	TypeReply MessageType = "reply"
+
+	// TypeQuery is a question addressed to the recipient. A reply is owed and
+	// the message must stay open until it is answered.
+	//
+	// Added for gt-do5c: "query" was named in the vocabulary everywhere but was
+	// never a valid value, so ParseMessageType coerced it to TypeNotification
+	// and `msg-type:query` could never appear on any bead. Its count of zero was
+	// a property of this enum, not of what senders were doing.
+	TypeQuery MessageType = "query"
+
+	// TypeHandoff is session-cycling context a role mails to itself. The
+	// successor consumes it by reading it and owes no answer.
+	//
+	// Added for gt-do5c: handoff mail bypassed the router's label builder
+	// entirely, so it carried no msg-type label at all — 18 of 18 untyped
+	// gt:message beads on the hq store were handoffs.
+	TypeHandoff MessageType = "handoff"
 )
+
+// ValidMessageTypes lists every recognised message type, in the order they
+// should be presented to a human (flag help, error messages).
+func ValidMessageTypes() []MessageType {
+	return []MessageType{
+		TypeNotification, TypeQuery, TypeReply, TypeTask,
+		TypeScavenge, TypeEscalation, TypeHandoff,
+	}
+}
+
+// IsValid reports whether t is a recognised message type.
+func (t MessageType) IsValid() bool {
+	switch t {
+	case TypeTask, TypeEscalation, TypeScavenge, TypeNotification,
+		TypeReply, TypeQuery, TypeHandoff:
+		return true
+	default:
+		return false
+	}
+}
+
+// ExpectsReply reports whether reading a message of this type leaves the
+// recipient owing a response.
+//
+// An unrecognised type expects a reply: a value this code does not understand
+// must never be treated as consumed. Callers get the same answer for a type
+// that has not been invented yet as for one deliberately left open.
+func (t MessageType) ExpectsReply() bool {
+	switch t {
+	case TypeNotification, TypeReply, TypeHandoff:
+		return false
+	default:
+		// query, task, scavenge, escalation, and anything unrecognised.
+		return true
+	}
+}
+
+// SafeToCloseOnRead reports whether a message of this type may be closed the
+// moment it is read, rather than left open in the recipient's work queue.
+//
+// This is the single predicate the close-on-read path (gt-qffl) and any future
+// mail GC should call. It fails CLOSED: an empty or unrecognised type is never
+// safe to auto-close, because an empty type is exactly what a writer that
+// forgot to stamp one produces, and those are indistinguishable from real
+// questions. TypeEscalation is never safe regardless — escalations have their
+// own ack surface and auto-closing one loses it.
+func (t MessageType) SafeToCloseOnRead() bool {
+	if t == TypeEscalation {
+		return false
+	}
+	return t.IsValid() && !t.ExpectsReply()
+}
 
 // Delivery specifies how a message is delivered to the recipient.
 type Delivery string
@@ -410,12 +485,11 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		priority = PriorityNormal
 	}
 
-	// Convert message type, default to notification
-	msgType := TypeNotification
-	switch MessageType(bm.msgType) {
-	case TypeTask, TypeEscalation, TypeScavenge, TypeReply:
-		msgType = MessageType(bm.msgType)
-	}
+	// Convert message type, default to notification. Delegated rather than
+	// re-switched: this used to carry its own copy of the case list, and the
+	// two drifted — a type added to ParseMessageType would still have read
+	// back as "notification" here (gt-do5c).
+	msgType := ParseMessageType(bm.msgType)
 
 	// Convert CC identities to addresses
 	var ccAddrs []string
@@ -538,14 +612,38 @@ func PriorityFromInt(p int) Priority {
 	}
 }
 
-// ParseMessageType parses a message type string, returning TypeNotification for invalid values.
+// ParseMessageType parses a message type string as READ BACK FROM STORAGE,
+// returning TypeNotification for unset or unrecognised values.
+//
+// This leniency is correct for reading a bead written by an older or newer
+// build, and wrong for accepting a value from a caller: a caller who asks for
+// a type this build does not know has made a mistake worth reporting, and
+// silently rewriting it to "notification" is what made msg-type uniform in the
+// first place (gt-do5c). Input from a caller goes through ValidateMessageType.
 func ParseMessageType(s string) MessageType {
-	switch MessageType(s) {
-	case TypeTask, TypeEscalation, TypeScavenge, TypeNotification, TypeReply:
-		return MessageType(s)
-	default:
-		return TypeNotification
+	if t := MessageType(s); t.IsValid() {
+		return t
 	}
+	return TypeNotification
+}
+
+// ValidateMessageType converts caller-supplied input into a MessageType,
+// rejecting anything unrecognised instead of coercing it.
+//
+// An empty string means "not specified" and yields TypeNotification, so
+// callers that never pass a type keep working.
+func ValidateMessageType(s string) (MessageType, error) {
+	if s == "" {
+		return TypeNotification, nil
+	}
+	if t := MessageType(s); t.IsValid() {
+		return t, nil
+	}
+	names := make([]string, 0, len(ValidMessageTypes()))
+	for _, t := range ValidMessageTypes() {
+		names = append(names, string(t))
+	}
+	return "", fmt.Errorf("unknown message type %q (valid: %s)", s, strings.Join(names, ", "))
 }
 
 // normalizeAddress handles the common normalization logic shared by

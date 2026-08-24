@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -1049,4 +1050,43 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 			t.Errorf("mayor should be exempt from cooldown, but waited %v", elapsed)
 		}
 	})
+}
+
+// TestHandoffMailLabelsStampsMsgType guards gt-do5c. sendHandoffMail bypasses
+// Router.buildLabels — the only other site that writes msg-type — so handoff
+// beads carried no message type at all. Every one of the 18 untyped gt:message
+// beads on the hq store was a handoff, which is what made msg-type:handoff
+// measure zero while looking like nobody was handing off.
+func TestHandoffMailLabelsStampsMsgType(t *testing.T) {
+	labels := handoffMailLabels("gastown/polecats/chrome")
+
+	want := "msg-type:" + string(mail.TypeHandoff)
+	if !strings.Contains(labels, want) {
+		t.Errorf("handoffMailLabels() = %q, missing %q", labels, want)
+	}
+	// Control: assert the sender label the caller has always relied on, so a
+	// bug returning an empty string fails as a missing from: rather than
+	// silently satisfying some weaker form of the check above.
+	if !strings.Contains(labels, "from:gastown/polecats/chrome") {
+		t.Errorf("handoffMailLabels() = %q, missing the from: label", labels)
+	}
+	// The result is spliced into a comma-separated --labels value; a stray
+	// space would make bd create a label named " msg-type:handoff".
+	for _, part := range strings.Split(labels, ",") {
+		if part != strings.TrimSpace(part) {
+			t.Errorf("label %q has surrounding whitespace in %q", part, labels)
+		}
+	}
+}
+
+// TestHandoffMailTypeIsSafeToCloseOnRead ties the label to the semantics that
+// make it worth stamping: a successor consumes handoff context by reading it,
+// so it must not linger in the work queue the way an unanswered query does.
+func TestHandoffMailTypeIsSafeToCloseOnRead(t *testing.T) {
+	if mail.TypeHandoff.ExpectsReply() {
+		t.Error("TypeHandoff.ExpectsReply() = true; a handoff to self owes no answer")
+	}
+	if !mail.TypeHandoff.SafeToCloseOnRead() {
+		t.Error("TypeHandoff.SafeToCloseOnRead() = false; handoff context is consumed by being read")
+	}
 }

@@ -112,8 +112,15 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		msg.Priority = mail.PriorityHigh
 	}
 
-	// Set message type
-	msg.Type = mail.ParseMessageType(mailType)
+	// Set message type. Reject an unrecognised value rather than rewriting it
+	// to "notification": the silent coercion meant `--type query` reported
+	// success and stored `msg-type:notification`, so a sender trying to be
+	// honest was overruled without being told (gt-do5c).
+	msgType, err := mail.ValidateMessageType(mailType)
+	if err != nil {
+		return err
+	}
+	msg.Type = msgType
 
 	// Set pinned flag
 	msg.Pinned = mailPinned

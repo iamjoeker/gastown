@@ -232,15 +232,27 @@ func (r *Router) ensureCustomTypes(beadsDir string) error {
 	return nil
 }
 
-func (r *Router) buildLabels(msg *Message) []string {
-	var labels []string
-	labels = append(labels, "gt:message")
+// messageIdentityLabels returns the labels every mail bead carries regardless
+// of which destination shape it lands in — direct, queue, announce or channel.
+//
+// msg-type belongs here rather than in each caller. The queue, announce and
+// channel writers each hand-rolled their own label slice under a comment
+// promising "labels for type, from/thread/reply-to/cc", and all three omitted
+// the type (gt-do5c). Sharing the line is what stops a fourth writer from
+// making the same omission just as quietly.
+func messageIdentityLabels(msg *Message) []string {
+	labels := []string{"gt:message", "from:" + msg.From, "msg-type:" + string(msg.Type)}
 	if msg.Type == TypeEscalation {
 		labels = append(labels, "gt:escalation")
 	}
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "msg-type:"+string(msg.Type))
-	labels = append(labels, DeliverySendLabels()...)
+	return labels
+}
+
+// messageThreadLabels returns the threading and CC metadata every mail bead
+// carries. Companion to messageIdentityLabels; the destination-specific label
+// (queue:, announce:, channel:) goes between the two.
+func messageThreadLabels(msg *Message) []string {
+	var labels []string
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -248,10 +260,38 @@ func (r *Router) buildLabels(msg *Message) []string {
 		labels = append(labels, "reply-to:"+msg.ReplyTo)
 	}
 	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
+		labels = append(labels, "cc:"+AddressToIdentity(cc))
 	}
 	return labels
+}
+
+func (r *Router) buildLabels(msg *Message) []string {
+	labels := messageIdentityLabels(msg)
+	labels = append(labels, DeliverySendLabels()...)
+	return append(labels, messageThreadLabels(msg)...)
+}
+
+// queueLabels builds the label set for a message landing in a work queue.
+func queueLabels(msg *Message, queueName string) []string {
+	labels := append(messageIdentityLabels(msg), "queue:"+queueName)
+	labels = append(labels, DeliverySendLabels()...)
+	return append(labels, messageThreadLabels(msg)...)
+}
+
+// announceLabels builds the label set for the origin copy of an announce
+// broadcast. delivery:pending is intentionally omitted — a broadcast has no
+// single recipient to ack against. Subscriber fan-out copies go through
+// sendToSingle, which adds delivery tracking.
+func announceLabels(msg *Message, announceName string) []string {
+	labels := append(messageIdentityLabels(msg), "announce:"+announceName)
+	return append(labels, messageThreadLabels(msg)...)
+}
+
+// channelLabels builds the label set for the origin copy of a channel post.
+// delivery:pending is omitted for the same reason as announceLabels.
+func channelLabels(msg *Message, channelName string) []string {
+	labels := append(messageIdentityLabels(msg), "channel:"+channelName)
+	return append(labels, messageThreadLabels(msg)...)
 }
 
 // isTownLevelAddress returns true if the address is for a town-level agent or the overseer.
@@ -1283,22 +1323,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 		return err
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus queue metadata
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "queue:"+queueName)
-	labels = append(labels, DeliverySendLabels()...)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := queueLabels(msg, queueName)
 
 	// Build command: bd create --assignee=queue:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1365,24 +1390,7 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 		}
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus announce metadata.
-	// Note: delivery:pending is intentionally omitted for announce messages —
-	// broadcast messages have no single recipient to ack against. Subscriber
-	// fan-out copies go through sendToSingle which adds delivery tracking.
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "announce:"+announceName)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := announceLabels(msg, announceName)
 
 	// Build command: bd create --assignee=announce:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1451,24 +1459,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 		return fmt.Errorf("channel %s is closed", channelName)
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus channel metadata.
-	// Note: delivery:pending is intentionally omitted for the channel-origin
-	// copy — it has no single recipient to ack. Subscriber fan-out copies go
-	// through sendToSingle which adds delivery tracking.
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "channel:"+channelName)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := channelLabels(msg, channelName)
 
 	// Build command: bd create --assignee=channel:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.

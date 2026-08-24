@@ -230,6 +230,47 @@ attached_at: <timestamp>
 
 ## Format Conventions
 
+### `--type`: does a reply come back?
+
+Every mail bead carries a `msg-type:<value>` label. The subject prefixes above
+say what a message is *about*; `msg-type` answers one narrower question:
+
+> After the recipient reads this, do they still owe you something?
+
+That is the only question, and it is the one that decides whether a message may
+be closed on read or must stay open in the recipient's work queue. It is **not**
+a record of how the mail was sent.
+
+| `--type` | Reply owed? | Meaning |
+|---|---|---|
+| `notification` (default) | no | Informational. Nothing can be replied to; reading consumes it. |
+| `reply` | no | An answer to someone else's question. Set automatically by `--reply-to`. |
+| `handoff` | no | Session-cycling context mailed to self. Set automatically by `gt handoff`. |
+| `query` | **yes** | A question. **Stays open until answered.** |
+| `task` | **yes** | Work assigned to the recipient. Reading it is not doing it. |
+| `scavenge` | **yes** | Optional first-come work. Still work until claimed. |
+| `escalation` | **yes** | Has its own ack surface (`gt escalate ack`). Never auto-closed. |
+
+**Pass `--type query` when you are blocked on the answer.** The default is
+`notification`, so a question sent without it is indistinguishable from a
+"convoy complete" — which is exactly how the mayor's inbox reached 375 unread
+with a HIGH escalation sitting unactioned for 3.7 days (gt-do5c).
+
+An unrecognised `--type` is now rejected. It used to be rewritten to
+`notification` and reported as sent, so `--type query` silently produced
+`msg-type:notification` and the sender was never told.
+
+In code, do not re-derive the rule from the type name — call the predicate:
+
+```go
+msg.Type.ExpectsReply()        // is the recipient still on the hook?
+msg.Type.SafeToCloseOnRead()   // may this be closed the moment it is read?
+```
+
+Both fail closed: an unset or unrecognised type is never safe to auto-close,
+because an unset type is precisely what a writer that forgot to stamp one
+produces, and those are indistinguishable from real questions.
+
 ### Subject Line
 
 - **Type prefix**: Uppercase, identifies message type

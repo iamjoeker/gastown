@@ -481,7 +481,7 @@ func init() {
 	mailSendCmd.Flags().BoolVar(&mailAllowEmpty, "allow-empty", false, "Send even when the body is empty (subject-only message)")
 	mailSendCmd.Flags().IntVar(&mailPriority, "priority", 2, "Message priority (0=urgent, 1=high, 2=normal, 3=low, 4=backlog)")
 	mailSendCmd.Flags().BoolVar(&mailUrgent, "urgent", false, "Set priority=0 (urgent)")
-	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type (task, scavenge, notification, reply)")
+	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type — does a reply come back? notification|reply|handoff owe nothing and are consumed by being read; query|task|scavenge|escalation stay open until answered")
 	mailSendCmd.Flags().StringVar(&mailReplyTo, "reply-to", "", "Message ID this is replying to")
 	mailSendCmd.Flags().BoolVarP(&mailNotify, "notify", "n", false, "Bump priority to high (notification is automatic; use --no-notify to suppress)")
 	mailSendCmd.Flags().BoolVar(&mailNoNotify, "no-notify", false, "Suppress auto-nudge notification to recipient")

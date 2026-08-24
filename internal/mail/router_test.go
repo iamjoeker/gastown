@@ -2434,3 +2434,59 @@ func TestEnqueueReplyReminder_DisabledByConfig(t *testing.T) {
 		t.Errorf("reply_reminder_delay=0s should disable reminders, got %d pending", pending)
 	}
 }
+
+// TestEverySendPathStampsMsgType is the guard for gt-do5c. The queue, announce
+// and channel writers each hand-rolled a label slice under a comment promising
+// "labels for type, from/thread/reply-to/cc" and all three omitted the type, so
+// their mail could never be classified by any query. Adding a fourth writer that
+// forgets it should fail here rather than on the hq store months later.
+func TestEverySendPathStampsMsgType(t *testing.T) {
+	msg := &Message{
+		From:     "gastown/witness",
+		To:       "mayor/",
+		Subject:  "Why was gt-wisp-0an54 rejected?",
+		Body:     "Blocked on the answer.",
+		Type:     TypeQuery,
+		ThreadID: "t-do5c",
+	}
+	r := &Router{}
+
+	paths := map[string][]string{
+		"direct":   r.buildLabels(msg),
+		"queue":    queueLabels(msg, "merge"),
+		"announce": announceLabels(msg, "townhall"),
+		"channel":  channelLabels(msg, "ops"),
+	}
+
+	for name, labels := range paths {
+		if !containsLabel(labels, "msg-type:query") {
+			t.Errorf("%s path labels %v carry no msg-type:query", name, labels)
+		}
+		// Control: assert a label this path is known to write, so a bug that
+		// returned an empty slice would fail as a missing gt:message rather
+		// than passing some weaker version of the check above.
+		if !containsLabel(labels, "gt:message") {
+			t.Errorf("%s path labels %v carry no gt:message — probe is not reading real labels", name, labels)
+		}
+	}
+}
+
+// TestMsgTypeLabelTracksTheMessage: a hardcoded "msg-type:notification" in each
+// writer would satisfy the presence check above while reproducing the original
+// bug exactly. This pins the label to the message's actual type.
+func TestMsgTypeLabelTracksTheMessage(t *testing.T) {
+	r := &Router{}
+	for _, mt := range ValidMessageTypes() {
+		msg := &Message{From: "deacon/", To: "mayor/", Subject: "s", Body: "b", Type: mt}
+		for name, labels := range map[string][]string{
+			"direct":   r.buildLabels(msg),
+			"queue":    queueLabels(msg, "q"),
+			"announce": announceLabels(msg, "a"),
+			"channel":  channelLabels(msg, "c"),
+		} {
+			if !containsLabel(labels, "msg-type:"+string(mt)) {
+				t.Errorf("%s path with Type=%q wrote %v", name, mt, labels)
+			}
+		}
+	}
+}

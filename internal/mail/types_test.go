@@ -2,6 +2,7 @@ package mail
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -967,5 +968,143 @@ func TestNewMessageFanOutCopiesGetUniqueIDs(t *testing.T) {
 	// The cleared copy should fail validation (sendToSingle regenerates it)
 	if err := msgCopy.Validate(); err == nil {
 		t.Error("copy with empty ID should fail validation before sendToSingle regenerates it")
+	}
+}
+
+// --- gt-do5c: msg-type must be able to discriminate ---------------------------
+//
+// The bug was that msg-type was uniformly "notification": 397 open beads carried
+// it while "query" and "handoff" were both zero. The zeros had two different
+// causes and both are regression-tested here.
+
+// TestParseMessageTypeAcceptsQueryAndHandoff pins the first cause: "query" and
+// "handoff" were not members of the enum, so ParseMessageType coerced them to
+// TypeNotification. Their count of zero described this switch statement, not
+// sender behaviour.
+func TestParseMessageTypeAcceptsQueryAndHandoff(t *testing.T) {
+	for _, want := range []MessageType{TypeQuery, TypeHandoff} {
+		if got := ParseMessageType(string(want)); got != want {
+			t.Errorf("ParseMessageType(%q) = %q, want %q (silently coerced — the gt-do5c bug)", want, got, want)
+		}
+	}
+}
+
+// TestParseMessageTypeRoundTripsEveryValidType is the self-validating control
+// for the test above: a probe that only checked query and handoff could pass
+// against an enum that had lost every other member.
+func TestParseMessageTypeRoundTripsEveryValidType(t *testing.T) {
+	for _, want := range ValidMessageTypes() {
+		if got := ParseMessageType(string(want)); got != want {
+			t.Errorf("ParseMessageType(%q) = %q, want round-trip", want, got)
+		}
+		if !want.IsValid() {
+			t.Errorf("%q is listed by ValidMessageTypes but IsValid says otherwise", want)
+		}
+	}
+}
+
+// TestParseMessageTypeStaysLenientForStorage: reading a bead written by another
+// build must not fail, so unrecognised values still degrade to notification on
+// the READ path. Only caller input is rejected (see ValidateMessageType).
+func TestParseMessageTypeStaysLenientForStorage(t *testing.T) {
+	for _, in := range []string{"", "bogus", "NOTIFICATION", "future-type"} {
+		if got := ParseMessageType(in); got != TypeNotification {
+			t.Errorf("ParseMessageType(%q) = %q, want TypeNotification on the read path", in, got)
+		}
+	}
+}
+
+// TestValidateMessageTypeRejectsUnknown pins the mechanism that made the field
+// uniform: `gt mail send --type query` reported success and stored
+// msg-type:notification, so a sender trying to be honest was overruled silently.
+func TestValidateMessageTypeRejectsUnknown(t *testing.T) {
+	if _, err := ValidateMessageType("query"); err != nil {
+		t.Fatalf("ValidateMessageType(query) errored: %v", err)
+	}
+	got, err := ValidateMessageType("")
+	if err != nil || got != TypeNotification {
+		t.Errorf("ValidateMessageType(\"\") = %q, %v; want notification with no error", got, err)
+	}
+	for _, bad := range []string{"bogus", "Query", "notifcation"} {
+		got, err := ValidateMessageType(bad)
+		if err == nil {
+			t.Errorf("ValidateMessageType(%q) = %q with no error; want rejection, not silent coercion", bad, got)
+		}
+		if got != "" {
+			t.Errorf("ValidateMessageType(%q) returned %q alongside its error; want the zero value", bad, got)
+		}
+	}
+}
+
+// TestValidateMessageTypeErrorNamesTheValidValues: an error that does not say
+// what to type instead sends the caller back to guessing, which is how "query"
+// came to be used in prose but never in the enum.
+func TestValidateMessageTypeErrorNamesTheValidValues(t *testing.T) {
+	_, err := ValidateMessageType("bogus")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range ValidMessageTypes() {
+		if !strings.Contains(err.Error(), string(want)) {
+			t.Errorf("error %q does not mention valid type %q", err, want)
+		}
+	}
+}
+
+// TestCloseOnReadSemantics is the predicate gt-qffl (close-on-read) and any
+// future mail GC depend on. Getting a row of this table wrong either loses a
+// question someone is blocked on, or leaves consumed mail in the work queue.
+func TestCloseOnReadSemantics(t *testing.T) {
+	tests := []struct {
+		msgType     MessageType
+		expectReply bool
+		safeToClose bool
+	}{
+		{TypeNotification, false, true},    // nothing can be replied to
+		{TypeReply, false, true},           // an answer owes nothing back
+		{TypeHandoff, false, true},         // consumed by the successor reading it
+		{TypeQuery, true, false},           // someone is blocked on the answer
+		{TypeTask, true, false},            // reading is not doing
+		{TypeScavenge, true, false},        // unclaimed work is still work
+		{TypeEscalation, true, false},      // has its own ack surface; never auto-close
+		{MessageType(""), true, false},     // a writer that forgot to stamp a type
+		{MessageType("nope"), true, false}, // written by a build we do not know
+	}
+	for _, tt := range tests {
+		if got := tt.msgType.ExpectsReply(); got != tt.expectReply {
+			t.Errorf("%q.ExpectsReply() = %v, want %v", tt.msgType, got, tt.expectReply)
+		}
+		if got := tt.msgType.SafeToCloseOnRead(); got != tt.safeToClose {
+			t.Errorf("%q.SafeToCloseOnRead() = %v, want %v", tt.msgType, got, tt.safeToClose)
+		}
+	}
+}
+
+// TestSafeToCloseOnReadFailsClosed states the direction of the predicate's bias
+// on its own, so a future edit cannot flip it while the table above still reads
+// as if it passes. Under-classifying is the dangerous direction: a real question
+// mistaken for a notification gets closed and the sender waits forever.
+func TestSafeToCloseOnReadFailsClosed(t *testing.T) {
+	for _, unknown := range []MessageType{"", "notifcation", "QUERY", "request", "ping"} {
+		if unknown.SafeToCloseOnRead() {
+			t.Errorf("%q.SafeToCloseOnRead() = true; an unrecognised type must never auto-close", unknown)
+		}
+	}
+	// Control: the predicate must still be able to return true, or the check
+	// above passes against a function that is simply hardwired to false.
+	if !TypeNotification.SafeToCloseOnRead() {
+		t.Error("TypeNotification.SafeToCloseOnRead() = false; the predicate can never say yes")
+	}
+}
+
+// TestBeadsMessageToMessageParsesNewTypes covers the second half of the drift:
+// ToMessage carried its own copy of ParseMessageType's case list, so a type
+// added to one would still read back as "notification" through the other.
+func TestBeadsMessageToMessageParsesNewTypes(t *testing.T) {
+	for _, want := range ValidMessageTypes() {
+		bm := BeadsMessage{ID: "hq-test", Labels: []string{"msg-type:" + string(want)}}
+		if got := bm.ToMessage().Type; got != want {
+			t.Errorf("msg-type:%s read back as %q, want %q", want, got, want)
+		}
 	}
 }
