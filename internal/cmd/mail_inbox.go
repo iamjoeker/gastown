@@ -16,6 +16,23 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 )
 
+// clearNudgesForMessage removes queued nudges announcing a message the reader
+// has just dealt with, so the notification does not outlive the message.
+//
+// Best-effort and deliberately quiet: DrainLive filters spent notifications at
+// delivery time regardless, so a failure here costs nothing but a wasted queue
+// entry. Clearing eagerly keeps the queue from counting dead entries against
+// its depth cap in the meantime.
+func clearNudgesForMessage(address, messageID, threadID string) {
+	workDir, err := findMailWorkDir()
+	if err != nil {
+		return
+	}
+	if err := mail.NewRouter(workDir).ClearMessageNudges(address, messageID, threadID); err != nil {
+		fmt.Fprintf(os.Stderr, "gt mail: could not clear queued nudges for %s: %v\n", messageID, err)
+	}
+}
+
 // getMailbox returns the mailbox for the given address.
 func getMailbox(address string) (*mail.Mailbox, error) {
 	// All mail uses town beads (two-level architecture)
@@ -256,6 +273,9 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 	if err := mailbox.MarkReadOnly(msgID); err != nil {
 		// Non-fatal: message was retrieved, just couldn't mark
 		style.PrintWarning("could not mark message as read: %v", err)
+	} else {
+		// "You have new mail" is spent the moment the mail is read (gt-loz6).
+		clearNudgesForMessage(address, msgID, msg.ThreadID)
 	}
 
 	// JSON output
@@ -524,12 +544,19 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 			// The bead stays open and stays the assignee's: only this
 			// recipient's cc copy left the inbox (gt-58s).
 			ccCleared++
+			// The bead stays open for its assignee, but this reader is done with
+			// it — so is its notification, which is per-recipient anyway.
+			clearNudgesForMessage(address, msgID, "")
 			fmt.Printf("  %s %s: cc copy cleared; the message itself remains open for its assignee\n",
 				style.Dim.Render("note"), msgID)
 		case err == nil:
 			archived++
+			clearNudgesForMessage(address, msgID, "")
 		case errors.Is(err, mail.ErrMessageNotFound):
 			gcd++
+			// The bead is gone but its notification may not be — that pairing is
+			// exactly what leaves a pointer to nothing in the queue (gt-loz6).
+			clearNudgesForMessage(address, msgID, "")
 			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), msgID)
 		default:
@@ -624,8 +651,10 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 		switch {
 		case err == nil:
 			archived++
+			clearNudgesForMessage(address, stale.Message.ID, stale.Message.ThreadID)
 		case errors.Is(err, mail.ErrMessageNotFound):
 			gcd++
+			clearNudgesForMessage(address, stale.Message.ID, stale.Message.ThreadID)
 			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), stale.Message.ID)
 		default:
@@ -689,6 +718,7 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 				style.PrintWarning("could not mark %s as read: %v", msg.ID, err)
 			} else {
 				marked++
+				clearNudgesForMessage(address, msg.ID, msg.ThreadID)
 			}
 		}
 		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
@@ -710,6 +740,7 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
 		} else {
 			marked++
+			clearNudgesForMessage(address, msgID, "")
 		}
 	}
 

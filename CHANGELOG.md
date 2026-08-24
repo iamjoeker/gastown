@@ -180,6 +180,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The queued-nudge banner no longer replays mail the reader already dealt
+  with** (gt-loz6). A nudge announcing mail is a pointer — "you have new mail
+  from X, subject Y" — and nothing connected it back to the message it points
+  at. Delivery makes that permanent: the poller, the idle watcher and the ACP
+  propeller drain the whole queue into one banner and type it at the target, and
+  when the submit is not verified (a busy or dirty composer, even though the
+  text lands and the agent reads it) every drained entry is requeued with its
+  original timestamp. So the banner both showed and kept its entries, and only
+  the TTL ever retired one — 2h for urgent, 30m for normal.
+
+  Measured on gastown/witness over ~40 minutes: 7, then 11, then 10 entries,
+  every one of them already read, replied to and archived. Six of the ten were
+  successive Mayor orders revising each other; the correction that carried the
+  live state had aged out while a revoked order that happened to be newer
+  stayed. Because the banner carried sender and subject only, the witness could
+  not tell which of the ten was in force — and priority grouping means position
+  does not answer it either. The polarity was lucky: the surviving stale order
+  forbade a destructive action. The same mechanism with an authorization on the
+  stale side keeps a revoked permission alive.
+
+  Liveness is now decided at the drain, the one point every consumer passes
+  through: `mail.DrainLive` discards a mail or escalation nudge once its message
+  is read, and a reply reminder once its message is archived. It fails open — a
+  stale notification is noise, a dropped one is a lost message — and leaves
+  nudges that carry their own content (`gt nudge`, hook signals) untouched.
+  `QueuedNudge` gains a `MessageID`, because thread was too coarse to decide
+  this: a thread outlives the messages on it, so a spent notification stayed
+  "live" as long as anything newer on the same thread was unread, which is
+  exactly how the revoked order survived. Nudges written before the field fall
+  back to thread state. `gt mail read`, `mark-read`, `archive`, `archive
+  --stale` and cc-clear also clear the queue eagerly, and `Enqueue` sweeps
+  expired entries before enforcing the depth cap — a queue full of nudges the
+  next drain would discard unread used to reject the live message arriving now.
+  Finally, each banner line carries when it was sent: `[URGENT from mayor/ ·
+  18:43 CDT (2h14m ago)]`.
+
 - **`gt compact` no longer deletes another agent's live molecule on age alone**
   (gt-98hh). Compaction's delete policy asked only how old a wisp was. Its
   `molecule step past TTL` branch is reached only when the status is *not*

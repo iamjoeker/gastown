@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -117,14 +118,15 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Drain and inject.
-			drained, err := nudge.Drain(townRoot, sessionName)
+			// Drain and inject. DrainLive also discards notifications whose
+			// mail the agent has already read or archived (gt-loz6).
+			drained, err := mail.DrainLive(townRoot, sessionName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: drain error for %s: %v\n", sessionName, err)
 				continue
 			}
 			if len(drained) == 0 {
-				continue // someone else drained it
+				continue // someone else drained it, or every entry was spent
 			}
 
 			formatted := nudge.FormatForInjection(drained)

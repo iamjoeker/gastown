@@ -1703,12 +1703,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			// Timeout (agent busy) — queue for cooperative delivery
 			// at the next turn boundary.
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:   msg.From,
-				Message:  notification,
-				Priority: priority,
-				Kind:     nudgeKindForMessage(msg),
-				ThreadID: msg.ThreadID,
-				Severity: prioritySeverityLabel(msg.Priority),
+				Sender:    msg.From,
+				Message:   notification,
+				Priority:  priority,
+				Kind:      nudgeKindForMessage(msg),
+				ThreadID:  msg.ThreadID,
+				MessageID: msg.ID,
+				Severity:  prioritySeverityLabel(msg.Priority),
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
@@ -1740,12 +1741,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 				continue
 			}
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:   msg.From,
-				Message:  notification,
-				Priority: priority,
-				Kind:     nudgeKindForMessage(msg),
-				ThreadID: msg.ThreadID,
-				Severity: prioritySeverityLabel(msg.Priority),
+				Sender:    msg.From,
+				Message:   notification,
+				Priority:  priority,
+				Kind:      nudgeKindForMessage(msg),
+				ThreadID:  msg.ThreadID,
+				MessageID: msg.ID,
+				Severity:  prioritySeverityLabel(msg.Priority),
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
@@ -1779,9 +1781,9 @@ func (r *Router) isSessionMuted(sessionID string) bool {
 
 func nudgeKindForMessage(msg *Message) string {
 	if msg.Type == TypeEscalation {
-		return "escalation"
+		return nudge.KindEscalation
 	}
-	return "mail"
+	return nudge.KindMail
 }
 
 func nudgePriorityForMailPriority(priority Priority) string {
@@ -1839,8 +1841,9 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 		Sender:       "system",
 		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
 		Priority:     nudge.PriorityNormal,
-		Kind:         "reply-reminder",
+		Kind:         nudge.KindReplyReminder,
 		ThreadID:     msg.ThreadID,
+		MessageID:    msg.ID,
 		DeliverAfter: time.Now().Add(delay),
 	}
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
@@ -1898,7 +1901,7 @@ func (r *Router) ClearReplyReminders(address, threadID string) error {
 
 	var firstErr error
 	for _, sessionID := range AddressToSessionIDs(address) {
-		if _, err := nudge.RemoveKindByThread(r.townRoot, sessionID, "reply-reminder", threadID); err != nil && firstErr == nil {
+		if _, err := nudge.RemoveKindByThread(r.townRoot, sessionID, nudge.KindReplyReminder, threadID); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

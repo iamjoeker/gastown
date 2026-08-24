@@ -351,7 +351,9 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			// Drain atomically claims queued entries (rename-based).
 			// If another process raced and drained first, we get an
 			// empty slice and skip delivery to avoid duplicates.
-			drained, _ := nudge.Drain(townRoot, sessionName)
+			// DrainLive additionally discards notifications for mail the
+			// agent has already read or archived (gt-loz6).
+			drained, _ := mail.DrainLive(townRoot, sessionName)
 			if len(drained) == 0 {
 				return
 			}
@@ -903,30 +905,7 @@ func shouldNudgeTarget(townRoot, targetAddress string, force bool) (bool, string
 //   - "hq-mayor" -> "mayor"
 //   - "hq-deacon" -> "deacon"
 func sessionNameToAddress(sessionName string) string {
-	identity, err := session.ParseSessionName(sessionName)
-	if err != nil {
-		return ""
-	}
-
-	// Use short address format: rig/name (not rig/polecats/name)
-	switch identity.Role {
-	case session.RoleMayor:
-		return constants.RoleMayor
-	case session.RoleDeacon:
-		return constants.RoleDeacon
-	case session.RoleDog:
-		return mail.DogAddress(identity.Name)
-	case session.RoleWitness:
-		return fmt.Sprintf("%s/witness", identity.Rig)
-	case session.RoleRefinery:
-		return fmt.Sprintf("%s/refinery", identity.Rig)
-	case session.RoleCrew:
-		return fmt.Sprintf("%s/crew/%s", identity.Rig, identity.Name)
-	case session.RolePolecat:
-		return fmt.Sprintf("%s/%s", identity.Rig, identity.Name)
-	default:
-		return ""
-	}
+	return mail.SessionNameToAddress(sessionName)
 }
 
 // addressToAgentBeadID converts a target address to an agent bead ID.
