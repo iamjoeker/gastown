@@ -2537,9 +2537,15 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	} else {
 		input.GitCheckFailed = true
 	}
+	// Tracked, not inferred: BranchPreservationStatus returns 0 unpreserved
+	// patches both when every commit is durable on the remote and when it could
+	// resolve no comparison ref at all, and only the first of those refutes
+	// anything (gt-3bzt).
+	preservationMeasured := false
 	if branch != "" {
 		if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
 			input.UnpushedCommits = preservation.UnpreservedPatchCount
+			preservationMeasured = true
 		} else {
 			input.GitCheckFailed = true
 		}
@@ -2548,6 +2554,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	// no local work at risk, treat the missing cleanup_status as clean; otherwise
 	// DecideSlotReuse will continue to fail closed on CleanupUnknown.
 	gitSafe := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0
+	input.PushFailedRefuted = GitFactsRefutePushFailed(preservationMeasured, input.GitCheckFailed, input.GitDirty, input.StashCount, input.UnpushedCommits)
 	if input.CleanupStatus == CleanupUnknown && gitSafe {
 		input.CleanupStatus = CleanupClean
 	}

@@ -1216,6 +1216,117 @@ func (g *Git) Push(remote, branch string, force bool) error {
 	return err
 }
 
+// nonFastForwardMarkers are the phrases git prints when it refuses a push
+// because the ref being updated is not an ancestor of what is being pushed.
+// Matched case-insensitively against the failed command's output.
+var nonFastForwardMarkers = []string{
+	"(non-fast-forward)",
+	"(fetch first)",
+	"updates were rejected because",
+}
+
+// IsNonFastForwardPushError reports whether err is a push that git refused for
+// being a non-fast-forward update.
+//
+// That refusal is the EXPECTED outcome of publishing a branch whose history was
+// rewritten: a rebase gives every commit a new sha, so the tip already on the
+// remote stops being an ancestor of the local tip and git declines without a
+// force. It is a statement about the two refs, not about whether the CONTENT
+// reached the remote — and callers must not read it as a failed push (gt-3bzt).
+// A polecat that rebased onto current origin/main, pushed, and was rejected here
+// had its work already merged into main; the flag set from this exit status
+// stranded it anyway, twice in 45 minutes.
+func IsNonFastForwardPushError(err error) bool {
+	if err == nil {
+		return false
+	}
+	haystack := err.Error()
+	var gitErr *GitError
+	if errors.As(err, &gitErr) {
+		// The wrapped Error() renders stderr only; read both streams so a rejection
+		// git happened to print on stdout is still classified.
+		haystack = gitErr.Stdout + "\n" + gitErr.Stderr
+	}
+	haystack = strings.ToLower(haystack)
+	for _, marker := range nonFastForwardMarkers {
+		if strings.Contains(haystack, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// PushWithLease republishes a branch this caller owns after its history was
+// rewritten, typically by a rebase onto the target branch.
+//
+// It is a force push, so the guard has to be the content and not the flag. Two
+// things stand between it and a lost commit, and they answer different questions:
+//
+//   - Before pushing, the remote's current tip is fetched and checked for
+//     preservation IN the branch about to replace it, by patch-id. A rebase
+//     passes that trivially — same patches, new shas — while a push that would
+//     actually drop someone's commit does not, and is refused. This is the check
+//     that matters, because --force-with-lease alone would happily overwrite a
+//     tip it had just read.
+//   - The lease itself is then pinned to that fetched sha rather than left to
+//     git's default, which leases against the local remote-tracking ref: a
+//     polecat worktree's refs/remotes/origin/<branch> is routinely stale or
+//     absent, and a bare --force-with-lease there fails for a reason that has
+//     nothing to do with the remote. It closes the window between the check
+//     above and the write.
+//
+// dstBranch must be a branch this caller owns. Pushing over the remote's default
+// branch is refused outright — a rewrite there is never this path's business.
+func (g *Git) PushWithLease(remote, srcBranch, dstBranch string) error {
+	srcBranch = strings.TrimSpace(srcBranch)
+	dstBranch = strings.TrimSpace(dstBranch)
+	if srcBranch == "" || dstBranch == "" {
+		return fmt.Errorf("lease push needs both a source and a destination branch")
+	}
+	defaultBranch := g.RemoteDefaultBranch()
+	refspec := srcBranch + ":" + dstBranch
+	if err := g.RefuseForkBackedDefaultPush(remote, refspec, defaultBranch); err != nil {
+		return err
+	}
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	if dstBranch == defaultBranch {
+		return fmt.Errorf("refusing to lease-push over the default branch %s/%s", remote, dstBranch)
+	}
+
+	// Fetched rather than read by ls-remote: the preservation check below needs
+	// the remote tip's OBJECTS, and a tip another actor pushed is not in this
+	// repository until something brings it in. Without the fetch that check would
+	// error on every case it exists to catch.
+	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+dstBranch)
+	if err != nil {
+		return fmt.Errorf("reading %s/%s before lease push: %w", remote, dstBranch, err)
+	}
+	defer cleanup()
+	tip, err := g.Rev(fetched)
+	if err != nil {
+		return fmt.Errorf("resolving %s/%s before lease push: %w", remote, dstBranch, err)
+	}
+	tip = strings.TrimSpace(tip)
+	if tip == "" {
+		return fmt.Errorf("no tip at %s/%s to lease against", remote, dstBranch)
+	}
+
+	preservation, err := g.preservationOfRefAgainstRef(fetched, srcBranch)
+	if err != nil {
+		return fmt.Errorf("checking whether %s/%s survives in %s: %w", remote, dstBranch, srcBranch, err)
+	}
+	if !preservation.Preserved {
+		return fmt.Errorf("refusing to lease-push %s over %s/%s: %d commit(s) on the remote are not preserved in %s",
+			srcBranch, remote, dstBranch, preservation.UnpreservedPatchCount, srcBranch)
+	}
+
+	lease := "--force-with-lease=refs/heads/" + dstBranch + ":" + tip
+	_, err = g.runWithTimeout(pushTimeout, "push", lease, remote, refspec)
+	return err
+}
+
 // PushWithEnv pushes with additional environment variables.
 // Used by gt mq integration land to set GT_INTEGRATION_LAND=1, which the
 // pre-push hook checks to allow integration branch content landing on main.

@@ -1079,6 +1079,7 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	clonePath := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
 	g := git.NewGit(clonePath)
 	bd := beads.New(beads.ResolveBeadsDir(workDir))
+	preservationMeasured := false
 	var targetRefs []string
 	if branch, err := g.CurrentBranch(); err == nil {
 		input.Branch = branch
@@ -1096,6 +1097,7 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		}
 		if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
 			input.UnpushedCommits = preservation.UnpreservedPatchCount
+			preservationMeasured = true
 		} else {
 			input.GitCheckFailed = true
 		}
@@ -1103,6 +1105,12 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		input.GitCheckFailed = true
 	}
 	gitSafe := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0
+	// Carried on the same terms check-recovery uses, so the two surfaces cannot
+	// reach opposite conclusions about the same polecat from the same measurement
+	// (gt-3bzt). Tracked rather than inferred: BranchPreservationStatus reports 0
+	// unpreserved patches both when everything is durable and when it resolved no
+	// comparison ref at all.
+	input.PushFailedRefuted = polecat.GitFactsRefutePushFailed(preservationMeasured, input.GitCheckFailed, input.GitDirty, input.StashCount, input.UnpushedCommits)
 	activeMRSafe := true
 	sourceTerminal := fields != nil && issueID != "" && witnessIssueTerminal(rigBeads, issueID)
 	if fields != nil && fields.ActiveMR != "" {

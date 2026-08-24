@@ -32,6 +32,12 @@ type SlotReuseInput struct {
 	MQLookupFailed       bool
 	MRRefused            bool
 
+	// PushFailedRefuted must be set only by callers whose measured git facts
+	// contradict push_failed. Carried through so this gate and check-recovery
+	// cannot reach opposite conclusions about the same polecat from the same
+	// measurement. See WorkstateInput.PushFailedRefuted (gt-3bzt).
+	PushFailedRefuted bool
+
 	// ReuseFactsMeasured must be set by callers that ran the git and
 	// merge-queue checks. Reuse is destructive — it force-deletes the branch —
 	// so an unmeasured caller is told UNVERIFIED rather than Reusable. See
@@ -54,6 +60,7 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		CleanupStatus:        in.CleanupStatus,
 		IgnoreCleanupStatus:  in.IgnoreCleanupStatus,
 		PushFailed:           in.PushFailed,
+		PushFailedRefuted:    in.PushFailedRefuted,
 		MRFailed:             in.MRFailed,
 		Branch:               in.Branch,
 		GitDirty:             in.GitDirty,

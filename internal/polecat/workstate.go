@@ -71,6 +71,30 @@ type WorkstateInput struct {
 	// in the same instant (gt-fbgq).
 	PausedAgentState string
 
+	// PushFailedRefuted records that this caller MEASURED the polecat's git state
+	// and found nothing a failed push could have lost: no uncommitted work, no
+	// stashes, and every commit's patch already preserved on the remote — with
+	// the preservation check having actually run, rather than having returned its
+	// zero value after an error.
+	//
+	// It exists because push_failed is not the claim its name makes. It is set
+	// from the exit status of one `git push`, and a rebase makes a
+	// non-fast-forward rejection there the EXPECTED outcome rather than a
+	// failure. Measured on gastown/brahmin twice in 45 minutes: `gt polecat
+	// git-state` said clean / 0 unpushed and the branch's commit was already an
+	// ancestor of origin/main, in the same instant the flag said a push had
+	// failed — and the flag won, routing a polecat with nothing at risk to
+	// NEEDS_RECOVERY with escalation as its only prescribed action, whose only
+	// remedy was a Mayor editing the field by hand (gt-3bzt).
+	//
+	// So the flag blocks only while it is unrefuted. This is deliberately not a
+	// blanket exemption: an unmeasured caller leaves the field false and
+	// push_failed keeps blocking, exactly as before. Only a caller that ran the
+	// git checks has earned the right to contradict it, and the merge-queue tail
+	// below still runs — pushed-but-unsubmitted work reaches NEEDS_MQ_SUBMIT
+	// rather than being waved through.
+	PushFailedRefuted bool
+
 	// MRRefused is the agent bead's record that gt done deliberately created no
 	// merge request because the source issue was already closed, leaving a
 	// pushed branch outside the queue (gt-46rk). Unlike every other merge-queue
@@ -192,7 +216,8 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if in.HookBead != "" && !in.PartialSpawnWithoutDurableHook {
 		block("hook-still-set", "has work on hook ("+in.HookBead+")", true)
 	}
-	if in.PushFailed {
+	// Refuted only by measurement, never by silence: see PushFailedRefuted.
+	if in.PushFailed && !in.PushFailedRefuted {
 		block("push-failed", "push_failed=true", true)
 	}
 	if in.MRFailed {
@@ -395,6 +420,18 @@ func ApplyBranchMRToWorkstateInput(in *WorkstateInput, mrID string, mrOpen bool)
 	}
 	in.ActiveMR = mrID
 	in.ActiveMRBlocker = "active_mr=" + mrID + " status=open source=branch-lookup"
+}
+
+// GitFactsRefutePushFailed reports whether measured git facts leave nothing a
+// failed push could have lost, and is the single definition of that bar for
+// every caller that fills WorkstateInput.PushFailedRefuted.
+//
+// gitMeasured is the caller's own statement that all four inputs come from
+// checks that RAN. It is separate from the values because a check that errored
+// returns the same zeros as a clean worktree, and "0 unpreserved patches"
+// arrived at that way is the false zero this predicate exists to not act on.
+func GitFactsRefutePushFailed(gitMeasured, gitCheckFailed, gitDirty bool, stashCount, unpushedCommits int) bool {
+	return gitMeasured && !gitCheckFailed && !gitDirty && stashCount == 0 && unpushedCommits == 0
 }
 
 // CanIgnoreStaleCleanupStatus returns true when a dirty persisted

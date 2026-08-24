@@ -1607,13 +1607,56 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
+		// Step 7 of mol-polecat-work rebases this branch onto current origin/main
+		// right before this push. The rebase rewrites every sha, so if the branch
+		// was ever published — an earlier gt done, a resumed run, a checkpoint push
+		// — republishing it is a non-fast-forward and git refuses it. That refusal
+		// is the expected outcome of the rebase we were told to do, not a failure
+		// (gt-3bzt). The branch belongs to this polecat, so the correct git
+		// operation is a leased force: it succeeds where the plain push could not,
+		// and still refuses if anyone else moved the branch underneath us.
+		if pushErr != nil && git.IsNonFastForwardPushError(pushErr) {
+			style.PrintWarning("push rejected as non-fast-forward (branch history was rewritten) — retrying under a lease")
+			if leaseErr := g.PushWithLease("origin", branch, branch); leaseErr != nil {
+				style.PrintWarning("lease push also failed: %v", leaseErr)
+			} else {
+				pushErr = nil
+				fmt.Printf("%s Branch republished after rebase (--force-with-lease)\n", style.Bold.Render("✓"))
+			}
+		}
+
 		if pushErr != nil {
-			// All push attempts failed
-			pushFailed = true
-			errMsg := fmt.Sprintf("push failed for branch '%s': %v", branch, pushErr)
-			doneErrors = append(doneErrors, errMsg)
-			style.PrintWarning("%s\nCommits exist locally but failed to push. Witness will be notified.", errMsg)
-			goto notifyWitness
+			// Every push attempt failed. push_failed must describe the CONTENT, not
+			// the exit status of the last git invocation (gt-3bzt) — so ask the
+			// remote before flagging the polecat. Both times this bug was reproduced
+			// the commit was demonstrably on origin and merged while the flag said a
+			// push had failed, and the flag is what decided the polecat's fate.
+			pushRejection := fmt.Sprintf("push failed for branch '%s': %v", branch, pushErr)
+			if pushedCommitSHA == "" {
+				pushedCommitSHA, _ = g.Rev("HEAD")
+			}
+			switch classifyFailedBranchPush(g, townRoot, rigName, branch, defaultBranch, pushedCommitSHA) {
+			case pushContentOnBranch:
+				// origin/<branch> already holds exactly this commit. Nothing is
+				// missing from the remote, so the MR below has everything it needs.
+				doneErrors = append(doneErrors, pushRejection+" (content already on origin/"+branch+")")
+				style.PrintWarning("%s\norigin/%s already holds %s — continuing.", pushRejection, branch, shortSHA(pushedCommitSHA))
+				pushErr = nil
+			case pushContentMerged:
+				// The commit is reachable from origin/<default>: this work already
+				// landed. There is nothing to submit and nothing at risk, so the
+				// polecat exits cleanly instead of holding its slot for a Mayor.
+				doneErrors = append(doneErrors, pushRejection+" (content already merged into "+defaultBranch+")")
+				fmt.Printf("%s %s is already merged into origin/%s — nothing to submit\n",
+					style.Bold.Render("✓"), shortSHA(pushedCommitSHA), defaultBranch)
+				doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
+				goto notifyWitness
+			default:
+				pushFailed = true
+				doneErrors = append(doneErrors, pushRejection)
+				style.PrintWarning("%s\nCommits exist locally and are not on the remote. Witness will be notified.", pushRejection)
+				goto notifyWitness
+			}
 		}
 
 		// Verify the pushed branch tip is the exact local commit before creating
@@ -2528,6 +2571,50 @@ func noteVerifiedPushSkipped(g *git.Git, sourceBD *beads.Beads, sourceIssue *bea
 		bd, _, _ = routedIssueBeads(cwd, issueID)
 	}
 	return reportLostLedgerAnnotation(issueID, msg, ledgerAddComment(bd, issueID, msg))
+}
+
+// failedPushContent is what the remote says about a commit whose push command
+// exited non-zero. push_failed claims the content did not reach the remote, so
+// nothing may set it until the remote has been asked (gt-3bzt).
+type failedPushContent int
+
+const (
+	// pushContentMissing: the remote has neither the branch at this commit nor
+	// the commit anywhere on the target branch. Work really is only local.
+	pushContentMissing failedPushContent = iota
+	// pushContentOnBranch: origin/<branch> is already at exactly this commit.
+	pushContentOnBranch
+	// pushContentMerged: the commit is reachable from the target branch, so the
+	// work landed. The branch ref lagging behind is bookkeeping, not risk.
+	pushContentMerged
+)
+
+// classifyFailedBranchPush asks the remote what actually happened after a push
+// command failed.
+//
+// The order matters. The exact-tip check comes first because it is the stronger
+// claim and the one the MR below depends on: if origin/<branch> holds this
+// commit, the refinery has everything it needs and gt done can carry on as if
+// the push had succeeded. Only then does it ask the weaker question — is this
+// commit already merged — which proves nothing is at risk but leaves nothing to
+// submit either.
+//
+// A remote that cannot be reached answers pushContentMissing, which is the
+// conservative reading: an unanswerable question is not evidence of safety.
+func classifyFailedBranchPush(g *git.Git, townRoot, rigName, branch, defaultBranch, commit string) failedPushContent {
+	if strings.TrimSpace(commit) == "" {
+		return pushContentMissing
+	}
+	if verifyPushedCommitWithBareFallback(g, townRoot, rigName, branch, commit) == nil {
+		return pushContentOnBranch
+	}
+	if strings.TrimSpace(defaultBranch) == "" {
+		return pushContentMissing
+	}
+	if g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, commit) == nil {
+		return pushContentMerged
+	}
+	return pushContentMissing
 }
 
 func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, commit string) error {

@@ -942,6 +942,12 @@ type GitState struct {
 	UnpreservedPatchCount int      `json:"unpreserved_patch_count"`
 	StashCount            int      `json:"stash_count"`                  // Current-branch stashes: per-polecat risk.
 	SharedStashCount      int      `json:"shared_stash_count,omitempty"` // Other branch stashes visible through the shared repo.
+
+	// PreservationMeasured records that BranchPreservationStatus actually ran and
+	// resolved a comparison. Without it UnpushedCommits==0 is ambiguous — the same
+	// zero means "everything is durable on the remote" and "nothing could be
+	// compared" — and only the first of those is evidence of anything (gt-3bzt).
+	PreservationMeasured bool `json:"preservation_measured"`
 }
 
 func runPolecatGitState(cmd *cobra.Command, args []string) error {
@@ -1051,6 +1057,7 @@ func getGitStateWithTargets(worktreePath string, targets []string) (*GitState, e
 
 	branch, _ := worktreeGit.CurrentBranch()
 	if preservation, preserveErr := worktreeGit.BranchPreservationStatus(branch, "origin", targets); preserveErr == nil {
+		state.PreservationMeasured = true
 		state.ComparisonBase = preservation.ComparisonBase
 		state.UnpreservedPatchCount = preservation.UnpreservedPatchCount
 		if preservation.UnpreservedPatchCount > 0 {
@@ -1252,6 +1259,21 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 
 	status.CleanupStatus = input.CleanupStatus
 	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr)
+	// push_failed is set from the exit status of one `git push`, and a rebase makes
+	// a non-fast-forward rejection there expected rather than fatal — so this
+	// command, which HAS just measured the worktree, gets to say when the flag is
+	// contradicted by what it measured. Reported either way: a flag that stopped
+	// deciding must still be visible, or the next reader sees a clean polecat and
+	// no trace of the field that stranded it (gt-3bzt).
+	if input.PushFailed {
+		input.PushFailedRefuted = polecat.GitFactsRefutePushFailed(
+			gitErr == nil && gitState != nil && gitState.PreservationMeasured,
+			input.GitCheckFailed, input.GitDirty, input.StashCount, input.UnpushedCommits)
+		if input.PushFailedRefuted {
+			status.Diagnostics = append(status.Diagnostics,
+				"ignored_stale_push_failed=true direct_git_state=safe (clean tree, no stash, 0 unpreserved patches)")
+		}
+	}
 	disposition := polecat.DecideWorkstate(input)
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
 
