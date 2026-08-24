@@ -515,13 +515,7 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 		return fmt.Errorf("creating deacon directory: %w", err)
 	}
 
-	// Resolve CLAUDE_CONFIG_DIR from accounts.json so deacon sessions
-	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
-	accountsPath := constants.MayorAccountsPath(townRoot)
-	runtimeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
-	if runtimeConfigDir == "" {
-		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
-	}
+	runtimeConfigDir := config.ResolveTownRuntimeConfigDir(townRoot)
 
 	// Ensure runtime settings exist (autonomous role needs mail in SessionStart)
 	runtimeConfig := config.ResolveRoleAgentConfig("deacon", townRoot, deaconDir)

@@ -136,12 +136,19 @@ func (m *Manager) Start(agentOverride string) error {
 		Sender:    "daemon",
 		Topic:     "patrol",
 	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, run gt sling mol-deacon-patrol deacon, then execute the hook it creates.")
+	// Resolve CLAUDE_CONFIG_DIR from accounts.json so this Deacon session runs on
+	// the town's account. This path (gt up / gt start / daemon) was missing it
+	// while the gt deacon path had it, so which command started the Deacon decided
+	// whether it could authenticate at all (gt-gllf).
+	runtimeConfigDir := config.ResolveTownRuntimeConfigDir(m.townRoot)
+
 	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
-		Role:        "deacon",
-		TownRoot:    m.townRoot,
-		Prompt:      initialPrompt,
-		Topic:       "patrol",
-		SessionName: sessionID,
+		Role:             "deacon",
+		TownRoot:         m.townRoot,
+		RuntimeConfigDir: runtimeConfigDir,
+		Prompt:           initialPrompt,
+		Topic:            "patrol",
+		SessionName:      sessionID,
 	}, "", initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
@@ -151,10 +158,11 @@ func (m *Manager) Start(agentOverride string) error {
 	// subprocesses (e.g., bd) via tmux -e flags. SetEnvironment after creation
 	// only affects newly spawned panes, not the running pane's tree (gt-neycp).
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:        "deacon",
-		TownRoot:    m.townRoot,
-		Agent:       agentOverride,
-		SessionName: sessionID,
+		Role:             "deacon",
+		TownRoot:         m.townRoot,
+		RuntimeConfigDir: runtimeConfigDir,
+		Agent:            agentOverride,
+		SessionName:      sessionID,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 

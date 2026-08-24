@@ -225,13 +225,7 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 	// Ensure runtime settings exist in the shared refinery parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 
-	// Resolve CLAUDE_CONFIG_DIR from accounts.json so refinery sessions
-	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
-	accountsPath := constants.MayorAccountsPath(townRoot)
-	runtimeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
-	if runtimeConfigDir == "" {
-		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
-	}
+	runtimeConfigDir := config.ResolveTownRuntimeConfigDir(townRoot)
 
 	runtimeConfig := config.ResolveRoleAgentConfig("refinery", townRoot, m.rig.Path)
 	refinerySettingsDir := config.RoleSettingsDir("refinery", m.rig.Path)
