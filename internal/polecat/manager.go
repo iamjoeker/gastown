@@ -3065,10 +3065,14 @@ func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	return true, NewSessionManager(m.tmux, m.rig).isSessionStale(sessionName)
 }
 
+// isCurrentHookedIssueForAssignee reports whether issue is the hooked work this
+// agent currently holds. The assignee comparison goes through
+// beads.SameAgentAddress because the bead's assignee and the address handed in
+// here come from different writers and need not have chosen the same form.
 func isCurrentHookedIssueForAssignee(issue *beads.Issue, assignee string) bool {
 	return issue != nil &&
 		issue.Status == beads.StatusHooked &&
-		issue.Assignee == assignee
+		beads.SameAgentAddress(issue.Assignee, assignee)
 }
 
 // setupSharedBeads creates a redirect file so the polecat uses the rig's shared .beads database.

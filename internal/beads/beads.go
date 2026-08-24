@@ -1740,15 +1740,28 @@ func (b *Beads) Show(id string) (*Issue, error) {
 }
 
 // FindLatestIssueByTitleAndAssignee finds the newest issue matching the given title and assignee.
+//
+// The assignee is queried in every form AgentAddressForms lists and matched with
+// SameAgentAddress, because the bead being looked up here was written by a
+// different command than the one looking it up — an exact-string match returned
+// ErrNotFound for a bead sitting right there under the other convention.
 func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issue, error) {
-	out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", assignee)
-	if err != nil {
-		return nil, fmt.Errorf("bd list: %w", err)
+	forms := AgentAddressForms(assignee)
+	if len(forms) == 0 {
+		forms = []string{assignee}
 	}
 
 	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	for _, form := range forms {
+		out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", form)
+		if err != nil {
+			return nil, fmt.Errorf("bd list: %w", err)
+		}
+		var found []*Issue
+		if err := json.Unmarshal(out, &found); err != nil {
+			return nil, fmt.Errorf("parsing bd list output: %w", err)
+		}
+		issues = append(issues, found...)
 	}
 	if len(issues) == 0 {
 		return nil, ErrNotFound
@@ -1756,7 +1769,7 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 
 	var newest *Issue
 	for _, issue := range issues {
-		if issue.Title != title || issue.Assignee != assignee {
+		if issue.Title != title || !SameAgentAddress(issue.Assignee, assignee) {
 			continue
 		}
 		if newest == nil || issue.CreatedAt > newest.CreatedAt {

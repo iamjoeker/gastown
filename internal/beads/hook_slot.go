@@ -19,6 +19,11 @@ import "strings"
 // NormalizedAgentPathAddress collapses a nested agent path to the short form
 // some writers use: "rig/crew/name" and "rig/polecats/name" both become
 // "rig/name". Other addresses are returned unchanged.
+//
+// This preserves the input's case and trailing slash, so it is the right tool
+// for producing an address to hand onward. To decide whether two addresses name
+// the same agent, use SameAgentAddress instead — this function knows only one
+// of the three dimensions gt disagrees on.
 func NormalizedAgentPathAddress(addr string) string {
 	parts := strings.Split(strings.TrimSpace(addr), "/")
 	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
@@ -32,21 +37,14 @@ func NormalizedAgentPathAddress(addr string) string {
 //
 // Every address form the agent's beads may carry counts as a match. A form this
 // misses would drop a real blocker, which is the expensive direction to be
-// wrong in.
+// wrong in — which is why the rule is SameAgentAddress and not a walk over
+// AgentAddressForms. This predicate used to combine the two form helpers by
+// hand, and it was the only surface in the tree that knew both dimensions.
 func HookSlotHeldBy(issue *Issue, assignee string) bool {
 	if issue == nil {
 		return false
 	}
-	beadAssignee := strings.TrimSpace(issue.Assignee)
-	if beadAssignee == "" || strings.TrimSpace(assignee) == "" {
-		return false
-	}
-	for _, form := range AgentAddressForms(assignee) {
-		if strings.EqualFold(beadAssignee, form) || strings.EqualFold(beadAssignee, NormalizedAgentPathAddress(form)) {
-			return true
-		}
-	}
-	return false
+	return SameAgentAddress(issue.Assignee, assignee)
 }
 
 // HookSlotReleased reports whether the issue store positively contradicts an

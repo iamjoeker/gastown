@@ -17,11 +17,17 @@ import (
 )
 
 // PatrolConfig holds role-specific patrol configuration.
+//
+// RoleName and Assignee are two renderings of one identity, and they differ:
+// "deacon" versus "deacon/". RoleName is for DISPLAY ONLY. Anything the store
+// will see — assignee, actor, ownership — must use Assignee, which is the
+// canonical form. Spawning under RoleName is how a patrol wisp came to be born
+// bare and corrected a step later (gt-gbv4).
 type PatrolConfig struct {
-	RoleName      string       // "deacon", "witness", "refinery"
+	RoleName      string       // display label only: "deacon", "witness", "refinery"
 	PatrolMolName string       // "mol-deacon-patrol", etc.
 	BeadsDir      string       // where to look for beads
-	Assignee      string       // agent identity for pinning
+	Assignee      string       // canonical agent identity: assignee, actor, ownership
 	HeaderEmoji   string       // display emoji
 	HeaderTitle   string       // "Patrol Status", etc.
 	WorkLoopSteps []string     // role-specific instructions
@@ -252,7 +258,15 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 	// below) and outputDeaconPatrolContext renders the full checklist inline on
 	// every `gt prime`. Materializing them as rows instead would put ~26 wisps
 	// per cycle back into the DB — the orphan flood gt-92jh removed.
-	spawnArgs := []string{"mol", "wisp", "create", protoID, "--root-only", "--actor", cfg.RoleName}
+	// Spawn under the canonical identity, not the display name. The acting
+	// identity is what beads' ownership guard compares against the assignee this
+	// same function writes three statements below, and RoleName is the other
+	// convention for the same agent ("deacon" vs "deacon/").
+	spawnActor := cfg.Assignee
+	if spawnActor == "" {
+		spawnActor = cfg.RoleName
+	}
+	spawnArgs := []string{"mol", "wisp", "create", protoID, "--root-only", "--actor", spawnActor}
 	for _, v := range cfg.ExtraVars {
 		spawnArgs = append(spawnArgs, "--var", v)
 	}

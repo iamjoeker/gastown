@@ -1673,7 +1673,11 @@ func partialSpawnWithoutDurableHook(bd issueShower, fields *beads.AgentFields, a
 	if err != nil || issue == nil {
 		return false, ""
 	}
-	if (issue.Status == beads.StatusHooked && issue.Assignee == assignee) || issue.Assignee == assignee {
+	// The hook is durable as long as the bead names this agent, whatever form
+	// the writer chose for the address. Comparing raw strings here reported a
+	// partial spawn for a perfectly hooked bead whenever the two sides had
+	// picked different conventions (gt-gbv4).
+	if issue.Assignee == assignee || beads.SameAgentAddress(issue.Assignee, assignee) {
 		return false, ""
 	}
 	return true, fmt.Sprintf("partial_spawn_without_durable_hook agent_state=%s hook_bead=%s hook_status=%s hook_assignee=%q", fields.AgentState, fields.HookBead, issue.Status, issue.Assignee)

@@ -3121,8 +3121,12 @@ func findAssignedBeadsForAgent(workDir, agentID string) []string {
 	return nil
 }
 
+// queryAssignedBeads returns the work this agent still holds, matching every
+// assignee form. `gt done` reads this to decide what it is finishing; a
+// single-form query that misses a held bead lets the agent exit reporting
+// nothing was assigned to it.
 func queryAssignedBeads(bd *beads.Beads, agentID string) []*beads.Issue {
-	hooked, err := bd.List(beads.ListOptions{
+	hooked, err := bd.ListAcrossAgentAddressForms(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
 		Priority: -1,
@@ -3130,7 +3134,7 @@ func queryAssignedBeads(bd *beads.Beads, agentID string) []*beads.Issue {
 	if err == nil && len(hooked) > 0 {
 		return hooked
 	}
-	inProgress, err := bd.List(beads.ListOptions{
+	inProgress, err := bd.ListAcrossAgentAddressForms(beads.ListOptions{
 		Status:   "in_progress",
 		Assignee: agentID,
 		Priority: -1,

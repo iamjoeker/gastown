@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -371,6 +372,28 @@ func runMailPeek(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// printOwnershipRefusalHint explains a beads ownership refusal in terms of the
+// command the reader actually ran.
+//
+// bd's refusal ends "reclaim or use --force to override". That advice is only
+// followable from a command that exposes --force: `gt mail archive` does,
+// `gt mail delete` does not, and repeating bd's wording there sends the reader
+// after a flag that command has never had. Name the command that carries the
+// flag instead (gt-gbv4).
+func printOwnershipRefusalHint(err error, msgID, address, verb string) {
+	if !mail.IsOwnershipRefusal(err) {
+		return
+	}
+	fmt.Printf("  %s %s is addressed to another agent — only its assignee can close it.\n",
+		style.Dim.Render("hint"), msgID)
+	fmt.Printf("  %s If you expected a cc copy, this message carries no cc label for %s.\n",
+		style.Dim.Render("hint"), address)
+	if verb != "archive" {
+		fmt.Printf("  %s To override anyway, use `%s mail archive %s --force` — `%s mail %s` has no --force.\n",
+			style.Dim.Render("hint"), cli.Name(), msgID, cli.Name(), verb)
+	}
+}
+
 func runMailDelete(cmd *cobra.Command, args []string) error {
 	if err := validateMessageIDArgs(args); err != nil {
 		return err
@@ -390,6 +413,7 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 	for _, msgID := range args {
 		if err := mailbox.Delete(msgID); err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
+			printOwnershipRefusalHint(err, msgID, address, "delete")
 		} else {
 			deleted++
 		}
@@ -510,13 +534,7 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 				style.Dim.Render("note"), msgID)
 		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, err))
-			if mail.IsOwnershipRefusal(err) {
-				// Naming only the refusal leaves the reader with no next step.
-				fmt.Printf("  %s %s is addressed to another agent — only its assignee can close it.\n",
-					style.Dim.Render("hint"), msgID)
-				fmt.Printf("  %s If you expected a cc copy, this message carries no cc label for %s.\n",
-					style.Dim.Render("hint"), address)
-			}
+			printOwnershipRefusalHint(err, msgID, address, "archive")
 		}
 	}
 

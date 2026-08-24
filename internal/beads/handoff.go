@@ -190,8 +190,13 @@ func (b *Beads) ClearMail(reason string) (*ClearMailResult, error) {
 // CloseStaleHookedMailBeads closes any gt:message beads in status=hooked assigned
 // to agentID. Called before creating a new handoff mail to prevent accumulation of
 // stale beads across sessions. Returns the number of beads closed. (GH#3859)
+//
+// The listing runs over every assignee form, because the accumulation this
+// exists to prevent is invisible under the one form the caller happens to hold:
+// a mail bead written to "deacon" is not found by a query for "deacon/", and the
+// beads pile up exactly as if this had never run.
 func (b *Beads) CloseStaleHookedMailBeads(agentID string) (int, error) {
-	hooked, err := b.List(ListOptions{
+	hooked, err := b.ListAcrossAgentAddressForms(ListOptions{
 		Status:   StatusHooked,
 		Label:    "gt:message",
 		Assignee: agentID,
