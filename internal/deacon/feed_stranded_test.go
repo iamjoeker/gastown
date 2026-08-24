@@ -3,6 +3,7 @@ package deacon
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,5 +218,56 @@ func TestSaveFeedStrandedState_CreatesDirectory(t *testing.T) {
 	stateFile := FeedStrandedStateFile(tmpDir)
 	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		t.Fatal("state file not created")
+	}
+}
+
+// TestStrandedConvoy_EvidenceSummary checks the deacon renders the scan's
+// evidence in a stable order, so a "needs agent review" line says what was
+// observed instead of only that something is wrong. (gt-bel1)
+func TestStrandedConvoy_EvidenceSummary(t *testing.T) {
+	tests := []struct {
+		name string
+		in   StrandedConvoy
+		want string
+	}{
+		{
+			name: "absent on an older gt",
+			in:   StrandedConvoy{TrackedCount: 2},
+			want: "",
+		},
+		{
+			name: "stable order",
+			in:   StrandedConvoy{Evidence: map[string]int{"blocked": 2, "working": 1}},
+			want: "1 working, 2 blocked",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.EvidenceSummary(); got != tc.want {
+				t.Fatalf("EvidenceSummary() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNeedsAttentionMessage_StatesEvidence pins the general remedy from gt-bel1:
+// the surface states its evidence alongside its verdict. Both forms must name
+// the tracked count, because an older gt sends no evidence at all.
+func TestNeedsAttentionMessage_StatesEvidence(t *testing.T) {
+	withEvidence := needsAttentionMessage(StrandedConvoy{
+		TrackedCount: 2,
+		Evidence:     map[string]int{"blocked": 2},
+	})
+	if !strings.Contains(withEvidence, "2 blocked") {
+		t.Errorf("message omits the evidence: %q", withEvidence)
+	}
+	if !strings.Contains(withEvidence, "requires agent review") {
+		t.Errorf("message omits the verdict: %q", withEvidence)
+	}
+
+	withoutEvidence := needsAttentionMessage(StrandedConvoy{TrackedCount: 2})
+	if !strings.Contains(withoutEvidence, "2 tracked issues, 0 ready") {
+		t.Errorf("fallback message lost the counts: %q", withoutEvidence)
 	}
 }

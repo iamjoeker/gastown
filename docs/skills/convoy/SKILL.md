@@ -88,6 +88,37 @@ Both feed paths iterate past failures instead of giving up:
 - `feedNextReadyIssue`: `continue` on dispatch failure, try next ready issue
 - `feedFirstReady`: `for range ReadyIssues` with `continue` on skip/failure, `return` on first success
 
+### 4. Waiting is not stranded (`classifyTrackedIssue`, gt-bel1)
+
+`findStrandedConvoys` classifies every tracked issue rather than reducing it to
+a ready/not-ready bit, because "0 ready" answered four different questions with
+one number. The dispositions:
+
+| Disposition | Meaning | Convoy verdict |
+|---|---|---|
+| `ready` | dispatchable now | feedable |
+| `deferred` | postponed on a stated condition | **waiting** |
+| `scheduled` | open sling context, awaiting capacity | **waiting** |
+| `working` | assignee's tmux session is alive | **waiting** |
+| `in-queue` | assignee gone, work is an open MR | **waiting** |
+| `blocked` | open blockers | needs-review |
+| `not-slingable` | town-level bead or non-slingable type | needs-review |
+| `unknown` | status unresolved (cross-rig DB unreachable) | needs-review |
+| `closed` | done | complete, when all of them are |
+
+Convoys whose verdict is `waiting` are **withheld from `--json`** — the daemon
+and the deacon treat every entry in that array as needing action. They are
+printed to humans in a separate dim section that prescribes nothing.
+
+Two orderings are load-bearing:
+- `deferred` is checked before `blocked`/`scheduled`. Deferral is the stated
+  intent and outranks whatever mechanical state accompanies it; reporting
+  "blocked" would send a reader to fix a blocker that is not what is holding it.
+- a dead session is not abandonment until the merge queue has been consulted
+  (`hasQueuedMergeRequest`). A polecat that pushed, submitted, and exited leaves
+  a hooked bead with no session — the ordinary end of a *successful* run. This
+  is the same misreading gt-0g5r fixed in the stuck-agent dog.
+
 ## CLI commands
 
 ### Stage and launch (validated creation)
@@ -122,9 +153,13 @@ gt convoy list --all             # include closed
 ### Find stranded work
 
 ```bash
-gt convoy stranded               # ready work with no active workers
-gt convoy stranded --json        # machine-readable
+gt convoy stranded               # convoys needing action, + a dim "waiting" list
+gt convoy stranded --json        # machine-readable; stranded only, no waiting
 ```
+
+Each entry carries a `reason` (`feedable`, `empty`, `complete`, `needs-review`)
+and an `evidence` tally of the tracked issues by disposition, so a reader never
+has to re-derive the verdict from the counts. See safety guard 4 above.
 
 ### Close and land
 

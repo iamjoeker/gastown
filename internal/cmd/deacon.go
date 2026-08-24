@@ -326,13 +326,18 @@ var deaconFeedStrandedCmd = &cobra.Command{
 A convoy is "stranded" when it is open AND either:
 - Has ready issues (open, unblocked, no assignee) but no workers
 - Has 0 tracked issues (empty — needs auto-close)
-- Has tracked issues but none are ready (needs agent review)
+- Has all tracked issues closed (complete — needs auto-close)
+- Has tracked issues that are blocked or unroutable (needs agent review)
+
+Convoys that are merely WAITING are not stranded and never reach this command:
+deferred beads, beads already scheduled, beads being worked by a live session,
+and beads whose work is sitting in the merge queue.
 
 This command:
 1. Runs 'gt convoy stranded --json' to find stranded convoys
 2. For feedable convoys (ready_count > 0): dispatches a dog via gt sling
-3. For empty convoys (tracked_count == 0): auto-closes via gt convoy check
-4. For tracked-but-not-ready convoys: surfaces raw data for deacon review
+3. For empty or complete convoys: auto-closes via gt convoy check
+4. For tracked-but-not-ready convoys: surfaces the evidence for deacon review
 5. Rate limits to avoid spawning too many dogs at once
 
 Rate limiting:

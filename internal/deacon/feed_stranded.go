@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -55,6 +56,37 @@ type StrandedConvoy struct {
 	TrackedCount int      `json:"tracked_count"`
 	ReadyCount   int      `json:"ready_count"`
 	ReadyIssues  []string `json:"ready_issues"`
+
+	// Reason is the convoy's verdict — "feedable", "empty", "complete", or
+	// "needs-review". Evidence tallies the tracked issues by disposition
+	// ("2 blocked", "1 deferred"). Both are empty when talking to a gt that
+	// predates gt-bel1, so callers must still handle the counts alone.
+	Reason   string         `json:"reason,omitempty"`
+	Evidence map[string]int `json:"evidence,omitempty"`
+}
+
+// Convoy verdicts emitted by `gt convoy stranded --json` (gt-bel1).
+const (
+	ReasonFeedable    = "feedable"
+	ReasonEmpty       = "empty"
+	ReasonComplete    = "complete"
+	ReasonNeedsReview = "needs-review"
+)
+
+// EvidenceSummary renders the disposition tally for an agent to read, e.g.
+// "2 blocked, 1 unknown". Returns "" when the gt in use predates the field.
+func (c StrandedConvoy) EvidenceSummary() string {
+	if len(c.Evidence) == 0 {
+		return ""
+	}
+	order := []string{"ready", "working", "in-queue", "scheduled", "deferred", "blocked", "not-slingable", "unknown", "closed"}
+	var parts []string
+	for _, dispo := range order {
+		if n := c.Evidence[dispo]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, dispo))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // FeedResult describes the outcome of a feed-stranded invocation.
@@ -246,35 +278,43 @@ func FeedStranded(townRoot string, maxPerCycle int, cooldown time.Duration) *Fee
 	for _, convoy := range stranded {
 		// Handle convoys with no ready issues.
 		if convoy.ReadyCount == 0 {
-			// Convoy has tracked issues but none are ready — surface raw data
-			// for the deacon agent to inspect. Go does not classify WHY issues
-			// aren't ready (dependency resolution, external block, etc.).
-			if convoy.TrackedCount > 0 {
+			// Tracked issues exist but none are ready. Since gt-bel1 the scan no
+			// longer sends convoys that are merely waiting (deferred, scheduled,
+			// worked, or queued to merge), so what arrives here genuinely has
+			// nothing self-resolving about it — except a "complete" convoy,
+			// which is mechanical: every tracked issue is closed, so run the
+			// same check that closes an empty one.
+			if convoy.TrackedCount > 0 && convoy.Reason != ReasonComplete {
 				result.NeedsAttention++
 				result.Details = append(result.Details, FeedConvoyResult{
 					ConvoyID:     convoy.ID,
 					Action:       "needs_attention",
-					Message:      fmt.Sprintf("%d tracked issues, 0 ready — requires agent review", convoy.TrackedCount),
+					Message:      needsAttentionMessage(convoy),
 					TrackedCount: convoy.TrackedCount,
 					ReadyCount:   0,
 				})
 				continue
 			}
 
-			// Truly empty convoy (0 tracked issues) — auto-close
+			// Empty convoy (0 tracked issues) or one whose issues are all
+			// closed — auto-close via gt convoy check.
 			if err := closeEmptyConvoy(townRoot, convoy.ID); err != nil {
 				result.Errors++
 				result.Details = append(result.Details, FeedConvoyResult{
 					ConvoyID: convoy.ID,
 					Action:   "error",
-					Message:  fmt.Sprintf("failed to auto-close empty convoy: %v", err),
+					Message:  fmt.Sprintf("failed to auto-close convoy: %v", err),
 				})
 			} else {
 				result.Closed++
+				reason := "0 tracked issues"
+				if convoy.TrackedCount > 0 {
+					reason = fmt.Sprintf("%d tracked issues, all closed", convoy.TrackedCount)
+				}
 				result.Details = append(result.Details, FeedConvoyResult{
 					ConvoyID: convoy.ID,
 					Action:   "closed",
-					Message:  "auto-closed empty convoy (0 tracked issues)",
+					Message:  fmt.Sprintf("auto-closed convoy (%s)", reason),
 				})
 			}
 			continue
@@ -333,6 +373,15 @@ func FeedStranded(townRoot string, maxPerCycle int, cooldown time.Duration) *Fee
 	}
 
 	return result
+}
+
+// needsAttentionMessage states the evidence alongside the verdict, so the agent
+// reading it knows what to look at rather than only that something is wrong.
+func needsAttentionMessage(c StrandedConvoy) string {
+	if summary := c.EvidenceSummary(); summary != "" {
+		return fmt.Sprintf("%d tracked issues, 0 ready (%s) — requires agent review", c.TrackedCount, summary)
+	}
+	return fmt.Sprintf("%d tracked issues, 0 ready — requires agent review", c.TrackedCount)
 }
 
 // closeEmptyConvoy runs `gt convoy check <id>` to auto-close an empty convoy.

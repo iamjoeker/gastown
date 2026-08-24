@@ -41,6 +41,28 @@ type strandedConvoyInfo struct {
 	ReadyIssues  []string  `json:"ready_issues"`
 	CreatedAt    time.Time `json:"created_at"`
 	BaseBranch   string    `json:"base_branch,omitempty"`
+
+	// Reason and Evidence carry the scan's verdict and what it observed
+	// ("2 blocked", "1 deferred"). Logged rather than branched on: the counts
+	// already decide the action, and an older gt omits both. (gt-bel1)
+	Reason   string         `json:"reason,omitempty"`
+	Evidence map[string]int `json:"evidence,omitempty"`
+}
+
+// describe renders the evidence for a log line, falling back to the bare
+// tracked count when talking to a gt that predates the field.
+func (c strandedConvoyInfo) describe() string {
+	order := []string{"ready", "working", "in-queue", "scheduled", "deferred", "blocked", "not-slingable", "unknown", "closed"}
+	var parts []string
+	for _, dispo := range order {
+		if n := c.Evidence[dispo]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, dispo))
+		}
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%d tracked", c.TrackedCount)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // ConvoyManager monitors beads events for issue closes and periodically scans for stranded convoys.
@@ -498,9 +520,11 @@ func (m *ConvoyManager) scan() {
 		} else {
 			// Tracked issues exist but none are ready. This could mean:
 			// (a) all tracked issues are closed → convoy should auto-close
-			// (b) issues are blocked/in-progress → needs agent review
+			// (b) issues are blocked or unroutable → needs agent review
 			// Run convoy check to handle case (a); it's a no-op for (b).
-			m.logger("Convoy %s: %d tracked issues, 0 ready — checking completion", c.ID, c.TrackedCount)
+			// Convoys that are merely waiting (deferred, scheduled, worked, or
+			// queued to merge) never reach here — the scan withholds them.
+			m.logger("Convoy %s: 0 ready (%s) — checking completion", c.ID, c.describe())
 			m.checkConvoyCompletion(c.ID)
 		}
 	}

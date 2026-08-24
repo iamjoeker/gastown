@@ -93,6 +93,24 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	reportMovedBead(beadID, owner)
 	info := owner.Info
 
+	// Guard against scheduling deferred beads (gt-bel1).
+	//
+	// runSling (sling.go) and executeSling (sling_dispatch.go) have refused
+	// deferred beads since gt-1326mw, but deferred DISPATCH MODE routes around
+	// both: with scheduler.max_polecats > 0, `gt sling <bead> <rig>` lands here
+	// instead, and here the gate was missing. That is not theoretical — bd-sdj,
+	// deferred since 2026-08-19 on a condition stated in its own title,
+	// accumulated five open sling contexts through this path while every other
+	// bead in the same window got one.
+	//
+	// This runs as soon as the status is known, ahead of the cross-rig guard and
+	// the sling-context lookup: deferral is a property of the bead alone, so
+	// nothing later can change the answer, and refusing first means a deferred
+	// bead never reaches the code that would write a context for it.
+	if isDeferredBead(info) && !opts.Force {
+		return fmt.Errorf("bead %s is deferred (use --force to override)", beadID)
+	}
+
 	if !opts.Force {
 		if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
 			return err
