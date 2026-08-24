@@ -111,7 +111,10 @@ This command:
 5. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
 
 **On signal received** (activity detected):
-Reset the idle counter and start next patrol cycle:
+`await-signal` has already reset the idle counter in-process — it does not
+delegate that to you (gt-609). Confirming it is optional and free; the command
+below skips the write when the counter is already 0, so it costs no Dolt commit
+(gt-i7g9). Start the next patrol cycle either way.
 ```bash
 gt agents state "$YOUR_AGENT_BEAD" --set idle=0
 ```
