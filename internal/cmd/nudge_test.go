@@ -866,3 +866,94 @@ func TestNudgeUsageOnlyForMalformedInvocations(t *testing.T) {
 		}
 	})
 }
+
+// An agent that answers by nudge — the channel the town's own hygiene rule tells
+// it to prefer — used to stay reminded, because only a mail reply could retire a
+// reminder and mail is the permanent Dolt commit that rule exists to avoid
+// (gt-w4ba).
+func TestRetireReplyRemindersToClearsWhatTheAnswerSatisfied(t *testing.T) {
+	setupNudgeTestRegistry(t)
+	// Force the role-derived sender path: with no pane there is no session name
+	// to prefer, which is also what a non-tmux caller sees.
+	t.Setenv("TMUX_PANE", "")
+
+	townRoot := t.TempDir()
+	prefix := session.PrefixFor("gastown")
+	mySession := session.CrewSessionName(prefix, "nudge-test-fixture")
+	witnessSession := session.WitnessSessionName(prefix)
+
+	queued := []nudge.QueuedNudge{
+		{Sender: "system", Message: "owed-witness-1", Kind: nudge.KindReplyReminder, ReplyTo: "gastown/witness", ThreadID: "thread-1"},
+		{Sender: "system", Message: "owed-witness-2", Kind: nudge.KindReplyReminder, ReplyTo: "gastown/witness", ThreadID: "thread-2"},
+		{Sender: "system", Message: "keep-mayor", Kind: nudge.KindReplyReminder, ReplyTo: "mayor/", ThreadID: "thread-3"},
+		{Sender: "gastown/witness", Message: "keep-mail", Kind: nudge.KindMail, ThreadID: "thread-1"},
+	}
+	for _, n := range queued {
+		if err := nudge.Enqueue(townRoot, mySession, n); err != nil {
+			t.Fatalf("Enqueue(%q): %v", n.Message, err)
+		}
+	}
+
+	retireReplyRemindersTo(townRoot, "gastown/crew/nudge-test-fixture", witnessSession)
+
+	drained, err := nudge.Drain(townRoot, mySession)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	var left []string
+	for _, n := range drained {
+		left = append(left, n.Message)
+	}
+	want := []string{"keep-mayor", "keep-mail"}
+	if len(left) != len(want) {
+		t.Fatalf("remaining = %v, want %v", left, want)
+	}
+	for i, w := range want {
+		if left[i] != w {
+			t.Errorf("remaining[%d] = %q, want %q", i, left[i], w)
+		}
+	}
+}
+
+// "unknown" is what GetRole reports from a context with no role. It is a display
+// label, not an address, and looking it up would clear reminders on whatever
+// session that string happens to resolve to.
+func TestRetireReplyRemindersToIgnoresUnknownSender(t *testing.T) {
+	setupNudgeTestRegistry(t)
+	t.Setenv("TMUX_PANE", "")
+
+	townRoot := t.TempDir()
+	prefix := session.PrefixFor("gastown")
+	mySession := session.CrewSessionName(prefix, "nudge-test-fixture")
+
+	if err := nudge.Enqueue(townRoot, mySession, nudge.QueuedNudge{
+		Sender: "system", Message: "owed-witness", Kind: nudge.KindReplyReminder,
+		ReplyTo: "gastown/witness", ThreadID: "thread-1",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	retireReplyRemindersTo(townRoot, unknownSender, session.WitnessSessionName(prefix))
+	retireReplyRemindersTo("", "gastown/crew/nudge-test-fixture", session.WitnessSessionName(prefix))
+
+	pending, err := nudge.Pending(townRoot, mySession)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending = %d, want 1 — a reminder was retired without a resolvable answerer", pending)
+	}
+
+	// Positive control. Every assertion above is satisfied by a call that does
+	// nothing at all — which is what a mis-detected town root produced on the
+	// first cut of this — so prove the same fixture clears when the answerer
+	// does resolve.
+	retireReplyRemindersTo(townRoot, "gastown/crew/nudge-test-fixture", session.WitnessSessionName(prefix))
+	pending, err = nudge.Pending(townRoot, mySession)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("control: pending = %d, want 0 — the fixture never retires, so the zeros above prove nothing", pending)
+	}
+}

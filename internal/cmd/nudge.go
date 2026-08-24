@@ -368,11 +368,48 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 	// Timeout — nudge stays in queue for next watcher or manual drain.
 }
 
+// retireReplyRemindersTo drops the reply reminders the nudging agent owes to
+// the agent it just nudged.
+//
+// An answer is an answer whichever channel carries it. Only a mail reply used
+// to retire a reminder, so an agent following the town's own "nudge, don't
+// mail" rule answered and stayed reminded — and the single way to stop being
+// reminded was the permanent Dolt commit that rule exists to avoid (gt-w4ba).
+//
+// Best-effort and quiet: a nudge that was delivered must not report failure
+// because a queue file would not go away.
+func retireReplyRemindersTo(townRoot, senderAddress, nudgedSession string) {
+	if townRoot == "" {
+		return
+	}
+	// Prefer the address of the session actually running this command over the
+	// role-derived one: the reminder was queued against a session, and the role
+	// lookup reports "unknown" from any context that has no role.
+	from := mail.SessionNameToAddress(tmux.CurrentSessionName())
+	if from == "" && senderAddress != unknownSender {
+		from = senderAddress
+	}
+	to := mail.SessionNameToAddress(nudgedSession)
+	if from == "" || to == "" {
+		return
+	}
+	// Explicit town root, not NewRouter's detection from a work directory: the
+	// caller already resolved the town, and a router that fails to re-detect it
+	// silently declines to clear anything.
+	if err := mail.NewRouterWithTownRoot(townRoot, townRoot).ClearReplyRemindersTo(from, to); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not clear satisfied reply reminders: %v\n", err)
+	}
+}
+
 func requeueDrainedNudges(townRoot, sessionName, source string, drained []nudge.QueuedNudge) {
 	if err := nudge.Requeue(townRoot, sessionName, drained); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed: %v\n", source, sessionName, err)
 	}
 }
+
+// unknownSender is the sender label used when the caller has no resolvable
+// role. It is a display string, never an address: nothing may look it up.
+const unknownSender = "unknown"
 
 // validNudgeModes is the set of allowed --mode values.
 var validNudgeModes = map[string]bool{
@@ -463,7 +500,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Identify sender for message prefix (needed before channel check)
-	sender := "unknown"
+	sender := unknownSender
 	if roleInfo, err := GetRole(); err == nil {
 		switch roleInfo.Role {
 		case RoleMayor:
@@ -550,6 +587,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		if err := deliverNudge(t, deaconSession, message, sender); err != nil {
 			return fmt.Errorf("nudging deacon: %w", err)
 		}
+		retireReplyRemindersTo(townRoot, sender, deaconSession)
 
 		fmt.Printf("%s Nudged deacon (%s)\n", style.Bold.Render("✓"), nudgeModeFlag)
 
@@ -575,6 +613,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		if err := deliverNudge(t, sessionName, message, sender); err != nil {
 			return fmt.Errorf("nudging dog: %w", err)
 		}
+		retireReplyRemindersTo(townRoot, sender, sessionName)
 
 		fmt.Printf("%s Nudged %s (%s)\n", style.Bold.Render("✓"), target, nudgeModeFlag)
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
@@ -645,6 +684,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		if err := deliverNudge(t, sessionName, message, sender); err != nil {
 			return fmt.Errorf("nudging session: %w", err)
 		}
+		retireReplyRemindersTo(townRoot, sender, sessionName)
 
 		fmt.Printf("%s Nudged %s/%s (%s)\n", style.Bold.Render("✓"), rigName, polecatName, nudgeModeFlag)
 
@@ -671,6 +711,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		if err := deliverNudge(t, target, message, sender); err != nil {
 			return fmt.Errorf("nudging session: %w", err)
 		}
+		retireReplyRemindersTo(townRoot, sender, target)
 
 		fmt.Printf("✓ Nudged %s (%s)\n", target, nudgeModeFlag)
 

@@ -180,6 +180,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Answering by nudge now retires the reply reminder** (gt-w4ba). A reply
+  reminder was retired by exactly one event: a mail reply on the same thread.
+  Every agent's CLAUDE.md tells it to prefer `gt nudge` for routine replies —
+  "`gt nudge` costs zero, `gt mail send` costs one Dolt commit forever" — so an
+  agent that answered the recommended way answered a trigger that could not
+  observe it, and the only way to stop being reminded was to spend the permanent
+  commit the rule exists to avoid. Following the hygiene rule guaranteed the
+  spurious reminder; breaking it was the documented cure.
+
+  Reminders now carry the address they are owed to, not just the thread they are
+  about, and `gt nudge <agent>` clears the reminders the nudger owes that agent
+  across every thread. The reminder text names both channels rather than mail
+  alone, since the reminder is the only instruction the recipient sees.
+
+  Addresses are compared through `beads.SameAgentAddress`, not `==`: the address
+  on the reminder is whatever the mail sender wrote and the one on the answer is
+  whatever the nudger typed, and the two spellings routinely differ in nesting
+  and case. Reminders written before the field existed name nobody and are never
+  matched — retiring those on any nudge would be worse than the bug. Clearing is
+  best-effort and never fails a delivered nudge.
+
+  Note the scope difference from the mail path, which is deliberate: a mail
+  reply retires the reminders for one thread, because mail is addressed to a
+  thread. A nudge retires every reminder owed to that agent, because a nudge is
+  addressed to an agent and carries no thread at all. Archiving the message
+  still retires its reminder at drain time (gt-loz6), and reading it does not —
+  the obligation is to reply, not to read.
+
 - **The queued-nudge banner no longer replays mail the reader already dealt
   with** (gt-loz6). A nudge announcing mail is a pointer — "you have new mail
   from X, subject Y" — and nothing connected it back to the message it points

@@ -1816,7 +1816,12 @@ func prioritySeverityLabel(priority Priority) string {
 }
 
 // enqueueReplyReminder queues a deferred nudge reminding the recipient to reply
-// via gt mail send rather than in chat. Best-effort: errors are logged, not returned.
+// over a channel the sender can actually receive, rather than in chat.
+// Best-effort: errors are logged, not returned.
+//
+// The reminder carries who it is owed to, not just what it is about, so that
+// answering by nudge retires it as a mail reply does — see
+// ClearReplyRemindersTo for why a mail-only trigger was unsatisfiable.
 //
 // Skipped when:
 //   - No town root (can't use nudge queue)
@@ -1839,11 +1844,12 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	}
 	reminder := nudge.QueuedNudge{
 		Sender:       "system",
-		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
+		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) — `gt nudge %s` for a routine answer, `gt mail send %s` if it must survive session death. Not in chat.", msg.From, msg.Subject, msg.From, msg.From),
 		Priority:     nudge.PriorityNormal,
 		Kind:         nudge.KindReplyReminder,
 		ThreadID:     msg.ThreadID,
 		MessageID:    msg.ID,
+		ReplyTo:      msg.From,
 		DeliverAfter: time.Now().Add(delay),
 	}
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
@@ -1902,6 +1908,36 @@ func (r *Router) ClearReplyReminders(address, threadID string) error {
 	var firstErr error
 	for _, sessionID := range AddressToSessionIDs(address) {
 		if _, err := nudge.RemoveKindByThread(r.townRoot, sessionID, nudge.KindReplyReminder, threadID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ClearReplyRemindersTo retires the reply reminders address owes to repliedTo,
+// whatever thread they sit on. Call it when address answers repliedTo over a
+// channel that leaves no mail record.
+//
+// A reminder that only a mail reply can satisfy is a reminder the town's own
+// hygiene rule cannot satisfy: agents are told to prefer `gt nudge` precisely
+// because mail costs a permanent Dolt commit, so answering the recommended way
+// left the reminder in force and the only way to silence it was to spend the
+// commit the rule exists to avoid (gt-w4ba).
+//
+// Matching is by agent, not by string: the address on a reminder is whatever
+// the mail sender wrote, and the one on the answer is whatever the nudger
+// typed. SameAgentAddress is where those spellings are reconciled.
+func (r *Router) ClearReplyRemindersTo(address, repliedTo string) error {
+	if r.townRoot == "" || address == "" || repliedTo == "" {
+		return nil
+	}
+	owedTo := func(replyTo string) bool {
+		return beads.SameAgentAddress(replyTo, repliedTo)
+	}
+
+	var firstErr error
+	for _, sessionID := range AddressToSessionIDs(address) {
+		if _, err := nudge.RemoveReplyReminders(r.townRoot, sessionID, owedTo); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

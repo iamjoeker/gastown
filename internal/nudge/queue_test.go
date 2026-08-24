@@ -919,6 +919,80 @@ func TestRemoveByMessage(t *testing.T) {
 	}
 }
 
+// A reply reminder used to record only what it was about, so nothing but a mail
+// reply on the same thread could retire it (gt-w4ba).
+func TestRemoveReplyReminders(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-remove-reply-reminders"
+
+	entries := []QueuedNudge{
+		{Sender: "system", Message: "owed to witness, thread-1", Kind: KindReplyReminder, ReplyTo: "gastown/witness", ThreadID: "thread-1"},
+		{Sender: "system", Message: "owed to witness, thread-2", Kind: KindReplyReminder, ReplyTo: "gastown/witness", ThreadID: "thread-2"},
+		{Sender: "system", Message: "owed to mayor", Kind: KindReplyReminder, ReplyTo: "mayor/", ThreadID: "thread-1"},
+		{Sender: "system", Message: "pre-ReplyTo reminder", Kind: KindReplyReminder, ThreadID: "thread-1"},
+		{Sender: "gastown/witness", Message: "mail announcement", Kind: KindMail, ThreadID: "thread-1"},
+		{Sender: "gastown/witness", Message: "plain nudge"},
+	}
+	for _, n := range entries {
+		if err := Enqueue(townRoot, session, n); err != nil {
+			t.Fatalf("Enqueue(%q): %v", n.Message, err)
+		}
+	}
+
+	removed, err := RemoveReplyReminders(townRoot, session, func(replyTo string) bool {
+		return replyTo == "gastown/witness"
+	})
+	if err != nil {
+		t.Fatalf("RemoveReplyReminders: %v", err)
+	}
+	// Both threads owed to the witness go; nothing else does. In particular the
+	// mail announcement stays: answering is not reading.
+	if removed != 2 {
+		t.Fatalf("removed %d, want 2", removed)
+	}
+
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 4 {
+		t.Fatalf("remaining %d, want 4: %+v", len(drained), drained)
+	}
+	for _, n := range drained {
+		if n.ReplyTo == "gastown/witness" {
+			t.Errorf("reminder owed to the nudged agent survived: %+v", n)
+		}
+	}
+}
+
+// A reminder written before ReplyTo existed names nobody. Matching it would
+// retire every agent's reminder on the first nudge to anyone.
+func TestRemoveReplyRemindersSkipsUnaddressedReminders(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-reply-reminders-legacy"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{
+		Sender: "system", Message: "pre-ReplyTo reminder", Kind: KindReplyReminder, ThreadID: "thread-1",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	called := false
+	removed, err := RemoveReplyReminders(townRoot, session, func(string) bool {
+		called = true
+		return true
+	})
+	if err != nil {
+		t.Fatalf("RemoveReplyReminders: %v", err)
+	}
+	if called {
+		t.Error("matcher was consulted for a reminder carrying no address")
+	}
+	if removed != 0 {
+		t.Fatalf("removed %d, want 0", removed)
+	}
+}
+
 // The banner used to carry sender and subject only, so an agent holding ten
 // queued orders could not tell which was current (gt-loz6).
 func TestFormatForInjectionCarriesTimestamps(t *testing.T) {

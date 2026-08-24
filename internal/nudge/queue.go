@@ -80,7 +80,14 @@ type QueuedNudge struct {
 	// single message on it, so a spent notification for an old message stays
 	// "live" as long as anything newer on the thread is unread — which is
 	// exactly how a revoked order kept being replayed (gt-loz6).
-	MessageID string    `json:"message_id,omitempty"`
+	MessageID string `json:"message_id,omitempty"`
+	// ReplyTo is the address a reply-reminder is owed to — the sender of the
+	// message the reminder is about. Without it a reminder records only what it
+	// is about and not who it is to, so the only event that could retire it was
+	// a mail reply on the same thread. An answer sent over the channel agents
+	// are told to prefer left no trace the reminder could see, and the reminder
+	// outlived the conversation it was chasing (gt-w4ba).
+	ReplyTo   string    `json:"reply_to,omitempty"`
 	Severity  string    `json:"severity,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
@@ -372,6 +379,24 @@ func RemoveKindByThread(townRoot, session, kind, threadID string) (int, error) {
 	}
 	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
 		return n.Kind == kind && n.ThreadID == threadID
+	})
+}
+
+// RemoveReplyReminders deletes queued reply-reminder nudges for a session whose
+// ReplyTo address satisfies owedTo, returning the number removed.
+//
+// The address comparison is the caller's: agent addresses have several live
+// spellings and reconciling them is the mail package's boundary, not this one.
+//
+// Reminders written before ReplyTo existed carry an empty address and are never
+// matched — owedTo is not consulted for them. They still retire on their own
+// TTL, and on a mail reply through RemoveKindByThread.
+func RemoveReplyReminders(townRoot, session string, owedTo func(replyTo string) bool) (int, error) {
+	if owedTo == nil {
+		return 0, nil
+	}
+	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
+		return n.Kind == KindReplyReminder && n.ReplyTo != "" && owedTo(n.ReplyTo)
 	})
 }
 
