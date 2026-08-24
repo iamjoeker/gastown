@@ -180,6 +180,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gt compact` no longer deletes another agent's live molecule on age alone**
+  (gt-98hh). Compaction's delete policy asked only how old a wisp was. Its
+  `molecule step past TTL` branch is reached only when the status is *not*
+  closed — the closed case is handled above it — so the one thing that branch
+  deleted was a step that was still open, hooked, blocked or in_progress: the
+  checklist of a molecule an agent is working right now. There is no restore.
+  The wisp tables are dolt-ignored (hq-del4), so there is no history to read
+  `AS OF` and no backup.
+
+  `gt compact` now builds an ancestry index over the whole `wisps` table before
+  it decides anything, and holds any wisp whose own status is not `closed`, or
+  which sits at any depth under a molecule whose root is not `closed`. Held
+  wisps are reported under `Protected` naming the molecule that held them,
+  alongside the existing pin and label guards. The release arm is a wisp whose
+  parent row is absent: that molecule has already been swept and cannot be
+  live. A failure to build the index is carried inside the value the guard
+  reads rather than returned to a caller who might not check it, so an
+  unreadable ancestry holds every candidate and says why.
+
+  The index query deliberately carries no infra-type exclusion, unlike
+  `mutableWispWhere`. That filter is right about what compaction may *mutate*
+  and wrong about what it may *look at*: an infra-typed parent compaction must
+  never touch can still be the parent of a step it may, and excluding it would
+  make that parent invisible and release its live children as orphans.
+
+  Measured against live `hq` on 2026-08-23 (14,495 wisps): the guard holds
+  nothing today — every one of the ~4,600 rows a bare run would delete is
+  closed under a closed parent, and the paired dry-run delete sets differ only
+  by a row crossing its TTL between the two runs. That is a fact about one
+  afternoon's data, not about the code. The same database holds 3,286 typed
+  step wisps under the dog molecules (`mol-dog-doctor`, `mol-dog-checkpoint`,
+  `mol-dog-jsonl`, `mol-dog-reaper`), all stamped `gc_report` with a 24h TTL; a
+  dog whose session dies mid-molecule leaves those steps open, and 24 hours
+  later they are exactly what the branch deleted — destroying the evidence of
+  the stuck dog. Verified end to end against a planted molecule on the
+  `gastown` rig: with the guard, a closed step of a `hooked` molecule moves
+  from `Deleted` to `Protected` naming the root, while the same step under a
+  *closed* root, an unprotected sibling and a plain past-TTL wisp all stay in
+  `Deleted`. `--dry-run` throughout; fixtures removed afterwards.
+
 - **A half-read planning scan no longer reports itself as an idle scheduler**
   (gt-vpds). When a store cannot be read, the sling-context scan skips it and
   plans on the rest — that isolation is deliberate (hq-v05uw), and the sentinel

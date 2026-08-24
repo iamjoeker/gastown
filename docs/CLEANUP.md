@@ -95,6 +95,15 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 > what a run removed, take the archived ids and subtract the ids still in
 > `wisps`. Relocate the archive with `GT_WISP_ARCHIVE_DIR`.
 
+> **Age never releases a live molecule.** `gt compact` will not delete a wisp
+> whose own status is anything but `closed`, nor one under a molecule — at any
+> depth — whose root is not closed. Before gt-98hh the `molecule step past TTL`
+> branch was reached only by steps that were still open, hooked, blocked or
+> in_progress, so the one thing it deleted was an agent's current work. Held
+> wisps are reported under **Protected**, naming the molecule that held them.
+> The release arm is a wisp whose parent row is gone: that molecule has already
+> been swept, so it cannot be live.
+
 > `gt compact` acts only on wisps whose `wisp_type` is set. Rows with an empty
 > `wisp_type` are counted as **Unclassified** and left untouched — no TTL policy
 > can be chosen for them, and defaulting them to 24h would delete 7d escalation,
@@ -117,9 +126,19 @@ should happen to the wisp at that age.
 
 The vocabulary is bd's and it is closed: bd rejects any other value at create
 time. There is deliberately no type for merge-request, sling-context or
-work-molecule wisps, so those stay unclassified and take the 24h default.
-Leave them that way rather than borrowing a bucket whose retention was reasoned
-about for something else.
+work-molecule wisps, so those stay unclassified and, per the paragraph above,
+are left untouched. Leave them that way rather than borrowing a bucket whose
+retention was reasoned about for something else.
+
+That is also the whole explanation for a large `Unclassified` count, and it is
+worth stating because the number invites a different reading. Measured on live
+`hq` 2026-08-23: 8,957 of 14,470 wisps (62%) untyped — 3,329 molecule roots and
+4,327 of their steps, 673 `gt:message` mail wisps and 637 `type:plugin-run`
+receipts. Every one of those is written by a path with no member of bd's
+seven-value vocabulary to write, so the column is empty for the reason the
+paragraph above gives and the rows are in the SAFE bucket. `Unclassified` is
+not a population awaiting deletion, and closing the gap by stamping a type
+would move 62% of the corpus from untouchable to TTL-enforced in one edit.
 
 Two write paths exist, because bd only offers one and it does not cover
 molecules:
