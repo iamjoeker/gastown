@@ -3,8 +3,11 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -608,9 +611,10 @@ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 	// watchAndDeliver checks QueueLen first — with no queue files,
 	// it should exit immediately. We verify it doesn't block.
 	done := make(chan struct{})
+	var watchErr error
 	go func() {
 		// Use a nil-safe Tmux — QueueLen returns 0 before IsIdle is called.
-		watchAndDeliver(nil, tmpDir, "test-session")
+		watchErr = watchAndDeliver(nil, tmpDir, "test-session")
 		close(done)
 	}()
 
@@ -619,6 +623,9 @@ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 		// Good — exited because queue was empty
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchAndDeliver did not exit within 2s for empty queue")
+	}
+	if watchErr != nil {
+		t.Errorf("watchAndDeliver = %v, want nil (nothing to deliver is not a failure)", watchErr)
 	}
 }
 
@@ -656,10 +663,11 @@ func TestIdleWatcherHonorsTestHook(t *testing.T) {
 	}
 
 	done := make(chan struct{})
+	var watchErr error
 	go func() {
 		// A nil *tmux.Tmux would panic on any tmux call, so surviving this is
 		// itself evidence that no delivery attempt was made.
-		watchAndDeliver(nil, townRoot, sessionName)
+		watchErr = watchAndDeliver(nil, townRoot, sessionName)
 		close(done)
 	}()
 
@@ -667,6 +675,9 @@ func TestIdleWatcherHonorsTestHook(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchAndDeliver did not return under the test hook")
+	}
+	if watchErr != nil {
+		t.Errorf("watchAndDeliver = %v, want nil (the recording hook is a benign outcome)", watchErr)
 	}
 
 	// The queue is still intact: the watcher neither drained it nor delivered it.
@@ -955,5 +966,80 @@ func TestRetireReplyRemindersToIgnoresUnknownSender(t *testing.T) {
 	}
 	if pending != 0 {
 		t.Fatalf("control: pending = %d, want 0 — the fixture never retires, so the zeros above prove nothing", pending)
+	}
+}
+
+// TestIdleWatcherReportsDeliveryFailure covers the verdict half of gt-32gf.
+//
+// The watcher used to log a delivery failure to stderr and return nothing, so
+// runNudge printed "✓ Nudged <target> (wait-idle)" one line below the failure
+// and exited 0. What is asserted here is the pair: an error out of the watcher,
+// AND the payload back in the queue — a report of failure that had dropped the
+// message would be no better than the success that hid it.
+//
+// Delivery is failed deterministically by withholding the socket
+// authorization guardTestNudge requires, which is the same refusal a test that
+// reached a live pane would get. No keystroke leaves this test.
+func TestIdleWatcherReportsDeliveryFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux session fixtures are unreliable on Windows")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+
+	// The watcher's own test hook returns before any polling, so the failure
+	// under test lives past it. Withdraw the hook for the duration.
+	if prev, ok := os.LookupEnv(tmux.TestNudgeLogEnv); ok {
+		if err := os.Unsetenv(tmux.TestNudgeLogEnv); err != nil {
+			t.Fatalf("unsetenv %s: %v", tmux.TestNudgeLogEnv, err)
+		}
+		t.Cleanup(func() { _ = os.Setenv(tmux.TestNudgeLogEnv, prev) })
+	}
+	// Authorize a socket this test does not own: the delivery attempt is then
+	// refused at the transport, exactly as it would be for a live pane.
+	t.Setenv(tmux.AllowTestNudgeEnv, "gt-test-nudge-verdict-some-other-socket")
+
+	socket := fmt.Sprintf("gt-test-nudge-verdict-%d", os.Getpid())
+	const sessionName = "gt-test-nudge-verdict"
+	// A pane parked at the composer prompt with no busy indicator is what
+	// WaitForIdle looks for; sleep keeps it that way for the whole test.
+	start := exec.Command("tmux", "-u", "-L", socket, "new-session", "-d",
+		"-s", sessionName, "sh", "-c", "printf '\\n"+tmux.DefaultReadyPromptPrefix+" '; sleep 60")
+	if out, err := start.CombinedOutput(); err != nil {
+		t.Skipf("could not start tmux fixture server: %v (%s)", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socket, "kill-server").Run() })
+	time.Sleep(300 * time.Millisecond)
+
+	origTimeout, origInterval := idleWatcherTimeout, idleWatcherPollInterval
+	t.Cleanup(func() {
+		idleWatcherTimeout = origTimeout
+		idleWatcherPollInterval = origInterval
+	})
+	// The poll interval doubles as WaitForIdle's timeout, and WaitForIdle
+	// needs two polls 200ms apart to call a pane idle — shorten it below that
+	// and the watcher can never reach delivery at all.
+	idleWatcherTimeout = 15 * time.Second
+	idleWatcherPollInterval = 1 * time.Second
+
+	townRoot := t.TempDir()
+	if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		Sender:   "tester",
+		Message:  "payload that must not be reported as delivered",
+		Priority: nudge.PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	err := watchAndDeliver(tmux.NewTmuxWithSocket(socket), townRoot, sessionName)
+	if err == nil {
+		t.Fatal("watchAndDeliver = nil after a refused delivery; the caller prints ✓ Nudged on nil")
+	}
+	if !errors.Is(err, tmux.ErrTestNudgeRefused) {
+		t.Fatalf("watchAndDeliver = %v, want it to wrap ErrTestNudgeRefused (was the nudge actually attempted?)", err)
+	}
+	if n := nudge.QueueLen(townRoot, sessionName); n != 1 {
+		t.Errorf("QueueLen after failed delivery = %d, want 1 (the drained nudge must be requeued)", n)
 	}
 }

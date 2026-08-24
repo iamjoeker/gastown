@@ -283,8 +283,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// this watcher. It exits on: delivery, session death, or timeout.
 		// Must be synchronous (not a goroutine) because gt nudge is a CLI
 		// command — the process exits after return, killing any goroutines.
-		watchAndDeliver(t, townRoot, sessionName)
-		return nil
+		return watchAndDeliver(t, townRoot, sessionName)
 
 	default: // NudgeModeImmediate
 		opts := tmux.NudgeOpts{TownRoot: townRoot}
@@ -307,15 +306,25 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 // send-keys input, so we cannot rely on it.
 //
 // This runs synchronously — gt nudge blocks until the watcher exits.
-// Errors are logged to stderr rather than returned since delivery failure
-// after successful queue write is non-fatal (queue persists for next drain).
+//
+// A delivery failure here is returned, not just logged. It used to be logged
+// to stderr on the theory that a queued nudge is recoverable, so the caller
+// went on to print "✓ Nudged <target> (wait-idle)" directly beneath the
+// failure line and exit 0. Callers that read the exit code, or the last line,
+// were told a message had been delivered that tmux had refused — and nudge is
+// the town-wide default for agent-to-agent messages, so the sender never
+// retried and the recipient never learned anything was meant for them.
+// Requeueing keeps the payload alive for the next drain; it does not make the
+// nudge delivered, and only delivery earns the check mark. (gt-32gf)
 //
 // Exit conditions:
 //   - Agent becomes idle: drain queue and deliver formatted content, exit.
-//   - Queue is empty (someone else drained it): exit.
-//   - Session disappears: exit (nothing to deliver to).
-//   - Timeout: exit (queue stays for next input or watcher cycle).
-func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+//   - Queue is empty (someone else drained it): exit nil.
+//   - Session disappears: exit nil (nothing to deliver to).
+//   - Timeout: exit nil — the nudge stays queued, which is what wait-idle
+//     promises when the agent never goes idle.
+//   - Delivery attempted and refused: return the error.
+func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) error {
 	// Test hook, mirroring deliverNudge. Reaching this function from
 	// deliverNudge already implies the hook was absent — the check at the top of
 	// deliverNudge returns before the call at the end of wait-idle mode — but
@@ -325,7 +334,7 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 	// the polling and the queue drain from running at all.
 	if logPath, inTest := testNudgeHook(); inTest {
 		writeTestNudgeLog(logPath, fmt.Sprintf("watch:%s\n", sessionName))
-		return
+		return nil
 	}
 
 	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
@@ -335,12 +344,12 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 
 		// If queue is already empty, someone else drained it.
 		if nudge.QueueLen(townRoot, sessionName) == 0 {
-			return
+			return nil
 		}
 
 		// Check if session still exists — no point watching a dead session.
 		if exists, _ := t.HasSession(sessionName); !exists {
-			return
+			return nil
 		}
 
 		// Use WaitForIdle with a short timeout instead of single-snapshot
@@ -355,17 +364,23 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			// agent has already read or archived (gt-loz6).
 			drained, _ := mail.DrainLive(townRoot, sessionName)
 			if len(drained) == 0 {
-				return
+				return nil
 			}
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
-				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-				requeueDrainedNudges(townRoot, sessionName, "idle-watcher", drained)
+				// Put the claimed entries back before reporting: the drain
+				// already removed them from the queue, so a bare error here
+				// would lose the payload as well as the delivery.
+				if reqErr := nudge.Requeue(townRoot, sessionName, drained); reqErr != nil {
+					return fmt.Errorf("idle-watcher: delivery for %s failed: %w; requeue also failed (%v) — %d nudge(s) lost", sessionName, err, reqErr, len(drained))
+				}
+				return fmt.Errorf("idle-watcher: delivery for %s failed: %w — %d nudge(s) requeued, still undelivered", sessionName, err, len(drained))
 			}
-			return
+			return nil
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
+	return nil
 }
 
 // retireReplyRemindersTo drops the reply reminders the nudging agent owes to
