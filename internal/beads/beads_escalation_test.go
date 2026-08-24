@@ -964,8 +964,9 @@ func TestAckEscalation_LabelsDeliveredCopies(t *testing.T) {
 }
 
 // Copies stranded by pre-fix closes must drop out of the queue with no
-// migration — but only on positive evidence that the record is closed.
-func TestDropResolvedEscalations(t *testing.T) {
+// migration — but only on positive evidence that the record is closed, and the
+// ones dropped must be handed back rather than lost (gt-f0b3).
+func TestPartitionResolvedEscalations(t *testing.T) {
 	stub := newEscalationStub(t)
 
 	closedRecord := escalationRecord("hq-wisp-closed")
@@ -981,16 +982,59 @@ func TestDropResolvedEscalations(t *testing.T) {
 	standalone := escalationRecord("hq-wisp-open2")
 
 	b := New(t.TempDir())
-	got := b.dropResolvedEscalations([]*Issue{resolved, live, orphan, standalone})
+	kept, strandedCopies := b.partitionResolvedEscalations([]*Issue{resolved, live, orphan, standalone})
 
+	want := []string{"hq-live", "hq-orphan", "hq-wisp-open2"}
+	if got := issueIDs(kept); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("kept = %v, want %v (a reaped record is not evidence of resolution)", got, want)
+	}
+	// Every bead in this half is still OPEN, so it still counts wherever beads
+	// are counted. Losing it here is what made `gt escalate list` disagree with
+	// `bd list --label=gt:escalation --status=open` with nothing to explain it.
+	if got := issueIDs(strandedCopies); strings.Join(got, ",") != "hq-resolved" {
+		t.Errorf("stranded = %v, want [hq-resolved]: the hidden copies must be reported, not discarded", got)
+	}
+}
+
+// ListEscalationsWithStranded is what `gt escalate list` reads. Its second
+// return is exactly the gap between that list and any count of open
+// gt:escalation beads.
+func TestListEscalationsWithStranded_ReportsTheHiddenCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	closedRecord := escalationRecord("hq-wisp-closed")
+	closedRecord.Status = "closed"
+	openRecord := escalationRecord("hq-wisp-open")
+	stub.bead(closedRecord)
+	stub.bead(openRecord)
+
+	resolved := escalationCopy("hq-resolved", "hq-wisp-closed", "mayor/")
+	live := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	stub.list("gt:escalation", resolved, live)
+
+	b := New(t.TempDir())
+	open, strandedCopies, err := b.ListEscalationsWithStranded()
+	if err != nil {
+		t.Fatalf("ListEscalationsWithStranded: %v", err)
+	}
+	if got := issueIDs(open); strings.Join(got, ",") != "hq-live" {
+		t.Errorf("open = %v, want [hq-live]", got)
+	}
+	if got := issueIDs(strandedCopies); strings.Join(got, ",") != "hq-resolved" {
+		t.Errorf("stranded = %v, want [hq-resolved]", got)
+	}
+	// The two halves must account for every open bead the query returned:
+	// anything in neither is hidden with no signal at all.
+	if len(open)+len(strandedCopies) != 2 {
+		t.Errorf("open(%d) + stranded(%d) must account for all 2 open escalation beads", len(open), len(strandedCopies))
+	}
+}
+
+func issueIDs(issues []*Issue) []string {
 	var ids []string
-	for _, issue := range got {
+	for _, issue := range issues {
 		ids = append(ids, issue.ID)
 	}
-	want := []string{"hq-live", "hq-orphan", "hq-wisp-open2"}
-	if strings.Join(ids, ",") != strings.Join(want, ",") {
-		t.Errorf("dropResolvedEscalations() = %v, want %v (a reaped record is not evidence of resolution)", ids, want)
-	}
+	return ids
 }
 
 // ListEscalations is what `gt escalate list`, the Mayor's queue, and

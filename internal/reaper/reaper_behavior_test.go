@@ -1198,7 +1198,7 @@ func closedEntryIDs(result *AutoCloseResult) []string {
 // The four defects gt-nhp describes compound here, so a partial guard is worse
 // than an obvious gap. Protecting only the DELETE leaves reap closing the record,
 // and a closed record makes `gt escalate list` hide every delivered copy of a
-// still-live escalation (dropResolvedEscalations) — the escalation is gone from
+// still-live escalation (partitionResolvedEscalations) — the escalation is gone from
 // the operator's only surface while still needing attention. Protecting only the
 // CLOSE leaves the row in the delete set the moment anything else closes it.
 //

@@ -608,17 +608,41 @@ func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) 
 
 // ListEscalations returns all open escalation beads.
 func (b *Beads) ListEscalations() ([]*Issue, error) {
+	open, _, err := b.ListEscalationsWithStranded()
+	return open, err
+}
+
+// ListEscalationsWithStranded returns the open escalations, and separately the
+// open delivered copies this list hides because their escalation record is
+// closed.
+//
+// The hidden set is not a detail. It is the whole difference between what
+// `gt escalate list` prints and what every bead-counting surface counts, and
+// losing it without trace is how the two came to disagree in silence: measured
+// on hq 2026-08-23, the list printed 3 while `bd list --label=gt:escalation
+// --status=open` returned 4, with no output of any kind about the fourth
+// (gt-f0b3). The missing bead was a HIGH the Mayor had been told was live.
+//
+// The hiding itself is right — a resolved escalation must not sit in the queue
+// as an open HIGH (gt-4xl) — but its evidence is weaker than it looks. A record
+// is an ephemeral wisp that anything can close: `bd close` run by hand, as
+// happened to hq-wisp-aor1wa, closes it without touching the copy the same way
+// a pre-gt-4xl `gt escalate close` did. So "record closed" means "probably
+// resolved, and nobody reconciled the halves", never "resolved". Returning the
+// set lets the caller say so and name the reconcile.
+func (b *Beads) ListEscalationsWithStranded() (open, stranded []*Issue, err error) {
 	out, err := b.run("list", "--label=gt:escalation", "--status=open", "--json")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+		return nil, nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return b.dropResolvedEscalations(filterEscalationRecords(issues)), nil
+	open, stranded = b.partitionResolvedEscalations(filterEscalationRecords(issues))
+	return open, stranded, nil
 }
 
 // ListEscalationsByFingerprint returns open escalation beads matching a stable fingerprint label.
@@ -641,7 +665,8 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return b.dropResolvedEscalations(filterEscalationRecords(issues)), nil
+	kept, _ := b.partitionResolvedEscalations(filterEscalationRecords(issues))
+	return kept, nil
 }
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
@@ -661,26 +686,32 @@ func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return b.dropResolvedEscalations(filterEscalationRecords(issues)), nil
+	kept, _ := b.partitionResolvedEscalations(filterEscalationRecords(issues))
+	return kept, nil
 }
 
-// dropResolvedEscalations removes delivered escalation copies whose escalation
-// record has already been closed.
+// partitionResolvedEscalations splits delivered escalation copies into the ones
+// the queue should show and the ones whose escalation record has already been
+// closed.
 //
 // A copy is a durable issue and its record is an ephemeral wisp, so closing the
-// record has never propagated to the copy. Without this filter every escalation
+// record has never propagated to the copy. Without this split every escalation
 // closed by the documented `gt escalate close <record-id>` stayed in the queue
 // as an open HIGH forever, and `gt escalate stale` would re-escalate resolved
 // escalations up to critical (gt-4xl). New closes now reconcile both halves;
 // this covers the copies stranded before that, with no migration.
 //
+// The resolved half is RETURNED rather than discarded. These beads are still
+// open, so they still count everywhere beads are counted, and dropping them on
+// the floor made the queue and those counts disagree with nothing to explain it
+// (gt-f0b3).
+//
 // Fails OPEN: a record that cannot be read — reaped, or Dolt unreachable — keeps
 // its copy listed. Hiding a live escalation is far worse than showing a resolved
 // one, and a missing record is not evidence of resolution.
-func (b *Beads) dropResolvedEscalations(issues []*Issue) []*Issue {
+func (b *Beads) partitionResolvedEscalations(issues []*Issue) (kept, resolvedCopies []*Issue) {
 	closedRecord := make(map[string]bool)
 
-	kept := issues[:0]
 	for _, issue := range issues {
 		recordID := EscalationRecordID(issue)
 		if recordID == "" || recordID == issue.ID {
@@ -695,11 +726,12 @@ func (b *Beads) dropResolvedEscalations(issues []*Issue) []*Issue {
 			closedRecord[recordID] = resolved
 		}
 		if resolved {
+			resolvedCopies = append(resolvedCopies, issue)
 			continue
 		}
 		kept = append(kept, issue)
 	}
-	return kept
+	return kept, resolvedCopies
 }
 
 // filterEscalationRecords drops mail-only beads that are not themselves escalations.

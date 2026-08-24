@@ -833,3 +833,45 @@ func TestGetNextSeverityMatchesConfig(t *testing.T) {
 		}
 	}
 }
+
+// --- The hidden half of the escalation queue (gt-f0b3) -----------------------
+//
+// `gt escalate list` hides a delivered copy whose escalation record is closed.
+// That is right (gt-4xl) and it was silent, which is not: measured on hq
+// 2026-08-23 the list printed 3 while `bd list --label=gt:escalation
+// --status=open` returned 4, and nothing anywhere accounted for the fourth.
+
+func TestPrintStrandedEscalations_NamesTheHiddenBeadsAndTheReconcile(t *testing.T) {
+	stranded := []*beads.Issue{{
+		ID:     "hq-budjm",
+		Status: "open",
+		Title:  "[HIGH] Scheduler dispatch dead town-wide 1h19m",
+		Labels: []string{"gt:escalation", "escalation:hq-wisp-aor1wa"},
+	}}
+
+	var buf strings.Builder
+	printStrandedEscalations(&buf, stranded)
+	got := buf.String()
+
+	for _, want := range []string{
+		"hq-budjm",                   // the bead the count disagreement is made of
+		"hq-wisp-aor1wa",             // the record whose closure hid it
+		"gt escalate close hq-budjm", // the command that reconciles the halves
+		"1 lower",                    // the size of the gap, stated
+		"not proof",                  // a closed record is not evidence of handling
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report must contain %q, got:\n%s", want, got)
+		}
+	}
+}
+
+// Nothing to report must print nothing at all: an unconditional footer would
+// train readers to skip the one case that matters.
+func TestPrintStrandedEscalations_SilentWhenNothingHidden(t *testing.T) {
+	var buf strings.Builder
+	printStrandedEscalations(&buf, nil)
+	if buf.String() != "" {
+		t.Errorf("no hidden beads must print nothing, got: %q", buf.String())
+	}
+}

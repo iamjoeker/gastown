@@ -327,6 +327,11 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 
 	var issues []*beads.Issue
+	// Open escalation beads this list hides because their record is closed. They
+	// are still open beads, so they still count wherever beads are counted, and
+	// saying nothing about them is what made this list disagree with those counts
+	// in silence (gt-f0b3).
+	var stranded []*beads.Issue
 	if escalateListAll {
 		// List all (open and closed)
 		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
@@ -337,7 +342,7 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("parsing escalations: %w", err)
 		}
 	} else {
-		issues, err = bd.ListEscalations()
+		issues, stranded, err = bd.ListEscalationsWithStranded()
 		if err != nil {
 			return fmt.Errorf("listing escalations: %w", err)
 		}
@@ -368,6 +373,10 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	if escalateListJSON {
 		out, _ := json.MarshalIndent(issues, "", "  ")
 		fmt.Println(string(out))
+		// The JSON shape stays a plain array of the open escalations, so the
+		// hidden set goes to stderr rather than changing what parsers see —
+		// the same channel the phantom warning above already uses.
+		printStrandedEscalations(os.Stderr, stranded)
 		return nil
 	}
 
@@ -378,6 +387,10 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Println("No escalations found")
 		}
+		// "No escalations found" is the most consequential line this command
+		// prints, and it must not be the whole story while open escalation beads
+		// exist.
+		printStrandedEscalations(os.Stdout, stranded)
 		return nil
 	}
 
@@ -400,7 +413,39 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 	}
 
+	printStrandedEscalations(os.Stdout, stranded)
+
 	return nil
+}
+
+// printStrandedEscalations reports the open escalation beads this list hid.
+//
+// An escalation is two beads: an ephemeral record wisp and a durable delivered
+// copy. When the record is closed and the copy is not, the copy is almost
+// certainly resolved residue and showing it as a live HIGH is the bug gt-4xl
+// fixed — but "almost certainly" is the whole point. Anything can close the
+// record without touching the copy: `bd close` run by hand, or any
+// `gt escalate close` from before gt-4xl. So the difference is reported rather
+// than swallowed, with the ID and the command that reconciles it. The count is
+// exactly the gap between this list and `bd list --label=gt:escalation
+// --status=open`, which is what nothing explained before (gt-f0b3).
+func printStrandedEscalations(w io.Writer, stranded []*beads.Issue) {
+	if len(stranded) == 0 {
+		return
+	}
+
+	noun := "escalation beads are"
+	if len(stranded) == 1 {
+		noun = "escalation bead is"
+	}
+	fmt.Fprintf(w, "%d open %s hidden from this list: the escalation record is closed but the delivered copy was never closed with it,\n", len(stranded), noun)
+	fmt.Fprintf(w, "so this list reads %d lower than any count of open gt:escalation beads. A closed record is not proof the escalation was handled.\n", len(stranded))
+	for _, issue := range stranded {
+		fmt.Fprintf(w, "  %s [%s] %s\n", issue.ID, issue.Status, issue.Title)
+		fmt.Fprintf(w, "     record %s is closed | reconcile: gt escalate close %s --reason \"...\"\n",
+			beads.EscalationRecordID(issue), issue.ID)
+	}
+	fmt.Fprintf(w, "  Full history, including these: gt escalate list --all\n")
 }
 
 func runEscalateAck(cmd *cobra.Command, args []string) error {

@@ -321,7 +321,7 @@ var ProtectedWispLabels = []string{"gt:merge-request", "gt:escalation"}
 // absent. An escalation record has no parent at all, so it is always eligible,
 // and reap closing it is not a harmless bookkeeping change: `gt escalate list`
 // renders the delivered copies and hides any copy whose RECORD is closed
-// (dropResolvedEscalations). So a reaped record silently removes a live,
+// (partitionResolvedEscalations). So a reaped record silently removes a live,
 // unacknowledged escalation from the only surface an operator reads — the
 // escalation still exists and still needs attention, and now nothing shows it.
 // Purge protection alone does not cover this: the record survives as a row and
