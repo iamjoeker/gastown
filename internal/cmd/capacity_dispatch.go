@@ -569,6 +569,13 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 		}
 		result[id] = beadStatusInfoFromBeadInfo(info)
 	}
+
+	// Both lookups above route by id prefix, which names the rig a bead was
+	// FILED in. For a bead moved to the rig that owns the work that is the
+	// closed source copy, and every caller here treats a closed row as a
+	// finished bead: the context gets reaped as "stale-work-bead", the bead
+	// leaves the queue, and `gt scheduler list` stops showing it (gt-ygb7).
+	adoptMovedWorkBeadRows(townRoot, requestedIDs, result)
 	return result
 }
 
@@ -816,6 +823,15 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 	rigPath := filepath.Join(townRoot, b.TargetRig)
 	rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
 	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
+		return nil
+	}
+	// The prefix cannot express a bead that moved. A bead filed in one rig and
+	// moved to the rig that owns the work keeps its id, so the guard above
+	// refuses the only rig that can run it — the same deadlock gt-ad32 fixed on
+	// the sling entry paths and left in place here (gt-ygb7). Ownership follows
+	// the live row, so a bead whose open row is in the target rig is not a
+	// cross-rig dispatch however its id reads.
+	if beadOwnedByRig(townRoot, b.TargetRig, b.WorkBeadID, nil) {
 		return nil
 	}
 	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)

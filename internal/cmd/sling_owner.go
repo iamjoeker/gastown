@@ -148,6 +148,65 @@ func closedBeadError(beadID string, owner *beadOwner) error {
 		beadID, owner.Info.Status, describeBeadStoreRig(owner.Rig))
 }
 
+// Ownership in the DEFERRED dispatch path (gt-ygb7).
+//
+// gt-ad32 taught the sling entry points to follow the live row, but the queue
+// behind them was never told. `gt sling` with scheduler.max_polecats > 0 does
+// not dispatch: it writes a sling context bead and returns, and a later
+// process — the daemon — reads that queue. beads.RegisterBeadStore is a
+// per-process table, so the reader starts with prefix routing and nothing else.
+//
+// Every scheduler surface then reads a moved bead's CLOSED source row:
+// cleanupStaleContexts closes the context as "stale-work-bead", the readiness
+// filter drops it for not being open, `gt scheduler list` hides it, and the
+// cross-rig prefix guard would refuse the dispatch even if the others let it
+// through. The operator sees only the "✓ Scheduled" that scheduleBead printed
+// while the bead was still, briefly, in the queue.
+//
+// The two helpers below give the reader the same rule the writer already uses.
+
+// adoptMovedWorkBeadRows replaces prefix-routed rows that are missing or dead
+// with the live row from whichever store holds it. Only ids whose prefix store
+// has no live row cost anything: a bead that is genuinely closed everywhere
+// stays closed, so stale-context cleanup still reaps completed work.
+//
+// resolveBeadOwner registers what it finds with the beads router, so the
+// blocked-dependency query and the hook writes that follow in this process
+// reach the live row too.
+func adoptMovedWorkBeadRows(townRoot string, ids []string, rows map[string]beadStatusInfo) {
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if row, ok := rows[id]; ok && beadStatusIsLive(row.Status) {
+			continue
+		}
+		owner, err := resolveBeadOwner(townRoot, id)
+		if err != nil || owner == nil || !owner.Moved || owner.Info == nil {
+			continue
+		}
+		rows[id] = beadStatusInfoFromBeadInfo(owner.Info)
+	}
+}
+
+// beadOwnedByRig reports whether beadID's live row lives in rigName. A non-nil
+// owner is used as given; otherwise ownership is resolved on the spot. Returns
+// false for an unnamed rig and for a bead that exists in no store — callers use
+// this to grant an exception, never to justify one.
+func beadOwnedByRig(townRoot, rigName, beadID string, owner *beadOwner) bool {
+	if rigName == "" {
+		return false
+	}
+	if owner == nil {
+		resolved, err := resolveBeadOwner(townRoot, beadID)
+		if err != nil || resolved == nil {
+			return false
+		}
+		owner = resolved
+	}
+	return owner.Rig == rigName
+}
+
 // describeBeadStoreRig renders a rig name for error messages, naming the
 // town-level store explicitly rather than as an empty string.
 func describeBeadStoreRig(rig string) string {

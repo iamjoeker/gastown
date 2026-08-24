@@ -117,6 +117,24 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		}
 	}
 
+	// Pre-flight the dispatcher's own cross-rig prefix guard (gt-ygb7).
+	//
+	// Deferred dispatch splits the decision in two: this command decides what to
+	// enqueue, and a later daemon process decides what to run. The daemon applies
+	// capacity.AcceptsPrefix, which this path never checked — so a bead the
+	// dispatcher will refuse still got a context bead, a convoy, and the "✓
+	// Scheduled" line below, and the refusal landed hours later on the daemon's
+	// stderr where no operator was reading. Five slings, five ticks, one dispatch.
+	//
+	// Refuse here instead, with the reason and the store that holds the row. Not
+	// bypassable by --force: --force overrides bead STATE, and this is a routing
+	// fact that no amount of forcing makes dispatchable.
+	rigPrefix := rigBeadsPrefix(townRoot, filepath.Join(townRoot, rigName), rigName)
+	if !capacity.AcceptsPrefix(rigPrefix, beadID) && !beadOwnedByRig(townRoot, rigName, beadID, owner) {
+		return fmt.Errorf("bead %s cannot be dispatched to rig %q: rig prefix is %q, bead prefix is %q, and the live row is in %s\nThe scheduler would refuse this bead after this command reported success — sling it to the rig that owns the row, or move the bead first",
+			beadID, rigName, rigPrefix, capacity.BeadIDPrefix(beadID), describeBeadStoreRig(owner.Rig))
+	}
+
 	// Idempotency: check for existing open sling context for this work bead.
 	// Fail fast on errors to avoid creating duplicate contexts on transient DB failures.
 	//
@@ -133,8 +151,23 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("checking for existing sling context: %w", findErr)
 	}
 	if existingCtx != nil {
-		fmt.Printf("%s Bead %s is already scheduled (context: %s), no-op\n",
-			style.Dim.Render("○"), beadID, existingCtx.ID)
+		// "Already scheduled" is a claim about the QUEUE, and an open context is
+		// only half of it: the scheduler drops any context whose work bead is not
+		// open, so a closed or already-dispatched bead has a live context and no
+		// queue entry (gt-ygb7). Re-slinging is the natural operator response to a
+		// bead that never ran, and answering it with a tick is what turned one
+		// silent failure into a confirmed one. Say which it is.
+		switch {
+		case !beadStatusIsLive(info.Status):
+			return fmt.Errorf("bead %s has an open sling context (%s) but is %s in %s — it is not in the scheduler queue\nClose the context or reopen the bead; retrying the sling cannot fix this",
+				beadID, existingCtx.ID, info.Status, describeBeadStoreRig(owner.Rig))
+		case info.Status != "open":
+			fmt.Printf("%s Bead %s is already %s (context: %s), no-op — dispatched, not queued\n",
+				style.Dim.Render("○"), beadID, info.Status, existingCtx.ID)
+		default:
+			fmt.Printf("%s Bead %s is already scheduled (context: %s), no-op\n",
+				style.Dim.Render("○"), beadID, existingCtx.ID)
+		}
 		return nil
 	}
 
