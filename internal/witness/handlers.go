@@ -1395,6 +1395,91 @@ func RestartPolecatSession(workDir, rigName, polecatName string) error {
 	return nil
 }
 
+// sessionProbe is the decision-time view of a live tmux session that
+// decideRestart needs. *tmux.Tmux satisfies it; tests supply a fake.
+type sessionProbe interface {
+	HasSession(name string) (bool, error)
+	IsBusy(name string) bool
+}
+
+// restartAction is what a decision-time probe says should happen to a polecat
+// whose zombie verdict would otherwise restart its session.
+type restartAction int
+
+const (
+	// restartProceed: the session is alive and nothing proves a turn is in flight.
+	restartProceed restartAction = iota
+	// restartSessionGone: the session exited between detection and this decision.
+	restartSessionGone
+	// restartBusy: the session is demonstrably mid-turn, so the verdict is stale.
+	restartBusy
+)
+
+// Readability constants for decideRestart's veto argument. Only verdicts
+// derived from bead metadata pass vetoBusySessions; see decideRestart.
+const (
+	vetoBusySessions  = true
+	restartEvenIfBusy = false
+)
+
+// decideRestart re-probes a polecat's tmux session at the moment the restart
+// would happen, and reports whether it may proceed.
+//
+// Two checks, for two different ways a verdict computed earlier in the sweep
+// can be wrong by the time it acts:
+//
+//  1. Liveness (gt-0pst): the session may have exited normally since it was
+//     classified, in which case there is nothing to restart and no zombie.
+//  2. Busy (gt-nof6): `gt patrol scan` restarted a healthy polecat mid-test on
+//     a done-intent age of 30h20m while its session was twenty minutes old,
+//     destroying fourteen minutes of in-flight test execution and orphaning
+//     the fixtures that test owned. A done-intent timestamp and a hook bead's
+//     status are bead metadata that lag the session; the pane is the only
+//     thing that knows what the agent is doing right now. When it shows a turn
+//     in flight, the metadata is wrong about that session and the restart must
+//     not happen.
+//
+// vetoIfBusy is false for verdicts that already rest on a decision-time check
+// of the agent itself. The agent-dead path is the one that matters: a pane
+// whose agent died mid-turn keeps rendering the busy footer of its last frame
+// forever, so vetoing on it would make exactly that case unrecoverable.
+//
+// IsBusy is positive-evidence-only — an unreadable pane, a missing tmux, or a
+// non-agent session all read as not-busy and the restart proceeds, which is the
+// behavior every caller had before this guard existed. It can therefore still
+// fail to protect a working agent; it cannot newly strand one.
+func decideRestart(p sessionProbe, sessionName string, vetoIfBusy bool) restartAction {
+	if alive, _ := p.HasSession(sessionName); !alive {
+		return restartSessionGone
+	}
+	if vetoIfBusy && p.IsBusy(sessionName) {
+		return restartBusy
+	}
+	return restartProceed
+}
+
+// applyRestart runs restart for a live-session zombie verdict if decideRestart
+// allows it, and records what happened in the ZombieResult. A vetoed restart is
+// still reported: the stale metadata that produced the verdict is real and the
+// operator needs to see it — it is only the destructive action that is dropped.
+//
+// Returning (ZombieResult{}, false) for a session that has gone away means the
+// caller drops the verdict entirely, since the polecat exited on its own.
+func applyRestart(p sessionProbe, sessionName string, vetoIfBusy bool, zombie ZombieResult, restart func() error, failPrefix string) (ZombieResult, bool) {
+	switch decideRestart(p, sessionName, vetoIfBusy) {
+	case restartSessionGone:
+		return ZombieResult{}, false
+	case restartBusy:
+		zombie.Action = fmt.Sprintf("restart-deferred-session-busy (%s verdict is stale; agent is mid-turn)", zombie.Classification)
+		return zombie, true
+	}
+	if err := restart(); err != nil {
+		zombie.Error = err
+		zombie.Action = fmt.Sprintf("%s: %v", failPrefix, err)
+	}
+	return zombie, true
+}
+
 // NukePolecat executes the actual nuke operation for a polecat.
 // This kills the tmux session, removes the worktree, and cleans up beads.
 // Refuses to nuke polecats with pending MRs in the refinery queue (gt-6a9d).
@@ -1893,16 +1978,12 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted-stuck-session (done-intent age=%v)", time.Since(doneIntent.Timestamp).Round(time.Second)),
 		}
-		// TOCTOU guard (gt-0pst): Re-check session liveness before restarting.
-		// The session could have exited normally between our initial check and here.
-		if alive, _ := t.HasSession(sessionName); !alive {
-			return ZombieResult{}, false
-		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
-		}
-		return zombie, true
+		// The done-intent timestamp is bead metadata and can be hours stale on a
+		// session minutes old, so this verdict does not get to act on a pane that
+		// shows a turn in flight (gt-nof6).
+		return applyRestart(t, sessionName, vetoBusySessions, zombie, func() error {
+			return RestartPolecatSession(workDir, rigName, polecatName)
+		}, "restart-stuck-session-failed")
 	}
 
 	// Tmux alive but agent process dead (gt-kj6r6).
@@ -1916,16 +1997,12 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         "restarted-agent-dead-session",
 		}
-		// TOCTOU guard (gt-0pst): Re-check session liveness before restarting.
-		// The session could have exited normally between our initial check and here.
-		if alive, _ := t.HasSession(sessionName); !alive {
-			return ZombieResult{}, false
-		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
-		}
-		return zombie, true
+		// No busy veto here: IsAgentAlive already probed the process at decision
+		// time, and a pane whose agent died mid-turn keeps rendering the busy
+		// footer of its last frame, which would strand this case forever (gt-nof6).
+		return applyRestart(t, sessionName, restartEvenIfBusy, zombie, func() error {
+			return RestartPolecatSession(workDir, rigName, polecatName)
+		}, "restart-agent-dead-session-failed")
 	}
 
 	// Agent alive but hooked bead closed — occupying slot without work (gt-h1l6i).
@@ -1940,16 +2017,12 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         "restarted-bead-closed-polecat",
 		}
-		// TOCTOU guard (gt-0pst): Re-check session liveness before restarting.
-		// The session could have exited normally between our initial check and here.
-		if alive, _ := t.HasSession(sessionName); !alive {
-			return ZombieResult{}, false
-		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
-		}
-		return zombie, true
+		// gt done closes the source issue well before it finishes, so a polecat
+		// still working through the rest of gt done reads as bead-closed here.
+		// The bead status is metadata; the pane is not (gt-nof6).
+		return applyRestart(t, sessionName, vetoBusySessions, zombie, func() error {
+			return RestartPolecatSession(workDir, rigName, polecatName)
+		}, "restart-bead-closed-failed")
 	}
 
 	// GH#3055: gt done can successfully submit work and leave cleanup_status=clean,

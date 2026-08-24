@@ -135,13 +135,16 @@ func TestRunPatrolScanPhaseEmitsProgressDiagnostics(t *testing.T) {
 		close(release)
 	}()
 
-	got := runPatrolScanPhase(diagnostics, "slow phase", func() string {
+	got, reason := runPatrolScanPhase(diagnostics, "slow phase", func() string {
 		<-release
 		return "ok"
 	})
 
 	if got != "ok" {
 		t.Fatalf("runPatrolScanPhase result = %q, want ok", got)
+	}
+	if reason != "" {
+		t.Fatalf("runPatrolScanPhase reason = %q, want empty for a phase that finished", reason)
 	}
 
 	output := diagnostics.String()
@@ -167,12 +170,15 @@ func TestRunPatrolScanPhaseZeroIntervalSkipsProgressTicks(t *testing.T) {
 	defer func() { patrolScanProgressInterval = oldInterval }()
 
 	var diagnostics bytes.Buffer
-	got := runPatrolScanPhase(&diagnostics, "fast phase", func() int {
+	got, reason := runPatrolScanPhase(&diagnostics, "fast phase", func() int {
 		return 42
 	})
 
 	if got != 42 {
 		t.Fatalf("runPatrolScanPhase result = %d, want 42", got)
+	}
+	if reason != "" {
+		t.Fatalf("runPatrolScanPhase reason = %q, want empty for a phase that finished", reason)
 	}
 
 	output := diagnostics.String()
@@ -219,5 +225,102 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 	}
 	if parsed.Error != "restart failed: tmux error" {
 		t.Errorf("Error = %q, want %q", parsed.Error, "restart failed: tmux error")
+	}
+}
+
+// A phase that never returns used to park the whole command — the witness that
+// hit this was killed at 5m0s inside completion discovery with Dolt healthy
+// throughout (gt-nof6). The deadline turns that into a reported failure.
+func TestRunPatrolScanPhaseAbandonsHungPhase(t *testing.T) {
+	oldTimeout := patrolScanPhaseTimeout
+	oldInterval := patrolScanProgressInterval
+	patrolScanPhaseTimeout = 20 * time.Millisecond
+	patrolScanProgressInterval = 5 * time.Millisecond
+	defer func() {
+		patrolScanPhaseTimeout = oldTimeout
+		patrolScanProgressInterval = oldInterval
+	}()
+
+	release := make(chan struct{})
+	defer close(release)
+
+	var diagnostics bytes.Buffer
+	got, reason := runPatrolScanPhase(&diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
+		<-release
+		return &witness.DiscoverCompletionsResult{}
+	})
+
+	if got != nil {
+		t.Fatalf("runPatrolScanPhase result = %v, want nil for an abandoned phase", got)
+	}
+	if !strings.Contains(reason, "completion discovery timed out") {
+		t.Fatalf("reason = %q, want it to name the phase and the timeout", reason)
+	}
+	if !strings.Contains(diagnostics.String(), "not empty") {
+		t.Fatalf("diagnostics %q must say the phase's results are unknown, not empty", diagnostics.String())
+	}
+}
+
+// The deadline must not depend on progress reporting being enabled: with the
+// ticker off, the old loop blocked on the result channel alone.
+func TestRunPatrolScanPhaseAbandonsHungPhaseWithProgressDisabled(t *testing.T) {
+	oldTimeout := patrolScanPhaseTimeout
+	oldInterval := patrolScanProgressInterval
+	patrolScanPhaseTimeout = 20 * time.Millisecond
+	patrolScanProgressInterval = 0
+	defer func() {
+		patrolScanPhaseTimeout = oldTimeout
+		patrolScanProgressInterval = oldInterval
+	}()
+
+	release := make(chan struct{})
+	defer close(release)
+
+	var diagnostics bytes.Buffer
+	_, reason := runPatrolScanPhase(&diagnostics, "zombie detection", func() int {
+		<-release
+		return 1
+	})
+
+	if reason == "" {
+		t.Fatal("hung phase returned no reason with progress reporting disabled")
+	}
+	if strings.Contains(diagnostics.String(), "still running") {
+		t.Fatalf("progress ticks leaked with interval disabled: %q", diagnostics.String())
+	}
+}
+
+// A timed-out phase reports zero of everything. The summary line must not turn
+// that into an all-clear — the reading that gets believed is the wrong one.
+func TestPatrolScanHumanSummaryFlagsIncompleteScan(t *testing.T) {
+	out := captureStdout(t, func() {
+		if err := outputPatrolScanHuman("gastown",
+			&witness.DetectZombiePolecatsResult{}, &witness.DetectStalledPolecatsResult{}, nil,
+			nil, []string{"completion discovery timed out after 3m0s"}); err != nil {
+			t.Fatalf("outputPatrolScanHuman: %v", err)
+		}
+	})
+
+	if strings.Contains(out, "All clear") {
+		t.Fatalf("incomplete scan reported as all clear:\n%s", out)
+	}
+	for _, want := range []string{"INCOMPLETE", "completion discovery timed out", "PARTIAL"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPatrolScanHumanSummaryStillReportsAllClear(t *testing.T) {
+	out := captureStdout(t, func() {
+		if err := outputPatrolScanHuman("gastown",
+			&witness.DetectZombiePolecatsResult{}, &witness.DetectStalledPolecatsResult{},
+			&witness.DiscoverCompletionsResult{}, nil, nil); err != nil {
+			t.Fatalf("outputPatrolScanHuman: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "All clear") {
+		t.Fatalf("a scan that finished with nothing to find should still be all clear:\n%s", out)
 	}
 }

@@ -64,6 +64,21 @@ func init() {
 
 var patrolScanProgressInterval = 10 * time.Second
 
+// patrolScanPhaseTimeout bounds each detection phase.
+//
+// Every phase shells out — to bd, to git, to tmux — and none of those calls is
+// individually bounded, so any one of them can park the whole command. A
+// witness ran this on an idle rig with nothing to find and never came back out
+// of completion discovery; it was killed at 5m0s with Dolt healthy and latency
+// at 0s throughout (gt-nof6). Patrols run this every cycle, so a phase that
+// hangs does not merely fail — it stops the agent that was supposed to notice.
+//
+// A timed-out phase is reported as incomplete rather than as empty. That
+// distinction is the whole point: a nil result rendered as "no zombies found"
+// is indistinguishable from a clean rig, and the clean-rig reading is the one
+// that gets believed.
+var patrolScanPhaseTimeout = 3 * time.Minute
+
 // PatrolScanOutput is the JSON output format for patrol scan results.
 type PatrolScanOutput struct {
 	Rig         string                    `json:"rig"`
@@ -72,6 +87,11 @@ type PatrolScanOutput struct {
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
 	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+	// IncompletePhases names the phases that were abandoned on timeout. When it
+	// is non-empty the counts above are a floor, not a total — the corresponding
+	// section is absent because nothing was learned, not because nothing is
+	// there. Consumers must not read this scan as an all-clear (gt-nof6).
+	IncompletePhases []string `json:"incomplete_phases,omitempty"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -158,15 +178,25 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// internally — it only uses the router for workspace context. Notifications
 	// are sent exclusively below via --notify, avoiding double-send.
 	diagnostics := cmd.ErrOrStderr()
-	zombieResult := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
+	var incomplete []string
+	recordPhase := func(reason string) {
+		if reason != "" {
+			incomplete = append(incomplete, reason)
+		}
+	}
+
+	zombieResult, reason := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
 		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
 	})
-	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
+	recordPhase(reason)
+	stallResult, reason := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
 		return witness.DetectStalledPolecats(workDir, rigName)
 	})
-	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
+	recordPhase(reason)
+	completionResult, reason := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
 	})
+	recordPhase(reason)
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
@@ -183,13 +213,24 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
+		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts, incomplete)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts, incomplete)
 }
 
-func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) T {
+// runPatrolScanPhase runs one detection phase under patrolScanPhaseTimeout,
+// reporting progress to diagnostics while it waits.
+//
+// On timeout it returns the zero value and a non-empty reason. Callers must
+// treat that reason as "this phase did not answer" and must not render the zero
+// value as a finding of none. The phase's goroutine and whatever subprocess it
+// is blocked on are left behind: the command is about to exit, and the child is
+// in its own process group either way. Bounding the subprocess is the inner
+// fix (see lsRemoteTimeout in internal/git); this is the backstop that keeps
+// any future unbounded call from parking a patrol again.
+func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) (T, string) {
+	var zero T
 	start := time.Now()
 	if diagnostics != nil {
 		fmt.Fprintf(diagnostics, "gt patrol scan: starting %s\n", name)
@@ -200,16 +241,17 @@ func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) 
 		done <- fn()
 	}()
 
-	if patrolScanProgressInterval <= 0 {
-		result := <-done
-		if diagnostics != nil {
-			fmt.Fprintf(diagnostics, "gt patrol scan: finished %s in %s\n", name, formatPatrolScanElapsed(time.Since(start)))
-		}
-		return result
-	}
+	deadline := time.NewTimer(patrolScanPhaseTimeout)
+	defer deadline.Stop()
 
-	ticker := time.NewTicker(patrolScanProgressInterval)
-	defer ticker.Stop()
+	// A nil channel blocks forever in select, so progress reporting switches off
+	// by never becoming ready rather than by racing the deadline.
+	var progress <-chan time.Time
+	if patrolScanProgressInterval > 0 {
+		ticker := time.NewTicker(patrolScanProgressInterval)
+		defer ticker.Stop()
+		progress = ticker.C
+	}
 
 	for {
 		select {
@@ -217,8 +259,14 @@ func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) 
 			if diagnostics != nil {
 				fmt.Fprintf(diagnostics, "gt patrol scan: finished %s in %s\n", name, formatPatrolScanElapsed(time.Since(start)))
 			}
-			return result
-		case <-ticker.C:
+			return result, ""
+		case <-deadline.C:
+			reason := fmt.Sprintf("%s timed out after %s", name, formatPatrolScanElapsed(patrolScanPhaseTimeout))
+			if diagnostics != nil {
+				fmt.Fprintf(diagnostics, "gt patrol scan: ABANDONED %s — results for this phase are unknown, not empty\n", reason)
+			}
+			return zero, reason
+		case <-progress:
 			if diagnostics != nil {
 				fmt.Fprintf(diagnostics, "gt patrol scan: still running %s after %s\n", name, formatPatrolScanElapsed(time.Since(start)))
 			}
@@ -285,11 +333,12 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	_ = router.Send(mayorMsg)
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt, incompletePhases []string) error {
 	output := PatrolScanOutput{
-		Rig:       rigName,
-		Timestamp: timestamp,
-		Receipts:  receipts,
+		Rig:              rigName,
+		Timestamp:        timestamp,
+		Receipts:         receipts,
+		IncompletePhases: incompletePhases,
 	}
 
 	// Zombies
@@ -366,7 +415,7 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt, incompletePhases []string) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -466,6 +515,21 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 	completionCount := 0
 	if completionResult != nil {
 		completionCount = len(completionResult.Discovered)
+	}
+
+	// An abandoned phase contributes zero to every count above, so the summary
+	// must say so before it says anything else. "All clear" is reserved for a
+	// scan that actually finished looking (gt-nof6).
+	if len(incompletePhases) > 0 {
+		fmt.Printf("%s Scan INCOMPLETE — these phases were abandoned and reported nothing:\n",
+			style.Bold.Render("⚠"))
+		for _, reason := range incompletePhases {
+			fmt.Printf("  • %s\n", reason)
+		}
+		fmt.Printf("  %s\n", style.Dim.Render("Counts below are a floor. Do not read this scan as an all-clear."))
+		fmt.Printf("Summary (PARTIAL): %d zombie(s) (%d active-work), %d stall(s), %d completion(s)\n",
+			zombieCount, activeCount, stallCount, completionCount)
+		return nil
 	}
 
 	if zombieCount == 0 && stallCount == 0 && completionCount == 0 {
