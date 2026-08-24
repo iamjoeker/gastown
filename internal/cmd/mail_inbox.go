@@ -372,6 +372,10 @@ func runMailPeek(cmd *cobra.Command, args []string) error {
 }
 
 func runMailDelete(cmd *cobra.Command, args []string) error {
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
+
 	// Determine which inbox
 	address := detectSender()
 
@@ -409,7 +413,45 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// validateMessageIDArgs rejects arguments that cannot be a single message ID.
+//
+// It runs before anything is archived, so a bad batch fails whole rather than
+// half-applied.
+//
+// The multi-ID forms these commands document are one argument per ID, and a
+// caller that joins them into ONE argument used to be answered with a
+// fabricated reassurance instead of an error. mailbox.Get returns
+// ErrMessageNotFound for any identifier it does not recognise — including one
+// that could never have been an ID — and archive reads that as "the underlying
+// bead was already GC'd", counts it as a success, prints "✓ Message archived"
+// in the singular and exits 0. Measured (gt-f0b3): 514 archives submitted as 13
+// joined batches reported 13 successes and moved the inbox by 2; the same list
+// one ID per invocation moved it by 512.
+//
+// A not-found is evidence that a bead was GC'd only if the identifier could
+// have been a bead ID in the first place. Whitespace is the discriminator that
+// costs nothing: no bead ID contains any.
+func validateMessageIDArgs(args []string) error {
+	for i, arg := range args {
+		fields := strings.Fields(arg)
+		switch {
+		case len(fields) == 0:
+			return fmt.Errorf("argument %d is empty: a message ID is required", i+1)
+		case len(fields) > 1:
+			return fmt.Errorf("%q is not a message ID: it looks like %d IDs passed as a single argument.\n"+
+				"Pass them as separate arguments: %s", arg, len(fields), strings.Join(fields, " "))
+		case fields[0] != arg:
+			return fmt.Errorf("message ID %q has surrounding whitespace; pass it as %q", arg, fields[0])
+		}
+	}
+	return nil
+}
+
 func runMailArchive(cmd *cobra.Command, args []string) error {
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
+
 	// Determine which inbox
 	address := detectSender()
 
@@ -488,12 +530,23 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to archive %d messages", len(errMsgs))
 	}
 
+	// Always a count, and always against the number asked for. The singular
+	// "Message archived" carried no number at all, so a batch that had collapsed
+	// to one operation was indistinguishable from a batch that worked (gt-f0b3).
 	total := archived + gcd + ccCleared
-	if total == 1 {
-		fmt.Printf("%s Message archived\n", style.Bold.Render("✓"))
-	} else {
-		fmt.Printf("%s Archived %d messages\n", style.Bold.Render("✓"), total)
+	var detail []string
+	if gcd > 0 {
+		detail = append(detail, fmt.Sprintf("%d underlying bead%s already gone", gcd, map[bool]string{true: "", false: "s"}[gcd == 1]))
 	}
+	if ccCleared > 0 {
+		detail = append(detail, fmt.Sprintf("%d cc cop%s cleared", ccCleared, map[bool]string{true: "y", false: "ies"}[ccCleared == 1]))
+	}
+	suffix := ""
+	if len(detail) > 0 {
+		suffix = " (" + strings.Join(detail, ", ") + ")"
+	}
+	fmt.Printf("%s Archived %d of %d message%s%s\n",
+		style.Bold.Render("✓"), total, len(args), map[bool]string{true: "", false: "s"}[len(args) == 1], suffix)
 	return nil
 }
 
@@ -627,6 +680,9 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("message ID required (or use --all to mark all as read)")
 	}
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
 
 	// Mark all specified messages as read
 	marked := 0
@@ -658,6 +714,10 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 }
 
 func runMailMarkUnread(cmd *cobra.Command, args []string) error {
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
+
 	// Determine which inbox
 	address := detectSender()
 
