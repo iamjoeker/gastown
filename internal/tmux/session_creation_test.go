@@ -1,6 +1,8 @@
 package tmux
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -247,4 +249,88 @@ func TestSendMessageToTarget_Chunking(t *testing.T) {
 	if count < 500 {
 		t.Errorf("expected ~600 A's in output, got %d (message may have been truncated)", count)
 	}
+}
+
+// TestSendLiteralArgs_SeparatesOptionsFromText pins the "--" that keeps tmux
+// from parsing payload text as send-keys options. Without it, any text run
+// beginning with "-" is rejected ("unknown flag -b") and nothing is typed.
+// A unit test rather than an integration one because this is the invariant the
+// integration test below can only observe indirectly. (gt-bp18)
+func TestSendLiteralArgs_SeparatesOptionsFromText(t *testing.T) {
+	args := sendLiteralArgs("gt-somewhere:0.0", "-bmh and the rest")
+
+	text := args[len(args)-1]
+	if text != "-bmh and the rest" {
+		t.Fatalf("text must be the final argument, got %q (args: %q)", text, args)
+	}
+	if sep := args[len(args)-2]; sep != "--" {
+		t.Errorf("argument before the text must be %q so tmux stops option parsing, got %q (args: %q)", "--", sep, args)
+	}
+}
+
+// TestSendMessageToTarget_ChunkBoundaryBeforeHyphen reproduces gt-bp18.
+//
+// Chunk boundaries land at fixed 512-byte offsets regardless of content. When
+// one fell immediately before a hyphen — common in agent messages, which are
+// dense with bead IDs like "dn-bmh" — tmux read the chunk as options rather
+// than text and rejected it, after the earlier chunks had already been typed
+// into the recipient's composer. The message arrived truncated mid-word and
+// only the receiving end could see it.
+//
+// The all-'A' chunking test above cannot catch this: no boundary in it can ever
+// begin with a hyphen, so it passes on the broken code.
+func TestSendMessageToTarget_ChunkBoundaryBeforeHyphen(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-hyphenchunk-" + t.Name()
+	_ = tm.KillSession(session)
+	defer func() { _ = tm.KillSession(session) }()
+
+	dir := t.TempDir()
+	if err := tm.NewSessionWithCommand(session, dir, "cat > received.txt"); err != nil {
+		t.Fatalf("session creation: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Place the hyphen exactly on the second chunk's first byte.
+	tail := "-bmh THE-TAIL-SURVIVED"
+	msg := strings.Repeat("A", sendKeysChunkSize) + tail
+	if msg[sendKeysChunkSize] != '-' {
+		t.Fatalf("fixture is wrong: byte at the chunk boundary is %q, want '-'", msg[sendKeysChunkSize])
+	}
+
+	if err := tm.sendMessageToTarget(session, msg); err != nil {
+		t.Fatalf("sendMessageToTarget: %v", err)
+	}
+	// cat is line-buffered by the tty; Enter flushes the line to the file.
+	if _, err := tm.run("send-keys", "-t", session, "Enter"); err != nil {
+		t.Fatalf("send Enter: %v", err)
+	}
+
+	got := waitForFileContaining(t, filepath.Join(dir, "received.txt"), tail)
+	if !strings.Contains(got, tail) {
+		t.Errorf("payload truncated before the hyphen: received %d bytes, want the trailing %q.\nreceived: %q",
+			len(got), tail, got)
+	}
+	if want := len(msg); len(strings.TrimRight(got, "\r\n")) != want {
+		t.Errorf("received %d bytes, want %d (partial delivery)", len(strings.TrimRight(got, "\r\n")), want)
+	}
+}
+
+// waitForFileContaining polls path until it holds want, or 5s elapses. Returns
+// whatever the file held at the end so a truncated payload can be reported.
+func waitForFileContaining(t *testing.T, path, want string) string {
+	t.Helper()
+	var last string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			last = string(data)
+			if strings.Contains(last, want) {
+				return last
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return last
 }

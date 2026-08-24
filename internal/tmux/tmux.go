@@ -1276,8 +1276,10 @@ func (t *Tmux) SendKeys(session, keys string) error {
 // This prevents race conditions where Enter arrives before paste is processed.
 func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr error) {
 	defer func() { telemetry.RecordPromptSend(context.Background(), session, keys, debounceMs, retErr) }()
-	// Send text using literal mode (-l) to handle special chars
-	if _, err := t.run("send-keys", "-t", session, "-l", keys); err != nil {
+	// Send text using literal mode (-l) to handle special chars.
+	// "--" is required: without it tmux parses payload text beginning with a
+	// hyphen as more send-keys options. See sendLiteral.
+	if _, err := t.run(sendLiteralArgs(session, keys)...); err != nil {
 		return err
 	}
 	// Wait for paste to be processed
@@ -1606,6 +1608,25 @@ func adaptiveTextDelay(messageLen int) time.Duration {
 // raw stdin (like Claude Code's TUI) are not affected.
 const sendKeysChunkSize = 512
 
+// sendLiteralArgs builds the tmux argv for sending one run of literal text.
+//
+// The "--" is load-bearing. tmux parses send-keys options with getopt, and -l
+// takes no argument, so a payload beginning with "-" is read as further option
+// flags rather than as the text to type:
+//
+//	tmux send-keys -t %3 -l "-bmh and the rest"
+//	  -> command send-keys: unknown flag -b   (exit 1, nothing sent)
+//
+// This bit chunked nudges (gt-bp18). Chunk boundaries fall at fixed 512-byte
+// offsets with no regard for content, and agent-to-agent messages are dense
+// with hyphens — bead IDs (dn-bmh, gt-bp18), "--flag", "- " list bullets. When
+// a boundary landed immediately before one, tmux rejected that chunk while the
+// preceding chunks had already been typed into the recipient's composer: the
+// message arrived truncated mid-word, cut exactly before the hyphen.
+func sendLiteralArgs(target, text string) []string {
+	return []string{"send-keys", "-t", target, "-l", "--", text}
+}
+
 func (t *Tmux) sendMessageToTarget(target, text string) error {
 	if len(text) <= sendKeysChunkSize {
 		return t.sendKeysLiteralWithRetry(target, text, constants.NudgeReadyTimeout)
@@ -1624,8 +1645,13 @@ func (t *Tmux) sendMessageToTarget(target, text string) error {
 				return err
 			}
 		} else {
-			if _, err := t.run("send-keys", "-t", target, "-l", chunk); err != nil {
-				return err
+			if _, err := t.run(sendLiteralArgs(target, chunk)...); err != nil {
+				// Everything before this chunk is already in the recipient's
+				// composer. Say so: a bare transport error reads as "nothing
+				// was sent", and the receiving end is the only place a partial
+				// payload is visible otherwise (gt-bp18).
+				return fmt.Errorf("partial delivery: %d of %d bytes already sent to %s before chunk at offset %d failed: %w",
+					i, len(text), target, i, err)
 			}
 		}
 		// Small delay between chunks to let the terminal process
@@ -1655,7 +1681,7 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 	var lastErr error
 
 	for time.Now().Before(deadline) {
-		_, err := t.run("send-keys", "-t", target, "-l", text)
+		_, err := t.run(sendLiteralArgs(target, text)...)
 		if err == nil {
 			return nil
 		}
