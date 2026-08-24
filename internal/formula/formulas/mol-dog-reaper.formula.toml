@@ -80,6 +80,10 @@ gt reaper scan --db=<name> \\
 - Treat an absent `molecule_step_candidates` field as zero
 - Flag any `dangling_parent_ref` anomalies — these indicate wisps with
   parent dependency records pointing to purged/missing parents
+- Flag any `stranded_molecules` anomalies — molecules poured for an executor
+  that never arrived. Do NOT close them one by one; that hides the emitter and
+  the next cycle mints more. Report the count and which formulas they are
+  (`bd mol wisp list --all --json`) so the emitting timer gets fixed (gt-bnpw)
 - If `open_wisps` exceeds {{alert_threshold}}, escalate
 
 **4. Decide whether to proceed:**

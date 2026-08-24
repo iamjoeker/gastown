@@ -479,6 +479,7 @@ type fakeWisp struct {
 	status    string
 	issueType string
 	createdAt time.Time
+	assignee  string
 }
 
 type fakeDep struct {
@@ -607,6 +608,23 @@ func (s *fakeReaperState) hasOpenParentLocked(id string) bool {
 	return false
 }
 
+// strandedMoleculesLocked mirrors Scan's stranded-molecule probe: open,
+// unassigned molecule wisps created before the cutoff.
+func (s *fakeReaperState) strandedMoleculesLocked(cutoff time.Time) []string {
+	var ids []string
+	for id, w := range s.wisps {
+		if w.issueType != "molecule" || !isOpenWispStatus(w.status) {
+			continue
+		}
+		if w.assignee != "" || !w.createdAt.Before(cutoff) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (s *fakeReaperState) openCountLocked() int {
 	count := 0
 	for _, w := range s.wisps {
@@ -652,6 +670,13 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	c.state.record(c.id, "QUERY "+normalized)
 
 	switch {
+	// Stranded-molecule probe. Must precede the stale-candidate case: it is also
+	// a COUNT over wisps w with a created_at bound, so it would otherwise be
+	// answered by the stale-candidate arm — which rejects it, and the caller
+	// swallows that error and reports zero. A probe that cannot fail is a probe
+	// that certifies nothing, so match it explicitly.
+	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "w.assignee IS NULL"):
+		return fakeCountRows(len(c.state.strandedMoleculesLocked(namedTime(args)))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -903,5 +928,87 @@ func TestScanAndAutoCloseShareOneExemptList(t *testing.T) {
 	if !strings.Contains(scanBody, "sqlLabelList(AutoCloseExemptLabels)") {
 		t.Error("Scan's stale-issue query must render AutoCloseExemptLabels; a second " +
 			"hand-written copy is what over-reported stale candidates in gt-jbn")
+	}
+}
+
+// TestScanFlagsStrandedMolecules covers the self-surfacing sweep gt-bnpw asked
+// for: an emitter that pours molecules nobody runs must show up in the scan
+// rather than waiting for a human to notice the table growing.
+//
+// Every other number Scan reports is about AGE, and a runaway emitter's output
+// is individually young — that is exactly why ~1000 dog-molecule wisps a day
+// accumulated silently. Open + unassigned + older than one cycle is the signal
+// that says "poured for an executor that never came".
+func TestScanFlagsStrandedMolecules(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			// Stranded: open, unassigned, past StrandedMoleculeAge.
+			"mol-stranded": {id: "mol-stranded", status: "open", issueType: "molecule", createdAt: now.Add(-4 * time.Hour)},
+			// Just poured — a dispatcher may still be on its way.
+			"mol-fresh": {id: "mol-fresh", status: "open", issueType: "molecule", createdAt: now.Add(-1 * time.Minute)},
+			// Old but picked up: somebody owns it, so it is work in flight.
+			"mol-assigned": {id: "mol-assigned", status: "hooked", issueType: "molecule", createdAt: now.Add(-4 * time.Hour), assignee: "deacon/dogs/alpha"},
+			// Old and unassigned but already closed — it ran, or was reaped.
+			"mol-closed": {id: "mol-closed", status: "closed", issueType: "molecule", createdAt: now.Add(-4 * time.Hour)},
+			// A step, not a molecule. Steps are unassigned by design; counting them
+			// would swamp the signal with the very population it is meant to explain.
+			"step-old": {id: "step-old", status: "open", issueType: "task", createdAt: now.Add(-4 * time.Hour)},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	var found *Anomaly
+	for i := range scan.Anomalies {
+		if scan.Anomalies[i].Type == "stranded_molecules" {
+			found = &scan.Anomalies[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected a stranded_molecules anomaly, got %+v", scan.Anomalies)
+	}
+	if found.Count != 1 {
+		t.Errorf("stranded_molecules Count = %d, want 1 (only mol-stranded qualifies)", found.Count)
+	}
+	if !strings.Contains(found.Message, "emitter") {
+		t.Errorf("the anomaly must point at the emitter, not at the rows; got %q", found.Message)
+	}
+}
+
+// TestScanQuietWhenNothingStranded keeps the anomaly from becoming noise. It
+// fires on a leak, not on a healthy town: measured across every production
+// database on 2026-08-24 it matched a single wisp.
+//
+// It proves nothing on its own — it passes just as happily when the probe is
+// broken and reports zero for everything, which is exactly what happens if the
+// query is answered by the wrong arm of the fake driver. Read it only alongside
+// TestScanFlagsStrandedMolecules, which is the half that can fail.
+func TestScanQuietWhenNothingStranded(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"mol-assigned": {id: "mol-assigned", status: "hooked", issueType: "molecule", createdAt: now.Add(-4 * time.Hour), assignee: "deacon/dogs/alpha"},
+			"mol-fresh":    {id: "mol-fresh", status: "open", issueType: "molecule", createdAt: now.Add(-1 * time.Minute)},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	for _, a := range scan.Anomalies {
+		if a.Type == "stranded_molecules" {
+			t.Errorf("healthy town must not raise stranded_molecules: %q", a.Message)
+		}
 	}
 }

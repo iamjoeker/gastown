@@ -189,17 +189,28 @@ func (d *Daemon) reapWisps() {
 
 	vars := reaperFormulaVars(d.patrolConfig)
 
-	// Pour the molecule for observability tracking.
-	mol := d.pourDogMolecule(constants.MolDogReaper, vars)
-	defer mol.close()
-
 	if config.DryRun {
 		d.logger.Printf("wisp_reaper: DRY RUN — reporting only, no changes will be made")
 	}
 
 	// Try dispatching to a Dog for formula-driven execution.
+	//
+	// The observability molecule is poured only on the fallback path, because on
+	// the dispatch path it is a duplicate. dispatchReaperDog slings the FORMULA
+	// NAME, not a molecule we poured, so `gt sling` pours its own — and a molecule
+	// poured here would be closed by this function while the Dog is still running
+	// the one it was given. Measured on hq 2026-08-24: every reaper cycle emitted
+	// two mol-dog-reaper roots 2-3 seconds apart, one assigned to
+	// deacon/dogs/alpha and one unassigned with six step children, and the
+	// unassigned seven-wisp molecule was the redundant half (gt-bnpw).
+	//
+	// The inline path is different: nothing else records that run, and
+	// reapWispsInline closes each step as it completes, so there the molecule is
+	// the only trace of the work.
 	if err := d.dispatchReaperDog(vars); err != nil {
 		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
+		mol := d.pourDogMolecule(constants.MolDogReaper, vars)
+		defer mol.close()
 		d.reapWispsInline(config, maxAge, deleteAge, staleAge, mailAge, mol)
 		return
 	}

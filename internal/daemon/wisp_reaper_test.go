@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -240,5 +242,106 @@ func TestDoltServerHostUsesConfiguredTownHost(t *testing.T) {
 	d := &Daemon{config: &Config{TownRoot: townRoot}}
 	if got := d.doltServerHost(); got != "127.0.0.2" {
 		t.Fatalf("doltServerHost() = %q, want configured host", got)
+	}
+}
+
+// fakeGTAndBD writes stub gt and bd binaries and returns their paths plus the
+// file that records every bd invocation.
+func fakeGTAndBD(t *testing.T, gtExit int) (gtPath, bdPath, bdLog string) {
+	t.Helper()
+	dir := t.TempDir()
+	bdLog = filepath.Join(dir, "bd-calls.log")
+
+	gtPath = filepath.Join(dir, "gt")
+	if err := os.WriteFile(gtPath, []byte(fmt.Sprintf("#!/bin/sh\nexit %d\n", gtExit)), 0o755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	bdPath = filepath.Join(dir, "bd")
+	bdScript := `#!/bin/sh
+printf '%s\n' "$*" >> "` + bdLog + `"
+case "$1" in
+  mol) printf 'Spawned wisp: hq-wisp-reap01 - mol-dog-reaper\n' ;;
+  show) printf '{"hq-wisp-reap01":[],"schema_version":1}\n' ;;
+  *) : ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	return gtPath, bdPath, bdLog
+}
+
+// reaperTestDaemon points the daemon at stub binaries and a dead Dolt port, so
+// the inline fallback fails fast on connect instead of reaching a real server.
+func reaperTestDaemon(t *testing.T, gtExit int) (*Daemon, string) {
+	t.Helper()
+	gtPath, bdPath, bdLog := fakeGTAndBD(t, gtExit)
+	return &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		gtPath: gtPath,
+		bdPath: bdPath,
+		logger: log.New(io.Discard, "", 0),
+		patrolConfig: &DaemonPatrolConfig{
+			Patrols: &PatrolsConfig{WispReaper: &WispReaperConfig{
+				Enabled: true,
+				// A database that cannot be reached: the fallback must not touch a
+				// live server just to prove it poured a molecule.
+				Databases: []string{"testonly_unreachable"},
+			}},
+		},
+		doltServer: &DoltServerManager{config: &DoltServerConfig{Host: "127.0.0.1", Port: 1}},
+	}, bdLog
+}
+
+func readBDCalls(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read bd call log: %v", err)
+	}
+	return string(data)
+}
+
+// TestReapWispsDoesNotPourWhenDispatchSucceeds is the gt-bnpw duplicate-pour
+// regression.
+//
+// dispatchReaperDog slings the FORMULA NAME, so `gt sling` pours the molecule
+// the Dog actually runs. A molecule poured here as well is a second, redundant
+// one — and reapWisps closed it while the Dog was still working on its own.
+// Measured on hq 2026-08-24: every cycle emitted two mol-dog-reaper roots 2-3
+// seconds apart, one assigned to deacon/dogs/alpha and one unassigned carrying
+// six step children.
+func TestReapWispsDoesNotPourWhenDispatchSucceeds(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks")
+	}
+	d, bdLog := reaperTestDaemon(t, 0)
+
+	d.reapWisps()
+
+	if calls := readBDCalls(t, bdLog); strings.Contains(calls, "mol wisp") {
+		t.Fatalf("a successful sling must not also pour a molecule here, got bd calls:\n%s", calls)
+	}
+}
+
+// TestReapWispsPoursOnInlineFallback: the molecule is not merely deleted. When
+// the sling fails, nothing else records the run and reapWispsInline closes each
+// step as it goes, so there it is the only trace of the work.
+func TestReapWispsPoursOnInlineFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks")
+	}
+	d, bdLog := reaperTestDaemon(t, 1) // gt sling fails
+
+	d.reapWisps()
+
+	calls := readBDCalls(t, bdLog)
+	if !strings.Contains(calls, "mol wisp "+constants.MolDogReaper) {
+		t.Fatalf("inline fallback must pour the observability molecule, got bd calls:\n%s", calls)
 	}
 }

@@ -210,6 +210,25 @@ const (
 	// against production Dolt until the context deadline; reaching it is an
 	// anomaly, not a normal outcome.
 	maxReapPasses = 20
+	// StrandedMoleculeAge is how long an unassigned open molecule wisp may sit
+	// before the scan calls it stranded.
+	//
+	// A molecule is poured to be RUN by somebody. One that is still open, still
+	// unassigned, and older than this was poured for an executor that never
+	// arrived — which is the shape of the gt-bnpw leak: a daemon timer minted
+	// ~1000 dog-molecule wisps a day for a formula nothing slings, and the
+	// accumulation was only ever noticed because a human went looking. Nothing
+	// reported it, because every other reaper number is about AGE, and these were
+	// individually young and collectively unbounded.
+	//
+	// An hour is long enough that a molecule waiting on a busy dispatcher is not
+	// flagged, and short enough that a broken emitter surfaces within one cycle
+	// rather than after a day of growth. Measured town-wide 2026-08-24 it matched
+	// exactly one wisp — a genuinely stranded mol-polecat-work — so this reports
+	// the leak rather than the working set. Reap does not close on this signal:
+	// an unassigned molecule may be legitimately queued, and the count is a
+	// prompt to look at the emitter, not a licence to delete its output.
+	StrandedMoleculeAge = 1 * time.Hour
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
@@ -701,6 +720,37 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 			Type:    "dangling_parent_ref",
 			Message: fmt.Sprintf("%d wisp(s) have parent dependency records pointing to purged/missing parents", danglingCount),
 			Count:   danglingCount,
+		})
+	}
+
+	// Anomaly detection: stranded molecules — poured, never picked up, still open.
+	//
+	// This is the leak-surfaces-itself half of gt-bnpw. Every other count here
+	// asks "what is old enough to clean up"; none of them can say "something is
+	// minting molecules nobody runs", because the emitter's output is always
+	// younger than max_age and the total is dominated by healthy wisps. An
+	// unassigned open molecule past StrandedMoleculeAge is that signal directly.
+	//
+	// Errors are swallowed the same way the dangling-ref probe swallows them:
+	// this is a diagnostic on top of a scan whose real job is the candidate
+	// counts, and a database without the column must not fail the scan. Note the
+	// consequence — a probe that errors reports zero, so a zero here means "none
+	// found OR not asked", which is why the count is a prompt to look rather than
+	// a clearance.
+	strandedQuery := fmt.Sprintf(`
+		SELECT COUNT(*) FROM wisps w
+		WHERE w.issue_type = 'molecule'
+		AND %s
+		AND (w.assignee IS NULL OR w.assignee = '')
+		AND w.created_at < ?`, openWispStatusWhere)
+	var strandedCount int
+	if err := db.QueryRowContext(ctx, strandedQuery, now.Add(-StrandedMoleculeAge)).Scan(&strandedCount); err == nil && strandedCount > 0 {
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type: "stranded_molecules",
+			Message: fmt.Sprintf(
+				"%d molecule wisp(s) are open, unassigned, and older than %s — poured but never dispatched; find the emitter rather than closing them by hand",
+				strandedCount, StrandedMoleculeAge),
+			Count: strandedCount,
 		})
 	}
 
