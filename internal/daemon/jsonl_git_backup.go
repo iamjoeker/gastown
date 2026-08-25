@@ -501,18 +501,57 @@ func (d *Daemon) runGitCmd(dir string, timeout time.Duration, args ...string) er
 }
 
 // escalate sends an escalation message to the mayor via gt escalate.
+//
+// The binary is d.gtPath, like every other subprocess the daemon spawns. This
+// was the one caller that hard-coded a bare "gt" and resolved it from PATH,
+// which made the escalation path the only one a test could not point at a stub
+// — so any test that reached it ran the REAL `gt escalate` against whatever
+// town the test process happened to sit in. Escalation is the reporting channel
+// this defect class depends on, so it must be reachable in a test.
+//
+// The failure is logged under the caller's source rather than a fixed patrol
+// name: an escalation that could not be sent is exactly the "reported success
+// without confirming it landed" shape, and attributing it to the wrong patrol
+// is how it stays unnoticed.
 func (d *Daemon) escalate(source, message string) {
+	if err := d.escalateE(source, message); err != nil {
+		d.logger.Printf("%s: escalation failed: %v", source, err)
+	}
+}
+
+// escalateE is escalate, but it tells the caller whether the escalation landed.
+//
+// escalate() returns nothing, so every caller in this package has been assuming
+// its report reached the Mayor. It runs a subprocess that can fail, and when it
+// does the only trace is one more line in the same daemon log the escalation
+// exists to escape. A caller that needs to know — because the thing it is
+// reporting is destructive, or because its own failure mode is shared with this
+// one — calls this instead and says so in its own output.
+//
+// The shared failure mode is the point. This spawns `gt`, so any caller
+// escalating BECAUSE a `gt` invocation failed cannot assume the escalation
+// itself got through: a broken gt binary silences the report of its own
+// breakage. Nothing here can fix that; what it can do is stop the caller from
+// believing it was reported.
+func (d *Daemon) escalateE(source, message string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", "HIGH",
+	gtPath := d.gtPath
+	if gtPath == "" {
+		gtPath = "gt"
+	}
+
+	cmd := exec.CommandContext(ctx, gtPath, "escalate", "-s", "HIGH", //nolint:gosec // G204: gtPath resolved at daemon init via LookPath
 		fmt.Sprintf("%s: %s", source, message))
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
 	util.SetDetachedProcessGroup(cmd)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		d.logger.Printf("jsonl_git_backup: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(output)))
 	}
+	return nil
 }
 
 // spikeThreshold returns the configured spike threshold or the default (20%).
