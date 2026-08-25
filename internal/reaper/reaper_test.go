@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestValidateDBName(t *testing.T) {
@@ -480,6 +482,16 @@ type fakeWisp struct {
 	issueType string
 	createdAt time.Time
 	assignee  string
+	// description carries the hook-bead fields when this wisp is itself a hook
+	// bead. A molecule's dispatch record lives here, not on the molecule.
+	description string
+}
+
+// fakeIssue is a row in `issues`. Only the description matters to the reaper's
+// stranded-molecule probe: it is where "attached_molecule: <id>" is written.
+type fakeIssue struct {
+	id          string
+	description string
 }
 
 type fakeDep struct {
@@ -492,6 +504,7 @@ type fakeDep struct {
 type fakeReaperState struct {
 	mu       sync.Mutex
 	wisps    map[string]*fakeWisp
+	issues   map[string]*fakeIssue
 	deps     []fakeDep
 	nextConn int
 	ops      map[int][]string
@@ -608,9 +621,13 @@ func (s *fakeReaperState) hasOpenParentLocked(id string) bool {
 	return false
 }
 
-// strandedMoleculesLocked mirrors Scan's stranded-molecule probe: open,
-// unassigned molecule wisps created before the cutoff.
-func (s *fakeReaperState) strandedMoleculesLocked(cutoff time.Time) []string {
+// unassignedMoleculesLocked mirrors the column-level half of Scan's
+// stranded-molecule probe: open molecule wisps created before the cutoff that
+// carry no assignee. The attachment half is applied by the reaper in Go, off the
+// descriptions the two arms below serve, so this deliberately does NOT filter on
+// dispatch — a fake that pre-filtered here would answer the very question under
+// test and the probe could not fail.
+func (s *fakeReaperState) unassignedMoleculesLocked(cutoff time.Time) []string {
 	var ids []string
 	for id, w := range s.wisps {
 		if w.issueType != "molecule" || !isOpenWispStatus(w.status) {
@@ -623,6 +640,35 @@ func (s *fakeReaperState) strandedMoleculesLocked(cutoff time.Time) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// descriptionsLocked returns the descriptions the reaper's attachment prefilter
+// would match, from `issues` or `wisps`. The prefilter is reproduced here rather
+// than assumed: a fake that returned every row would let a probe pass whose SQL
+// filters away the rows it needs.
+func (s *fakeReaperState) descriptionsLocked(table string) []string {
+	var descs []string
+	matches := func(desc string) bool {
+		lower := strings.ToLower(desc)
+		i := strings.Index(lower, "attached")
+		return i >= 0 && strings.Contains(lower[i:], "molecule")
+	}
+	switch table {
+	case "issues":
+		for _, i := range s.issues {
+			if matches(i.description) {
+				descs = append(descs, i.description)
+			}
+		}
+	case "wisps":
+		for _, w := range s.wisps {
+			if matches(w.description) {
+				descs = append(descs, w.description)
+			}
+		}
+	}
+	sort.Strings(descs)
+	return descs
 }
 
 func (s *fakeReaperState) openCountLocked() int {
@@ -670,13 +716,19 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	c.state.record(c.id, "QUERY "+normalized)
 
 	switch {
-	// Stranded-molecule probe. Must precede the stale-candidate case: it is also
-	// a COUNT over wisps w with a created_at bound, so it would otherwise be
-	// answered by the stale-candidate arm — which rejects it, and the caller
-	// swallows that error and reports zero. A probe that cannot fail is a probe
-	// that certifies nothing, so match it explicitly.
-	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "w.assignee IS NULL"):
-		return fakeCountRows(len(c.state.strandedMoleculesLocked(namedTime(args)))), nil
+	// Stranded-molecule probe, first half. Must precede the stale-candidate
+	// cases: it is also a SELECT over wisps w with a created_at bound, so it
+	// would otherwise be answered by the stale-candidate arm — which rejects it,
+	// and the caller swallows that error and reports zero. A probe that cannot
+	// fail is a probe that certifies nothing, so match it explicitly.
+	case strings.Contains(normalized, "FROM wisps w") && strings.Contains(normalized, "w.assignee IS NULL"):
+		return fakeIDRows(c.state.unassignedMoleculesLocked(namedTime(args))), nil
+	// Stranded-molecule probe, second half: the dispatch records. These live in
+	// hook-bead descriptions, in either table.
+	case strings.HasPrefix(normalized, "SELECT description FROM issues"):
+		return fakeIDRows(c.state.descriptionsLocked("issues")), nil
+	case strings.HasPrefix(normalized, "SELECT description FROM wisps"):
+		return fakeIDRows(c.state.descriptionsLocked("wisps")), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -943,7 +995,7 @@ func TestScanFlagsStrandedMolecules(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		wisps: map[string]*fakeWisp{
-			// Stranded: open, unassigned, past StrandedMoleculeAge.
+			// Stranded: open, unassigned, unattached, past StrandedMoleculeAge.
 			"mol-stranded": {id: "mol-stranded", status: "open", issueType: "molecule", createdAt: now.Add(-4 * time.Hour)},
 			// Just poured — a dispatcher may still be on its way.
 			"mol-fresh": {id: "mol-fresh", status: "open", issueType: "molecule", createdAt: now.Add(-1 * time.Minute)},
@@ -954,6 +1006,17 @@ func TestScanFlagsStrandedMolecules(t *testing.T) {
 			// A step, not a molecule. Steps are unassigned by design; counting them
 			// would swamp the signal with the very population it is meant to explain.
 			"step-old": {id: "step-old", status: "open", issueType: "task", createdAt: now.Add(-4 * time.Hour)},
+		},
+		issues: map[string]*fakeIssue{
+			// A hook bead that dispatched something else. It must not launder
+			// mol-stranded: the exclusion is keyed on the molecule ID, not on the
+			// mere presence of an attachment line somewhere in the database.
+			"bug-other": {id: "bug-other", description: "attached_molecule: mol-elsewhere\nattached_formula: mol-polecat-work"},
+			// Prose that discusses attachment without recording one. The reaper's
+			// LIKE is a prefilter; the parser is what decides, so this row is read
+			// and contributes nothing (the CONTAMINATION failure mode: text ABOUT a
+			// thing satisfying a search FOR it).
+			"bug-prose": {id: "bug-prose", description: "The Attached Molecule mol-stranded looked wrong to me."},
 		},
 		ops: map[int][]string{},
 	}
@@ -1009,6 +1072,185 @@ func TestScanQuietWhenNothingStranded(t *testing.T) {
 	for _, a := range scan.Anomalies {
 		if a.Type == "stranded_molecules" {
 			t.Errorf("healthy town must not raise stranded_molecules: %q", a.Message)
+		}
+	}
+}
+
+// TestScanIgnoresAttachedMolecules is the gt-id8x regression: a molecule that
+// was dispatched by ATTACHMENT must not be called stranded.
+//
+// The old predicate read wisps.assignee and nothing else, so it answered "does
+// this row carry an assignee" for a question that was "was this dispatched".
+// Those come apart for the whole mol-polecat-work family: gt sling writes the
+// dispatch onto the hook bead as "attached_molecule: <id>", the molecule wisp
+// keeps a NULL assignee for its entire working life, and a root-only molecule
+// materializes no child wisps to carry one either. Every in-flight polecat older
+// than an hour therefore matched, and the scan escalated five times in one day
+// about work that was proceeding normally.
+//
+// Verified against the live gastown database while this fix was being written:
+// this polecat's own molecule (gt-wisp-roivi, open, assignee NULL, attached to
+// gt-id8x which was hooked to gastown/polecats/brahmin) was the sole row the old
+// predicate returned. That is the empirical observation the bead's scope note
+// said was missing.
+//
+// Each case here must be able to FAIL: the "stranded" fixture in every one of
+// them is identical to the attached fixture except for the dispatch record, so a
+// probe that stopped looking at attachments would flag two and a probe that
+// excluded everything would flag none.
+func TestScanIgnoresAttachedMolecules(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-4 * time.Hour)
+
+	tests := []struct {
+		name   string
+		issues map[string]*fakeIssue
+		wisps  map[string]*fakeWisp
+	}{
+		{
+			// The shape that produced gt-id8x: a base bead in `issues`.
+			name: "hook bead is an issue",
+			issues: map[string]*fakeIssue{
+				"gt-id8x": {id: "gt-id8x", description: "attached_molecule: mol-dispatched\nattached_formula: mol-polecat-work\nattached_at: 2026-08-25T23:41:04Z"},
+			},
+		},
+		{
+			// A hook bead can itself be a wisp, so the dispatch record can live in
+			// either table. Checking only `issues` would leave this one flagged.
+			name: "hook bead is a wisp",
+			wisps: map[string]*fakeWisp{
+				"hq-wisp-hook": {id: "hq-wisp-hook", status: "hooked", issueType: "task", createdAt: old, description: "attached_molecule: mol-dispatched"},
+			},
+		},
+		{
+			// Key aliases beads.ParseAttachmentFields accepts. The writer only ever
+			// emits the underscore form, but the reader must not be narrower than
+			// the parser the rest of gastown reads attachments with.
+			name: "hyphenated key",
+			issues: map[string]*fakeIssue{
+				"gt-id8x": {id: "gt-id8x", description: "Attached-Molecule: mol-dispatched"},
+			},
+		},
+		{
+			// The hook bead has finished. The molecule is a leftover, not something
+			// that was never dispatched — so the "no dispatch record" claim is still
+			// false and this must not be reported under that heading.
+			name: "hook bead already closed",
+			issues: map[string]*fakeIssue{
+				"gt-id8x": {id: "gt-id8x", description: "attached_molecule: mol-dispatched"},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wisps := map[string]*fakeWisp{
+				// Dispatched by attachment: open, NULL assignee, hours old. Healthy.
+				"mol-dispatched": {id: "mol-dispatched", status: "open", issueType: "molecule", createdAt: old},
+				// Identical but for the dispatch record. This one IS stranded, and it
+				// is the control that proves the case can fail: if the probe went
+				// silent altogether, the anomaly would disappear and this test with it.
+				"mol-stranded": {id: "mol-stranded", status: "open", issueType: "molecule", createdAt: old},
+			}
+			for id, w := range tc.wisps {
+				wisps[id] = w
+			}
+			state := &fakeReaperState{wisps: wisps, issues: tc.issues, ops: map[int][]string{}}
+			db := openFakeReaperDB(t, state)
+			t.Cleanup(func() { _ = db.Close() })
+
+			scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+			if err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+
+			var found *Anomaly
+			for i := range scan.Anomalies {
+				if scan.Anomalies[i].Type == "stranded_molecules" {
+					found = &scan.Anomalies[i]
+				}
+			}
+			if found == nil {
+				t.Fatalf("mol-stranded has no dispatch record and must still be reported; anomalies: %+v", scan.Anomalies)
+			}
+			if found.Count != 1 {
+				t.Errorf("stranded_molecules Count = %d, want 1: only mol-stranded qualifies — mol-dispatched was dispatched by attachment, which is what %q means", found.Count, found.Message)
+			}
+		})
+	}
+}
+
+// TestStrandedMessageStatesWhatWasMeasured pins the message to its evidence.
+//
+// The old text asserted "poured but never dispatched" and told the reader to
+// "find the emitter" — a cause the check never tested and a hunt with no quarry,
+// since the emitter of an attached molecule is the ordinary gt mol attach path.
+// Three agents spent cycles on that sentence before anyone read the query. A
+// message may name what it measured; it may not name what it inferred.
+func TestStrandedMessageStatesWhatWasMeasured(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"mol-stranded": {id: "mol-stranded", status: "open", issueType: "molecule", createdAt: now.Add(-4 * time.Hour)},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var msg string
+	for _, a := range scan.Anomalies {
+		if a.Type == "stranded_molecules" {
+			msg = a.Message
+		}
+	}
+	if msg == "" {
+		t.Fatalf("expected a stranded_molecules anomaly, got %+v", scan.Anomalies)
+	}
+	if strings.Contains(msg, "never dispatched") {
+		t.Errorf("the check cannot observe that a molecule was never dispatched, only that no dispatch record exists; got %q", msg)
+	}
+	for _, want := range []string{"no assignee", "attached to no hook bead"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message must name what it measured (%q); got %q", want, msg)
+		}
+	}
+}
+
+// TestParseAttachedMoleculeIDMatchesBeads is the anti-drift control for the one
+// piece of beads logic this package reimplements.
+//
+// internal/reaper deliberately imports nothing from gastown, so the attachment
+// parser here is a copy. A copy that drifts is worse than no check at all: it
+// would silently start disagreeing with `gt mol attachment` about which
+// molecules are dispatched, and the disagreement would surface as the same false
+// anomaly this fix removes. Every case below is run through both.
+func TestParseAttachedMoleculeIDMatchesBeads(t *testing.T) {
+	descriptions := []string{
+		"",
+		"no fields here at all",
+		"attached_molecule: gt-wisp-roivi",
+		"attached_molecule: gt-wisp-roivi\nattached_formula: mol-polecat-work\nattached_at: 2026-08-25T23:41:04Z",
+		"mode: ralph\nattached-molecule: gt-wisp-abc\nconvoy_id: hq-cv-xyz",
+		"AttachedMolecule: gt-wisp-caps",
+		"  attached_molecule:   gt-wisp-padded  ",
+		"attached_molecule:",
+		"attached_molecule: \n",
+		"attached_molecule: gt-wisp-first\nattached_molecule: gt-wisp-last",
+		"attached_formula: mol-polecat-work\nno molecule attached",
+		"The attached molecule was gt-wisp-prose, with no colon on that line.",
+	}
+	for _, desc := range descriptions {
+		want := ""
+		if fields := beads.ParseAttachmentFields(&beads.Issue{Description: desc}); fields != nil {
+			want = fields.AttachedMolecule
+		}
+		if got := parseAttachedMoleculeID(desc); got != want {
+			t.Errorf("parseAttachedMoleculeID(%q) = %q, beads.ParseAttachmentFields = %q", desc, got, want)
 		}
 	}
 }

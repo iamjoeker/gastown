@@ -210,24 +210,28 @@ const (
 	// against production Dolt until the context deadline; reaching it is an
 	// anomaly, not a normal outcome.
 	maxReapPasses = 20
-	// StrandedMoleculeAge is how long an unassigned open molecule wisp may sit
-	// before the scan calls it stranded.
+	// StrandedMoleculeAge is how long an open molecule wisp with no dispatch
+	// record may sit before the scan calls it stranded.
 	//
-	// A molecule is poured to be RUN by somebody. One that is still open, still
-	// unassigned, and older than this was poured for an executor that never
-	// arrived — which is the shape of the gt-bnpw leak: a daemon timer minted
-	// ~1000 dog-molecule wisps a day for a formula nothing slings, and the
+	// A molecule is poured to be RUN by somebody. One that is still open, older
+	// than this, and carries no dispatch record at all was poured for an executor
+	// that never arrived — which is the shape of the gt-bnpw leak: a daemon timer
+	// minted ~1000 dog-molecule wisps a day for a formula nothing slings, and the
 	// accumulation was only ever noticed because a human went looking. Nothing
 	// reported it, because every other reaper number is about AGE, and these were
 	// individually young and collectively unbounded.
 	//
+	// "No dispatch record" is two conditions, not one — see strandedMoleculeIDs.
+	// The wisp must carry no assignee AND no hook bead may name it in an
+	// attached_molecule line. Testing only the first called every in-flight
+	// root-only molecule stranded, because attachment-dispatched work never
+	// writes an assignee onto the molecule wisp (gt-id8x).
+	//
 	// An hour is long enough that a molecule waiting on a busy dispatcher is not
 	// flagged, and short enough that a broken emitter surfaces within one cycle
-	// rather than after a day of growth. Measured town-wide 2026-08-24 it matched
-	// exactly one wisp — a genuinely stranded mol-polecat-work — so this reports
-	// the leak rather than the working set. Reap does not close on this signal:
-	// an unassigned molecule may be legitimately queued, and the count is a
-	// prompt to look at the emitter, not a licence to delete its output.
+	// rather than after a day of growth. Reap does not close on this signal: an
+	// undispatched molecule may be legitimately queued, and the count is a prompt
+	// to look at the emitter, not a licence to delete its output.
 	StrandedMoleculeAge = 1 * time.Hour
 )
 
@@ -282,6 +286,143 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 }
 
 const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
+
+// parseAttachedMoleculeID returns the molecule ID a bead description records as
+// attached to it, or "" if it records none.
+//
+// It mirrors beads.ParseAttachmentFields' handling of the attached_molecule key
+// exactly — same key aliases, same trimming, same last-line-wins overwrite. The
+// duplication is deliberate: this package is free of gastown-internal imports so
+// the reaper can be linked into the daemon without dragging the bd exec layer
+// along. TestParseAttachedMoleculeIDMatchesBeads pins the two together so they
+// cannot drift apart silently.
+func parseAttachedMoleculeID(desc string) string {
+	id := ""
+	for _, line := range strings.Split(desc, "\n") {
+		line = strings.TrimSpace(line)
+		colonIdx := strings.Index(line, ":")
+		if colonIdx == -1 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(line[:colonIdx])) {
+		case "attached_molecule", "attached-molecule", "attachedmolecule":
+		default:
+			continue
+		}
+		if value := strings.TrimSpace(line[colonIdx+1:]); value != "" {
+			id = value
+		}
+	}
+	return id
+}
+
+// attachedMoleculeIDs returns every molecule ID that some bead in this database
+// records as attached to it — that is, every molecule with a dispatch record.
+//
+// The attachment IS the dispatch record, and it lives in the HOOK BEAD's
+// description as an "attached_molecule: <id>" line, never on the molecule wisp.
+// A root-only molecule therefore has an empty wisps.assignee for its whole
+// working life: the assignment sits on the issue it is attached to, and it
+// materializes no child wisps to carry one either. Reading wisps.assignee asked
+// "does this row carry an assignee" when the question was "was this dispatched";
+// those come apart for the entire mol-polecat-work family, so the old predicate
+// called every in-flight polecat molecule stranded (gt-id8x).
+//
+// Both tables are scanned. Base beads live in `issues`, but a hook bead can
+// itself be a wisp, and a molecule attached to either one was dispatched.
+//
+// The LIKE is only a prefilter to keep the scan off descriptions that cannot
+// match; every returned row is parsed as a field, so a description that merely
+// discusses attachment inline contributes nothing.
+//
+// One case it cannot separate: a bead that reproduces "attached_molecule: <id>"
+// on a line of its own — a verbatim paste of a real attachment block into a bug
+// report — is indistinguishable from an attachment, and will suppress the
+// anomaly for that molecule. That is the direction to err in. The failure this
+// replaces was the opposite one, a confident false claim about healthy work that
+// cost three agents a day and five escalations; a rare missed report costs a
+// count that was already documented as a prompt to look, not a clearance.
+func attachedMoleculeIDs(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	attached := make(map[string]bool)
+	for _, table := range []string{"issues", "wisps"} {
+		query := "SELECT description FROM " + table + " WHERE description LIKE '%attached%molecule%'"
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			if isTableNotFound(err) {
+				// No such table on this server — it holds no attachments either.
+				continue
+			}
+			return nil, fmt.Errorf("read %s attachments: %w", table, err)
+		}
+		scanErr := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var desc sql.NullString
+				if err := rows.Scan(&desc); err != nil {
+					return fmt.Errorf("scan %s attachment: %w", table, err)
+				}
+				if id := parseAttachedMoleculeID(desc.String); id != "" {
+					attached[id] = true
+				}
+			}
+			return rows.Err()
+		}()
+		if scanErr != nil {
+			return nil, fmt.Errorf("read %s attachments: %w", table, scanErr)
+		}
+	}
+	return attached, nil
+}
+
+// strandedMoleculeIDs returns the open molecule wisps older than cutoff for
+// which no dispatch record exists: no assignee on the wisp AND no hook bead
+// naming them in an attached_molecule line.
+//
+// The attachment lookup runs only when the column-level filter yields
+// candidates, so a database with no stranded molecules pays one COUNT-shaped
+// SELECT and nothing else.
+func strandedMoleculeIDs(ctx context.Context, db *sql.DB, cutoff time.Time) ([]string, error) {
+	query := fmt.Sprintf(`
+		SELECT w.id FROM wisps w
+		WHERE w.issue_type = 'molecule'
+		AND %s
+		AND (w.assignee IS NULL OR w.assignee = '')
+		AND w.created_at < ?`, openWispStatusWhere)
+	rows, err := db.QueryContext(ctx, query, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("query unassigned molecules: %w", err)
+	}
+	var candidates []string
+	scanErr := func() error {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			candidates = append(candidates, id)
+		}
+		return rows.Err()
+	}()
+	if scanErr != nil {
+		return nil, fmt.Errorf("query unassigned molecules: %w", scanErr)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	attached, err := attachedMoleculeIDs(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var stranded []string
+	for _, id := range candidates {
+		if !attached[id] {
+			stranded = append(stranded, id)
+		}
+	}
+	return stranded, nil
+}
 
 // ProtectedWispLabels lists labels whose wisps purge must never delete,
 // whatever their age, status, or caller.
@@ -729,7 +870,8 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// asks "what is old enough to clean up"; none of them can say "something is
 	// minting molecules nobody runs", because the emitter's output is always
 	// younger than max_age and the total is dominated by healthy wisps. An
-	// unassigned open molecule past StrandedMoleculeAge is that signal directly.
+	// open molecule past StrandedMoleculeAge with no dispatch record is that
+	// signal directly.
 	//
 	// Errors are swallowed the same way the dangling-ref probe swallows them:
 	// this is a diagnostic on top of a scan whose real job is the candidate
@@ -737,20 +879,13 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// consequence — a probe that errors reports zero, so a zero here means "none
 	// found OR not asked", which is why the count is a prompt to look rather than
 	// a clearance.
-	strandedQuery := fmt.Sprintf(`
-		SELECT COUNT(*) FROM wisps w
-		WHERE w.issue_type = 'molecule'
-		AND %s
-		AND (w.assignee IS NULL OR w.assignee = '')
-		AND w.created_at < ?`, openWispStatusWhere)
-	var strandedCount int
-	if err := db.QueryRowContext(ctx, strandedQuery, now.Add(-StrandedMoleculeAge)).Scan(&strandedCount); err == nil && strandedCount > 0 {
+	if stranded, err := strandedMoleculeIDs(ctx, db, now.Add(-StrandedMoleculeAge)); err == nil && len(stranded) > 0 {
 		result.Anomalies = append(result.Anomalies, Anomaly{
 			Type: "stranded_molecules",
 			Message: fmt.Sprintf(
-				"%d molecule wisp(s) are open, unassigned, and older than %s — poured but never dispatched; find the emitter rather than closing them by hand",
-				strandedCount, StrandedMoleculeAge),
-			Count: strandedCount,
+				"%d molecule wisp(s) are open, older than %s, carry no assignee, and are attached to no hook bead — no dispatch record exists for them; look for the emitter rather than closing them by hand",
+				len(stranded), StrandedMoleculeAge),
+			Count: len(stranded),
 		})
 	}
 

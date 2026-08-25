@@ -80,10 +80,19 @@ gt reaper scan --db=<name> \\
 - Treat an absent `molecule_step_candidates` field as zero
 - Flag any `dangling_parent_ref` anomalies — these indicate wisps with
   parent dependency records pointing to purged/missing parents
-- Flag any `stranded_molecules` anomalies — molecules poured for an executor
-  that never arrived. Do NOT close them one by one; that hides the emitter and
-  the next cycle mints more. Report the count and which formulas they are
-  (`bd mol wisp list --all --json`) so the emitting timer gets fixed (gt-bnpw)
+- Flag any `stranded_molecules` anomalies — open molecules past the age bound
+  for which no dispatch record exists: no assignee on the wisp, and no hook bead
+  naming them in an `attached_molecule` line. Do NOT close them one by one; that
+  hides the emitter and the next cycle mints more. Report the count and which
+  formulas they are (`bd mol wisp list --all --json`) so the emitting timer gets
+  fixed (gt-bnpw).
+  Before escalating, CONFIRM the claim against the object it names — run
+  `gt mol attachment <hook-bead>` or `gt mol status <agent>` for the molecule.
+  The check reports the absence of a dispatch RECORD, which is not the same as
+  a molecule that was never dispatched. The earlier version of this check read
+  only `wisps.assignee`, called every in-flight polecat molecule stranded, and
+  was escalated five times in one day about work that was proceeding normally
+  (gt-id8x). One confirmation is cheaper than one escalation
 - If `open_wisps` exceeds {{alert_threshold}}, escalate
 
 **4. Decide whether to proceed:**

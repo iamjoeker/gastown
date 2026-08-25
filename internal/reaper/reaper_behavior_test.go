@@ -1407,3 +1407,99 @@ func TestAutoCloseSparesOpenEscalations(t *testing.T) {
 			"would satisfy the exemption assertion for the wrong reason", got)
 	}
 }
+
+// TestStrandedMoleculeProbeBehaviour runs the stranded-molecule probe's real SQL
+// against a real engine. It is the acceptance test for gt-id8x.
+//
+// The unit tests in reaper_test.go go through a fake driver that re-implements
+// the predicate in Go, so they cannot fail when the SQL stops matching that
+// logic. This one can: the engine evaluates the query the daemon actually
+// sends, against a table whose `issues.description` column is where the dispatch
+// record lives.
+//
+// Both controls are present and both are load-bearing:
+//   - mol-attached is a healthy in-flight polecat molecule — open, hours old,
+//     assignee NULL (root-only molecules never carry one; the assignment sits on
+//     the issue) and named by a hook bead's attached_molecule line. Reporting it
+//     is the bug: the old predicate flagged every one of these, escalated five
+//     times in a day, and sent three agents hunting an emitter that was just
+//     `gt mol attach`.
+//   - mol-orphan differs from it in exactly one respect — nothing names it — and
+//     must still be reported, or a probe that went silent would pass.
+func TestStrandedMoleculeProbeBehaviour(t *testing.T) {
+	f := newFixture(t, "stranded_molecule")
+	now := time.Now().UTC()
+	old := now.Add(-4 * time.Hour)
+
+	f.insertIssues(t,
+		// The hook bead. This is the shape gt sling writes for mol-polecat-work.
+		issueRow{id: "gt-id8x", status: "hooked", priority: 1, updatedAt: old,
+			description: "attached_molecule: mol-attached\nattached_formula: mol-polecat-work\nattached_at: 2026-08-25T23:41:04Z"},
+		// CONTAMINATION CONTROL: a bug report that quotes the field inline without
+		// recording an attachment. The LIKE prefilter matches it, so it reaches the
+		// parser, and a naive `description LIKE '%attached_molecule: <id>%'` would
+		// launder mol-orphan straight out of the anomaly. Parsing the line as a
+		// field rejects it: the key here is "Quoting the reaper", not
+		// attached_molecule. Text ABOUT a thing must not satisfy a search FOR it.
+		issueRow{id: "gt-report", status: "open", priority: 2, updatedAt: old,
+			description: "Quoting the reaper: it says attached_molecule: mol-orphan, but no bead records that."},
+	)
+	f.insertWisps(t,
+		// Dispatched by attachment. Healthy work in flight.
+		wispRow{id: "mol-attached", status: "open", issueType: "molecule", createdAt: old},
+		// NEGATIVE CONTROL: identical but for the dispatch record.
+		wispRow{id: "mol-orphan", status: "open", issueType: "molecule", createdAt: old},
+		// Too young to judge — a dispatcher may still be on its way.
+		wispRow{id: "mol-fresh", status: "open", issueType: "molecule", createdAt: now.Add(-time.Minute)},
+		// Dispatched the other way: the wisp itself carries the assignee.
+		wispRow{id: "mol-assigned", status: "hooked", issueType: "molecule", createdAt: old, assignee: "deacon/dogs/alpha"},
+		// A hook bead that is itself a wisp. Attachment records live in both
+		// tables, and a molecule attached from either one was dispatched.
+		wispRow{id: "hq-wisp-hook", status: "hooked", createdAt: old,
+			description: "attached_molecule: mol-wisp-attached"},
+		wispRow{id: "mol-wisp-attached", status: "open", issueType: "molecule", createdAt: old},
+	)
+
+	scan, err := Scan(f.db, f.dbName, staleAge, purgeAge, purgeAge, staleAge)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	var found *Anomaly
+	for i := range scan.Anomalies {
+		if scan.Anomalies[i].Type == "stranded_molecules" {
+			found = &scan.Anomalies[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("mol-orphan has no dispatch record and must be reported; anomalies: %+v", scan.Anomalies)
+	}
+	if found.Count != 1 {
+		t.Errorf("stranded_molecules Count = %d, want 1 (mol-orphan alone). Anything higher means a "+
+			"dispatched molecule was called stranded — the gt-id8x defect. Message: %q", found.Count, found.Message)
+	}
+	if strings.Contains(found.Message, "never dispatched") {
+		t.Errorf("the probe observes the absence of a dispatch RECORD, not the absence of a "+
+			"dispatch; got %q", found.Message)
+	}
+
+	// The probe must also survive a database with no issues table — the reaper
+	// reaches servers where beads keeps issues elsewhere (that is what
+	// isTableNotFound exists for). Losing one attachment source must degrade the
+	// probe, not silence it: the wisp-side records must still be read.
+	//
+	// strandedMoleculeIDs is called directly here because dropping the table also
+	// breaks Scan's unrelated molecule-step count, which would mask this.
+	f.exec(t, "DROP TABLE issues")
+	stranded, err := strandedMoleculeIDs(context.Background(), f.db, now.Add(-StrandedMoleculeAge))
+	if err != nil {
+		t.Fatalf("strandedMoleculeIDs with no issues table: %v", err)
+	}
+	sort.Strings(stranded)
+	// mol-attached loses its dispatch record along with the table, so it joins
+	// mol-orphan. mol-wisp-attached keeps its wisp-side record and must not.
+	if want := []string{"mol-attached", "mol-orphan"}; !reflect.DeepEqual(stranded, want) {
+		t.Errorf("stranded = %v, want %v — with issues gone the wisp-side attachment must still "+
+			"be read, and the probe must not go silent", stranded, want)
+	}
+}
