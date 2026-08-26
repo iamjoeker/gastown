@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/witness"
 )
 
@@ -707,5 +708,234 @@ func TestPatrolBranchesDeletableFlagIsRegistered(t *testing.T) {
 	}
 	if !strings.Contains(patrolBranchesCmd.Long, "--deletable") {
 		t.Errorf("help text does not document --deletable:\n%s", patrolBranchesCmd.Long)
+	}
+}
+
+// --- superseded markers (gt-8xcg) ---------------------------------------
+
+// supersededSweepFixture is the shape the marker was built for: a settled check
+// row and a settled landed-but-not-an-ancestor row alongside one of each that
+// nobody has settled.
+func supersededSweepFixture() *witness.BranchSweepResult {
+	result := sweepFixture()
+	result.MarksMeasured = true
+	result.Scanned = 6
+	result.Findings = append(result.Findings,
+		witness.BranchSweepFinding{
+			Branch: "polecat/settled/gt-fbgq+eee", CommitSHA: "sha5",
+			IssueID: "gt-fbgq", IssueStatus: "closed",
+			Class: witness.BranchSweepSuperseded, UnderlyingClass: witness.BranchSweepCheck,
+			Superseded: &git.SupersededMark{
+				Branch: "polecat/settled/gt-fbgq+eee", Commit: "sha5",
+				Reason: "landed out of band as 7a108237", MarkedBy: "gastown/witness", MarkedAt: "2026-08-26T06:00:00Z",
+			},
+			Note: "settled: landed out of band as 7a108237 [by gastown/witness on 2026-08-26T06:00:00Z]; would otherwise be check",
+		},
+		witness.BranchSweepFinding{
+			Branch: "polecat/settled/gt-egq9+fff", CommitSHA: "sha6",
+			IssueID: "gt-egq9", IssueStatus: "closed",
+			Class: witness.BranchSweepSuperseded, UnderlyingClass: witness.BranchSweepLanded,
+			Evidence: "cherry", ContainedIn: "origin/main", HygieneUnreachable: true,
+			Superseded: &git.SupersededMark{
+				Branch: "polecat/settled/gt-egq9+fff", Commit: "sha6",
+				Reason: "keep the branch: only surviving copy as originally authored", MarkedBy: "mayor",
+			},
+			Note: "settled: keep the branch: only surviving copy as originally authored [by mayor]; would otherwise be landed",
+		},
+	)
+	return result
+}
+
+func TestPatrolBranchesHidesSettledBranchesButAccountsForThem(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", supersededSweepFixture(), false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	for _, settled := range []string{"polecat/settled/gt-fbgq+eee", "polecat/settled/gt-egq9+fff"} {
+		if strings.Contains(out, settled) {
+			t.Errorf("default output still lists the settled branch %s:\n%s", settled, out)
+		}
+	}
+	// Hidden, not vanished. A sweep that quietly drops rows is the same defect
+	// as one that cannot tell settled from stranded, arriving from the other
+	// side — the reader must be able to see that suppression happened.
+	if !strings.Contains(out, "2 superseded") {
+		t.Errorf("summary does not tally the settled branches:\n%s", out)
+	}
+	if !strings.Contains(out, "6 scanned") {
+		t.Errorf("settled branches were dropped from the scan count:\n%s", out)
+	}
+	if !strings.Contains(out, "--superseded") {
+		t.Errorf("output does not say how to review what was settled:\n%s", out)
+	}
+	// The still-unsettled check row is untouched.
+	if !strings.Contains(out, "polecat/dust/gt-k3v+aaa") {
+		t.Errorf("an unsettled check row went missing:\n%s", out)
+	}
+}
+
+// The one deletion the marker must call off: a settled landed branch stops
+// asking to be deleted, because on the rig this was built for the ruling was
+// explicitly to KEEP the branch.
+func TestPatrolBranchesDeletableExcludesSettledBranches(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesDeletable(&buf, "gastown", supersededSweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if strings.Contains(out, "polecat/settled/gt-egq9+fff") {
+		t.Errorf("--deletable still asks for the deletion of a settled branch:\n%s", out)
+	}
+	if strings.Contains(out, "git push origin --delete polecat/settled/gt-egq9+fff") {
+		t.Errorf("--deletable printed a delete command for a branch marked keep:\n%s", out)
+	}
+	// The unsettled one is still there — the filter is per-row, not a mode.
+	if !strings.Contains(out, "polecat/refinery/gt-aqk+ddd") {
+		t.Errorf("--deletable dropped the branch that IS deletable:\n%s", out)
+	}
+}
+
+func TestPatrolBranchesSupersededViewShowsTheDerivation(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesSuperseded(&buf, "gastown", supersededSweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"polecat/settled/gt-fbgq+eee",
+		"landed out of band as 7a108237",
+		"gastown/witness",
+		"2026-08-26T06:00:00Z",
+		// The class the marker replaced, so an audit can tell a settled check
+		// from a settled landed one.
+		"check",
+		"unmark",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--superseded output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// A zero here is a measurement and must say what it measured, or it is
+// indistinguishable from a build that never looked.
+func TestPatrolBranchesSupersededViewSaysWhenNothingIsSettled(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesSuperseded(&buf, "gastown", sweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "none has been settled") {
+		t.Errorf("empty --superseded output does not say what was measured:\n%s", out)
+	}
+	if !strings.Contains(out, "4 scanned") {
+		t.Errorf("empty --superseded output does not say how many branches it looked at:\n%s", out)
+	}
+	if !strings.Contains(out, "mark") {
+		t.Errorf("empty --superseded output does not say how to record one:\n%s", out)
+	}
+}
+
+// A marked branch that is STILL being reported reads as the marker failing,
+// unless the output says the tip moved under it.
+func TestPatrolBranchesSaysWhyAStaleMarkerDidNotApply(t *testing.T) {
+	result := sweepFixture()
+	result.MarksMeasured = true
+	result.Findings[0].SupersededStale = true
+	result.Findings[0].Note += " — NOTE: a superseded marker exists but names sha-OLD, and the tip is now sha-NEW, so the branch was pushed to after it was settled and the marker does NOT apply"
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "NO LONGER APPLIES") {
+		t.Errorf("output does not raise the stale marker:\n%s", out)
+	}
+	if !strings.Contains(out, "1 marker(s) STALE") {
+		t.Errorf("summary does not tally stale markers:\n%s", out)
+	}
+}
+
+// A sweep that lost its markers looks exactly like a rig that has none, and the
+// two differ by every settled branch on it.
+func TestPatrolBranchesSaysWhenMarkersCouldNotBeRead(t *testing.T) {
+	result := sweepFixture()
+	result.MarksMeasured = false
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "superseded markers UNMEASURED") {
+		t.Errorf("summary presents an unread marker store as an empty one:\n%s", out)
+	}
+}
+
+func TestPatrolBranchesJSONCarriesTheMarkerTotals(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesJSON(&buf, "gastown", supersededSweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var out PatrolBranchesOutput
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v\n%s", err, buf.String())
+	}
+	if out.Superseded != 2 {
+		t.Errorf("superseded = %d, want 2", out.Superseded)
+	}
+	if out.HygieneUnreachable != 1 {
+		t.Errorf("hygiene_unreachable = %d, want 1 — a settled branch is still being counted as awaiting deletion", out.HygieneUnreachable)
+	}
+	// Every branch is in the JSON whatever its class: a consumer selects for
+	// itself rather than re-running the sweep with a different flag.
+	if len(out.Findings) != 6 {
+		t.Errorf("JSON carries %d findings, want 6", len(out.Findings))
+	}
+}
+
+func TestPatrolBranchesMarkerSubcommandsAreRegistered(t *testing.T) {
+	subs := map[string]bool{}
+	for _, sub := range patrolBranchesCmd.Commands() {
+		subs[sub.Name()] = true
+	}
+	for _, want := range []string{"mark", "unmark", "marks"} {
+		if !subs[want] {
+			t.Errorf("gt patrol branches %s is not registered; registered: %v", want, subs)
+		}
+	}
+	if patrolBranchesCmd.Flags().Lookup("superseded") == nil {
+		t.Error("flag --superseded is missing")
+	}
+	// A marker with no derivation is one the next reader has to redo, so the
+	// reason has to be reachable from the command line at all.
+	if patrolBranchesMarkCmd.Flags().Lookup("reason") == nil {
+		t.Error("gt patrol branches mark has no --reason flag")
+	}
+	if patrolBranchesMarkCmd.Flags().ShorthandLookup("m") == nil {
+		t.Error("gt patrol branches mark has no -m shorthand for --reason")
+	}
+	if patrolBranchesMarkCmd.Flags().Lookup("force") == nil {
+		t.Error("gt patrol branches mark has no --force, so an existing derivation could only be replaced by deleting it first")
+	}
+}
+
+// The reason is refused before anything is resolved, so the error is about the
+// missing derivation rather than about a rig or a remote.
+func TestPatrolBranchesMarkRefusesWithoutAReason(t *testing.T) {
+	saved := patrolBranchesMarkReason
+	t.Cleanup(func() { patrolBranchesMarkReason = saved })
+	patrolBranchesMarkReason = "   "
+
+	err := runPatrolBranchesMark(patrolBranchesMarkCmd, []string{"polecat/dust/gt-k3v+aaa"})
+	if err == nil {
+		t.Fatal("mark accepted a settlement with no reason")
+	}
+	if !strings.Contains(err.Error(), "reason") {
+		t.Errorf("error does not name what is missing: %v", err)
 	}
 }

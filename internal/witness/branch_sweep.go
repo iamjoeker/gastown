@@ -124,6 +124,20 @@ const (
 	// git or beads lookup failed. It is deliberately not folded into any
 	// other class: "I could not tell" must never read as "nothing to see".
 	BranchSweepUnknown BranchSweepClass = "unknown"
+
+	// BranchSweepSuperseded means somebody already settled this branch AT THIS
+	// TIP and wrote the derivation down (gt-8xcg). It is the one class this
+	// sweep does not compute: every other verdict is re-derived from the
+	// repository on each run, and that is exactly the problem — the same 21
+	// branches were re-derived on every cycle because a correct answer had
+	// nowhere to live.
+	//
+	// It replaces whatever the branch would otherwise have been, and the
+	// replaced class travels on in UnderlyingClass so the measurement is not
+	// lost, only routed. Suppression is conditional on the marker still naming
+	// the listed tip: a branch pushed to after being marked is NOT superseded,
+	// and says so loudly.
+	BranchSweepSuperseded BranchSweepClass = "superseded"
 )
 
 // NeedsAttention reports whether a class belongs on the short list an operator
@@ -186,6 +200,27 @@ type BranchSweepFinding struct {
 
 	// Err records a lookup that failed for this branch specifically.
 	Err string `json:"error,omitempty"`
+
+	// Superseded is the durable settlement marker read out of git, when one
+	// applies to this branch at this tip. Its presence is what moves Class to
+	// superseded; its Reason is the derivation that would otherwise have been
+	// re-done.
+	Superseded *git.SupersededMark `json:"superseded,omitempty"`
+
+	// UnderlyingClass is what the branch would have been classified as if it
+	// carried no marker. It is recorded because suppressing a row must not
+	// destroy the measurement behind it: an operator auditing the markers needs
+	// to know whether a settled branch was a check or a landed one, and a
+	// marker that erased that would be indistinguishable from one hiding a
+	// stranding.
+	UnderlyingClass BranchSweepClass `json:"underlying_class,omitempty"`
+
+	// SupersededStale marks a branch that HAS a marker which no longer applies:
+	// the tip moved after it was written. The row is NOT suppressed — the
+	// settlement was about content that is no longer there — and this field is
+	// what lets the reader be told why a marked branch is still on the list,
+	// rather than concluding the marker was ignored.
+	SupersededStale bool `json:"superseded_stale,omitempty"`
 }
 
 // BranchSweepResult is the whole sweep.
@@ -213,6 +248,13 @@ type BranchSweepResult struct {
 	// MRsMeasured is false when the merge-request listing failed. Without it,
 	// an absent MR is not evidence there is no MR.
 	MRsMeasured bool `json:"mrs_measured"`
+
+	// MarksMeasured is false when the superseded markers could not be read.
+	// Without it a sweep that lost its markers looks exactly like a rig that
+	// has none — and the two differ by 21 rows on the one that motivated them.
+	// A failed read over-reports rather than under-reports, which is the safe
+	// direction, but the reader still has to be told which they are looking at.
+	MarksMeasured bool `json:"marks_measured"`
 }
 
 // AttentionCount is the size of the short list.
@@ -229,6 +271,44 @@ func (r *BranchSweepResult) AttentionCount() int {
 	return n
 }
 
+// SupersededCount is how many rows a marker settled on this run.
+//
+// It is reported alongside every other tally rather than folded away, because a
+// suppressed row is still a measurement: "0 to check" out of 36 scanned means
+// something different when 21 of them were settled by hand than when none were,
+// and a summary that showed only the first number would make a marker look like
+// a repository that fixed itself.
+func (r *BranchSweepResult) SupersededCount() int {
+	if r == nil {
+		return 0
+	}
+	n := 0
+	for _, f := range r.Findings {
+		if f.Class == BranchSweepSuperseded {
+			n++
+		}
+	}
+	return n
+}
+
+// StaleMarkCount is how many branches carry a marker that no longer applies
+// because the tip moved after it was written. Those rows are on the short list,
+// not off it, and this is what says so out loud: a marked branch that is still
+// being reported looks like a marker that was ignored unless the reason is
+// named.
+func (r *BranchSweepResult) StaleMarkCount() int {
+	if r == nil {
+		return 0
+	}
+	n := 0
+	for _, f := range r.Findings {
+		if f.SupersededStale {
+			n++
+		}
+	}
+	return n
+}
+
 // HygieneUnreachableCount is how many landed branches nothing will ever delete.
 //
 // It is counted apart from AttentionCount because the two ask for different
@@ -236,13 +316,21 @@ func (r *BranchSweepResult) AttentionCount() int {
 // sweep cannot tell. These rows need no decision: containment is already
 // proved. They ask for a DELETION, and they will keep asking on every sweep
 // until someone performs it.
+//
+// A branch settled by a marker is NOT counted, and the row keeps
+// HygieneUnreachable set: the measurement is still true — hygiene still cannot
+// delete it — but the deletion it was asking for has been answered. On the rig
+// that motivated the marker the answer was explicitly "keep the branch": the
+// commits are the only remaining copy of the work AS ORIGINALLY AUTHORED, since
+// the substance landed via different commits. Counting it would go on demanding
+// a deletion that has been ruled out, which is how a listing gets ignored.
 func (r *BranchSweepResult) HygieneUnreachableCount() int {
 	if r == nil {
 		return 0
 	}
 	n := 0
 	for _, f := range r.Findings {
-		if f.HygieneUnreachable {
+		if f.HygieneUnreachable && f.Class != BranchSweepSuperseded {
 			n++
 		}
 	}
@@ -300,6 +388,15 @@ type BranchSweepOptions struct {
 	Targets []string
 	// Prefix limits which refs are swept. Defaults to refs/heads/polecat/.
 	Prefix string
+
+	// Superseded are the durable settlement markers, keyed by branch name
+	// (without refs/heads/). They are passed IN rather than read here so the
+	// sweep stays a pure classifier over facts the caller gathered, and so a
+	// failure to read them is reported by the caller as an unmeasured column
+	// rather than silently becoming "no branch is settled".
+	//
+	// A marker only suppresses when it names the tip the sweep actually listed.
+	Superseded map[string]git.SupersededMark
 }
 
 const defaultPolecatRefPrefix = "refs/heads/polecat/"
@@ -366,7 +463,9 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 		}
 		result.Scanned++
 		if remoteDown != "" {
-			result.Findings = append(result.Findings, notComparedFinding(ref, remoteDown))
+			notCompared := notComparedFinding(ref, remoteDown)
+			applySupersededMark(&notCompared, ref, opts.Superseded)
+			result.Findings = append(result.Findings, notCompared)
 			continue
 		}
 		// Landed branches are returned too — the caller decides whether to
@@ -379,6 +478,7 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 				"%s stopped responding while comparing %s: %v — every branch after it was classified UNKNOWN WITHOUT being compared, so this sweep is a partial measurement",
 				remote, strings.TrimPrefix(ref.Name, "refs/heads/"), cmpErr))
 		}
+		applySupersededMark(&finding, ref, opts.Superseded)
 		result.Findings = append(result.Findings, finding)
 	}
 
@@ -534,6 +634,111 @@ func classifyBranch(
 	finding.Class = BranchSweepCheck
 	finding.Note = branchCheckNote(finding, mrsMeasured)
 	return finding, nil
+}
+
+// applySupersededMark folds a durable settlement marker into a finding.
+//
+// Three outcomes, and the middle one is the whole reason the marker records a
+// commit at all:
+//
+//   - No marker: the finding is untouched. This is every branch on a rig where
+//     nobody has settled anything, so it must cost nothing and change nothing.
+//
+//   - A marker naming a DIFFERENT tip than the one just listed: the branch was
+//     pushed to after it was settled, so the settlement was about content that
+//     is no longer there. The row keeps its computed class and goes on the short
+//     list, and SupersededStale is what stops that reading as "the marker was
+//     ignored". A marker that suppressed by branch NAME would hide live work
+//     behind a verdict about a commit nobody is looking at any more — the one
+//     failure mode that would make this feature worse than the noise it removes.
+//
+//   - A marker naming the listed tip: the class becomes superseded, the
+//     computed class is preserved in UnderlyingClass, and the reason travels in
+//     the note. Nothing is deleted and nothing is recomputed; the row simply
+//     stops asking a question that has been answered, in the words of whoever
+//     answered it.
+//
+// It never marks a finding superseded on its own judgement. Every suppression
+// here is the replay of a decision a person or agent already made and wrote
+// down, which is the only kind of suppression this sweep can afford.
+func applySupersededMark(finding *BranchSweepFinding, ref git.RemoteRef, marks map[string]git.SupersededMark) {
+	if finding == nil || len(marks) == 0 {
+		return
+	}
+	mark, ok := marks[finding.Branch]
+	if !ok {
+		return
+	}
+
+	if mark.StaleFor(ref.Hash) {
+		finding.SupersededStale = true
+		finding.Note += supersededStaleNote(mark, ref.Hash)
+		return
+	}
+
+	finding.UnderlyingClass = finding.Class
+	finding.Class = BranchSweepSuperseded
+	markCopy := mark
+	finding.Superseded = &markCopy
+	finding.Note = supersededNote(mark, finding.UnderlyingClass)
+}
+
+// supersededNote is the human column for a settled branch: the reason first,
+// because the reason is the artifact, then who settled it and when, then what
+// the sweep would have said without it.
+func supersededNote(mark git.SupersededMark, underlying BranchSweepClass) string {
+	var b strings.Builder
+	b.WriteString("settled: ")
+	reason := strings.TrimSpace(mark.Reason)
+	if reason == "" {
+		// A marker whose blob would not parse still suppresses — the ref is the
+		// decision — but it must not pretend to carry a derivation it lost.
+		reason = "(marker is present but its reason could not be read)"
+	}
+	b.WriteString(reason)
+	if by := strings.TrimSpace(mark.MarkedBy); by != "" {
+		b.WriteString(" [by ")
+		b.WriteString(by)
+		if at := strings.TrimSpace(mark.MarkedAt); at != "" {
+			b.WriteString(" on ")
+			b.WriteString(at)
+		}
+		b.WriteString("]")
+	} else if at := strings.TrimSpace(mark.MarkedAt); at != "" {
+		b.WriteString(" [on ")
+		b.WriteString(at)
+		b.WriteString("]")
+	}
+	if underlying != "" {
+		b.WriteString("; would otherwise be ")
+		b.WriteString(string(underlying))
+	}
+	return b.String()
+}
+
+// supersededStaleNote explains why a marked branch is STILL on the list.
+func supersededStaleNote(mark git.SupersededMark, tip string) string {
+	marked := strings.TrimSpace(mark.Commit)
+	if marked == "" {
+		marked = "an unrecorded commit"
+	} else {
+		marked = shortSHA(marked)
+	}
+	return " — NOTE: a superseded marker exists but names " + marked +
+		", and the tip is now " + shortSHA(tip) +
+		", so the branch was pushed to after it was settled and the marker does NOT apply"
+}
+
+// shortSHA abbreviates for the human column without hiding that it is a SHA.
+func shortSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	if sha == "" {
+		return "(no commit)"
+	}
+	return sha
 }
 
 // notComparedFinding is the row for a branch the sweep deliberately did not ask
@@ -714,6 +919,9 @@ func sortFindings(findings []BranchSweepFinding) {
 		BranchSweepQueued:   3,
 		BranchSweepActive:   4,
 		BranchSweepLanded:   5,
+		// Last, and it is the point: a settled branch is the one row nobody
+		// needs to read again.
+		BranchSweepSuperseded: 6,
 	}
 	sort.SliceStable(findings, func(i, j int) bool {
 		ri, rj := rank[findings[i].Class], rank[findings[j].Class]

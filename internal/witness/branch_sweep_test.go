@@ -878,3 +878,224 @@ func TestHygieneUnreachableCountOnNilResult(t *testing.T) {
 		t.Fatalf("HygieneUnreachableCount on nil = %d, want 0", got)
 	}
 }
+
+// --- superseded markers (gt-8xcg) ---------------------------------------
+//
+// The sweep re-derived the same verdict on the same branches on every cycle
+// because a correct answer had nowhere to live: 21 of 36 branches on gastown
+// came back unchanged across cycles 1, 6 and 16 of one witness session. These
+// tests pin the two halves of the remedy — a marker settles a branch, and a
+// marker stops applying the moment the branch moves under it.
+
+func supersededMark(branch, commit, reason string) git.SupersededMark {
+	return git.SupersededMark{
+		Branch:   branch,
+		Commit:   commit,
+		Reason:   reason,
+		MarkedBy: "gastown/witness",
+		MarkedAt: "2026-08-26T06:00:00Z",
+	}
+}
+
+// The acceptance case from the bead: a check row and a landed-but-not-an-
+// ancestor row, both settled, leave a short list of zero and a --deletable list
+// of zero — without either branch being deleted or reclassified by guesswork.
+func TestSweepSettlesMarkedBranchesAndStopsReportingThem(t *testing.T) {
+	g := &fakeSweepGit{
+		refs: []git.RemoteRef{
+			remoteRef("polecat/dust/gt-k3v+aaa", "sha-k3v"),
+			remoteRef("polecat/refinery/gt-aqk+ddd", "sha-aqk"),
+		},
+		status: map[string]git.BranchPreservationStatus{
+			"polecat/dust/gt-k3v+aaa":     {Preserved: false, UnpreservedPatchCount: 2},
+			"polecat/refinery/gt-aqk+ddd": {Preserved: true, Evidence: "cherry"},
+		},
+	}
+	bd := &fakeSweepBeads{issues: map[string]*beads.Issue{
+		"gt-k3v": {ID: "gt-k3v", Status: "closed"},
+		"gt-aqk": {ID: "gt-aqk", Status: "closed"},
+	}}
+
+	// Measure the same rig with no markers first. Without this the assertions
+	// below prove only that two branches are quiet, not that the MARKER is what
+	// quieted them — and "quiet" is what a broken sweep produces too.
+	before, err := SweepUnmergedPolecatBranches(g, bd, BranchSweepOptions{Targets: []string{"origin/main"}})
+	if err != nil {
+		t.Fatalf("baseline sweep: %v", err)
+	}
+	if before.AttentionCount() != 1 || before.HygieneUnreachableCount() != 1 {
+		t.Fatalf("baseline is not the state this test is about: %d to check, %d unreachable",
+			before.AttentionCount(), before.HygieneUnreachableCount())
+	}
+
+	result, err := SweepUnmergedPolecatBranches(g, bd, BranchSweepOptions{
+		Targets: []string{"origin/main"},
+		Superseded: map[string]git.SupersededMark{
+			"polecat/dust/gt-k3v+aaa":     supersededMark("polecat/dust/gt-k3v+aaa", "sha-k3v", "residual is 2 test files, both since deleted"),
+			"polecat/refinery/gt-aqk+ddd": supersededMark("polecat/refinery/gt-aqk+ddd", "sha-aqk", "superseded by gt-u5c; net contribution zero"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := result.AttentionCount(); got != 0 {
+		t.Errorf("short list is %d, want 0 — a settled branch is still being reported", got)
+	}
+	if got := result.HygieneUnreachableCount(); got != 0 {
+		t.Errorf("--deletable list is %d, want 0 — a settled branch is still asking to be deleted", got)
+	}
+	if got := result.SupersededCount(); got != 2 {
+		t.Errorf("superseded tally is %d, want 2 — suppressed rows must still be counted", got)
+	}
+	if got := result.Scanned; got != 2 {
+		t.Errorf("scanned %d, want 2 — suppression must not drop branches from the scan", got)
+	}
+	if got := result.StaleMarkCount(); got != 0 {
+		t.Errorf("stale marker tally is %d, want 0", got)
+	}
+
+	// The measurement behind each suppressed row survives, so an audit can tell
+	// a settled CHECK from a settled landed one.
+	check := findingFor(t, result, "polecat/dust/gt-k3v+aaa")
+	if check.Class != BranchSweepSuperseded {
+		t.Errorf("marked branch is %s, want superseded", check.Class)
+	}
+	if check.UnderlyingClass != BranchSweepCheck {
+		t.Errorf("underlying class is %q, want check — the measurement was destroyed, not routed", check.UnderlyingClass)
+	}
+	if check.Superseded == nil || !strings.Contains(check.Superseded.Reason, "2 test files") {
+		t.Errorf("the derivation did not travel with the finding: %+v", check.Superseded)
+	}
+	if !strings.Contains(check.Note, "2 test files") {
+		t.Errorf("note does not carry the reason, so a reader still cannot see why:\n%s", check.Note)
+	}
+
+	landed := findingFor(t, result, "polecat/refinery/gt-aqk+ddd")
+	if landed.UnderlyingClass != BranchSweepLanded {
+		t.Errorf("underlying class is %q, want landed", landed.UnderlyingClass)
+	}
+	// The row keeps the measurement even though the count excludes it: hygiene
+	// still cannot delete this branch, and that remains true after settling.
+	if !landed.HygieneUnreachable {
+		t.Error("settling a branch erased the measurement that hygiene cannot reach it")
+	}
+}
+
+// The failure mode that would make this feature worse than the noise it
+// removes: a branch settled once, then pushed to, going on being suppressed
+// while genuinely unmerged work sits on it.
+func TestSweepDoesNotSettleABranchThatMovedAfterItWasMarked(t *testing.T) {
+	g := &fakeSweepGit{
+		refs: []git.RemoteRef{remoteRef("polecat/dust/gt-k3v+aaa", "sha-NEW")},
+		status: map[string]git.BranchPreservationStatus{
+			"polecat/dust/gt-k3v+aaa": {Preserved: false, UnpreservedPatchCount: 3},
+		},
+	}
+	bd := &fakeSweepBeads{issues: map[string]*beads.Issue{"gt-k3v": {ID: "gt-k3v", Status: "closed"}}}
+
+	result, err := SweepUnmergedPolecatBranches(g, bd, BranchSweepOptions{
+		Targets: []string{"origin/main"},
+		Superseded: map[string]git.SupersededMark{
+			"polecat/dust/gt-k3v+aaa": supersededMark("polecat/dust/gt-k3v+aaa", "sha-OLD", "settled at the old tip"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	finding := findingFor(t, result, "polecat/dust/gt-k3v+aaa")
+	if finding.Class != BranchSweepCheck {
+		t.Fatalf("branch is %s, want check — a stale marker suppressed live work", finding.Class)
+	}
+	if result.AttentionCount() != 1 {
+		t.Errorf("short list is %d, want 1", result.AttentionCount())
+	}
+	if result.SupersededCount() != 0 {
+		t.Errorf("a stale marker was counted as a settlement")
+	}
+	if !finding.SupersededStale || result.StaleMarkCount() != 1 {
+		t.Errorf("the stale marker is invisible: SupersededStale=%v, tally=%d", finding.SupersededStale, result.StaleMarkCount())
+	}
+	// A marked branch that is still on the list reads as a marker being ignored
+	// unless the row says which commit was settled and which is now the tip.
+	for _, want := range []string{"sha-OLD", "sha-NEW", "pushed to after it was settled"} {
+		if !strings.Contains(finding.Note, want) {
+			t.Errorf("note does not explain why the marker did not apply (missing %q):\n%s", want, finding.Note)
+		}
+	}
+	if finding.Superseded != nil {
+		t.Error("a stale marker was attached as though it applied")
+	}
+}
+
+// A marker for a branch nobody else touched must change nothing about any other
+// branch — the suppression is per-row, not a mode the sweep enters.
+func TestSweepLeavesUnmarkedBranchesAlone(t *testing.T) {
+	g := &fakeSweepGit{
+		refs: []git.RemoteRef{
+			remoteRef("polecat/dust/gt-k3v+aaa", "sha-k3v"),
+			remoteRef("polecat/crater/gt-dr6t+ccc", "sha-dr6t"),
+		},
+		status: map[string]git.BranchPreservationStatus{
+			"polecat/dust/gt-k3v+aaa":    {Preserved: false, UnpreservedPatchCount: 2},
+			"polecat/crater/gt-dr6t+ccc": {Preserved: false, UnpreservedPatchCount: 3},
+		},
+	}
+	bd := &fakeSweepBeads{issues: map[string]*beads.Issue{
+		"gt-k3v":  {ID: "gt-k3v", Status: "closed"},
+		"gt-dr6t": {ID: "gt-dr6t", Status: "closed"},
+	}}
+
+	result, err := SweepUnmergedPolecatBranches(g, bd, BranchSweepOptions{
+		Targets: []string{"origin/main"},
+		Superseded: map[string]git.SupersededMark{
+			"polecat/dust/gt-k3v+aaa": supersededMark("polecat/dust/gt-k3v+aaa", "sha-k3v", "settled"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	other := findingFor(t, result, "polecat/crater/gt-dr6t+ccc")
+	if other.Class != BranchSweepCheck {
+		t.Errorf("an unmarked branch is %s, want check", other.Class)
+	}
+	if other.Superseded != nil || other.SupersededStale || other.UnderlyingClass != "" {
+		t.Errorf("an unmarked branch picked up marker state: %+v", other)
+	}
+	if result.AttentionCount() != 1 {
+		t.Errorf("short list is %d, want 1 — exactly the unmarked branch", result.AttentionCount())
+	}
+}
+
+// A settled branch sorts last, because it is the row nobody needs to read again.
+func TestSweepSortsSettledBranchesLast(t *testing.T) {
+	g := &fakeSweepGit{
+		refs: []git.RemoteRef{
+			remoteRef("polecat/aaa/gt-1+aaa", "sha-1"),
+			remoteRef("polecat/zzz/gt-2+bbb", "sha-2"),
+		},
+		status: map[string]git.BranchPreservationStatus{
+			"polecat/aaa/gt-1+aaa": {Preserved: false, UnpreservedPatchCount: 1},
+			"polecat/zzz/gt-2+bbb": {Preserved: false, UnpreservedPatchCount: 1},
+		},
+	}
+	bd := &fakeSweepBeads{issues: map[string]*beads.Issue{
+		"gt-1": {ID: "gt-1", Status: "closed"},
+		"gt-2": {ID: "gt-2", Status: "closed"},
+	}}
+
+	result, err := SweepUnmergedPolecatBranches(g, bd, BranchSweepOptions{
+		Targets: []string{"origin/main"},
+		Superseded: map[string]git.SupersededMark{
+			"polecat/aaa/gt-1+aaa": supersededMark("polecat/aaa/gt-1+aaa", "sha-1", "settled"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if result.Findings[0].Branch != "polecat/zzz/gt-2+bbb" {
+		t.Errorf("settled branch did not sort last: %v", []string{result.Findings[0].Branch, result.Findings[1].Branch})
+	}
+}

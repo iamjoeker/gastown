@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gt patrol branches` can be told a branch is settled, and remembers** (gt-8xcg).
+  The sweep re-derived every verdict on every run because a correct answer had
+  nowhere to live. Measured on gastown: 39 branches scanned, and 22 of them — 6
+  on the CHECK list, 16 landed-but-not-an-ancestor — came back unchanged across
+  cycles 1, 6 and 16 of a single witness session. The sweep cannot tell
+  "superseded — correctly closed, branch redundant" from "closed prematurely —
+  work stranded", so every new reader re-did the whole classification to learn
+  which it was. Two agents independently settled the same five branches by
+  different instruments within an hour of each other; both derivations were
+  correct and both were discarded.
+
+  `gt patrol branches mark <branch> -m "why"` records the settlement,
+  `unmark` takes it back, `marks` lists them, and `--superseded` shows what has
+  been settled next to the tips it was settled against. A marked branch is
+  classified `superseded`, drops off the short list and out of `--deletable`,
+  and its reason travels in the note. The class it would otherwise have had is
+  kept on the row, so an audit can still tell a settled check from a settled
+  landed one. A reason is required: a marker carrying only the verdict
+  reproduces the original defect one level up.
+
+  The marker lives in git — a ref under `refs/gt/superseded/<branch>` pointing
+  at a blob of JSON — because the governing constraint is a lifetime one: the
+  marker must live at least as long as the thing it marks. A branch persists
+  indefinitely; a wisp is purged at 168h and the purge takes `wisp_events`,
+  `wisp_comments` AND `wisp_labels` with it, so any marker held there is
+  guaranteed to die before the branch it describes, by configuration rather than
+  by bug. A ref shares its lifetime with the branch structurally, travels with
+  the repo, survives every Dolt operation, and costs no database round trip.
+
+  The marker names the exact commit it settles, and suppression is conditional
+  on that still being the tip. Push to a settled branch and the marker stops
+  applying, the row returns to the short list, and the sweep says which commit
+  was settled and which is now the tip — a marker can never hide work that
+  arrived after it. Suppressed rows are tallied in the summary and in JSON
+  (`superseded`, `stale_marks`), and a marker store that cannot be read is
+  reported as UNMEASURED rather than as a rig with no markers.
+
 - **`gt mol await-signal` filters the activity feed by rig** (gt-p54t). The feed
   is one town-wide file, and await-signal returned on the first new line
   whatever produced it — so an idle rig's witness woke on every event every rig
