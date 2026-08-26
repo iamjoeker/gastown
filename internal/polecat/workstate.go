@@ -393,6 +393,35 @@ type WorkstateInput struct {
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
 
+	// SourceCloseDischargesMQ records that the polecat's source bead was closed
+	// with an explicit terminal category — duplicate, no-changes, superseded —
+	// declaring that no merge request will ever be created for it. See
+	// CloseReasonDischargesMergeQueue.
+	//
+	// It exists because HasSubmittableWork is a DIVERGENCE measure, not a pending-
+	// work measure, and the classifier below has no other way to tell the two
+	// apart. hasSubmittableWorkForWorkstate asks `git cherry` whether the branch
+	// holds patches the target lacks, which is true of every branch that was cut,
+	// committed on, and then abandoned — and it stays true no matter what the
+	// polecat does next. Measured on beads/polecats/ace: HEAD identical to its
+	// remote ref, nothing uncommitted, two "unpreserved" patches, and a diff
+	// against main of 130 files / +235 / -9399. The branch was 43 commits BEHIND;
+	// its 235 insertions were the fork point's older formulation of settings main
+	// had since restructured, so submitting it would have reverted main. Its bead
+	// was closed "duplicate: same bug as bd-8ob".
+	//
+	// So mq-not-submitted fired correctly on a fact that was correctly measured
+	// and answered the wrong question, and there was no state the polecat could
+	// reach that cleared it: the gate reconsidered and refused the same slot on
+	// every dispatch, forever (gt-xm6w).
+	//
+	// Acting on it is safe only because of where it is read. By the time the
+	// merge-queue tail runs, the blocker tail above has already required
+	// UnpushedCommits == 0 from a MEASURED BranchPreservationStatus — every commit
+	// on the branch is durable on the remote. This flag then supplies the second
+	// half: the branch is not merely safe to leave, it is unwanted.
+	SourceCloseDischargesMQ bool
+
 	// AssignedWorkBead is the ISSUE STORE's answer to "what hooked, non-terminal
 	// work does this polecat hold" — the bead found by querying for hooked issues
 	// assigned to it, not a field copied off its agent bead.
@@ -537,6 +566,9 @@ type WorkstateDisposition struct {
 //	      git-unpushed        UnpushedCommits > 0
 //	(b) mq-lookup-failed          MQCheckRequired && MQLookupFailed
 //	(c) mq-not-submitted          MQCheckRequired, submittable work, no MR
+//	(c') mq-not-submitted-closed-source  as (c), and the source bead is already
+//	    closed without declaring the work unwanted, so no gt done will ever queue
+//	    it and the refusal repeats on every dispatch (gt-xm6w)
 //	(d) mq-refused-closed-source  MRRefused && !MRSubmitted, unresolved
 //	(e) stalled-session-pending-mr  an open MR over a MEASURED-absent session that
 //	    is still holding work — see sessionAbsentHoldingWork
@@ -880,6 +912,32 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.MQStatus = "not_required"
 		} else if in.MRSubmitted {
 			d.MQStatus = "submitted"
+		} else if in.SourceCloseDischargesMQ {
+			// The source bead was closed AS PRODUCING NOTHING. No `gt done` will
+			// ever queue this branch (gt done refuses an MR against a closed source
+			// issue, gt-7qm), so the requirement cannot be discharged by submitting
+			// — only by saying out loud that it was never owed. See
+			// WorkstateInput.SourceCloseDischargesMQ for why this is safe here and
+			// nowhere earlier.
+			d.MQStatus = "not_required_source_closed"
+		} else if in.AssignedBeadTerminal {
+			// Same shape, no declaration. The bead is closed, so nothing will
+			// submit this branch either — but the closure did not say the work was
+			// unwanted, so this still blocks exactly as hard as mq-not-submitted.
+			// Only the words change, and they change because they are what
+			// pool_reuse_refused records: refused as "mq-not-submitted" this slot
+			// reads like a polecat that merely has not got round to submitting yet,
+			// and a reader has no way to see that the same refusal will repeat on
+			// every dispatch until a human intervenes (gt-xm6w).
+			d.Verdict = WorkstateVerdictNeedsMQSubmit
+			d.Reason = "mq-not-submitted-closed-source"
+			d.NeedsRecovery = true
+			d.NeedsMQSubmit = true
+			d.MQStatus = "not_submitted_closed_source"
+			d.CountsTowardCapacity = true
+			d.ReuseStatus = ReuseStatusRecoveryNeeded
+			d.Blockers = append(d.Blockers, "mq_status=not_submitted_closed_source (branch holds unsubmitted patches and the source bead is already closed, so no gt done will queue them; this refusal repeats on every dispatch until the branch is submitted by hand or the slot is released deliberately)")
+			return d
 		} else {
 			d.Verdict = WorkstateVerdictNeedsMQSubmit
 			d.Reason = "mq-not-submitted"
@@ -906,7 +964,12 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	// conclude the work is safe (gt-46rk).
 	if in.MRRefused && !in.MRSubmitted {
 		checked := in.MQCheckRequired && !in.MQLookupFailed
-		resolved := checked && (!in.HasSubmittableWork || in.MQNotRequired)
+		// SourceCloseDischargesMQ discharges the refusal for the same reason it
+		// discharges the requirement above, and is gated on `checked` alongside the
+		// other two: the declaration says the work is unwanted, but only a caller
+		// that actually ran the git and queue checks has established that there is
+		// nothing else at risk (gt-46rk).
+		resolved := checked && (!in.HasSubmittableWork || in.MQNotRequired || in.SourceCloseDischargesMQ)
 		if !resolved {
 			d.Verdict = WorkstateVerdictNeedsMQSubmit
 			d.NeedsRecovery = true

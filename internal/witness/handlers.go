@@ -1134,6 +1134,7 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = witnessMQNotRequiredSource(rigBeads, issueID)
+	input.SourceCloseDischargesMQ = witnessSourceCloseDischargesMQ(rigBeads, issueID)
 	// A terminal source bead no longer skips this lookup: the closed bead IS the
 	// stranding signature, so skipping it blinded the check to both directions
 	// of the fact — no MR at all, and an MR someone else submitted (gt-46rk).
@@ -1306,6 +1307,25 @@ func witnessMQNotRequiredSource(bd *beads.Beads, issueID string) bool {
 		return false
 	}
 	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
+}
+
+// witnessSourceCloseDischargesMQ is the witness-side twin of
+// (*polecat.Manager).sourceCloseDischargesMQ. It reads the CLOSE REASON, which
+// witnessIssueTerminal above deliberately does not: both a merged bead and a
+// duplicate are terminal, and only one of them says the branch is unwanted
+// (gt-xm6w).
+func witnessSourceCloseDischargesMQ(bd *beads.Beads, issueID string) bool {
+	if bd == nil || issueID == "" {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	if !beads.IssueStatus(issue.Status).IsTerminal() {
+		return false
+	}
+	return polecat.CloseReasonDischargesMergeQueue(issue.CloseReason)
 }
 
 func witnessHasSubmittableWork(worktreePath string, targetRefs []string) bool {

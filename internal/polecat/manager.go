@@ -2597,6 +2597,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = m.mqNotRequiredSource(workIssue)
+	input.SourceCloseDischargesMQ = m.sourceCloseDischargesMQ(workIssue)
 	// A terminal source bead no longer skips this lookup: the closed bead IS the
 	// stranding signature, so skipping it blinded the check to both directions
 	// of the fact — no MR at all, and an MR someone else submitted (gt-46rk).
@@ -2670,6 +2671,33 @@ func (m *Manager) mqNotRequiredSource(issueID string) bool {
 	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
 }
 
+// sourceCloseDischargesMQ reads the source bead's CLOSE REASON — not merely its
+// status — and reports whether it declares that no merge request was ever owed.
+//
+// Status alone is the wrong instrument and was already available here as
+// AssignedBeadTerminal: a bead closed because its work merged and a bead closed
+// as a duplicate are both terminal and mean opposite things about the branch
+// still sitting in the polecat's sandbox (gt-xm6w).
+func (m *Manager) sourceCloseDischargesMQ(issueID string) bool {
+	if issueID == "" {
+		return false
+	}
+	issue, err := m.beads.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	if !beads.IssueStatus(issue.Status).IsTerminal() {
+		return false
+	}
+	return CloseReasonDischargesMergeQueue(issue.CloseReason)
+}
+
+// hasSubmittableWorkForWorkstate answers "does this branch hold patches the
+// target lacks", which is NOT the same question as "does this branch hold work
+// still owed to the merge queue" — it is a divergence measure, and a branch
+// abandoned behind main keeps answering yes forever. Nothing here can tell the
+// two apart; the discharge that can lives in the classifier, on
+// WorkstateInput.SourceCloseDischargesMQ (gt-xm6w).
 func hasSubmittableWorkForWorkstate(worktreePath string, targetRefs []string) bool {
 	g := git.NewGit(worktreePath)
 	branch, _ := g.CurrentBranch()

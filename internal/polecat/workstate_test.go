@@ -95,9 +95,71 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "submitted", ReuseStatus: "idle-preserved"},
 		},
 		{
+			// Everything that DECIDES here is what it always was — the polecat is
+			// still refused, still counted, still NEEDS_MQ_SUBMIT. Only the words
+			// changed, and they changed because the words are what
+			// pool_reuse_refused records: this refusal will repeat identically on
+			// every dispatch, because nothing submits a branch whose source bead is
+			// already closed, and "mq-not-submitted" reads like a polecat that
+			// simply has not got round to it yet (gt-xm6w).
 			name: "terminal source alone does not prove mq submitted",
 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-not-submitted", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "not_submitted", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-not-submitted-closed-source", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "not_submitted_closed_source", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+		},
+		{
+			// THE gt-xm6w CASE. beads/polecats/ace: HEAD identical to its remote
+			// ref, nothing uncommitted, two patches `git cherry` calls unpreserved,
+			// and a branch 43 commits BEHIND main whose merge would have reverted
+			// 9399 lines. Its bead was closed "duplicate: same bug as bd-8ob".
+			//
+			// HasSubmittableWork is TRUE here on purpose: the fact is correctly
+			// measured and answers the wrong question, and no state the polecat can
+			// reach makes it false. The discharge is the only road out.
+			name: "source closed as producing nothing releases the slot",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/ace/bd-byk", MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true, SourceCloseDischargesMQ: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "not_required_source_closed", ReuseStatus: ReuseStatusPreserved},
+		},
+		{
+			// gt done records mr_refused on exactly this road (gt-46rk): it made no
+			// MR BECAUSE the source was closed. The discharge has to clear that too,
+			// or the slot moves from one permanent blocker to another and nothing
+			// observable changes.
+			name: "source closed as producing nothing also discharges the recorded mr refusal",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/ace/bd-byk", MRRefused: true, MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true, SourceCloseDischargesMQ: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "not_required_source_closed", ReuseStatus: ReuseStatusPreserved},
+		},
+		{
+			// The discharge is a claim about the QUEUE, never about the worktree.
+			// Local work at risk still outranks it — the blocker tail runs first and
+			// must keep winning, because the whole safety argument for acting on the
+			// discharge is that git has already proved nothing is at risk.
+			name: "uncommitted work outranks the close-reason discharge",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/ace/bd-byk", GitDirty: true, GitDirtyReason: "git_state=has_uncommitted uncommitted_files=1", MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true, SourceCloseDischargesMQ: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-dirty", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_uncommitted uncommitted_files=1"}},
+		},
+		{
+			// Same for unpushed commits: the discharge says the work is unwanted,
+			// not that it is durable, and only the second fact makes releasing the
+			// slot non-destructive.
+			name: "unpushed commits outrank the close-reason discharge",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/ace/bd-byk", UnpushedCommits: 2, MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true, SourceCloseDischargesMQ: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_unpushed unpushed_commits=2"}},
+		},
+		{
+			// A surface that never consulted the queue does not get to act on the
+			// discharge either: mr_refused fires on bead facts alone, and the
+			// unchecked road must stay conservative exactly as it was (gt-46rk).
+			name: "the close-reason discharge does not rescue an unchecked mr refusal",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/ace/bd-byk", MRRefused: true, AssignedBeadTerminal: true, SourceCloseDischargesMQ: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-refused-unchecked", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "refused_closed_source_unchecked", CountsTowardCapacity: true, ReuseStatus: ReuseStatusMQUnchecked},
+		},
+		{
+			// And an OPEN source bead keeps the original vocabulary: that polecat
+			// can still be recovered and its work submitted, so the condition is
+			// genuinely transient and must not be reported as stranded.
+			name: "an open source bead keeps the plain mq-not-submitted reason",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, HasSubmittableWork: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-not-submitted", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "not_submitted", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"mq_status=not_submitted"}},
 		},
 		{
 			name: "dirty worktree blocks terminal source",

@@ -1843,6 +1843,7 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	input.AssignedBeadTerminal = beadTerminal
 	input.HasSubmittableWork = hasSubmittableWorkForRecovery(worktreePath, targetRefs, gitState, gitErr)
 	input.MQNotRequired = isMQNotRequiredSource(bd, status.Issue)
+	input.SourceCloseDischargesMQ = sourceCloseDischargesMQForRecovery(bd, status.Issue)
 	if targetRefLookupFailed {
 		input.MQLookupFailed = true
 	}
@@ -2361,6 +2362,25 @@ func isAssignedBeadTerminal(bd *beads.Beads, issueID string) bool {
 		return false
 	}
 	return beads.IssueStatus(issue.Status).IsTerminal()
+}
+
+// sourceCloseDischargesMQForRecovery reads the source bead's CLOSE REASON,
+// which isAssignedBeadTerminal above deliberately does not. Both a merged bead
+// and one closed as a duplicate are terminal, and only the second declares that
+// the branch still in the sandbox is unwanted — the distinction that decides
+// whether the slot is stranded forever (gt-xm6w).
+func sourceCloseDischargesMQForRecovery(bd issueShower, issueID string) bool {
+	if issueID == "" || bd == nil {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	if !beads.IssueStatus(issue.Status).IsTerminal() {
+		return false
+	}
+	return polecat.CloseReasonDischargesMergeQueue(issue.CloseReason)
 }
 
 // isMQNotRequiredSource reports whether the source bead intentionally bypasses
