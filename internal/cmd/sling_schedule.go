@@ -182,7 +182,28 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return closedBeadError(beadID, owner)
 	}
 
-	if (info.Status == "pinned" || info.Status == "hooked" || info.Status == "in_progress") && !opts.Force {
+	// Reclaim a hook whose holder is confirmed dead (gt-s1id).
+	//
+	// runSling (sling.go) and executeSling (sling_dispatch.go) have auto-forced
+	// past a dead assignee since gt-pqf9x/gt-npzy. Deferred dispatch routes
+	// around both: the daemon's convoy feeder runs `gt sling <bead> <rig>` with
+	// no --force, and with scheduler.max_polecats > 0 that lands here, where the
+	// check was missing. A polecat whose session died holding the hook therefore
+	// stranded its convoy permanently — the feeder retried the identical sling
+	// every 30s and logged the identical failure forever, and only a human
+	// noticing ever cleared it. Reproduced twice in one evening on one polecat.
+	//
+	// Bypassing the gate is not enough, and on its own would be worse: the
+	// scheduler dispatches a context only when its work bead is "open"
+	// (isScheduledWorkBeadReady), and cleanupStaleContexts closes any context
+	// whose work bead is "hooked" as "stale-work-bead". Enqueueing a still-hooked
+	// bead buys a context that is reaped before it can run — turning a loud
+	// livelock into a silent one. So release the hook here, and only then queue.
+	staleHookHolder := ""
+	if (info.Status == "hooked" || info.Status == "in_progress") && info.Assignee != "" && isHookedAgentDeadFn(info.Assignee) {
+		staleHookHolder = info.Assignee
+	}
+	if (info.Status == "pinned" || info.Status == "hooked" || info.Status == "in_progress") && !opts.Force && staleHookHolder == "" {
 		return fmt.Errorf("bead %s is already %s to %s\nUse --force to override", beadID, info.Status, info.Assignee)
 	}
 
@@ -202,11 +223,27 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 
 	if opts.DryRun {
 		fmt.Printf("Would schedule %s → %s\n", beadID, rigName)
+		if staleHookHolder != "" {
+			fmt.Printf("  Would release stale hook from %s (no active session)\n", staleHookHolder)
+		}
 		fmt.Printf("  Would create sling context bead\n")
 		if !opts.NoConvoy {
 			fmt.Printf("  Would create auto-convoy\n")
 		}
 		return nil
+	}
+
+	// Release the stale hook now that every gate above has passed — in
+	// particular checkPriorWorkGuard, which still sees opts.Force and so still
+	// refuses a bead whose branch is already queued to merge. A dead polecat is
+	// exactly how a bead ends up hooked with its work already pushed, and
+	// re-dispatching that is duplicate work, not recovery.
+	if staleHookHolder != "" {
+		if err := releaseStaleHookForSchedule(townRoot, beadID, staleHookHolder, info.Status); err != nil {
+			return err
+		}
+		info.Status = "open"
+		info.Assignee = ""
 	}
 
 	// Cook formula after dry-run check to avoid side effects
@@ -287,6 +324,43 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	_ = events.LogFeed(events.TypeSchedulerEnqueue, actor, events.SchedulerEnqueuePayload(beadID, rigName))
 
 	fmt.Printf("%s Scheduled %s → %s (context: %s)\n", style.Bold.Render("✓"), beadID, rigName, ctxBead.ID)
+	return nil
+}
+
+// releaseStaleHookForSchedule returns a bead held by a dead agent to open and
+// unassigned, so the capacity scheduler can dispatch it (gt-s1id).
+//
+// The write is verified by re-reading the row. An unverified release is worse
+// than a failed one here: the caller goes on to create a sling context, and a
+// context whose work bead is still hooked is closed as "stale-work-bead" on the
+// next cleanup pass — so a silently-ineffective release would report "Scheduled"
+// for work that can never be dispatched. Failing loudly leaves the convoy
+// visibly stranded, which is what the feeder's retry is for.
+func releaseStaleHookForSchedule(townRoot, beadID, holder, priorStatus string) error {
+	fmt.Printf("%s Hooked agent %s has no active session, releasing stale hook on %s...\n",
+		style.Warning.Render("⚠"), holder, beadID)
+
+	unhookDir := beads.ResolveHookDir(townRoot, beadID, "")
+	if out, err := BdCmd("update", beadID, "--status=open", "--assignee=").
+		Dir(unhookDir).
+		WithAutoCommit().
+		CombinedOutput(); err != nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			err = fmt.Errorf("%w: %s", err, trimmed)
+		}
+		return fmt.Errorf("releasing stale hook on %s from dead agent %s: %w", beadID, holder, err)
+	}
+
+	verified, err := getBeadInfoFromTownRoot(townRoot, beadID)
+	if err != nil {
+		return fmt.Errorf("verifying stale hook release on %s: %w", beadID, err)
+	}
+	if verified.Status == "hooked" || verified.Status == "in_progress" {
+		return fmt.Errorf("stale hook release on %s did not take: still %s to %q (was %s to %s)\nThe bead lives in %s — release it there before re-slinging",
+			beadID, verified.Status, verified.Assignee, priorStatus, holder, unhookDir)
+	}
+
+	fmt.Printf("%s Released %s from %s (now %s)\n", style.Dim.Render("○"), beadID, holder, verified.Status)
 	return nil
 }
 
