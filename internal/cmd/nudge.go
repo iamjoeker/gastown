@@ -51,8 +51,10 @@ const (
 	// NudgeModeImmediate sends directly via tmux send-keys (current behavior).
 	// This interrupts in-flight work but guarantees immediate delivery.
 	NudgeModeImmediate = "immediate"
-	// NudgeModeQueue writes to a file queue; agent picks up via hook at next
-	// turn boundary. Zero interruption but delivery depends on agent turn frequency.
+	// NudgeModeQueue writes to a file queue; the agent picks it up via its hook
+	// at the next turn boundary, or via the background nudge-poller that
+	// ensureQueueDrain guarantees is running. Zero interruption either way —
+	// the poller injects only once the pane is idle.
 	NudgeModeQueue = "queue"
 	// NudgeModeWaitIdle waits for the agent to become idle (prompt visible),
 	// then delivers directly. Falls back to queue on timeout. Best of both worlds.
@@ -84,16 +86,20 @@ Delivery modes (--mode):
              directly. Falls back to queue on timeout. If both idle-wait and
              queue fail, falls back to immediate delivery as a last resort.
              This is the default — it avoids interrupting active tool calls.
-  queue      Write to a file queue; agent picks up via hook at next turn
-             boundary. Zero interruption. Use for non-urgent coordination.
+  queue      Write to a file queue; the agent picks it up at its next turn
+             boundary, or via the nudge-poller if it is parked and takes no
+             further turn. Zero interruption. Use for non-urgent coordination.
   immediate  Send directly via tmux send-keys. Interrupts in-flight work
              but guarantees immediate delivery. Use only when you need to
              break through (e.g., stuck agent, emergency).
 
 Queue and wait-idle modes require a drain mechanism. Claude agents drain
-via UserPromptSubmit hook; other agents use a background nudge-poller
-that periodically drains and injects via tmux. If neither is available,
-use --mode=immediate.
+via UserPromptSubmit hook, but that hook fires only when the agent takes
+another turn — an agent parked at its prompt never does. So queue mode
+also ensures a background nudge-poller is running for the target, which
+drains and injects via tmux once the pane is idle (still no interruption).
+If no drain can be established, the nudge stays queued and the command
+exits non-zero rather than reporting delivery.
 
 This is the ONLY way to send messages to Claude sessions.
 Do not use raw tmux send-keys elsewhere.
@@ -170,7 +176,8 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 	// Use the requested mode, but force queue mode for ACP sessions.
 	// ACP agents don't have tmux panes to send-keys to.
 	mode := nudgeModeFlag
-	if hasACPSessionByName(townRoot, sessionName) {
+	isACP := hasACPSessionByName(townRoot, sessionName)
+	if isACP {
 		mode = NudgeModeQueue
 	}
 
@@ -184,11 +191,14 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		if townRoot == "" {
 			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
 		}
-		return nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 			Sender:   sender,
 			Message:  message,
 			Priority: nudgePriorityFlag,
-		})
+		}); err != nil {
+			return err
+		}
+		return ensureQueueDrain(townRoot, sessionName, isACP)
 
 	case NudgeModeWaitIdle:
 		if townRoot == "" {
@@ -297,6 +307,70 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		}
 		return t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
 	}
+}
+
+// Injection points for ensureQueueDrain, so its decision can be tested without
+// spawning a real poller process or reading a real PID file.
+var (
+	queueDrainPollerAlive = nudge.PollerAlive
+	queueDrainStartPoller = nudge.StartPoller
+)
+
+// ensureQueueDrain guarantees that a nudge just written to the file queue has
+// something that will take it back OUT again, and returns an error naming the
+// case when it cannot.
+//
+// Enqueue succeeding means the file was written. It says nothing about whether
+// anyone will read it. Exactly two things drain the queue:
+//
+//   - the agent's own turn-boundary hook (Claude's UserPromptSubmit), which
+//     fires when the agent submits a prompt; and
+//   - a background nudge-poller, which polls every 10s and injects via tmux
+//     once the pane is idle.
+//
+// An agent PARKED at its prompt has no next turn boundary — that is what parked
+// means — so for a parked target with no poller the first mechanism cannot fire
+// and the second does not exist. The nudge is then not unlucky or racy but
+// structurally undeliverable, and `gt nudge --mode=queue` printed
+// "✓ Nudged <target> (queue)" and exited 0 over it anyway (gt-1t0v instance 10:
+// a queued nudge to a parked polecat produced no interrupt after 12s or 72s,
+// while --mode=immediate to the same target resumed it in 20s).
+//
+// The command already knew the precondition existed — its own help says "Queue
+// and wait-idle modes require a drain mechanism ... If neither is available,
+// use --mode=immediate" — and simply never checked it.
+//
+// The sharp part, and the reason refusing outright would be the wrong fix: the
+// default mode (wait-idle) falls back through queue to immediate and would
+// eventually have worked. Queue mode is chosen DELIBERATELY, to avoid
+// interrupting possible in-flight work — so the considerate choice was the one
+// that silently failed, and "just use immediate" is bad advice because it
+// interrupts a live agent. Starting the poller supplies the missing mechanism
+// while keeping the promise: the poller waits for the pane to go idle before
+// injecting, so a queued nudge still never interrupts a turn in flight. This is
+// the same recovery `--mode=wait-idle` already performs for agents without
+// prompt detection, and the same poller `gt crew start` launches for every crew
+// session — polecat, mayor and dog sessions were simply never given one.
+//
+// Only if no drain can be established does this report failure, and then the
+// error says the payload is still queued: it is undelivered, not lost.
+func ensureQueueDrain(townRoot, sessionName string, isACP bool) error {
+	// ACP sessions have no tmux pane for a poller to inject into. Their queue is
+	// drained by the ACP propulsion loop, which is not turn-boundary-bound.
+	if isACP {
+		return nil
+	}
+	if _, alive := queueDrainPollerAlive(townRoot, sessionName); alive {
+		return nil
+	}
+	if _, err := queueDrainStartPoller(townRoot, sessionName); err != nil {
+		return fmt.Errorf("nudge queued for %s but nothing will drain it: the session has no nudge-poller "+
+			"and starting one failed (%w). A queued nudge is picked up at the agent's next turn boundary, "+
+			"which an agent parked at its prompt never reaches. The message is still in the queue and will "+
+			"be delivered if the agent takes another turn; to deliver it now, re-send with --mode=immediate",
+			sessionName, err)
+	}
+	return nil
 }
 
 // watchAndDeliver polls a session for idle state over idleWatcherTimeout.
