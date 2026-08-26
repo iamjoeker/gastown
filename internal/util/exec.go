@@ -32,11 +32,7 @@ func ExecWithOutput(workDir, cmd string, args ...string) (string, error) {
 	c.Stderr = &stderr
 
 	if err := c.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return "", fmt.Errorf("%s", errMsg)
-		}
-		return "", err
+		return "", subprocessError(err, stderr.String())
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
@@ -53,12 +49,27 @@ func ExecRun(workDir, cmd string, args ...string) error {
 	c.Stderr = &stderr
 
 	if err := c.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return fmt.Errorf("%s", errMsg)
-		}
-		return err
+		return subprocessError(err, stderr.String())
 	}
 
 	return nil
+}
+
+// subprocessError turns a failed command into the most informative error
+// available: the subprocess's own stderr when it managed to write any, and
+// otherwise a description of how it died.
+//
+// A killed process writes nothing — SIGKILL gives it no chance — so an empty
+// stderr is exactly the case where the wait status is all the information
+// there is. Reporting it as Go's bare "signal: killed" loses both the exit
+// code an operator would recognize and the fact that an unrequested SIGKILL is
+// usually the OOM killer.
+func subprocessError(err error, stderr string) error {
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		return fmt.Errorf("%s", msg)
+	}
+	if info := ClassifyExitError(err, nil); info.Signaled {
+		return fmt.Errorf("%s", info.Describe())
+	}
+	return err
 }

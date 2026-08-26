@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -460,7 +461,7 @@ if [ "$1" = "list" ]; then
       printf '%s\n' '[{"id":"issue-direct-open","title":"Direct open","description":"","status":"open","priority":2,"assignee":"gastown/synth","created_at":"2026-06-12T12:00:05Z","labels":["gt:message","from:mayor/"]},{"id":"issue-direct-hooked","title":"Direct hooked","description":"","status":"hooked","priority":2,"assignee":"gastown/synth","created_at":"2026-06-12T12:00:04Z","labels":["gt:message","from:mayor/"]},{"id":"issue-direct-closed","title":"Direct closed","description":"","status":"closed","priority":2,"assignee":"gastown/synth","created_at":"2026-06-12T12:00:03Z","labels":["gt:message","from:mayor/"]}]'
       exit 0
       ;;
-    *"--label cc:gastown/synth"*)
+    *"--label-any cc:gastown/synth"*)
       printf '%s\n' '[{"id":"issue-cc-open","title":"CC open","description":"","status":"open","priority":2,"assignee":"mayor/","created_at":"2026-06-12T12:00:02Z","labels":["gt:message","cc:gastown/synth","from:mayor/"]},{"id":"issue-cc-hooked","title":"CC hooked","description":"","status":"hooked","priority":2,"assignee":"mayor/","created_at":"2026-06-12T12:00:01Z","labels":["gt:message","cc:gastown/synth","from:mayor/"]}]'
       exit 0
       ;;
@@ -582,6 +583,94 @@ exit 1
 			t.Fatalf("generated SQL missing %q:\n%s", want, sql)
 		}
 	}
+}
+
+// Every mail poll costs one bd subprocess per query, so a mailbox whose
+// address has two forms used to pay two subprocesses for the CC half alone.
+// The forms are labels, and labels can be ORed, so one call answers both.
+func TestQueryIssueMessagesByCCUsesOneCallForAllAddressForms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	fakeBD := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_LOG"
+if [ "$1" = "list" ]; then
+  case "$*" in
+    *"--label-any cc:deacon/,cc:deacon"*)
+      printf '%s\n' '[{"id":"cc-slashed","title":"To the slashed form","description":"","status":"open","priority":2,"assignee":"mayor/","created_at":"2026-06-12T12:00:02Z","labels":["gt:message","cc:deacon/","from:mayor/"]},{"id":"cc-bare","title":"To the bare form","description":"","status":"open","priority":2,"assignee":"mayor/","created_at":"2026-06-12T12:00:01Z","labels":["gt:message","cc:deacon","from:mayor/"]}]'
+      exit 0
+      ;;
+  esac
+  printf '%s\n' 'No issues found.'
+  exit 0
+fi
+printf 'unexpected bd args: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(fakeBD, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_LOG", logPath)
+
+	m := NewMailboxWithBeadsDir("deacon/", t.TempDir(), t.TempDir())
+	forms := beads.AgentAddressForms("deacon/")
+	if len(forms) != 2 {
+		t.Fatalf("premise check: deacon/ must have two address forms, got %v", forms)
+	}
+
+	msgs := m.queryIssueMessagesByCC(t.TempDir(), forms)
+
+	got := make(map[string]bool, len(msgs))
+	for _, msg := range msgs {
+		got[msg.ID] = true
+	}
+	// Both forms must still be found — collapsing the calls must not collapse
+	// the coverage.
+	for _, id := range []string{"cc-slashed", "cc-bare"} {
+		if !got[id] {
+			t.Fatalf("missing %s; merging the queries lost an address form: %v", id, got)
+		}
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	if n := strings.Count(string(logBytes), "list "); n != 1 {
+		t.Fatalf("bd list calls = %d, want 1; log:\n%s", n, string(logBytes))
+	}
+}
+
+func TestCCLabelBatches(t *testing.T) {
+	t.Run("all forms in one batch", func(t *testing.T) {
+		got := ccLabelBatches([]string{"deacon/", "deacon"})
+		want := [][]string{{"cc:deacon/", "cc:deacon"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	// bd's --label-any is comma-separated, so a comma in an address would
+	// silently become two labels that match nothing. One call per form is the
+	// old behaviour and still correct.
+	t.Run("an address containing a comma falls back to one batch per form", func(t *testing.T) {
+		got := ccLabelBatches([]string{"rig/a,b", "rig/c"})
+		want := [][]string{{"cc:rig/a,b"}, {"cc:rig/c"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("no identities means no calls", func(t *testing.T) {
+		if got := ccLabelBatches(nil); got != nil {
+			t.Fatalf("got %v, want nil", got)
+		}
+	})
 }
 
 func TestSQLStringListEscapesSQLLiterals(t *testing.T) {

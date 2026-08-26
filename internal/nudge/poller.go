@@ -83,8 +83,12 @@ func StartPoller(townRoot, session string) (int, error) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write poller PID file: %v\n", err)
 	}
 
-	// Release the process so it runs independently.
-	_ = cmd.Process.Release()
+	// Reap in the background so the poller cannot linger as a zombie. Release
+	// was here before and does not do this job: it drops Go's handle on the
+	// process without collecting its wait status, so the corpse stays in the
+	// process table until the spawner — a crew manager, i.e. the daemon —
+	// exits. The PID above stays valid; ReapDetached takes only the wait.
+	util.ReapDetached(cmd)
 
 	return pid, nil
 }

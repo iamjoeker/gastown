@@ -171,7 +171,7 @@ if [ "$1" = "list" ]; then
       printf '%s\n' '[{"id":"issue-mine","title":"Mine","description":"","status":"open","priority":2,"assignee":"gastown/witness","created_at":"2026-08-18T01:00:00Z","labels":["gt:message","from:mayor/","cc-cleared:gastown/witness"]}]'
       exit 0
       ;;
-    *"--label cc:gastown/witness"*)
+    *"--label-any cc:gastown/witness"*)
       printf '%s\n' '[{"id":"issue-cc-live","title":"CC live","description":"","status":"open","priority":2,"assignee":"beads/refinery","created_at":"2026-08-18T00:59:00Z","labels":["gt:message","from:mayor/","cc:gastown/witness"]},{"id":"issue-cc-cleared","title":"CC cleared","description":"","status":"open","priority":2,"assignee":"beads/refinery","created_at":"2026-08-18T00:58:00Z","labels":["gt:message","from:mayor/","cc:gastown/witness","cc-cleared:gastown/witness"]}]'
       exit 0
       ;;

@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/web"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -197,5 +198,11 @@ func openBrowser(url string) {
 	default:
 		return
 	}
-	_ = cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	// The dashboard outlives the browser launcher, so the launcher's exit
+	// status has to be collected or it becomes a zombie child of a
+	// long-running process.
+	util.ReapDetached(cmd)
 }

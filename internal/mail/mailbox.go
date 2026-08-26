@@ -254,12 +254,36 @@ func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []str
 	return messages, nil
 }
 
+// queryIssueMessagesByCC fetches messages where any of this agent's address
+// forms appears as a CC recipient.
+//
+// The address forms are ORed inside a single bd call rather than run as one
+// call per form. Every mail poll spawns a bd subprocess per query, and bd
+// subprocesses are the unit of load on Dolt.
+//
+// The saving is narrow and worth stating exactly: beads.AgentAddressForms
+// returns two forms only for the town-level singleton roles — "deacon/" and
+// "deacon", "mayor/" and "mayor" — and one form for everyone else. So this
+// removes one bd subprocess per poll from the mayor's and the deacon's
+// mailboxes, which are the two busiest in the town, and changes nothing for a
+// polecat. It also makes the CC query shape independent of how many forms an
+// address grows later.
+//
+// The direct-recipient half cannot be folded in the same way: it selects on
+// --assignee, which takes a single value and is ANDed with labels, so it
+// cannot be ORed against a cc: label. Merging the two halves into one call
+// would require the recipient to be carried as a to:<agent> LABEL as well as
+// an assignee, and no message carries one today (verified against the live
+// store: 0 of 2576 gt:message beads have any to: label, while 188 carry cc:
+// and all 2576 carry from:, so the query is not blind). Adding the label at
+// send time would only help mail sent afterwards; every existing message would
+// silently drop out of a merged query.
 func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) []BeadsMessage {
 	var messages []BeadsMessage
-	for _, id := range identities {
+	for _, batch := range ccLabelBatches(identities) {
 		args := []string{"list",
 			"--label", "gt:message",
-			"--label", "cc:" + id,
+			"--label-any", strings.Join(batch, ","),
 			"--json",
 			"--limit", "0",
 		}
@@ -277,6 +301,31 @@ func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) [
 		messages = append(messages, msgs...)
 	}
 	return messages
+}
+
+// ccLabelBatches turns identities into the cc: label sets to query.
+//
+// Normally that is one batch holding every form, answered by a single bd call.
+// bd's --label-any takes a comma-separated list, so an identity containing a
+// comma would be split into two labels that match nothing; such an identity
+// falls back to one batch per form, which is what this code did for every
+// identity before.
+func ccLabelBatches(identities []string) [][]string {
+	labels := make([]string, 0, len(identities))
+	for _, id := range identities {
+		if strings.Contains(id, ",") {
+			batches := make([][]string, 0, len(identities))
+			for _, one := range identities {
+				batches = append(batches, []string{"cc:" + one})
+			}
+			return batches
+		}
+		labels = append(labels, "cc:"+id)
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return [][]string{labels}
 }
 
 func parseBeadsListOutput(stdout []byte) ([]BeadsMessage, error) {

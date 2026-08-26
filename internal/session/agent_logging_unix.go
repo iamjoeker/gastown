@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // ActivateAgentLogging spawns a detached `gt agent-log` process to stream the
@@ -73,6 +75,14 @@ func ActivateAgentLogging(sessionID, workDir, runID string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting agent-log process: %w", err)
 	}
+
+	// Setsid detaches the watcher from our session; it does NOT detach it from
+	// us as a parent. Without a wait it stays a zombie for as long as the
+	// spawner lives — and the spawner here is the daemon, which respawns
+	// sessions for the life of the town. The zombies also broke
+	// killPreviousAgentLogger below, whose Signal(0) probe cannot tell an
+	// unreaped corpse from a live process.
+	util.ReapDetached(cmd)
 
 	// Write PID for later cleanup.
 	pidStr := strconv.Itoa(cmd.Process.Pid)

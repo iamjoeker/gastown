@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -18,8 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 // logEntry captures a single structured log record for test assertions.
@@ -296,38 +299,112 @@ func TestHandleExec(t *testing.T) {
 
 func TestRunCommand(t *testing.T) {
 	t.Run("echo world produces expected stdout", func(t *testing.T) {
-		stdout, stderr, code := runCommand(context.Background(), []string{"echo", "world"}, "")
+		stdout, stderr, info := runCommand(context.Background(), []string{"echo", "world"}, "")
 		assert.Equal(t, "world\n", stdout)
 		assert.Equal(t, "", stderr)
-		assert.Equal(t, 0, code)
+		assert.Equal(t, 0, info.Code)
 	})
 
 	t.Run("sh exit 42 returns exitCode 42", func(t *testing.T) {
-		_, _, code := runCommand(context.Background(), []string{"sh", "-c", "exit 42"}, "")
-		assert.Equal(t, 42, code)
+		_, _, info := runCommand(context.Background(), []string{"sh", "-c", "exit 42"}, "")
+		assert.Equal(t, 42, info.Code)
+		assert.False(t, info.Signaled)
 	})
 
 	t.Run("stderr is captured separately", func(t *testing.T) {
-		stdout, stderr, code := runCommand(context.Background(), []string{"sh", "-c", "echo err >&2"}, "")
+		stdout, stderr, info := runCommand(context.Background(), []string{"sh", "-c", "echo err >&2"}, "")
 		assert.Equal(t, "", stdout)
 		assert.Equal(t, "err\n", stderr)
-		assert.Equal(t, 0, code)
+		assert.Equal(t, 0, info.Code)
 	})
 
 	t.Run("non-existent binary returns exitCode 1", func(t *testing.T) {
-		_, _, code := runCommand(context.Background(), []string{"/no/such/binary/xyzzy"}, "")
-		assert.Equal(t, 1, code)
+		_, _, info := runCommand(context.Background(), []string{"/no/such/binary/xyzzy"}, "")
+		assert.Equal(t, 1, info.Code)
+		assert.False(t, info.Started)
 	})
 
 	t.Run("environment is restricted", func(t *testing.T) {
 		// Set a sentinel in the test process env; the subprocess must not see it.
 		t.Setenv("PROXY_TEST_SENTINEL", "super_secret_sentinel_12345")
 
-		stdout, _, code := runCommand(context.Background(), []string{"sh", "-c", "echo ${PROXY_TEST_SENTINEL:-NOT_SET}"}, "")
-		assert.Equal(t, 0, code)
+		stdout, _, info := runCommand(context.Background(), []string{"sh", "-c", "echo ${PROXY_TEST_SENTINEL:-NOT_SET}"}, "")
+		assert.Equal(t, 0, info.Code)
 		assert.NotContains(t, stdout, "super_secret_sentinel_12345",
 			"subprocess should not inherit test env vars")
 	})
+
+	// A SIGKILLed subprocess is what an OOM kill looks like to the spawner.
+	// Go reports it as -1; the proxy must report the shell's 137 so the number
+	// the agent sees is the number an operator recognizes.
+	t.Run("SIGKILL reports 137 and is flagged as a suspected OOM kill", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("POSIX signal semantics")
+		}
+		_, _, info := runCommand(context.Background(), []string{"sh", "-c", "kill -9 $$"}, "")
+		assert.Equal(t, util.SIGKILLExitCode, info.Code)
+		assert.True(t, info.Signaled)
+		assert.True(t, info.OOMSuspected())
+	})
+
+	// The control: the proxy's own execTimeout kills with SIGKILL too, and
+	// must not be reported to the agent as an out-of-memory kill.
+	t.Run("deadline kill is not reported as OOM", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("POSIX signal semantics")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		_, _, info := runCommand(ctx, []string{"sleep", "5"}, "")
+		assert.True(t, info.Signaled)
+		assert.Equal(t, util.SIGKILLExitCode, info.Code)
+		assert.False(t, info.OOMSuspected())
+	})
+}
+
+// The agent on the other end of the proxy sees only the JSON body. A killed
+// subprocess writes nothing to stderr, so unless the handler says so the death
+// arrives as an empty stderr and a bare number.
+func TestHandleExec_SignaledSubprocessExplainsItselfInStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX signal semantics")
+	}
+
+	dir := t.TempDir()
+	fakeBD := filepath.Join(dir, "bd")
+	require.NoError(t, os.WriteFile(fakeBD, []byte("#!/bin/sh\nkill -9 $$\n"), 0o755))
+
+	srv := &Server{
+		cfg:           Config{TownRoot: dir},
+		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		allowed:       map[string]bool{"bd": true},
+		allowedSubs:   map[string]map[string]bool{"bd": {"list": true}},
+		resolvedPaths: map[string]string{"bd": fakeBD},
+		execSem:       make(chan struct{}, 1),
+		rateLimit:     rate.Inf,
+		rateBurst:     1,
+	}
+
+	body, err := json.Marshal(execRequest{Argv: []string{"bd", "list"}})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/v1/exec", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.handleExec(rec, req)
+
+	var resp execResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, util.SIGKILLExitCode, resp.ExitCode)
+	assert.Contains(t, resp.Stderr, "SIGKILL")
+	assert.Contains(t, resp.Stderr, "out-of-memory")
+}
+
+func TestAppendDiagnostic(t *testing.T) {
+	assert.Equal(t, "note\n", appendDiagnostic("", "note"))
+	assert.Equal(t, "existing\nnote\n", appendDiagnostic("existing", "note"))
+	assert.Equal(t, "existing\nnote\n", appendDiagnostic("existing\n", "note"),
+		"subprocess stderr must not be swallowed or double-spaced")
 }
 
 func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {

@@ -218,8 +218,15 @@ func (b *Boot) spawnDegraded() error {
 	cmd.Env = config.EnvForExecCommand(envVars)
 	cmd.Env = append(cmd.Env, "GT_DEGRADED=true")
 
-	// Run async - don't wait for completion
-	return cmd.Start()
+	// Run async - don't wait for completion. The wait still has to happen, just
+	// not on this goroutine: the caller here is the daemon, so an uncollected
+	// exit status would sit in the process table as a `gt <defunct>` child for
+	// the daemon's whole lifetime.
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	util.ReapDetached(cmd)
+	return nil
 }
 
 // IsDegraded returns whether Boot is in degraded mode.
