@@ -100,6 +100,21 @@ func shouldUpdateAgentStateOnDone(pushFailed, mrFailed bool) bool {
 	return !pushFailed && !mrFailed
 }
 
+// doneReportedExit is the exit type gt done reports once the outcome is known.
+// A COMPLETED run whose branch never reached the remote is an escalation: the
+// work is unpublished, the hook stays intact, and a witness reading COMPLETED
+// would otherwise have to notice push_failed separately to tell the difference
+// (gt-mqmh).
+//
+// mrFailed is deliberately not demoted here. The branch IS on the remote on
+// that path, the recovery is different, and mrFailed already carries it.
+func doneReportedExit(exitType string, pushFailed bool) string {
+	if pushFailed && exitType == ExitCompleted {
+		return ExitEscalated
+	}
+	return exitType
+}
+
 func shouldRetirePolecatSessionAfterDone(exitType, mergeStrategy string, pushFailed, mrFailed bool) bool {
 	if exitType != ExitCompleted || pushFailed || mrFailed {
 		return false
@@ -1668,14 +1683,32 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Resume: skip push if already completed in a previous run (gt-aufru).
 		// Validate checkpoint branch matches current branch (ge-sbo: stale checkpoint
 		// on polecat reassignment causes new work to skip push for old branch).
+		//
+		// The checkpoint records a branch NAME, and a name survives a rewrite of
+		// what it points at. Rework-after-rejection is exactly that: the polecat
+		// rebases and re-runs gt done, the name still matches, and skipping the
+		// push here submits an MR over a commit origin has never seen (gt-mqmh).
+		// So the checkpoint is a reason not to push again, never on its own a
+		// reason to believe the push happened — ask the remote before trusting it,
+		// and fall through to the push below when the answer is no.
 		if checkpoints[CheckpointPushed] != "" {
 			if checkpoints[CheckpointPushed] == branch {
-				fmt.Printf("%s Branch already pushed (resumed from checkpoint)\n", style.Bold.Render("✓"))
-				goto afterPush
+				pushedCommitSHA, _ = g.Rev("HEAD")
+				if doneSkipVerify {
+					fmt.Printf("%s Branch already pushed (resumed from checkpoint, unverified: --skip-verify)\n", style.Bold.Render("✓"))
+					goto afterPush
+				}
+				if verifyErr := verifyPushedCommitWithBareFallback(g, townRoot, rigName, branch, pushedCommitSHA); verifyErr == nil {
+					fmt.Printf("%s Branch already pushed (resumed from checkpoint, verified)\n", style.Bold.Render("✓"))
+					goto afterPush
+				}
+				style.PrintWarning("push checkpoint for %s does not describe HEAD (%s is not on origin/%s) — pushing again",
+					branch, shortSHA(pushedCommitSHA), branch)
+			} else {
+				// Stale checkpoint from a previous assignment — discard and push normally.
+				fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
+					checkpoints[CheckpointPushed], branch)
 			}
-			// Stale checkpoint from a previous assignment — discard and push normally.
-			fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
-				checkpoints[CheckpointPushed], branch)
 		}
 
 		// CRITICAL: Push branch BEFORE creating MR bead (hq-6dk53, hq-a4ksk)
@@ -2287,6 +2320,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 notifyWitness:
+	// The push is a precondition for the merge request, not an optional side
+	// effect (gt-mqmh). exitType is what this run ASKED for; a run that could
+	// not publish its branch has completed nothing, and reporting COMPLETED
+	// beside the push failure that caused it is how three of these reached a
+	// witness looking normal. Demoted here, after every path that sets
+	// pushFailed and before the completion metadata and POLECAT_DONE line are
+	// built from it, so both say the same thing.
+	exitType = doneReportedExit(exitType, pushFailed)
+
 	// Nudge refinery — MR bead is already on main (transaction-based shared main).
 	if shouldNudgeRefinery(exitType, mrID) {
 		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
@@ -2763,6 +2805,30 @@ func classifyFailedBranchPush(g *git.Git, townRoot, rigName, branch, defaultBran
 	return pushContentMissing
 }
 
+// verifyPushedCommitWithBareFallback answers "is this commit published at
+// origin/<branch>", and asks the remote twice rather than once: a polecat
+// worktree's git context is sometimes broken (stale gitdir, GH #1348) in a way
+// that fails the invocation itself, while <townRoot>/<rig>/.repo.git — the
+// shared bare repo that hosts every worktree — always has a working one and the
+// same origin. The fallback exists to survive that, not to lower the bar.
+//
+// The fallback used to read the bare repo's own refs/heads/<branch> and treat a
+// match as proof of a push (gt-mqmh). It is not evidence of anything. That ref
+// is where the worktree's commits live: `git worktree add` from a bare repo
+// creates the branch in the bare repo, and every commit the polecat makes
+// updates it. Origin is GitHub; the bare repo's remote refs live under
+// refs/remotes/origin/*, and refs/heads/* is purely local. So the check asked
+// the polecat's own branch whether the polecat's own branch held the commit,
+// and it always did — a guard comparing against its own source.
+//
+// What that cost: this function is what classifyFailedBranchPush consults to
+// decide push_failed, and what gates MR creation. A rebase-after-rejection
+// makes the plain push a correct non-fast-forward refusal; the local ref then
+// answered "already on origin", push_failed was cleared, and a merge request
+// was created over a commit the remote had never seen — reported as
+// exit=COMPLETED beside the push failure that caused it. Three occurrences
+// across two polecats, twice saved only by the refinery happening to hold the
+// object locally.
 func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, commit string) error {
 	verifyErr := g.VerifyPushedCommit("origin", branch, commit)
 	if verifyErr == nil {
@@ -2774,8 +2840,7 @@ func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, c
 		return verifyErr
 	}
 	bareGit := git.NewGitWithDir(bareRepoPath, "")
-	tip, tipErr := bareGit.Rev("refs/heads/" + branch)
-	if tipErr == nil && strings.TrimSpace(tip) == strings.TrimSpace(commit) {
+	if bareErr := bareGit.VerifyPushedCommit("origin", branch, commit); bareErr == nil {
 		return nil
 	}
 	return verifyErr

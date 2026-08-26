@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+// gt-mqmh: a POLECAT_DONE carried "exit=COMPLETED" and the non-fast-forward
+// push failure that had stopped the branch from ever reaching origin, in the
+// same line. COMPLETED is what the run ASKED for; it must not also be what the
+// witness and the completion metadata are told happened.
+func TestDoneReportedExit(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitType   string
+		pushFailed bool
+		want       string
+	}{
+		{"a completed run that pushed stays completed", ExitCompleted, false, ExitCompleted},
+		{"a completed run that could not push escalates", ExitCompleted, true, ExitEscalated},
+		// The requested status is not overwritten when it already says the work
+		// did not land — these carry their own meaning to the witness.
+		{"a deferred run is left alone", ExitDeferred, true, ExitDeferred},
+		{"an escalated run is left alone", ExitEscalated, true, ExitEscalated},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := doneReportedExit(tt.exitType, tt.pushFailed); got != tt.want {
+				t.Errorf("doneReportedExit(%q, %v) = %q, want %q", tt.exitType, tt.pushFailed, got, tt.want)
+			}
+		})
+	}
+}
+
 // gt done reported push failures, MR failures and refused merge requests to the
 // witness and then returned nil, so the process exited 0 (gt-7k3q). A caller
 // checking exit status could not tell a completion that landed from one that
