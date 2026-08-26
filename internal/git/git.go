@@ -3895,6 +3895,35 @@ type PrunedBranch struct {
 	Reason string // Why it was pruned: "merged", "no-remote", "no-remote-merged"
 }
 
+// SkippedBranch represents a local branch that matched the staleness predicate
+// but survived the prune, and why it survived.
+//
+// A skip must never be silent. An empty prune list with a non-empty skip list
+// means "found candidates, deleted none" — a different answer from "found
+// none", and the two must not be reported the same way.
+type SkippedBranch struct {
+	Name   string // Branch name
+	Reason string // Why it was a candidate: "merged", "no-remote", "no-remote-merged"
+	Detail string // Why it survived (worktree checkout, git branch -d refusal, ...)
+}
+
+// PruneReport is the full outcome of a prune pass: what went, and what stayed
+// despite matching. Callers that only want the deletions can use
+// PruneStaleBranches.
+type PruneReport struct {
+	Pruned  []PrunedBranch
+	Skipped []SkippedBranch
+}
+
+// Candidates is the number of branches that matched the staleness predicate,
+// whether or not they were deleted.
+func (r *PruneReport) Candidates() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.Pruned) + len(r.Skipped)
+}
+
 // PruneStaleBranches finds and deletes local branches matching a pattern that are
 // stale — either fully merged to the default branch or whose remote tracking branch
 // no longer exists (indicating the remote branch was deleted after merge).
@@ -3907,6 +3936,24 @@ type PrunedBranch struct {
 // Safety: never deletes the current branch or the default branch (main/master).
 // Uses git branch -d (not -D), so only fully-merged branches are deleted.
 func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, error) {
+	report, err := g.PruneStaleBranchesReport(pattern, dryRun)
+	if err != nil {
+		return nil, err
+	}
+	return report.Pruned, nil
+}
+
+// PruneStaleBranchesReport is PruneStaleBranches with the survivors included.
+//
+// The dry-run and the real run share this one discovery step, so the preview is
+// only as honest as its ability to predict a refusal. Two refusals are modelled:
+//
+//   - A branch checked out in any worktree. git branch -d always refuses these,
+//     so they are reported as skipped in dry-run too — the preview must not
+//     promise a deletion the action cannot perform.
+//   - A git branch -d failure at delete time, reported with git's own message
+//     rather than dropped.
+func (g *Git) PruneStaleBranchesReport(pattern string, dryRun bool) (*PruneReport, error) {
 	if pattern == "" {
 		pattern = "polecat/*"
 	}
@@ -3915,13 +3962,25 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 	currentBranch, _ := g.CurrentBranch()
 	defaultBranch := g.RemoteDefaultBranch()
 
+	// Branches checked out in a worktree cannot be deleted by git branch -d,
+	// in dry-run or otherwise. Best effort: if the listing fails we fall back
+	// to reporting the delete failure at action time.
+	checkedOut := map[string]string{}
+	if worktrees, wtErr := g.WorktreeList(); wtErr == nil {
+		for _, wt := range worktrees {
+			if wt.Branch != "" {
+				checkedOut[wt.Branch] = wt.Path
+			}
+		}
+	}
+
 	// List all local branches matching the pattern
 	branches, err := g.ListBranches(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("listing branches: %w", err)
 	}
 
-	var pruned []PrunedBranch
+	report := &PruneReport{}
 	for _, branch := range branches {
 		branch = strings.TrimSpace(branch)
 		if branch == "" || branch == currentBranch || branch == defaultBranch {
@@ -3956,22 +4015,37 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 			continue // Branch has remote and is not merged — keep it
 		}
 
+		// A checked-out branch is refused by git branch -d in every mode, so it
+		// is a skip in the preview as well as in the action.
+		if wtPath, inUse := checkedOut[branch]; inUse {
+			report.Skipped = append(report.Skipped, SkippedBranch{
+				Name:   branch,
+				Reason: reason,
+				Detail: fmt.Sprintf("checked out at %s", wtPath),
+			})
+			continue
+		}
+
 		if !dryRun {
 			// Use -d (not -D) for safety — only deletes fully merged branches.
 			// For "no-remote" branches that aren't merged, -d will fail safely.
 			if err := g.DeleteBranch(branch, false); err != nil {
-				// If -d fails (not merged), skip this branch
+				report.Skipped = append(report.Skipped, SkippedBranch{
+					Name:   branch,
+					Reason: reason,
+					Detail: strings.TrimSpace(err.Error()),
+				})
 				continue
 			}
 		}
 
-		pruned = append(pruned, PrunedBranch{
+		report.Pruned = append(report.Pruned, PrunedBranch{
 			Name:   branch,
 			Reason: reason,
 		})
 	}
 
-	return pruned, nil
+	return report, nil
 }
 
 // SubmoduleChange represents a changed submodule pointer between two refs.

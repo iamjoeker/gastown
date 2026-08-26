@@ -1296,6 +1296,168 @@ func TestPruneStaleBranches_SkipsUnmerged(t *testing.T) {
 	}
 }
 
+// makeStaleMergedBranch creates a polecat branch, merges it to main, then
+// deletes its remote so it classifies as "no-remote-merged" — the exact
+// predicate the prune preview matches on.
+func makeStaleMergedBranch(t *testing.T, g *Git, localDir, mainBranch, branch, file string) {
+	t.Helper()
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, file), []byte(file), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add(file); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("work on " + branch); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", branch)
+
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	if err := g.Merge(branch); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", mainBranch)
+	runGit(t, localDir, "push", "origin", "--delete", branch)
+	if err := g.FetchPrune("origin"); err != nil {
+		t.Fatalf("FetchPrune: %v", err)
+	}
+}
+
+// A branch checked out in a worktree can never be deleted by git branch -d.
+// The preview must say so, and the real run must not report it as "found none"
+// (gt-p12r: --dry-run promised 11 deletions, the real run deleted nothing and
+// reported no stale branches at all — every one was held by a live worktree).
+func TestPruneStaleBranchesReport_WorktreeHeldBranchSkippedInBothModes(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const branch = "polecat/worktree-held"
+
+	makeStaleMergedBranch(t, g, localDir, mainBranch, branch, "held.txt")
+
+	wtPath := filepath.Join(t.TempDir(), "held-worktree")
+	runGit(t, localDir, "worktree", "add", wtPath, branch)
+
+	for _, dryRun := range []bool{true, false} {
+		report, err := g.PruneStaleBranchesReport("polecat/*", dryRun)
+		if err != nil {
+			t.Fatalf("PruneStaleBranchesReport(dryRun=%v): %v", dryRun, err)
+		}
+		if len(report.Pruned) != 0 {
+			t.Errorf("dryRun=%v: pruned %d branch(es), want 0: %+v", dryRun, len(report.Pruned), report.Pruned)
+		}
+		if len(report.Skipped) != 1 {
+			t.Fatalf("dryRun=%v: skipped %d branch(es), want 1: %+v", dryRun, len(report.Skipped), report.Skipped)
+		}
+		if report.Skipped[0].Name != branch {
+			t.Errorf("dryRun=%v: skipped name = %q, want %q", dryRun, report.Skipped[0].Name, branch)
+		}
+		if report.Skipped[0].Reason != "no-remote-merged" {
+			t.Errorf("dryRun=%v: skipped reason = %q, want no-remote-merged", dryRun, report.Skipped[0].Reason)
+		}
+		if !strings.Contains(report.Skipped[0].Detail, wtPath) {
+			t.Errorf("dryRun=%v: skipped detail = %q, want it to name the worktree %q", dryRun, report.Skipped[0].Detail, wtPath)
+		}
+		// Candidates() is what separates "found none" from "deleted none".
+		if report.Candidates() != 1 {
+			t.Errorf("dryRun=%v: Candidates() = %d, want 1", dryRun, report.Candidates())
+		}
+	}
+
+	if _, err := g.run("rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		t.Errorf("branch %s should still exist after a refused prune: %v", branch, err)
+	}
+}
+
+// The preview and the action must agree on the same repository. This is the
+// property gt-p12r violated: 11 promised, 0 delivered, and no way to tell from
+// the output that anything had been refused.
+func TestPruneStaleBranchesReport_DryRunPredictsRealRun(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	makeStaleMergedBranch(t, g, localDir, mainBranch, "polecat/deletable", "free.txt")
+	makeStaleMergedBranch(t, g, localDir, mainBranch, "polecat/pinned", "pinned.txt")
+	runGit(t, localDir, "worktree", "add", filepath.Join(t.TempDir(), "pinned-wt"), "polecat/pinned")
+
+	preview, err := g.PruneStaleBranchesReport("polecat/*", true)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	actual, err := g.PruneStaleBranchesReport("polecat/*", false)
+	if err != nil {
+		t.Fatalf("real run: %v", err)
+	}
+
+	if len(preview.Pruned) != len(actual.Pruned) {
+		t.Errorf("preview promised %d deletion(s), real run made %d", len(preview.Pruned), len(actual.Pruned))
+	}
+	if len(actual.Pruned) != 1 || actual.Pruned[0].Name != "polecat/deletable" {
+		t.Errorf("pruned = %+v, want just polecat/deletable", actual.Pruned)
+	}
+	if len(actual.Skipped) != 1 || actual.Skipped[0].Name != "polecat/pinned" {
+		t.Errorf("skipped = %+v, want just polecat/pinned", actual.Skipped)
+	}
+}
+
+// git branch -d refusals that are not predictable up front must still be
+// reported, never swallowed into an empty result.
+func TestPruneStaleBranchesReport_DeleteFailureIsReported(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const branch = "polecat/unmerged-no-remote"
+
+	// Unmerged work whose remote has gone away: matches the "no-remote"
+	// predicate, but git branch -d refuses to delete it.
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "wip.txt"), []byte("wip"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("wip.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("unmerged work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", branch)
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", "--delete", branch)
+	if err := g.FetchPrune("origin"); err != nil {
+		t.Fatalf("FetchPrune: %v", err)
+	}
+
+	report, err := g.PruneStaleBranchesReport("polecat/*", false)
+	if err != nil {
+		t.Fatalf("PruneStaleBranchesReport: %v", err)
+	}
+	if len(report.Pruned) != 0 {
+		t.Errorf("pruned = %+v, want none", report.Pruned)
+	}
+	if len(report.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want 1 entry naming the refusal", report.Skipped)
+	}
+	if report.Skipped[0].Detail == "" {
+		t.Error("skipped entry has no detail; git's refusal message was dropped")
+	}
+	if _, err := g.run("rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		t.Errorf("branch %s should survive a refused delete: %v", branch, err)
+	}
+}
+
 func TestListPushRemoteRefsWithHashesClassifiesRemoteOnlyMergedBranch(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)

@@ -355,6 +355,11 @@ Finds and deletes polecat branches that are no longer needed:
 Uses safe deletion (git branch -d) — only removes fully merged branches.
 Also cleans up remote polecat branches that are fully merged.
 
+A branch checked out in a live polecat worktree is never deletable. Those are
+listed as kept, with the worktree holding them — nuke the polecat to release
+the branch. --dry-run reports them the same way, so the preview matches what
+the real run will do.
+
 Use --dry-run to preview what would be pruned.
 Use --remote to also prune remote polecat branches on origin.
 
@@ -2742,22 +2747,28 @@ func runPolecatPrune(cmd *cobra.Command, args []string) error {
 	}
 
 	// Prune local branches that are merged or have no remote
-	pruned, err := repoGit.PruneStaleBranches("polecat/*", polecatPruneDryRun)
+	report, err := repoGit.PruneStaleBranchesReport("polecat/*", polecatPruneDryRun)
 	if err != nil {
 		return fmt.Errorf("pruning local branches: %w", err)
 	}
 
-	if len(pruned) == 0 {
+	if report.Candidates() == 0 {
 		fmt.Println("No stale local polecat branches found.")
 	} else {
 		verb := "Pruned"
 		if polecatPruneDryRun {
 			verb = "Would prune"
 		}
-		for _, b := range pruned {
+		for _, b := range report.Pruned {
 			fmt.Printf("  %s %s (%s)\n", style.Success.Render("✓"), b.Name, b.Reason)
 		}
-		fmt.Printf("\n%s %d local branch(es).\n", verb, len(pruned))
+		for _, b := range report.Skipped {
+			fmt.Printf("  %s %s (%s): %s\n", style.Warning.Render("⚠"), b.Name, b.Reason, b.Detail)
+		}
+		fmt.Printf("\n%s %d local branch(es).\n", verb, len(report.Pruned))
+		if len(report.Skipped) > 0 {
+			fmt.Printf("Kept %d stale local branch(es) that could not be deleted.\n", len(report.Skipped))
+		}
 	}
 
 	// Optionally prune remote polecat branches
