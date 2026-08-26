@@ -143,6 +143,19 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 			if fetchErr := repoGit.FetchPrune(targetRemote); fetchErr != nil {
 				// A stale target overstates the short list rather than
 				// understating it, so this is a warning and not a stop.
+				//
+				// A deadline kill is said apart from an ordinary refresh
+				// failure, because the two ask for different things. Stale
+				// means "re-read the list with suspicion". Unresponsive means
+				// the remote is not answering ANYONE, and everything below it
+				// is about to be unmeasured — the refresh is simply the first
+				// place it shows. This is the call that was measured hanging
+				// past four minutes on two rigs at once (gt-i9wz); it now
+				// returns, and this line is where a reader learns why.
+				if git.IsRemoteUnresponsive(fetchErr) {
+					warnings = append(warnings, fmt.Sprintf("%s STOPPED RESPONDING while refreshing: %v — it was killed on its deadline rather than waited on, and the classification below is unreliable for the same reason. Re-run when the remote answers", targetRemote, fetchErr))
+					continue
+				}
 				warnings = append(warnings, fmt.Sprintf("could not refresh %s: %v (its ref may be stale, so 'check' may include branches that have since landed)", targetRemote, fetchErr))
 			}
 		}

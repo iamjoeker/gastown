@@ -146,13 +146,79 @@ const pushTimeout = 60 * time.Second
 // instead of a parked agent.
 const lsRemoteTimeout = 60 * time.Second
 
+// fetchTimeout bounds every `git fetch` that contacts a remote.
+//
+// git has no native fetch timeout, and nothing underneath it supplies one
+// either. Measured on 2026-08-23 (gt-i9wz), the whole chain was blocked and no
+// layer of it had a deadline: gt waiting on the pipe from git, git waiting on
+// the pipe from ssh, ssh in wait_woken on a TCP connection that had gone dead.
+// Both wedged ssh processes had finished their handshake, written 22 bytes, and
+// then moved ZERO bytes across a 25-second sample, still alive at 4:27 elapsed.
+// A fresh ssh to the same host during the stall authenticated in under a
+// second, so it was neither an outage nor an auth failure — it was a connection
+// that died with nothing watching for it. Two rigs hit it in the same moment.
+//
+// It is longer than lsRemoteTimeout because a fetch transfers objects where
+// ls-remote only reads a ref advertisement. It bounds the INCREMENTAL fetch
+// helpers below; cloneInternal's first fetch of a fresh repository is left
+// unbounded deliberately, because there is no honest deadline for "download an
+// entire repository" and picking one would fail big clones to fix a stall.
+//
+// It is a var solely so tests can shorten it; TestFetchTimeoutDefault asserts
+// the shipped value, because a fixture that pins a timeout can otherwise hide
+// what production actually runs with.
+var fetchTimeout = 120 * time.Second
+
+// ErrRemoteUnresponsive marks a git command that was killed for exceeding its
+// network deadline.
+//
+// It is a sentinel rather than only a message because a caller that contacts
+// the remote once per ref has to tell two situations apart: "this one ref could
+// not be compared", which is a single unknown row, and "the remote is not
+// answering anybody", which is every remaining ref — each paid for at the full
+// deadline. A per-call timeout alone converts one unbounded hang into N bounded
+// ones, which is not obviously an improvement; recognising the second case is
+// what makes it one.
+var ErrRemoteUnresponsive = errors.New("remote did not respond within the deadline")
+
+// IsRemoteUnresponsive reports whether err came from a network deadline kill.
+func IsRemoteUnresponsive(err error) bool {
+	return errors.Is(err, ErrRemoteUnresponsive)
+}
+
+// deadlineKillWaitDelay bounds how long Wait blocks after the deadline kill.
+//
+// Killing the process group closes the pipes in the normal case. WaitDelay is
+// for the case that is not normal: a descendant that put itself in another
+// process group survives the kill, keeps the inherited stdout pipe open, and
+// Wait blocks on the copy goroutine forever — the hang re-entering through the
+// door the timeout just closed.
+const deadlineKillWaitDelay = 5 * time.Second
+
+// deadlineError renders a timeout kill as an error carrying ErrRemoteUnresponsive.
+func deadlineError(sub string, timeout time.Duration) error {
+	if sub == "" {
+		sub = "command"
+	}
+	return fmt.Errorf("git %s timed out after %v and its process group was killed: %w", sub, timeout, ErrRemoteUnresponsive)
+}
+
 // runWithTimeout executes a git command with a deadline. If the command does
-// not finish within the timeout, the process is killed and an error is returned.
+// not finish within the timeout, the process GROUP is killed and an error
+// wrapping ErrRemoteUnresponsive is returned.
+//
+// The group, not the process, and that distinction is the whole fix. Measured
+// on the wedged chain (gt-i9wz), each layer had to be signalled individually:
+// killing gt left `git fetch` running, killing git left ssh running and
+// reparented to init, holding a dead TCP connection with no parent left to
+// attribute it to. A deadline that kills only the immediate child does not end
+// the stall, it launders it into an orphan nothing will ever reap.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
 	if err := g.guardUnsafeTownRootMutation(args); err != nil {
 		return "", err
 	}
 
+	sub, _ := gitSubcommand(args)
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}
@@ -161,7 +227,10 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", args...)
-	util.SetDetachedProcessGroup(cmd)
+	// After CommandContext, which installs a Cancel that kills the process
+	// alone. SetProcessGroup replaces it with one that signals the negative pgid.
+	util.SetProcessGroup(cmd)
+	cmd.WaitDelay = deadlineKillWaitDelay
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -172,8 +241,11 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 
 	err := cmd.Run()
 	if err != nil {
+		// ctx.Err(), not errors.Is(err, context.DeadlineExceeded): os/exec
+		// prefers the process's own error when it has one, and a killed process
+		// always has one, so the context error never reaches the caller.
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
+			return "", deadlineError(sub, timeout)
 		}
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
@@ -193,14 +265,15 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 		return "", err
 	}
 
+	sub, _ := gitSubcommand(args)
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}
 
 	var cmd *exec.Cmd
+	var ctx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
-		var ctx context.Context
 		ctx, cancel = context.WithTimeout(context.Background(), timeout)
 		cmd = exec.CommandContext(ctx, "git", args...)
 	} else {
@@ -209,7 +282,14 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	if cancel != nil {
 		defer cancel()
 	}
-	util.SetDetachedProcessGroup(cmd)
+	if timeout > 0 {
+		// Same reasoning as runWithTimeout: the deadline has to reach the ssh
+		// grandchild, and only the process group does.
+		util.SetProcessGroup(cmd)
+		cmd.WaitDelay = deadlineKillWaitDelay
+	} else {
+		util.SetDetachedProcessGroup(cmd)
+	}
 
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
@@ -222,16 +302,60 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		if timeout > 0 {
-			// Check if the context's deadline was exceeded
-			if errors.Is(err, context.DeadlineExceeded) {
-				return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
-			}
+		// ctx.Err() rather than errors.Is(err, context.DeadlineExceeded). The
+		// latter was here and could not fire: os/exec keeps the process's own
+		// error when it has one, and a process killed by the deadline always
+		// has one, so a timeout reported itself as a plain exit failure.
+		if ctx != nil && ctx.Err() == context.DeadlineExceeded {
+			return "", deadlineError(sub, timeout)
 		}
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
+
+// runFetch runs `git fetch` under fetchTimeout with ssh keepalives installed.
+//
+// Every incremental fetch goes through here so that bounding one caller does
+// not leave the same hang reachable from its neighbours: the stall is a
+// property of the transport, not of the call site.
+func (g *Git) runFetch(args ...string) error {
+	_, err := g.runWithEnvAndTimeout(append([]string{"fetch"}, args...), g.sshKeepaliveEnv(), fetchTimeout)
+	return err
+}
+
+// sshKeepaliveEnv makes ssh notice a dead peer itself.
+//
+// This is the second layer, and it is not redundant with the deadline above:
+// the deadline only works while gt is alive to enforce it. A caller-side
+// `timeout 240 gt patrol branches` — exactly what the gastown witness was
+// using — kills gt and nothing else, and the measured result was a git fetch
+// and an ssh that outlived it, reparented to init, still holding a dead
+// connection to github. Nothing in the town knows those exist. ServerAlive*
+// is the only thing that can end them, because it runs INSIDE the orphan:
+// four missed probes at fifteen seconds turns an unbounded hang into a ~60s
+// error. ConnectTimeout bounds the other end of the same call, the connect
+// that never completes.
+//
+// It yields nothing when the operator has configured their own ssh invocation.
+// GIT_SSH_COMMAND overrides both core.sshCommand and GIT_SSH, so setting it
+// unconditionally would replace a rig's configured transport — breaking
+// authentication to fix a timeout is not a trade worth making silently.
+func (g *Git) sshKeepaliveEnv() []string {
+	if strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND")) != "" || strings.TrimSpace(os.Getenv("GIT_SSH")) != "" {
+		return nil
+	}
+	// A local config read: no network, and an unset key exits non-zero, which
+	// correctly reads as "nothing configured".
+	if out, err := g.run("config", "--get", "core.sshCommand"); err == nil && strings.TrimSpace(out) != "" {
+		return nil
+	}
+	return []string{"GIT_SSH_COMMAND=" + sshKeepaliveCommand}
+}
+
+// sshKeepaliveCommand is the ssh invocation that will not wait forever on a
+// peer that has stopped answering.
+const sshKeepaliveCommand = "ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=10"
 
 func (g *Git) guardUnsafeTownRootMutation(args []string) error {
 	cmd, rest := gitSubcommand(args)
@@ -967,23 +1091,24 @@ func (g *Git) CheckoutResetBranch(branch, startPoint string) error {
 	return err
 }
 
-// Fetch fetches from the remote.
+// Fetch fetches from the remote, under fetchTimeout.
 func (g *Git) Fetch(remote string) error {
-	_, err := g.run("fetch", remote)
-	return err
+	return g.runFetch(remote)
 }
 
 // FetchPrune fetches from the remote and prunes stale remote-tracking refs.
 // This removes remote-tracking branches for branches that no longer exist on the remote.
+//
+// It runs under fetchTimeout: this is the call `gt patrol branches` makes to
+// refresh its comparison target, and the one measured hanging past four minutes
+// on two rigs at once (gt-i9wz).
 func (g *Git) FetchPrune(remote string) error {
-	_, err := g.run("fetch", "--prune", remote)
-	return err
+	return g.runFetch("--prune", remote)
 }
 
-// FetchBranch fetches a specific branch from the remote.
+// FetchBranch fetches a specific branch from the remote, under fetchTimeout.
 func (g *Git) FetchBranch(remote, branch string) error {
-	_, err := g.run("fetch", remote, branch)
-	return err
+	return g.runFetch(remote, branch)
 }
 
 // FetchBranchShallow fetches a single branch with --depth 1 and creates the
@@ -991,8 +1116,7 @@ func (g *Git) FetchBranch(remote, branch string) error {
 // clones to add a branch that wasn't included in the initial clone.
 func (g *Git) FetchBranchShallow(remote, branch string) error {
 	refspec := branch + ":refs/remotes/" + remote + "/" + branch
-	_, err := g.run("fetch", "--depth", "1", remote, refspec)
-	return err
+	return g.runFetch("--depth", "1", remote, refspec)
 }
 
 // Pull pulls from the remote branch.
@@ -1706,10 +1830,9 @@ func (g *Git) HasUpstreamRemote() (bool, error) {
 	return true, nil
 }
 
-// FetchUpstream fetches from the upstream remote.
+// FetchUpstream fetches from the upstream remote, under fetchTimeout.
 func (g *Git) FetchUpstream() error {
-	_, err := g.run("fetch", "upstream")
-	return err
+	return g.runFetch("upstream")
 }
 
 // Remotes returns the list of configured remote names.
@@ -3409,7 +3532,11 @@ func (g *Git) fetchPushRemoteRefToPrivateRef(remote, refName string) (ref string
 	// --force because a crashed run can leave a ref at this name behind: pids are
 	// reused, and a non-fast-forward update would otherwise fail on the leftover
 	// rather than on anything real.
-	if _, err := g.run("fetch", "--no-tags", "--no-write-fetch-head", "--force", g.pushTarget(remote), refName+":"+dest); err != nil {
+	// Under fetchTimeout, and the per-branch shape is why it matters: a sweep
+	// pays this once per polecat branch, so an unbounded one parks the caller on
+	// the FIRST branch and never reaches the rest (gt-i9wz). %w carries
+	// ErrRemoteUnresponsive out to the sweep, which uses it to stop asking.
+	if err := g.runFetch("--no-tags", "--no-write-fetch-head", "--force", g.pushTarget(remote), refName+":"+dest); err != nil {
 		remove()
 		return "", func() {}, fmt.Errorf("fetching candidate %s: %w", refName, err)
 	}
@@ -4002,12 +4129,15 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
-	util.SetDetachedProcessGroup(cmd)
+	// The GROUP, for the same reason as runWithTimeout: killing git alone
+	// leaves its ssh child holding the connection, orphaned and unbounded.
+	util.SetProcessGroup(cmd)
+	cmd.WaitDelay = deadlineKillWaitDelay
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("pushing submodule %s timed out after %v (remote may be unreachable)", submodulePath, pushTimeout)
+			return fmt.Errorf("pushing submodule %s timed out after %v: %w", submodulePath, pushTimeout, ErrRemoteUnresponsive)
 		}
 		abbrev := sha
 		if len(abbrev) > 8 {

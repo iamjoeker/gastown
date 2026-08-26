@@ -348,15 +348,38 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 		result.Errors = append(result.Errors, "no beads handle: bead and MR columns are UNMEASURED")
 	}
 
+	// remoteDown records the first deadline kill. A remote that has stopped
+	// answering has not stopped answering for ONE branch: comparison fetches a
+	// candidate ref per branch, so the network deadline that ends the hang is
+	// paid once per branch, and a sweep of nine against a blackholed remote
+	// costs nine full deadlines. That is the same witness, parked for nearly as
+	// long, by a fix — the timeout would have RELOCATED the stall rather than
+	// removed it. So the first kill is read as a fact about the remote and the
+	// rest are classified without touching the network.
+	//
+	// They are classified UNKNOWN, never landed and never check: declining to
+	// ask must produce a smaller bill, never a verdict.
+	var remoteDown string
 	for _, ref := range refs {
 		if !strings.HasPrefix(ref.Name, "refs/heads/") {
 			continue
 		}
 		result.Scanned++
+		if remoteDown != "" {
+			result.Findings = append(result.Findings, notComparedFinding(ref, remoteDown))
+			continue
+		}
 		// Landed branches are returned too — the caller decides whether to
 		// show them, and their presence is what makes a zero short list
 		// interpretable rather than merely empty.
-		result.Findings = append(result.Findings, classifyBranch(g, bd, remote, targets, ref, mrsByBranch, result.MRsMeasured))
+		finding, cmpErr := classifyBranch(g, bd, remote, targets, ref, mrsByBranch, result.MRsMeasured)
+		if git.IsRemoteUnresponsive(cmpErr) {
+			remoteDown = cmpErr.Error()
+			result.Errors = append(result.Errors, fmt.Sprintf(
+				"%s stopped responding while comparing %s: %v — every branch after it was classified UNKNOWN WITHOUT being compared, so this sweep is a partial measurement",
+				remote, strings.TrimPrefix(ref.Name, "refs/heads/"), cmpErr))
+		}
+		result.Findings = append(result.Findings, finding)
 	}
 
 	sortFindings(result.Findings)
@@ -374,6 +397,11 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 // The classification tests themselves run containment first, because it is the
 // only one that can prove there is nothing to do, then the cheap explanations,
 // then the short list.
+//
+// The second return is the raw containment error, unwrapped, and it exists for
+// exactly one caller decision: a network deadline kill is a fact about the
+// REMOTE, and the sweep must be able to see that through the finding's prose.
+// It is nil whenever the comparison ran, whatever the class.
 func classifyBranch(
 	g BranchSweepGit,
 	bd BranchSweepBeads,
@@ -382,7 +410,7 @@ func classifyBranch(
 	ref git.RemoteRef,
 	mrsByBranch map[string]*branchMR,
 	mrsMeasured bool,
-) BranchSweepFinding {
+) (BranchSweepFinding, error) {
 	branch := strings.TrimPrefix(ref.Name, "refs/heads/")
 	finding := BranchSweepFinding{Branch: branch, CommitSHA: ref.Hash}
 	if meta, ok := polecat.ParseBranchName(branch); ok {
@@ -423,7 +451,7 @@ func classifyBranch(
 		finding.Class = BranchSweepUnknown
 		finding.Err = err.Error()
 		finding.Note = "could not compare against " + strings.Join(targets, " or ") + ": " + err.Error()
-		return finding
+		return finding, err
 	}
 	finding.Evidence = status.Evidence
 	finding.UnpreservedPatches = status.UnpreservedPatchCount
@@ -450,41 +478,41 @@ func classifyBranch(
 		if mr != nil && mr.Open() {
 			finding.Note += "; open MR " + mr.ID + " is still queued for content that already landed"
 		}
-		return finding
+		return finding, nil
 	}
 
 	if mr != nil && mr.Open() {
 		finding.Class = BranchSweepQueued
 		finding.Note = "open MR " + mr.ID + " — queued, not stranded"
-		return finding
+		return finding, nil
 	}
 
 	if bd == nil {
 		finding.Class = BranchSweepUnknown
 		finding.Note = "unmerged, and bead state was not measured"
-		return finding
+		return finding, nil
 	}
 
 	if finding.IssueID == "" {
 		finding.Class = BranchSweepCheck
 		finding.Note = "unmerged, and no work bead could be identified from the branch name or an MR"
-		return finding
+		return finding, nil
 	}
 
 	switch {
 	case issueErr != nil && isBeadNotFound(issueErr):
 		finding.Class = BranchSweepCheck
 		finding.Note = "unmerged, and work bead " + finding.IssueID + " no longer exists"
-		return finding
+		return finding, nil
 	case issueErr != nil:
 		finding.Class = BranchSweepUnknown
 		finding.Err = issueErr.Error()
 		finding.Note = "unmerged, and bead " + finding.IssueID + " could not be read"
-		return finding
+		return finding, nil
 	case issue == nil:
 		finding.Class = BranchSweepCheck
 		finding.Note = "unmerged, and work bead " + finding.IssueID + " no longer exists"
-		return finding
+		return finding, nil
 	}
 
 	if !beads.IssueStatus(finding.IssueStatus).IsTerminal() {
@@ -493,18 +521,42 @@ func classifyBranch(
 		// uses to decide a rejection stranded nothing.
 		finding.Class = BranchSweepActive
 		finding.Note = "bead is " + finding.IssueStatus + " — still re-slingable"
-		return finding
+		return finding, nil
 	}
 
 	if report := findOpenStrandedReport(bd, finding.IssueID); report != "" {
 		finding.Class = BranchSweepReported
 		finding.ReportBead = report
 		finding.Note = "already reported as stranded by " + report
-		return finding
+		return finding, nil
 	}
 
 	finding.Class = BranchSweepCheck
 	finding.Note = branchCheckNote(finding, mrsMeasured)
+	return finding, nil
+}
+
+// notComparedFinding is the row for a branch the sweep deliberately did not ask
+// the remote about, after an earlier branch's fetch was killed on its deadline.
+//
+// Everything it does not know is left EMPTY rather than filled with a plausible
+// default. A blank bead column reads as "we did not look", which is what
+// happened; a landed or check verdict here would be a claim manufactured out of
+// a network failure, and the class exists precisely so that "I could not tell"
+// never renders as "nothing to see".
+func notComparedFinding(ref git.RemoteRef, cause string) BranchSweepFinding {
+	branch := strings.TrimPrefix(ref.Name, "refs/heads/")
+	finding := BranchSweepFinding{
+		Branch:    branch,
+		CommitSHA: ref.Hash,
+		Class:     BranchSweepUnknown,
+		Err:       cause,
+	}
+	if meta, ok := polecat.ParseBranchName(branch); ok {
+		finding.Polecat = meta.Polecat
+		finding.IssueID = meta.Issue
+	}
+	finding.Note = "NOT COMPARED: the remote stopped responding earlier in this sweep (" + cause + ") — re-run when it answers"
 	return finding
 }
 
