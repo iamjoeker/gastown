@@ -233,6 +233,47 @@ func TestShouldSendEscape_LivePaneWithContaminatedTranscript(t *testing.T) {
 	requireOldScanSaysBusy(t, pane)
 }
 
+// A busy pane is never in Rewind mode (gt-z8ra). Rewind is a modal UI that
+// captures all input, so an agent generating is not sitting in it — and the
+// remedy for a hit is a real Escape, which cancels the turn. This path runs at
+// nudge step 0, ahead of the shouldSendEscape guard, so it was the one route by
+// which a nudge could still interrupt a working agent.
+//
+// The fixture is the worst realistic case: an agent mid-turn whose transcript
+// is discussing the Rewind menu, quoting its action prompts verbatim.
+func TestIsInRewindMode_BusyPaneIsNeverInRewind(t *testing.T) {
+	tm := newTestTmux(t)
+
+	discussingRewind := []string{
+		"  The Rewind menu offers 'Enter to select' and 'Esc to go back',",
+		"  which is why a stray Escape can open it.",
+		"",
+		plainBox, plainPrompt, plainBox, plainFooterBusy,
+	}
+	pane := renderFixturePane(t, tm, "gt-test-rewind-busy",
+		discussingRewind, "Enter to select", plainFooterBusy)
+
+	if tm.isInRewindMode("gt-test-rewind-busy") {
+		t.Fatalf("isInRewindMode on a busy pane discussing Rewind = true, want false;"+
+			" a nudge would fire Escape into a working turn. pane:\n%s", pane)
+	}
+
+	// CONTROL: the detector must still fire on a genuine Rewind menu, or the
+	// negative above proves only that it stopped working.
+	rewindMenu := []string{
+		"  Rewind conversation",
+		"    ▸ checkpoint 3   2 minutes ago",
+		"  Enter to select · Esc to go back",
+	}
+	ctlPane := renderFixturePane(t, tm, "gt-test-rewind-control",
+		rewindMenu, "Rewind conversation", "Esc to go back")
+
+	if !tm.isInRewindMode("gt-test-rewind-control") {
+		t.Fatalf("CONTROL FAILED: isInRewindMode on a real Rewind menu = false;"+
+			" the negative result above certifies nothing. pane:\n%s", ctlPane)
+	}
+}
+
 // The other direction, live: a busy footer under the composer still suppresses
 // the Escape and still reads as busy. Anchoring must not have cost the signal
 // the two calls exist for.

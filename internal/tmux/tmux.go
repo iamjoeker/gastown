@@ -1475,24 +1475,63 @@ func sanitizeNudgeMessage(msg string) string {
 //
 // Detection is based on pane content analysis. Returns false on any error
 // (defensive — don't block nudge delivery on detection failure).
+//
+// A BUSY pane is never in Rewind mode, and that is checked first (gt-z8ra).
+// Rewind is a modal UI that captures all input — an agent sitting in it is not
+// generating, so "mid-turn" and "in Rewind" are mutually exclusive states. The
+// gate matters because the remedy is destructive: dismissRewindMode sends a
+// real Escape, and Escape cancels in-flight generation. It runs at nudge step
+// 0, BEFORE the shouldSendEscape guard that protects step 5, so a false
+// positive here is the one path by which a nudge still interrupts a working
+// agent — killing the turn and every child process of it, with no error, no
+// log, and no signal record anywhere, because it is a keystroke.
+//
+// The textual check alone cannot carry that weight: it scans for a bare "esc"
+// substring, which the busy footer "esc to interrupt" satisfies on every busy
+// Claude Code pane, permanently. That left only "rewind" and "enter" to be
+// found anywhere in the snapshot — which an agent's own transcript supplies
+// whenever it discusses rewinding or a word containing "enter". Because pane
+// content persists, a contaminated transcript makes EVERY nudge arriving in
+// that window fire the Escape, which is why the failures cluster.
 func (t *Tmux) isInRewindMode(target string) bool {
-	content, err := t.CapturePane(target, 15)
+	lines, err := t.CapturePaneLines(target, idleCaptureHistoryLines)
 	if err != nil {
 		return false
 	}
-	return containsRewindIndicators(content)
+	// Structural discriminator, checked before the textual one: if the agent is
+	// demonstrably mid-turn, the Rewind modal is not up and no Escape is owed.
+	if busyFromLines(lines, readyPromptPrefixForSession(t, target)) {
+		return false
+	}
+	return containsRewindIndicators(strings.Join(lines, "\n"))
 }
 
 // containsRewindIndicators checks pane content for Claude Code Rewind menu
 // patterns. The Rewind UI takes over the terminal and shows distinctive
 // action prompts (Enter to act, Esc to cancel/exit). We require multiple
 // co-occurring indicators to avoid false positives from conversation text.
+//
+// Every indicator must be an ACTION PROMPT ("enter to …", "esc to …"), never a
+// bare "enter"/"esc" substring, and status-footer lines are excluded before
+// matching (gt-z8ra). Both rules exist for the same reason: the pane holds the
+// agent's own transcript as well as its chrome, so text ABOUT rewinding, and
+// the busy footer's own "esc to interrupt", used to satisfy a search FOR the
+// Rewind menu. The caller acts on a hit by sending Escape, so a false positive
+// here interrupts a working agent.
 func containsRewindIndicators(content string) bool {
-	lower := strings.ToLower(content)
+	// Drop the agent's status footer: "esc to interrupt" is the busy indicator,
+	// not Rewind chrome, and it matches every "esc to …" pattern below.
+	kept := make([]string, 0, strings.Count(content, "\n")+1)
+	for _, line := range strings.Split(content, "\n") {
+		if !hasBusyIndicator(line) {
+			kept = append(kept, line)
+		}
+	}
+	lower := strings.ToLower(strings.Join(kept, "\n"))
 
 	// Primary: "rewind" appears alongside both Enter and Esc action prompts.
 	if strings.Contains(lower, "rewind") {
-		if strings.Contains(lower, "enter") && strings.Contains(lower, "esc") {
+		if strings.Contains(lower, "enter to ") && strings.Contains(lower, "esc to ") {
 			return true
 		}
 	}

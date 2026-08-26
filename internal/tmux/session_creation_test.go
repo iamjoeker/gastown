@@ -211,6 +211,17 @@ func TestContainsRewindIndicators(t *testing.T) {
 		{"only esc no enter", "Esc to exit", false},
 		{"conversation mentioning rewind", "User said: please rewind the video\n❯ ", false},
 		{"partial match no pair", "Enter to continue\nSome other text", false},
+
+		// gt-z8ra: the cases above take every negative on an IDLE pane, which is
+		// the one frame where this defect cannot appear. On a BUSY pane the
+		// footer reads "esc to interrupt", so a bare "esc" substring was always
+		// satisfied — leaving only "rewind" and "enter" to be found anywhere in
+		// the agent's own transcript before a real Escape was fired into a
+		// working turn. Each case below returned true before the fix.
+		{"busy pane discussing rewind", "I'll rewind the migration and re-enter the loop.\n⏵⏵ Running… (esc to interrupt)", false},
+		{"busy pane, 'entered' in prose", "The user entered a rewind request earlier.\n✻ Thinking… (esc to interrupt)", false},
+		{"busy pane discussing this very bug", "nudge rewind hypothesis: Enter key handling\n⏵⏵ Bash… (esc to interrupt)", false},
+		{"busy footer alone supplies no esc action prompt", "Rewind the tape\nenter to continue\n⏵⏵ (esc to interrupt)", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
