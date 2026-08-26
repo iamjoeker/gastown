@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/gcprotect"
 )
 
 // TestDonePurgeArgsAlwaysBoundByAge is the regression guard for gt-fdj.
@@ -80,4 +84,127 @@ func argvContains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// gt-x6yk: the purge must not be issued without bd's label guard in place
+// ---------------------------------------------------------------------------
+
+// recordingBD answers `bd config get`/`config set` and records every argv it is
+// handed, so a test can assert what was run AND what was not.
+type recordingBD struct {
+	calls   [][]string
+	value   string
+	set     bool
+	failGet bool
+}
+
+func (r *recordingBD) run(args ...string) ([]byte, error) {
+	r.calls = append(r.calls, args)
+	switch {
+	case len(args) >= 3 && args[0] == "config" && args[1] == "get":
+		if r.failGet {
+			return nil, fmt.Errorf("dolt: connection refused")
+		}
+		if !r.set {
+			return []byte(args[2] + " (not set)\n"), nil
+		}
+		return []byte(r.value + "\n"), nil
+	case len(args) >= 4 && args[0] == "config" && args[1] == "set":
+		r.value, r.set = args[3], true
+		return []byte("Set " + args[2] + " = " + args[3] + "\n"), nil
+	}
+	return []byte("0\n"), nil
+}
+
+func (r *recordingBD) ranPurge() bool {
+	for _, c := range r.calls {
+		if len(c) > 0 && c[0] == "purge" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPurgeIsGuardedBeforeItRuns pins the wiring, not the source text.
+//
+// `bd purge --force` spares only the labels in the target database's
+// `gc.protected_labels`, which by default omits gt:escalation — the label
+// reaper.ProtectedWispLabels holds and `gt compact` honours. On the deployed bd
+// 1.2.2 an unpinned closed escalation wisp on hq probed purge_count 1 while a
+// gt:message control on the same probe came back label_protected_skipped 1.
+// Escalation wisps are unversioned, dolt-ignored and unarchived, so the guard
+// has to be established BEFORE the argv is issued, not merely somewhere in the
+// file.
+func TestPurgeIsGuardedBeforeItRuns(t *testing.T) {
+	r := &recordingBD{}
+	purgeClosedEphemeralBeadsWith(r.run)
+
+	if !r.ranPurge() {
+		t.Fatalf("control failed: the purge was never issued at all, so the ordering "+
+			"assertion below proves nothing. calls=%v", r.calls)
+	}
+
+	guardIdx, purgeIdx := -1, -1
+	for i, c := range r.calls {
+		if guardIdx == -1 && len(c) >= 3 && c[0] == "config" && c[2] == gcprotect.ConfigKey {
+			guardIdx = i
+		}
+		if purgeIdx == -1 && len(c) > 0 && c[0] == "purge" {
+			purgeIdx = i
+		}
+	}
+	if guardIdx == -1 {
+		t.Fatalf("`gt done` issued `bd purge --force` without ever touching %s, so "+
+			"whichever database it lands in spares only bd's defaults and deletes "+
+			"escalation records (gt-x6yk). calls=%v", gcprotect.ConfigKey, r.calls)
+	}
+	if guardIdx > purgeIdx {
+		t.Errorf("%s was configured AFTER the purge ran (guard at %d, purge at %d); "+
+			"the protection arrives too late to spare anything this run deleted. "+
+			"calls=%v", gcprotect.ConfigKey, guardIdx, purgeIdx, r.calls)
+	}
+
+	if len(missing(parseProtected(r.value), gcprotect.Required())) > 0 {
+		t.Errorf("guard installed %q, which does not cover %v",
+			r.value, gcprotect.Required())
+	}
+}
+
+// TestPurgeIsSkippedWhenTheGuardCannotBeConfirmed. Failing OPEN here would be
+// the worst outcome available: the purge deletes, its protection was never
+// established, and nothing in the output distinguishes that from a guarded run.
+// Skipping costs accumulated wisp rows, which are visible and reversible.
+func TestPurgeIsSkippedWhenTheGuardCannotBeConfirmed(t *testing.T) {
+	r := &recordingBD{failGet: true}
+	purgeClosedEphemeralBeadsWith(r.run)
+
+	if r.ranPurge() {
+		t.Errorf("the guard could not read %s and the purge ran anyway: %v",
+			gcprotect.ConfigKey, r.calls)
+	}
+}
+
+func parseProtected(v string) []string {
+	var out []string
+	for _, f := range strings.Split(v, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func missing(have, want []string) []string {
+	present := make(map[string]bool, len(have))
+	for _, h := range have {
+		present[h] = true
+	}
+	var out []string
+	for _, w := range want {
+		if !present[w] {
+			out = append(out, w)
+		}
+	}
+	return out
 }

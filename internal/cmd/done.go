@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/gcprotect"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -3630,8 +3631,38 @@ func buildDonePurgeArgs() []string {
 //
 // Age matches the reaper's purge_age and doltserver.purgeMinAge so the town's
 // destructive paths cannot disagree about "old enough to delete".
+//
+// ⚠️ WHAT bd SPARES IS NOT gastown's LIST (gt-x6yk). `bd purge` protects by
+// LABEL and only the labels in the target database's `gc.protected_labels`,
+// which defaults to gt:merge-request + gt:message — NOT the gt:escalation that
+// reaper.ProtectedWispLabels holds and that `gt compact` and the reaper's SQL
+// delete both honour. Measured on the deployed bd 1.2.2 against an unpinned
+// closed escalation wisp on hq: purge_count 1, while a gt:message control on
+// the same probe came back label_protected_skipped 1. Escalation wisps are
+// unversioned and dolt-ignored, and `bd purge` does not archive, so that is
+// final. gcprotect.EnsureForArgs makes the key say what gastown requires and
+// confirms it by reading it back; if it cannot, this purge does not run.
 func purgeClosedEphemeralBeads(bd *beads.Beads) {
-	out, err := bd.Run(buildDonePurgeArgs()...)
+	purgeClosedEphemeralBeadsWith(bd.Run)
+}
+
+// purgeClosedEphemeralBeadsWith is the body, taking the bd invoker rather than a
+// *beads.Beads. Split out so a test can watch the ORDER of the calls: that the
+// guard precedes the purge, and that a guard which cannot confirm protection
+// stops the purge from being issued at all. Asserting the source contains a
+// gcprotect call would pass with the call in a branch that never runs, which is
+// the failure mode gt-am7 catalogues.
+func purgeClosedEphemeralBeadsWith(run gcprotect.Runner) {
+	args := buildDonePurgeArgs()
+	if err := gcprotect.EnsureForArgs(run, args); err != nil {
+		// Fail closed. Skipping the purge costs accumulated wisp rows, which is
+		// visible and reversible; running it without the guard costs escalation
+		// records, which is neither.
+		fmt.Fprintf(os.Stderr, "Warning: skipping wisp purge — %v\n", err)
+		return
+	}
+
+	out, err := run(args...)
 	if err != nil {
 		// Non-fatal: purge failure shouldn't block session completion
 		fmt.Fprintf(os.Stderr, "Warning: wisp purge failed: %v\n", err)
