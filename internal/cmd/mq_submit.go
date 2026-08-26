@@ -330,6 +330,27 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Pin the MR wisp (gt-31nn). Both branches above reach here, so an MR that
+	// predates this code gets pinned on its next submit too.
+	//
+	// The label alone does not protect this row. It keeps the MR out of a plain
+	// purge, but the archive-then-delete path selects exactly the rows that are
+	// protected by TYPE and NOT pinned, exports them, and deletes them — so the
+	// pin is what makes the record survive retention. Every other writer here
+	// already assumes it: this function and the refinery both force-close their
+	// own MRs to get past a pin that was never actually set (gt-6dp, gt-obth).
+	//
+	// Non-fatal. The MR exists, the refinery can merge it, and the label still
+	// covers the purge path; an unpinned MR is the pre-gt-31nn status quo, which
+	// is not worth failing a submit over. It is worth saying out loud, because
+	// silence at exactly this point is what left the column empty.
+	if err := bd.PinWisps(rigName, mrIssue.ID); err != nil {
+		style.PrintWarning("could not pin MR %s: %v\n"+
+			"The MR is submitted and mergeable, but its record is not protected from "+
+			"the archive-then-delete path. Pin it by hand if it must survive retention:\n"+
+			"  bd sql \"UPDATE wisps SET pinned = 1 WHERE id = '%s'\"", mrIssue.ID, err, mrIssue.ID)
+	}
+
 	// Success output
 	fmt.Printf("%s Submitted to merge queue\n", style.Bold.Render("✓"))
 	fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrIssue.ID))

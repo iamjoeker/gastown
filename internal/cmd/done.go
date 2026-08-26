@@ -2075,6 +2075,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				style.PrintWarning("MR bead prefix mismatch: %v\nThe refinery may not find this MR — check 'gt mq list %s'", prefixErr, rigName)
 			}
 
+			// Pin the MR wisp (gt-31nn). `gt done` is the path almost every MR
+			// is actually created on, so a pin added only to `gt mq submit`
+			// would be inert here. See the same block there for why the label
+			// alone does not protect this row from the archive-then-delete
+			// path, and why the failure is non-fatal.
+			if pinErr := bd.PinWisps(rigName, mrID); pinErr != nil {
+				style.PrintWarning("could not pin MR %s: %v\n"+
+					"The MR is submitted and mergeable, but its record is not protected from "+
+					"the archive-then-delete path. Pin it by hand if it must survive retention:\n"+
+					"  bd sql \"UPDATE wisps SET pinned = 1 WHERE id = '%s'\"", mrID, pinErr, mrID)
+			}
+
 			// GH#3032: Supersede older open MRs for the same source issue.
 			// When a polecat re-submits after fixing a gate failure, the old MR
 			// (same branch, different SHA) is stale. Close it so the refinery
@@ -2086,7 +2098,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							continue // skip the one we just created
 						}
 						reason := fmt.Sprintf("superseded by %s", mrID)
-						if closeErr := bd.CloseWithReason(reason, old.ID); closeErr != nil {
+						// Force: MR wisps are pinned (gt-31nn), and `bd close`
+						// refuses a pinned bead without --force. The pin exists
+						// to stop retention deleting the record, not to stop the
+						// merge queue retiring its own — the same reasoning
+						// `gt mq submit` and the refinery already apply
+						// (gt-6dp, gt-obth). Without this the supersede fails on
+						// every re-submit and the stale MR stays in the queue.
+						if closeErr := bd.ForceCloseWithReason(reason, old.ID); closeErr != nil {
 							style.PrintWarning("could not supersede old MR %s: %v", old.ID, closeErr)
 							continue
 						}

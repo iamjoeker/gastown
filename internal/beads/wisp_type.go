@@ -94,21 +94,33 @@ func WispTypeUpdateSQL(wispType string, ids []string) (string, error) {
 		return "", fmt.Errorf("invalid wisp type %q (must be one of %s)",
 			wispType, strings.Join(validWispTypes, ", "))
 	}
-	if len(ids) == 0 {
-		return "", fmt.Errorf("no wisp IDs given")
-	}
-
-	quoted := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id == "" {
-			return "", fmt.Errorf("empty wisp ID")
-		}
-		if strings.ContainsAny(id, "'\"\\`") {
-			return "", fmt.Errorf("refusing to build SQL for wisp ID %q: contains a quote", id)
-		}
-		quoted = append(quoted, "'"+id+"'")
+	quoted, err := quoteWispIDs(ids)
+	if err != nil {
+		return "", err
 	}
 
 	return fmt.Sprintf("UPDATE wisps SET wisp_type = '%s' WHERE id IN (%s)",
 		wispType, strings.Join(quoted, ", ")), nil
+}
+
+// quoteWispIDs renders ids as a SQL literal list for an IN clause.
+//
+// Rejects an ID containing a quote — IDs are bd-generated slugs, so a quote
+// means the caller parsed the wrong token out of command output, and
+// interpolating it would be an injection.
+func quoteWispIDs(ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no wisp IDs given")
+	}
+	quoted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return nil, fmt.Errorf("empty wisp ID")
+		}
+		if strings.ContainsAny(id, "'\"\\`") {
+			return nil, fmt.Errorf("refusing to build SQL for wisp ID %q: contains a quote", id)
+		}
+		quoted = append(quoted, "'"+id+"'")
+	}
+	return quoted, nil
 }
