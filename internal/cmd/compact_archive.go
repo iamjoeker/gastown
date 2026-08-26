@@ -39,6 +39,18 @@ import (
 // A record that cannot be written CANCELS the delete pass. A wisp not deleted
 // today is deleted tomorrow once the archive is writable again; a wisp deleted
 // today without a record is gone.
+//
+// DEPTH, not just presence (gt-wv8h). Both writers append to the same archive
+// file, so a reader cannot tell which one produced a given line — and until
+// gt-wv8h neither recorded wisp_events at all, while the reaper's delete list
+// named that table and its comment claimed the rows "were written out first".
+// The events key is now mandatory in every record for exactly that reason, so
+// this writer has to fill it too: a record here that omitted events while the
+// reaper's carried them would put the two meanings of an empty list back into
+// one file. Whether `bd delete --force` cascades into wisp_events is bd's
+// business and not observable from here, which is the argument FOR recording
+// them rather than against — an archive that depends on a guess about someone
+// else's delete semantics is not a record.
 
 // archiveIDChunk bounds how many ids go into one enrichment query. The list is
 // inlined into SQL (bd's sql subcommand takes a query string, not placeholders),
@@ -61,6 +73,13 @@ var safeWispID = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
 const compactArchiveColumns = `id, title, description, design, notes, close_reason, ` +
 	`status, priority, issue_type, wisp_type, assignee, created_by, owner, ` +
 	`source_repo, created_at, updated_at, closed_at`
+
+// compactEventColumns mirrors the reaper's attachArchiveEvents. Compaction
+// writes into the SAME archive file the reaper writes, so the two must record a
+// wisp to the same depth: an events key that means "collected, there were none"
+// in one writer and "never looked" in the other is the unreadable absence
+// gt-wv8h was reported as, moved one file over.
+const compactEventColumns = `issue_id, event_type, actor, old_value, new_value, comment, created_at`
 
 // archiveRow is one wisps-table row as the enrichment query returns it.
 // Timestamps stay strings here for the same reason wispAge accepts two layouts:
@@ -85,6 +104,20 @@ type archiveRow struct {
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`
 	ClosedAt    string `json:"closed_at"`
+}
+
+// archiveAuxRow is one wisp_events or wisp_comments row. The two share a shape
+// because a comment is an event with only a body: keeping one decoder means a
+// column added to one query cannot be silently dropped from the other.
+type archiveAuxRow struct {
+	IssueID   string `json:"issue_id"`
+	EventType string `json:"event_type"`
+	Actor     string `json:"actor"`
+	OldValue  string `json:"old_value"`
+	NewValue  string `json:"new_value"`
+	Comment   string `json:"comment"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
 }
 
 // archiveDeletions records every wisp the delete pass is about to remove and
@@ -140,11 +173,127 @@ func buildArchiveRecords(bd *beads.Beads, dbName string, pending []*compactIssue
 			"reading full wisp records for the archive: %v — archived id, title and status only", err))
 	}
 
+	// Events and comments are loaded separately so one failing does not cost the
+	// other, and neither costs the row.
+	events, eventsErr := loadArchiveAux(bd, pending, "wisp_events", compactEventColumns)
+	if eventsErr != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf(
+			"reading wisp_events for the archive: %v — the records say so rather than reading as "+
+				"wisps that had no events", eventsErr))
+	}
+	comments, commentsErr := loadArchiveAux(bd, pending, "wisp_comments", "issue_id, text, created_at")
+	if commentsErr != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf(
+			"reading wisp_comments for the archive: %v — archived without them", commentsErr))
+	}
+
 	records := make([]reaper.ArchivedWisp, 0, len(pending))
 	for _, w := range pending {
-		records = append(records, archiveRecordFor(w, rows[w.ID], dbName, now))
+		rec := archiveRecordFor(w, rows[w.ID], dbName, now)
+		attachCompactEvents(&rec, events[w.ID], eventsErr)
+		for _, c := range comments[w.ID] {
+			rec.Comments = append(rec.Comments, c.Text)
+		}
+		records = append(records, rec)
 	}
 	return records
+}
+
+// attachCompactEvents fills the record's event history, or says why it could
+// not.
+//
+// The events key is deliberately not omitempty in reaper.ArchivedWisp: a record
+// without it predates gt-wv8h and lost its history, a record with it is
+// complete as written. That only holds while nothing writes a null events key
+// for a wisp it never queried — so when the query failed, this writes one
+// marker event saying so instead of an empty list that would read as "this wisp
+// had no events". A record that overstates its own completeness is worse than
+// one that admits a hole, because only the second can be found later.
+func attachCompactEvents(rec *reaper.ArchivedWisp, rows []archiveAuxRow, loadErr error) {
+	if loadErr != nil {
+		rec.Events = []reaper.ArchivedEvent{{
+			EventType: archiveEventsUnread,
+			Comment:   fmt.Sprintf("wisp_events could not be read for this record: %v", loadErr),
+		}}
+		return
+	}
+	for _, e := range rows {
+		rec.Events = append(rec.Events, reaper.ArchivedEvent{
+			EventType: e.EventType,
+			Actor:     e.Actor,
+			OldValue:  e.OldValue,
+			NewValue:  e.NewValue,
+			Comment:   e.Comment,
+			CreatedAt: parseWispTimestamp(e.CreatedAt),
+		})
+	}
+}
+
+// archiveEventsUnread is the event_type of the marker attachCompactEvents
+// writes when the events query failed. It is not an event type the wisp tables
+// produce, so a reader grepping the archive for it finds exactly the records
+// whose history is unknown rather than absent.
+const archiveEventsUnread = "gt:archive-events-unread"
+
+// loadArchiveAux reads one auxiliary table for the pending wisps, in chunks,
+// keyed by issue_id and kept in the order the query returned.
+//
+// A chunk that fails aborts the whole load for the same reason loadArchiveRows
+// does: a caller holding half the events and no error would write half the
+// records complete and say nothing about the rest.
+func loadArchiveAux(bd *beads.Beads, pending []*compactIssue, table, columns string) (map[string][]archiveAuxRow, error) {
+	if bd == nil {
+		return nil, fmt.Errorf("no beads handle")
+	}
+
+	ids := make([]string, 0, len(pending))
+	for _, w := range pending {
+		if safeWispID.MatchString(w.ID) {
+			ids = append(ids, w.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	byID := map[string][]archiveAuxRow{}
+	for start := 0; start < len(ids); start += archiveIDChunk {
+		end := start + archiveIDChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk, err := queryArchiveAuxRows(bd, table, columns, ids[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range chunk {
+			byID[row.IssueID] = append(byID[row.IssueID], row)
+		}
+	}
+	return byID, nil
+}
+
+func queryArchiveAuxRows(bd *beads.Beads, table, columns string, ids []string) ([]archiveAuxRow, error) {
+	quoted := make([]string, len(ids))
+	for i, id := range ids {
+		quoted[i] = "'" + id + "'"
+	}
+	// Ordered by created_at then id: the value of an event list is the SEQUENCE,
+	// and an AUTO_INCREMENT id shared with concurrent writers is only
+	// incidentally chronological.
+	query := "SELECT " + columns + " FROM " + table + " WHERE issue_id IN (" +
+		strings.Join(quoted, ", ") + ") ORDER BY issue_id, created_at, id"
+
+	out, err := bd.Run("sql", "--json", query)
+	if err != nil {
+		return nil, fmt.Errorf("querying %s for archive: %w", table, err)
+	}
+
+	var rows []archiveAuxRow
+	if err := json.Unmarshal(extractJSONArray(out), &rows); err != nil {
+		return nil, fmt.Errorf("parsing %s rows: %w", table, err)
+	}
+	return rows, nil
 }
 
 // loadArchiveRows reads the archive columns for the pending wisps, in chunks.

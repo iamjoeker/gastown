@@ -1431,6 +1431,13 @@ func FormatWispTypeDigest(byType map[string]int) string {
 // deleted. Identical to the purge path's list, because the retention path
 // deletes exactly what purge deletes — the difference is only that these rows
 // were written out first.
+//
+// "written out first" is a claim about collectArchivableWisps, and for
+// wisp_events it was false from the day this list was written until gt-wv8h:
+// the table was named here and read nowhere, so every released wisp lost its
+// event history unrecorded while this comment said it had not. The two lists
+// are kept equal by TestArchiveRecordsEveryTableTheReleaseDeletes, because a
+// comment cannot notice when a fifth table is added to one of them.
 var wispArchiveAuxTables = []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
 // archiveProtectedWisps exports closed, label-protected, unpinned wisps past the

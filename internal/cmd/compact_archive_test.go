@@ -132,8 +132,26 @@ func TestArchiveRecordSurvivesUnreadableEnrichment(t *testing.T) {
 	if len(records) != 1 || records[0].ID != "gt-wisp-a" {
 		t.Fatalf("records = %+v, want one record for the pending wisp", records)
 	}
-	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "archive") {
-		t.Errorf("Errors = %v, want the degraded record reported, not swallowed", result.Errors)
+	// One per enrichment query — the wisps row, the events, the comments. They
+	// are separate so one failing does not cost the other two.
+	if len(result.Errors) != 3 {
+		t.Errorf("Errors = %v, want 3 (row, events, comments) — a swallowed one is an "+
+			"enrichment nobody knows was skipped", result.Errors)
+	}
+	if !containsSubstring(result.Errors, "wisp_events") {
+		t.Errorf("Errors = %v, want the unread events named", result.Errors)
+	}
+
+	// The events key is not omitempty, so a record whose events were never read
+	// would otherwise serialise as `"events":null` — indistinguishable from a
+	// wisp that genuinely had none, which is the unreadable absence of gt-wv8h.
+	events := records[0].Events
+	if len(events) != 1 || events[0].EventType != archiveEventsUnread {
+		t.Fatalf("Events = %+v, want one %s marker; an empty list here claims this wisp had no "+
+			"history when in fact nothing looked", events, archiveEventsUnread)
+	}
+	if !strings.Contains(events[0].Comment, "could not be read") {
+		t.Errorf("marker Comment = %q, want it to say why", events[0].Comment)
 	}
 }
 
@@ -218,6 +236,20 @@ func TestCompactWritesTheRecordBeforeItDeletes(t *testing.T) {
 	// operator reconstructs the wisp from.
 	if !strings.Contains(string(snapshot), "the payload that would have been lost") {
 		t.Errorf("archived record carries no description:\n%s", string(snapshot))
+	}
+	// Compaction writes into the same archive the reaper writes, so it must
+	// record a wisp to the same depth. The wisps row holds the FINAL status
+	// only; without these, "closed" cannot be told from "closed after being
+	// reopened twice" once the row is gone (gt-wv8h).
+	for _, want := range []string{`"event_type":"status_changed"`, `"actor":"gastown/deacon"`,
+		"deacon: nothing to reap this cycle"} {
+		if !strings.Contains(string(snapshot), want) {
+			t.Errorf("archived record is missing %s:\n%s", want, string(snapshot))
+		}
+	}
+	if strings.Contains(string(snapshot), archiveEventsUnread) {
+		t.Errorf("archived record carries the unread-events marker though bd answered the "+
+			"query — the enrichment is not reaching wisp_events:\n%s", string(snapshot))
 	}
 }
 
@@ -334,8 +366,26 @@ func setupCompactStubs(t *testing.T) compactStubEnv {
 		"updated_at":   "2020-01-02T00:00:00Z",
 		"closed_at":    "2020-01-02T00:00:00Z",
 	}}
+	// The event history the wisps row cannot hold: it keeps only the final
+	// status, so "dispatched, then completed" exists nowhere else (gt-wv8h).
+	eventRows := []map[string]any{{
+		"issue_id":   "gt-wisp-doomed",
+		"event_type": "status_changed",
+		"actor":      "gastown/deacon",
+		"old_value":  "open",
+		"new_value":  "closed",
+		"comment":    "",
+		"created_at": "2020-01-02T00:00:00Z",
+	}}
+	commentRows := []map[string]any{{
+		"issue_id":   "gt-wisp-doomed",
+		"text":       "deacon: nothing to reap this cycle",
+		"created_at": "2020-01-02T00:00:00Z",
+	}}
 	wispRowsPath := writeStubJSON(t, filepath.Join(logDir, "wisps.json"), wispRows)
 	archiveRowsPath := writeStubJSON(t, filepath.Join(logDir, "archive.json"), archiveRows)
+	eventRowsPath := writeStubJSON(t, filepath.Join(logDir, "events.json"), eventRows)
+	commentRowsPath := writeStubJSON(t, filepath.Join(logDir, "comments.json"), commentRows)
 
 	// $* is matched rather than $3: the wrapper may prepend a global flag, which
 	// would shift every positional argument.
@@ -349,6 +399,8 @@ case "$1" in
     case "$*" in
       *"FROM wisps w "*)          cat "$WISP_ROWS" ; exit 0 ;;
       *"FROM wisps WHERE id IN"*) cat "$ARCHIVE_ROWS" ; exit 0 ;;
+      *"FROM wisp_events"*)       cat "$EVENT_ROWS" ; exit 0 ;;
+      *"FROM wisp_comments"*)     cat "$COMMENT_ROWS" ; exit 0 ;;
       *"SHOW COLUMNS"*)           printf 'Field,Type\n' ; exit 0 ;;
       *)                          printf 'OK, 0 rows affected\n' ; exit 0 ;;
     esac
@@ -375,6 +427,8 @@ exit 1
 	t.Setenv("DELETE_LOG", env.deleteLog)
 	t.Setenv("WISP_ROWS", wispRowsPath)
 	t.Setenv("ARCHIVE_ROWS", archiveRowsPath)
+	t.Setenv("EVENT_ROWS", eventRowsPath)
+	t.Setenv("COMMENT_ROWS", commentRowsPath)
 	t.Setenv("ARCHIVE_SNAPSHOT", env.archiveSnapshot)
 	t.Setenv("ARCHIVE_DIR", archiveDir)
 	t.Setenv(reaper.ArchiveDirEnv, archiveDir)
