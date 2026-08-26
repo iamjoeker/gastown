@@ -221,7 +221,7 @@ func runMQNext(cmd *cobra.Command, args []string) error {
 			case mrBranchStateMissing:
 				exists := false
 				out.BranchExists = &exists
-			case mrBranchStateEmpty, mrBranchStateOK:
+			case mrBranchStateEmpty, mrBranchStatePresent:
 				exists := true
 				empty := next.state == mrBranchStateEmpty
 				ahead := next.ahead
@@ -277,8 +277,12 @@ func runMQNext(cmd *cobra.Command, args []string) error {
 // claiming an unchecked branch is fine.
 func describeMQNextGitState(c *mqNextCandidate) string {
 	switch c.state {
-	case mrBranchStateOK:
-		return style.Success.Render(fmt.Sprintf("OK (%d commit(s) ahead of target)", c.ahead))
+	case mrBranchStatePresent:
+		// PRESENT, not OK, and not styled Success: this line reports that the
+		// branch is reachable and carries work, which is not the same as saying
+		// the merge will succeed. Rendered as a green OK it was read as merge
+		// clearance for branches that conflicted in 17 files (gt-0w2l).
+		return fmt.Sprintf("PRESENT (%d commit(s) ahead of target — reachability only, not a merge verdict)", c.ahead)
 	case mrBranchStateMissing:
 		return style.Error.Render("MISSING (no local or origin ref — the merge will fail)")
 	case mrBranchStateErr:

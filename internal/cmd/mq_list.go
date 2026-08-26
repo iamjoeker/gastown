@@ -27,6 +27,13 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	// Create beads wrapper for the rig - use BeadsPath() to get the git-synced location
 	b := beads.New(r.BeadsPath())
 
+	// --merge-check is strictly more work than --verify and needs everything
+	// --verify resolves, so asking for it turns --verify on rather than failing
+	// on a flag combination the operator had no reason to expect.
+	if mqListMergeCheck {
+		mqListVerify = true
+	}
+
 	// Create git client for branch verification when --verify is set
 	var gitClient *git.Git
 	if mqListVerify {
@@ -80,11 +87,13 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	// Apply additional filters and calculate scores
 	now := time.Now()
 	type scoredIssue struct {
-		issue        *beads.Issue
-		fields       *beads.MRFields
-		score        float64
-		branchState  mrBranchState // git verification result (when --verify is set)
-		commitsAhead int           // commits the branch carries over its target (valid for OK/EMPTY)
+		issue         *beads.Issue
+		fields        *beads.MRFields
+		score         float64
+		branchState   mrBranchState // git verification result (when --verify is set)
+		commitsAhead  int           // commits the branch carries over its target (valid for PRESENT/EMPTY)
+		mergeState    mrMergeState  // merge rehearsal result (when --merge-check is set)
+		conflictFiles int           // files that conflict (valid for CONFLICTS)
 	}
 	var scored []scoredIssue
 
@@ -138,12 +147,22 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check the branch if --verify is set: does it exist (local + remote-tracking
-		// refs), and does it actually carry commits over its target?
-		branchState, commitsAhead := verifyBranch(mqListVerify, gitClient, fields)
+		// refs), and does it actually carry commits over its target? Neither
+		// question is "would it merge" — that is --merge-check, below.
+		verification := verifyBranchRefs(mqListVerify, gitClient, fields)
+		mergeState, conflictFiles := rehearseMerge(mqListMergeCheck, gitClient, verification)
 
 		// Calculate priority score
 		score := calculateMRScore(issue, fields, now)
-		scored = append(scored, scoredIssue{issue: issue, fields: fields, score: score, branchState: branchState, commitsAhead: commitsAhead})
+		scored = append(scored, scoredIssue{
+			issue:         issue,
+			fields:        fields,
+			score:         score,
+			branchState:   verification.state,
+			commitsAhead:  verification.commitsAhead,
+			mergeState:    mergeState,
+			conflictFiles: conflictFiles,
+		})
 	}
 
 	// Sort by score descending (highest priority first)
@@ -163,11 +182,14 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			// Extend JSON with verification results
 			type verifiedIssue struct {
 				*beads.Issue
-				BranchExists *bool  `json:"branch_exists,omitempty"`
-				BranchEmpty  *bool  `json:"branch_empty,omitempty"`
-				CommitsAhead *int   `json:"commits_ahead,omitempty"`
-				GitState     string `json:"git_state,omitempty"`
-				VerifyError  bool   `json:"verify_error,omitempty"`
+				BranchExists  *bool  `json:"branch_exists,omitempty"`
+				BranchEmpty   *bool  `json:"branch_empty,omitempty"`
+				CommitsAhead  *int   `json:"commits_ahead,omitempty"`
+				GitState      string `json:"git_state,omitempty"`
+				VerifyError   bool   `json:"verify_error,omitempty"`
+				MergeState    string `json:"merge_state,omitempty"`
+				MergeClean    *bool  `json:"merge_clean,omitempty"`
+				ConflictFiles *int   `json:"conflict_files,omitempty"`
 			}
 			var verified []verifiedIssue
 			for _, s := range scored {
@@ -180,13 +202,32 @@ func runMQList(cmd *cobra.Command, args []string) error {
 					case mrBranchStateMissing:
 						exists := false
 						vi.BranchExists = &exists
-					case mrBranchStateEmpty, mrBranchStateOK:
+					case mrBranchStateEmpty, mrBranchStatePresent:
 						exists := true
 						empty := s.branchState == mrBranchStateEmpty
 						ahead := s.commitsAhead
 						vi.BranchExists = &exists
 						vi.BranchEmpty = &empty
 						vi.CommitsAhead = &ahead
+					}
+					// merge_clean is a pointer so "not rehearsed" is absent
+					// rather than false — the whole defect this fixes was a
+					// non-answer reading as a verdict (gt-0w2l).
+					switch s.mergeState {
+					case mrMergeStateClean:
+						clean := true
+						files := 0
+						vi.MergeState = string(s.mergeState)
+						vi.MergeClean = &clean
+						vi.ConflictFiles = &files
+					case mrMergeStateConflicts:
+						clean := false
+						files := s.conflictFiles
+						vi.MergeState = string(s.mergeState)
+						vi.MergeClean = &clean
+						vi.ConflictFiles = &files
+					case mrMergeStateErr:
+						vi.MergeState = string(s.mergeState)
 					}
 				}
 				verified = append(verified, vi)
@@ -217,8 +258,8 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Create styled table - add GIT column when --verify is set
-	table := style.NewTable(buildMQListColumns(mqListVerify)...)
+	// Create styled table - add GIT/MERGE columns when the flags ask for them
+	table := style.NewTable(buildMQListColumns(mqListVerify, mqListMergeCheck)...)
 
 	// Add rows using scored items (already sorted by score)
 	for _, item := range scored {
@@ -292,11 +333,33 @@ func runMQList(cmd *cobra.Command, args []string) error {
 				gitStatus = style.Error.Render("MISSING")
 			case mrBranchStateEmpty:
 				// The branch exists but carries no commits over its target:
-				// merging it is a no-op. Distinct from OK because the correct
-				// disposition is rejection, not merge (gt-d5u).
+				// merging it is a no-op. Distinct from PRESENT because the
+				// correct disposition is rejection, not merge (gt-d5u).
 				gitStatus = style.Error.Render("EMPTY")
-			case mrBranchStateOK:
-				gitStatus = style.Success.Render("OK")
+			case mrBranchStatePresent:
+				// Deliberately NOT styled Success, and deliberately not called
+				// OK: this cell says the branch is reachable and non-empty, and
+				// a green OK next to a green "ready" reads as merge clearance
+				// it cannot give (gt-0w2l). --merge-check fills the MERGE column
+				// with the verdict this one does not carry.
+				gitStatus = "PRESENT"
+			}
+		}
+
+		// Format the merge rehearsal when --merge-check is set
+		mergeStatus := ""
+		if mqListMergeCheck {
+			switch item.mergeState {
+			case mrMergeStateClean:
+				mergeStatus = style.Success.Render("CLEAN")
+			case mrMergeStateConflicts:
+				mergeStatus = style.Error.Render(fmt.Sprintf("CONFLICTS=%d", item.conflictFiles))
+			case mrMergeStateErr:
+				mergeStatus = style.Warning.Render("ERR")
+			default:
+				// Not rehearsed — the branch never reached PRESENT, so its GIT
+				// cell already carries the disposition.
+				mergeStatus = style.Dim.Render("-")
 			}
 		}
 
@@ -309,12 +372,15 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			displayID = displayID[:12]
 		}
 
-		// Build row with conditional GIT column
+		// Build row with conditional GIT/MERGE columns
+		row := []string{displayID, scoreStr, priority, convoyDisplay, branch, target, styledStatus}
 		if mqListVerify {
-			table.AddRow(displayID, scoreStr, priority, convoyDisplay, branch, target, styledStatus, gitStatus, style.Dim.Render(age))
-		} else {
-			table.AddRow(displayID, scoreStr, priority, convoyDisplay, branch, target, styledStatus, style.Dim.Render(age))
+			row = append(row, gitStatus)
 		}
+		if mqListMergeCheck {
+			row = append(row, mergeStatus)
+		}
+		table.AddRow(append(row, style.Dim.Render(age))...)
 	}
 
 	fmt.Print(table.Render())
@@ -323,13 +389,26 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	if mqListVerify {
 		missingCount := 0
 		emptyCount := 0
+		presentCount := 0
 		for _, item := range scored {
 			switch item.branchState {
 			case mrBranchStateMissing:
 				missingCount++
 			case mrBranchStateEmpty:
 				emptyCount++
+			case mrBranchStatePresent:
+				presentCount++
 			}
+		}
+		// Say what PRESENT does not mean, at the call site, every time it
+		// appears. The states are individually accurate and the omission is what
+		// misleads: PRESENT beside a "ready" status was read as clearance to
+		// merge two branches that conflicted in 17 and 12 files (gt-0w2l).
+		if presentCount > 0 && !mqListMergeCheck {
+			fmt.Printf("\n  %s\n", style.Dim.Render(fmt.Sprintf(
+				"PRESENT means reachable and non-empty. It is NOT a merge verdict — %d of these may still conflict.", presentCount)))
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf(
+				"To find out, rehearse the merge: gt mq list %s --merge-check", rigName)))
 		}
 		if missingCount > 0 {
 			fmt.Printf("\n  %s %d MR(s) with missing branches\n",
@@ -341,6 +420,31 @@ func runMQList(cmd *cobra.Command, args []string) error {
 				style.Error.Render("⚠"),
 				emptyCount)
 			fmt.Printf("  %s\n", style.Dim.Render("Merging one is a no-op that still closes the source issue — reject instead: gt mq reject <rig> <mr-id> --reason \"empty branch\" --notify"))
+		}
+	}
+
+	// Show the merge rehearsal summary when --merge-check is set
+	if mqListMergeCheck {
+		conflicted := 0
+		mergeErrs := 0
+		for _, item := range scored {
+			switch item.mergeState {
+			case mrMergeStateConflicts:
+				conflicted++
+			case mrMergeStateErr:
+				mergeErrs++
+			}
+		}
+		if conflicted > 0 {
+			fmt.Printf("\n  %s %d MR(s) whose branch does not merge cleanly into its target\n",
+				style.Error.Render("⚠"),
+				conflicted)
+			fmt.Printf("  %s\n", style.Dim.Render("Rehearsed with git merge-tree against the same refs the queue merges. Rebase the branch or land it by cherry-pick — a plain merge will stop on conflicts."))
+		}
+		if mergeErrs > 0 {
+			fmt.Printf("\n  %s %d MR(s) whose merge could not be rehearsed — treat as UNKNOWN, not as clean\n",
+				style.Warning.Render("⚠"),
+				mergeErrs)
 		}
 	}
 
@@ -427,7 +531,7 @@ func outputJSON(data interface{}) error {
 	return enc.Encode(data)
 }
 
-func buildMQListColumns(verify bool) []style.Column {
+func buildMQListColumns(verify, mergeCheck bool) []style.Column {
 	columns := []style.Column{
 		{Name: "ID", Width: 12},
 		{Name: "SCORE", Width: 7, Align: style.AlignRight},
@@ -438,7 +542,13 @@ func buildMQListColumns(verify bool) []style.Column {
 		{Name: "STATUS", Width: 10},
 	}
 	if verify {
+		// Wide enough for PRESENT and MISSING. The header stays GIT because the
+		// values now say what they mean on their own (gt-0w2l).
 		columns = append(columns, style.Column{Name: "GIT", Width: 8})
+	}
+	if mergeCheck {
+		// Wide enough for CONFLICTS=nnn.
+		columns = append(columns, style.Column{Name: "MERGE", Width: 14})
 	}
 	return append(columns, style.Column{Name: "AGE", Width: 6, Align: style.AlignRight})
 }
@@ -484,15 +594,24 @@ func calculateMRScore(issue *beads.Issue, fields *beads.MRFields, now time.Time)
 // work is waiting" from "merging this changes nothing" (gt-d5u). The states are
 // kept distinct because their dispositions differ — an EMPTY MR is rejected, not
 // merged and not retried.
+//
+// WILL-IT-MERGE is a THIRD question, and none of these states answer it. That is
+// why the good state is spelled PRESENT and not OK (gt-0w2l): rendered as OK, in
+// a column called GIT, beside a STATUS column reading "ready", it was read as
+// merge clearance by the Mayor, who instructed the refinery to merge two
+// branches that conflicted in 17 and 12 files. Both were correctly PRESENT — they
+// existed and carried 700 commits each over a merge base 700 commits back. For an
+// actual merge verdict see mrMergeState, which runs a three-way merge.
 type mrBranchState string
 
 const (
 	// mrBranchStateSkipped means no verification ran (--verify off, no client,
 	// or the MR records no branch).
 	mrBranchStateSkipped mrBranchState = ""
-	// mrBranchStateOK means the branch exists and carries at least one commit
-	// over its target branch.
-	mrBranchStateOK mrBranchState = "OK"
+	// mrBranchStatePresent means the branch exists and carries at least one
+	// commit over its target branch. It says NOTHING about whether the merge
+	// would succeed.
+	mrBranchStatePresent mrBranchState = "PRESENT"
 	// mrBranchStateMissing means neither a local nor a remote-tracking ref exists.
 	mrBranchStateMissing mrBranchState = "MISSING"
 	// mrBranchStateEmpty means the branch exists but is not ahead of its target:
@@ -503,6 +622,27 @@ const (
 	mrBranchStateErr mrBranchState = "ERR"
 )
 
+// mrMergeState is the result of rehearsing an MR's merge with `--merge-check`.
+//
+// This is the verdict mrBranchState is not. It comes from a real three-way merge
+// (git merge-tree --write-tree) against the same refs the queue would merge, so
+// CONFLICTS is measured rather than inferred.
+type mrMergeState string
+
+const (
+	// mrMergeStateSkipped means no merge rehearsal ran (--merge-check off, or
+	// the branch never resolved far enough to rehearse).
+	mrMergeStateSkipped mrMergeState = ""
+	// mrMergeStateClean means the three-way merge produced a tree with no
+	// conflicts.
+	mrMergeStateClean mrMergeState = "CLEAN"
+	// mrMergeStateConflicts means the merge conflicts; the count of conflicted
+	// files travels alongside.
+	mrMergeStateConflicts mrMergeState = "CONFLICTS"
+	// mrMergeStateErr means git could not rehearse the merge.
+	mrMergeStateErr mrMergeState = "ERR"
+)
+
 // branchVerifier abstracts the git checks --verify performs, for testability.
 type branchVerifier interface {
 	BranchExists(branch string) (bool, error)
@@ -510,23 +650,51 @@ type branchVerifier interface {
 	CommitsAhead(base, branch string) (int, error)
 }
 
+// mergeRehearser abstracts the extra git check --merge-check performs. It is
+// separate from branchVerifier because the two flags are separate: --verify
+// answers reachability, --merge-check answers mergeability, and a caller that
+// wants only the first should not have to supply the second.
+type mergeRehearser interface {
+	MergeConflicts(base, branch string) ([]string, error)
+}
+
 // defaultMRTargetBranch is the target assumed when an MR records none.
 const defaultMRTargetBranch = "main"
 
+// mrVerification is everything --verify (and optionally --merge-check) learned
+// about one MR's branch.
+type mrVerification struct {
+	state        mrBranchState
+	commitsAhead int
+	// branchRef and targetRef are the refs the checks actually resolved to —
+	// origin/<branch> when it exists, the local ref otherwise. A merge rehearsal
+	// must use these exact refs, not the branch names, or it answers about a
+	// different commit than the queue will merge.
+	branchRef string
+	targetRef string
+}
+
 // verifyBranch checks that an MR's branch both exists and contains work.
-// Returns the resulting state and, when it is OK or EMPTY, the number of commits
-// the branch carries over its target.
+// Returns the resulting state and, when it is PRESENT or EMPTY, the number of
+// commits the branch carries over its target.
 func verifyBranch(verify bool, client branchVerifier, fields *beads.MRFields) (mrBranchState, int) {
+	v := verifyBranchRefs(verify, client, fields)
+	return v.state, v.commitsAhead
+}
+
+// verifyBranchRefs is verifyBranch, keeping the refs it resolved so a caller can
+// run further checks against the same commits.
+func verifyBranchRefs(verify bool, client branchVerifier, fields *beads.MRFields) mrVerification {
 	if !verify || client == nil || fields == nil || fields.Branch == "" {
-		return mrBranchStateSkipped, 0
+		return mrVerification{state: mrBranchStateSkipped}
 	}
 
 	branchRef, found, err := resolveVerifyRef(client, fields.Branch)
 	if err != nil {
-		return mrBranchStateErr, 0
+		return mrVerification{state: mrBranchStateErr}
 	}
 	if !found {
-		return mrBranchStateMissing, 0
+		return mrVerification{state: mrBranchStateMissing}
 	}
 
 	// Content check: does the branch carry anything the target does not already
@@ -539,18 +707,42 @@ func verifyBranch(verify bool, client branchVerifier, fields *beads.MRFields) (m
 	targetRef, targetFound, err := resolveVerifyRef(client, target)
 	if err != nil || !targetFound {
 		// Existence held but the target could not be resolved, so "does this
-		// contain work" is unanswered. Report that rather than implying OK.
-		return mrBranchStateErr, 0
+		// contain work" is unanswered. Report that rather than implying PRESENT.
+		return mrVerification{state: mrBranchStateErr}
 	}
 
 	ahead, err := client.CommitsAhead(targetRef, branchRef)
 	if err != nil {
-		return mrBranchStateErr, 0
+		return mrVerification{state: mrBranchStateErr, branchRef: branchRef, targetRef: targetRef}
 	}
 	if ahead == 0 {
-		return mrBranchStateEmpty, 0
+		return mrVerification{state: mrBranchStateEmpty, branchRef: branchRef, targetRef: targetRef}
 	}
-	return mrBranchStateOK, ahead
+	return mrVerification{state: mrBranchStatePresent, commitsAhead: ahead, branchRef: branchRef, targetRef: targetRef}
+}
+
+// rehearseMerge runs a real three-way merge of the MR's branch into its target
+// and reports whether it conflicts, and in how many files.
+//
+// It only runs for a PRESENT branch. MISSING and EMPTY have their own
+// dispositions that a merge verdict cannot change, and ERR means the refs were
+// never established — rehearsing against refs we could not resolve would produce
+// a verdict about nothing.
+func rehearseMerge(check bool, client mergeRehearser, v mrVerification) (mrMergeState, int) {
+	if !check || client == nil || v.state != mrBranchStatePresent {
+		return mrMergeStateSkipped, 0
+	}
+	if v.branchRef == "" || v.targetRef == "" {
+		return mrMergeStateSkipped, 0
+	}
+	conflicts, err := client.MergeConflicts(v.targetRef, v.branchRef)
+	if err != nil {
+		return mrMergeStateErr, 0
+	}
+	if len(conflicts) == 0 {
+		return mrMergeStateClean, 0
+	}
+	return mrMergeStateConflicts, len(conflicts)
 }
 
 // resolveVerifyRef finds a usable ref for a branch name, preferring the

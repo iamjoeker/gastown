@@ -38,12 +38,13 @@ var (
 	mqRejectStdin  bool // Read reason from stdin
 
 	// List command flags
-	mqListReady  bool
-	mqListStatus string
-	mqListWorker string
-	mqListEpic   string
-	mqListJSON   bool
-	mqListVerify bool
+	mqListReady      bool
+	mqListStatus     string
+	mqListWorker     string
+	mqListEpic       string
+	mqListJSON       bool
+	mqListVerify     bool
+	mqListMergeCheck bool
 
 	// Status command flags
 	mqStatusJSON bool
@@ -160,14 +161,29 @@ Output format:
   gt-mr-003   blocked      P1        polecat/Capable/gt-def    Capable 8m
               (waiting on gt-mr-001)
 
-With --verify, a GIT column reports what git says about each branch:
-  OK       Branch exists and carries at least one commit over its target
+--verify answers REACHABILITY AND NON-EMPTINESS ONLY. It is not a merge verdict.
+The GIT column reports:
+  PRESENT  Branch exists and carries at least one commit over its target
   EMPTY    Branch exists but is not ahead of its target — merging it is a no-op
   MISSING  Neither a local nor an origin ref for the branch exists
   ERR      git could not answer (unresolvable target, unreadable repo)
 
 EMPTY is a rejection, not a merge: an empty branch rehearses and tests cleanly,
 so every downstream gate reports success while zero lines change (gt-d5u).
+
+PRESENT is not clearance to merge. The good state used to be spelled OK, and in
+a column called GIT beside a STATUS column reading "ready" it was taken for a
+merge verdict — two branches so reported conflicted in 17 and 12 files, because
+their merge base was 700 commits back (gt-0w2l). Existence and mergeability are
+different questions and --verify only asks the first.
+
+To ask the second, use --merge-check. It runs a real three-way merge of each
+branch into its target with git merge-tree, in the object store only — no
+worktree, no index, nothing to unwind — and adds a MERGE column:
+  CLEAN          The merge produces a tree with no conflicts
+  CONFLICTS=<n>  The merge stops on n conflicted files
+  ERR            git could not rehearse it — UNKNOWN, not clean
+  -              Not rehearsed (branch was MISSING, EMPTY or ERR)
 
 Examples:
   gt mq list greenplace
@@ -176,7 +192,8 @@ Examples:
   gt mq list greenplace --status=closed    # merged/rejected MRs (audit)
   gt mq list greenplace --status=all       # every MR regardless of status
   gt mq list greenplace --worker=Nux
-  gt mq list greenplace --verify`,
+  gt mq list greenplace --verify           # can it be reached? is it non-empty?
+  gt mq list greenplace --merge-check      # will it actually merge?`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMQList,
 }
@@ -404,7 +421,8 @@ func init() {
 	mqListCmd.Flags().StringVar(&mqListWorker, "worker", "", "Filter by worker name")
 	mqListCmd.Flags().StringVar(&mqListEpic, "epic", "", "Show MRs targeting integration/<epic>")
 	mqListCmd.Flags().BoolVar(&mqListJSON, "json", false, "Output as JSON")
-	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Verify branches in git (MISSING for deleted branches, EMPTY for branches with no commits over their target)")
+	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Check branch REACHABILITY and non-emptiness only — PRESENT is not a merge verdict (MISSING for deleted branches, EMPTY for branches with no commits over their target). Use --merge-check for mergeability")
+	mqListCmd.Flags().BoolVar(&mqListMergeCheck, "merge-check", false, "Rehearse each branch's merge into its target with git merge-tree and report CLEAN or CONFLICTS=<n> (implies --verify)")
 
 	// Reject flags
 	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required unless --stdin)")

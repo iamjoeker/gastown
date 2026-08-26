@@ -56,7 +56,7 @@ func TestSelectNextMRSkipsEmptyBranches(t *testing.T) {
 	if pick == nil || pick.issue.ID != "gt-real" {
 		t.Fatalf("pick = %v, want gt-real", pickID(pick))
 	}
-	if pick.state != mrBranchStateOK || pick.ahead != 2 {
+	if pick.state != mrBranchStatePresent || pick.ahead != 2 {
 		t.Errorf("pick state = %q ahead = %d, want OK/2", pick.state, pick.ahead)
 	}
 	if others != 0 {
@@ -267,7 +267,8 @@ func TestDescribeMQNextGitState(t *testing.T) {
 		want      string // substring; "" means no line at all
 	}{
 		{name: "unverified prints nothing", candidate: mqNextCandidate{state: mrBranchStateSkipped}},
-		{name: "ok reports commit count", candidate: mqNextCandidate{state: mrBranchStateOK, ahead: 3}, want: "3 commit"},
+		{name: "present reports commit count", candidate: mqNextCandidate{state: mrBranchStatePresent, ahead: 3}, want: "3 commit"},
+		{name: "present says it is not a merge verdict", candidate: mqNextCandidate{state: mrBranchStatePresent, ahead: 3}, want: "not a merge verdict"},
 		{name: "missing is named", candidate: mqNextCandidate{state: mrBranchStateMissing}, want: "MISSING"},
 		{name: "err is named", candidate: mqNextCandidate{state: mrBranchStateErr}, want: "ERR"},
 	}

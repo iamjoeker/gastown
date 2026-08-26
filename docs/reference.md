@@ -703,6 +703,8 @@ gt mq list <rig> --status closed   # Merged/rejected MRs — THE audit surface
 gt mq list <rig> --status all      # Every MR regardless of status
 gt mq next [rig]             # Show highest-priority merge request
 gt mq next <rig> --verify=false    # Select without the git content check
+gt mq list <rig> --verify          # Is each branch reachable and non-empty?
+gt mq list <rig> --merge-check     # Will each branch actually merge?
 gt mq submit                 # Submit current branch to merge queue
 gt mq status <id>            # Show detailed merge request status
 gt mq retry <id>             # Retry a failed merge request
@@ -723,6 +725,19 @@ branch with work from one that points at its own target. `gt mq next` will not
 hand back an MR whose branch carries no commits over its target — merging one is
 a no-op that still closes the source issue — and names every MR it skipped, with
 the `gt mq reject` command to dispose of them.
+
+**`--verify` is not a merge verdict.** It answers reachability and
+non-emptiness: `PRESENT` means the branch exists and carries commits over its
+target, `EMPTY` means it carries none, `MISSING` means no ref resolves. A
+`PRESENT` branch can still be unmergeable — the good state used to be spelled
+`OK`, and read as clearance it sent two branches to the refinery that conflicted
+in 17 and 12 files, their merge base 700 commits back (gt-0w2l).
+
+To ask whether a branch merges, use `gt mq list <rig> --merge-check`. It
+rehearses each merge with `git merge-tree --write-tree` against the same refs
+the queue would merge — object store only, no worktree and no state to unwind —
+and reports `CLEAN` or `CONFLICTS=<n>` in a `MERGE` column. A rehearsal git
+could not run reports `ERR`, which means UNKNOWN, never clean.
 
 #### Integration Branch Commands
 

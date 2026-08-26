@@ -221,6 +221,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   happened. A rebuild that leaves the binary stale escalates instead of
   recording success.
 
+- **`gt mq list --verify` no longer renders reachability as merge clearance**
+  (gt-0w2l). The good state was spelled `OK`, styled green, in a column called
+  `GIT`, beside a `STATUS` column reading `ready`. It meant only
+  present-and-non-empty — `MISSING` is for deleted branches and `EMPTY` for
+  branches with no commits over their target, so a present, non-empty,
+  17-way-conflicting branch was correctly `OK` by that definition. The
+  definition was invisible at the call site, and the Mayor read "3 MRs, all
+  verify GIT=OK" as clearance and instructed the refinery to merge two branches
+  that conflicted in **17 and 12 files** — both carrying 700 commits over a
+  merge base 700 commits back. The refinery had already landed the queue by
+  cherry-pick, so nothing burned; had the order been reversed, two merges that
+  were never going to work would have.
+
+  `OK` is now `PRESENT`, unstyled, and the listing says at the call site what
+  `PRESENT` does not mean, with the command that answers the other question.
+  `gt mq next` reports the same way. The JSON `git_state` field carries
+  `PRESENT` in place of `OK`.
+
+  **`--merge-check` is the verdict `--verify` never was.** It rehearses each
+  merge with `git merge-tree --write-tree` against the same refs the queue would
+  merge — object store only, no worktree, no index, nothing to unwind — and adds
+  a `MERGE` column reading `CLEAN` or `CONFLICTS=<n>`, plus `merge_state`,
+  `merge_clean` and `conflict_files` in `--json`. It implies `--verify`.
+
+  A rehearsal git could not run reports `ERR`, and the summary names it as
+  UNKNOWN rather than clean. That distinction needed defending in code:
+  `merge-tree` is documented to exit 1 for a conflicted merge and >1 for a
+  failure, but on git 2.55 an **unresolvable ref also exits 1**, writing to
+  stderr with stdout EMPTY. A reader that trusts the exit code parses that empty
+  stdout into zero conflicted files and reports `CLEAN` — the same
+  non-answer-as-verdict this change exists to end. The result tree's OID on the
+  first line of stdout is therefore the discriminator, and its absence is an
+  error.
+
 - **Answering by nudge now retires the reply reminder** (gt-w4ba). A reply
   reminder was retired by exactly one event: a mail reply on the same thread.
   Every agent's CLAUDE.md tells it to prefer `gt nudge` for routine replies —

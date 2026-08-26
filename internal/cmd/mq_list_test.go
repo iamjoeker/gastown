@@ -6,6 +6,7 @@ func TestBuildMQListColumns_IncludesTarget(t *testing.T) {
 	tests := []struct {
 		name          string
 		verify        bool
+		mergeCheck    bool
 		wantColumnSeq []string
 	}{
 		{
@@ -22,11 +23,19 @@ func TestBuildMQListColumns_IncludesTarget(t *testing.T) {
 				"ID", "SCORE", "PRI", "CONVOY", "BRANCH", "TARGET", "STATUS", "GIT", "AGE",
 			},
 		},
+		{
+			name:       "with merge check",
+			verify:     true,
+			mergeCheck: true,
+			wantColumnSeq: []string{
+				"ID", "SCORE", "PRI", "CONVOY", "BRANCH", "TARGET", "STATUS", "GIT", "MERGE", "AGE",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cols := buildMQListColumns(tt.verify)
+			cols := buildMQListColumns(tt.verify, tt.mergeCheck)
 			if len(cols) != len(tt.wantColumnSeq) {
 				t.Fatalf("len(columns) = %d, want %d", len(cols), len(tt.wantColumnSeq))
 			}

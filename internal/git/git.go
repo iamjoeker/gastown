@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -3459,6 +3460,113 @@ func (g *Git) preservationOfRefAgainstRef(head, ref string) (BranchPreservationS
 
 func (g *Git) mergeTreeNoopAgainstRef(ref string) (bool, error) {
 	return g.mergeTreeNoopBetweenRefs("HEAD", ref)
+}
+
+// MergeConflicts reports the files that would conflict if branch were merged
+// into base, using `git merge-tree --write-tree` — a real three-way merge
+// against the actual merge base, run entirely in the object store with no
+// worktree, no index and no state to unwind.
+//
+// It answers the question branch EXISTENCE cannot: a branch can exist, be
+// pushed, and carry hundreds of commits over its target while still being
+// unmergeable. Measured on gastown 2026-08-23 (gt-0w2l), two branches that
+// every existence-and-content check called fine conflicted in 17 and 12 files
+// respectively, because their merge base was 700 commits back.
+//
+// A nil slice with a nil error means the merge is clean.
+//
+// Exit 1 is NOT sufficient to conclude "conflicts". The docs promise 1 for a
+// conflicted merge and >1 for a failure, but git 2.55 also exits 1 for an
+// unresolvable ref ("merge-tree: no/such/branch - not something we can merge"),
+// with the message on stderr and stdout EMPTY. A reader that trusts the exit
+// code alone parses that empty stdout into zero conflicted files and reports the
+// merge CLEAN — the same class of non-answer-reading-as-a-verdict this whole
+// check exists to end (gt-0w2l). So the OUTPUT is the discriminator: a real
+// merge always writes the resulting tree's OID on the first line, and its
+// absence means git answered nothing.
+func (g *Git) MergeConflicts(base, branch string) ([]string, error) {
+	stdout, code, err := g.runAllowingConflictExit("merge-tree", "--write-tree", "--name-only", base, branch)
+	if err != nil {
+		return nil, err
+	}
+	if code == 0 {
+		return nil, nil
+	}
+	names, ok := parseMergeTreeConflictNames(stdout)
+	if !ok {
+		return nil, fmt.Errorf("git merge-tree %s %s: conflicted exit with no merge result on stdout (unmergeable or unresolvable ref)", base, branch)
+	}
+	if len(names) == 0 {
+		// git said the merge conflicted and then named nothing. Whatever this
+		// is, it is not evidence of a clean merge.
+		return nil, fmt.Errorf("git merge-tree %s %s: reported a conflict but named no files", base, branch)
+	}
+	return names, nil
+}
+
+// mergeTreeOIDPattern matches the object id merge-tree writes on its first line.
+// Both sha1 (40) and sha256 (64) repositories are in scope.
+var mergeTreeOIDPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
+// parseMergeTreeConflictNames extracts the conflicted paths from `merge-tree
+// --write-tree --name-only` output.
+//
+// The format is a tree OID on the first line, then one path per line, then a
+// blank line, then human-readable "CONFLICT (content): ..." messages. Reading
+// past the blank line would count prose as filenames, so the scan stops there.
+//
+// The bool reports whether the output was a merge result at all. False means
+// there was no OID to anchor on, so nothing after it can be trusted as paths.
+func parseMergeTreeConflictNames(out string) ([]string, bool) {
+	lines := strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
+	if len(lines) == 0 || !mergeTreeOIDPattern.MatchString(strings.TrimSpace(lines[0])) {
+		return nil, false
+	}
+	var names []string
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+		names = append(names, line)
+	}
+	return names, true
+}
+
+// runAllowingConflictExit runs git and returns stdout together with the exit
+// code, instead of discarding stdout the way run() does on any non-zero exit.
+//
+// merge-tree is the reason: its whole answer for the conflicted case is on
+// stdout AND its exit code is 1, so a runner that treats non-zero as failure
+// throws away the result it was called for. Exit codes above 1 are still errors.
+func (g *Git) runAllowingConflictExit(args ...string) (string, int, error) {
+	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+		return "", 0, err
+	}
+
+	fullArgs := args
+	if g.gitDir != "" {
+		fullArgs = append([]string{"--git-dir=" + g.gitDir}, args...)
+	}
+
+	cmd := exec.Command("git", fullArgs...)
+	util.SetDetachedProcessGroup(cmd)
+	if g.workDir != "" {
+		cmd.Dir = g.workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err == nil {
+		return stdout.String(), 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return stdout.String(), 1, nil
+	}
+	return "", 0, g.wrapError(err, stdout.String(), stderr.String(), fullArgs)
 }
 
 func (g *Git) mergeTreeNoopBetweenRefs(head, ref string) (bool, error) {
