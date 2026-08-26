@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -558,9 +559,14 @@ func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) err
 		return err
 	}
 
-	// Close the issue
-	_, err := target.run("close", issue.ID, "--reason="+reason)
-	return err
+	// Close the issue. --force because escalation records are routinely pinned
+	// to keep `bd purge` from deleting them, and bd's pin guard refuses a plain
+	// close (gt-u3mo). Pinning protects a record from DELETION; resolving one is
+	// not deletion, and a pinned+closed row is still purge-protected. Without
+	// this, protecting escalations made every escalation in the town
+	// un-closeable through the command that exists to close them.
+	_, err := target.run("close", issue.ID, "--force", "--reason="+reason)
+	return scrubForceAdvice(err)
 }
 
 // closeEscalationCopy closes one delivered escalation mail bead.
@@ -576,7 +582,33 @@ func (b *Beads) closeEscalationCopy(issue *Issue, reason string) error {
 		return err
 	}
 	_, err := target.run("close", issue.ID, "--force", "--reason="+reason)
-	return err
+	return scrubForceAdvice(err)
+}
+
+// forceAdvice matches bd's "(use --force to override)" remedy, which it appends
+// to guard failures such as "cannot modify pinned issue".
+var forceAdvice = regexp.MustCompile(`\(use --force[^)]*\)`)
+
+// scrubForceAdvice rewrites bd's "--force" advice out of an escalation close
+// failure.
+//
+// The advice is unreachable from where the operator stands: `gt escalate close`
+// has no --force flag, so following it verbatim produces "unknown flag"
+// (gt-u3mo). It is also stale — the escalation close path already passes
+// --force to bd, so if bd still refuses, adding the flag is not the remedy.
+//
+// Anything that is not that exact remedy is passed through untouched: a bd
+// whose wording differs should surface verbatim rather than be mangled.
+func scrubForceAdvice(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	scrubbed := forceAdvice.ReplaceAllString(msg, "(gt escalate close already passes --force; it is not a flag you can add)")
+	if scrubbed == msg {
+		return err
+	}
+	return errors.New(scrubbed)
 }
 
 // pluralCopies renders "1 delivered copy <verb>" / "N delivered copies <verb>".

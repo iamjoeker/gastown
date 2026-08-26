@@ -498,6 +498,15 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 func runEscalateClose(cmd *cobra.Command, args []string) error {
 	escalationID := args[0]
 
+	// Cobra only honours SilenceUsage from the executed command and the ROOT, so
+	// the flag on `escalate` never reached its subcommands: a close that failed
+	// printed the error and then dumped the usage block over it. That is how
+	// three failed closes read as quiet successes — the operator's `| tail -1`
+	// showed the last line of the usage block, not the error (gt-u3mo).
+	// Setting it here rather than on the command keeps usage on arg/flag misuse,
+	// which cobra validates before RunE.
+	cmd.SilenceUsage = true
+
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)

@@ -2,6 +2,7 @@ package beads
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -823,7 +824,11 @@ func TestCloseEscalation_ClosesDeliveredCopies(t *testing.T) {
 		t.Errorf("CopyIDs = %v, want both delivered copies", result.CopyIDs)
 	}
 
-	if !stub.hasWrite("close", "hq-wisp-r1", "--reason=resolved: dolt restarted") {
+	// --force on the record too: escalation records are routinely pinned against
+	// bd purge, and the pin guard refuses a plain close (gt-u3mo). This is the
+	// control for TestCloseEscalation_ClosesPinnedRecord — an UNPINNED record
+	// closes by the same path, so the fix did not simply special-case pinning.
+	if !stub.hasWrite("close", "hq-wisp-r1", "--force", "--reason=resolved: dolt restarted") {
 		t.Errorf("record was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
 	}
 	for _, id := range []string{"hq-c1", "hq-c2"} {
@@ -1312,6 +1317,123 @@ func TestCloseEscalation_StillFailsOnUnknownID(t *testing.T) {
 	b := New(t.TempDir())
 	if _, err := b.CloseEscalation("hq-wisp-nosuch", "mayor/", "resolved"); err == nil {
 		t.Fatal("closing an ID with no record and no copies must fail, not report success")
+	}
+}
+
+// --- Pinned escalations must still close (gt-u3mo) ---------------------------
+//
+// Escalation records were pinned town-wide to keep `bd purge` from deleting
+// them. bd's pin guard rejects a plain `bd close`, so the mitigation for
+// "escalations can be deleted" produced "escalations cannot be resolved": every
+// escalation in the town became un-closeable through the command that exists to
+// close it. Pinning protects a record from DELETION; a pinned+closed row is
+// still purge-protected, so closing must go through.
+
+// pinGuard puts a bd in front of the stub that refuses any close lacking
+// --force, exactly as bd's pin guard does, and passes everything else through
+// so the stub keeps answering shows and recording writes.
+func (s *escalationStub) pinGuard() {
+	s.t.Helper()
+	s.interpose(`
+forced=""
+for arg in "$@"; do
+  if [ "$arg" = "--force" ]; then forced=1; fi
+done
+case "$1" in
+  close)
+    if [ -z "$forced" ]; then
+      echo "Error: cannot modify pinned issue $2 (use --force to override)" >&2
+      exit 1
+    fi
+    ;;
+esac
+`)
+}
+
+// interpose installs a bd on PATH that runs body and then execs the stub's bd.
+func (s *escalationStub) interpose(body string) {
+	s.t.Helper()
+	dir := s.t.TempDir()
+	script := "#!/bin/sh\n" + body + "\nexec \"" + filepath.Join(s.dir, "bd") + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "bd"), []byte(script), 0755); err != nil {
+		s.t.Fatalf("write interposed bd: %v", err)
+	}
+	s.t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+}
+
+func TestCloseEscalation_ClosesPinnedRecord(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+	stub.pinGuard()
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved: dolt restarted")
+	if err != nil {
+		t.Fatalf("CloseEscalation on a pinned record: %v", err)
+	}
+
+	// Both halves, not just the record: forcing one half by hand is exactly the
+	// closed-record/open-copy split gt-4xl fixed.
+	if !stub.hasWrite("close", "hq-wisp-r1", "--force") {
+		t.Errorf("pinned record was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
+	}
+	if !stub.hasWrite("close", "hq-c1", "--force") {
+		t.Errorf("delivered copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// bd's guard advises "(use --force to override)". That remedy is unreachable
+// from where the operator stands — `gt escalate close` has no --force flag, so
+// following it verbatim produces "unknown flag" — and stale besides, since the
+// close path already passes --force. Surfacing it sends the reader after a flag
+// that does not exist.
+func TestCloseEscalation_DoesNotAdviseAFlagTheCommandLacks(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	stub.bead(record)
+	stub.list(EscalationLinkLabelPrefix + "hq-wisp-r1")
+	// A bd that refuses the close even WITH --force, still advising the flag.
+	stub.interpose(`
+case "$1" in
+  close)
+    echo "Error: cannot modify pinned issue $2 (use --force to override)" >&2
+    exit 1
+    ;;
+esac
+`)
+
+	b := New(t.TempDir())
+	_, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved")
+	if err == nil {
+		t.Fatal("CloseEscalation reported success while the record stayed open")
+	}
+	if strings.Contains(err.Error(), "use --force to override") {
+		t.Errorf("error advises a flag gt escalate close does not accept: %v", err)
+	}
+	// The diagnosis itself must survive the scrub — dropping "pinned" would
+	// trade misleading advice for no advice at all.
+	if !strings.Contains(err.Error(), "pinned") {
+		t.Errorf("error lost the reason for the failure: %v", err)
+	}
+}
+
+// Anything that is not bd's exact --force remedy passes through untouched: a
+// scrub that rewrote unrelated errors would hide real diagnoses.
+func TestScrubForceAdvice_LeavesOtherErrorsAlone(t *testing.T) {
+	if got := scrubForceAdvice(nil); got != nil {
+		t.Errorf("scrubForceAdvice(nil) = %v, want nil", got)
+	}
+	orig := errors.New("bd close hq-c1: assignee is mayor/, actor is gastown/witness")
+	if got := scrubForceAdvice(orig); got != orig {
+		t.Errorf("scrubForceAdvice rewrote an unrelated error: %v", got)
 	}
 }
 

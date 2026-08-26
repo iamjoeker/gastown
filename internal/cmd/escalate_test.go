@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 )
@@ -811,6 +813,79 @@ func TestDefaultRoutesAllDeliver(t *testing.T) {
 // gt escalate --help pointed at ~/gt/settings/escalation.json, which is not a
 // town root on any host: it cost duly_noted/witness a patrol cycle looking for a
 // config file that does not exist.
+// escalateCloseCmdDeclaredSilenceUsage captures the declared value before any
+// test can mutate the shared command: package-level vars initialize after
+// escalateCloseCmd itself and before any test body, so this is the value in the
+// source, not one an earlier test left behind.
+var escalateCloseCmdDeclaredSilenceUsage = escalateCloseCmd.SilenceUsage
+
+// TestEscalateCloseUsageOnlyForMalformedInvocations covers gt-u3mo, the same
+// defect gt-5h2 fixed for `gt nudge`. Cobra honours SilenceUsage only from the
+// executed command and the ROOT, so the flag declared on `escalate` never
+// reached `escalate close`: a close that failed printed its error and then
+// dumped ~8 lines of usage over it. That is how three failed closes read as
+// quiet successes — the operator's `| tail -1` showed the last line of the
+// usage block rather than the error.
+//
+// The malformed case is the control: suppressing usage everywhere would be just
+// as wrong, and it fails independently if the fix is moved onto the command
+// literal.
+func TestEscalateCloseUsageOnlyForMalformedInvocations(t *testing.T) {
+	if escalateCloseCmdDeclaredSilenceUsage {
+		t.Fatal("escalateCloseCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runEscalateClose instead (gt-u3mo)")
+	}
+
+	newCloseTestCmd := func(out *bytes.Buffer) *cobra.Command {
+		c := &cobra.Command{
+			Use:          escalateCloseCmd.Use,
+			Args:         escalateCloseCmd.Args,
+			RunE:         runEscalateClose,
+			SilenceUsage: escalateCloseCmdDeclaredSilenceUsage,
+		}
+		c.SetOut(out)
+		c.SetErr(out)
+		return c
+	}
+
+	t.Run("runtime error prints no usage", func(t *testing.T) {
+		// Both env vars as well as the cwd: GT_TOWN_ROOT and GT_ROOT outrank the
+		// working directory in workspace resolution, so chdir alone would still
+		// resolve the live town and go on to touch its beads.
+		outside := t.TempDir()
+		t.Setenv("GT_TOWN_ROOT", outside)
+		t.Setenv("GT_ROOT", outside)
+		t.Chdir(outside)
+
+		var out bytes.Buffer
+		c := newCloseTestCmd(&out)
+		c.SetArgs([]string{"hq-wisp-nosuch"})
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() outside a workspace returned nil, want an error")
+		}
+		got := out.String()
+		if !strings.Contains(got, "not in a Gas Town workspace") {
+			t.Errorf("output does not carry the diagnosis; the error itself must keep printing:\n%s", got)
+		}
+		if strings.Contains(got, "Usage:") {
+			t.Errorf("runtime failure printed cobra's usage block over its error:\n%s", got)
+		}
+	})
+
+	t.Run("malformed invocation still prints usage", func(t *testing.T) {
+		var out bytes.Buffer
+		c := newCloseTestCmd(&out)
+		c.SetArgs([]string{}) // violates Args: ExactArgs(1), so RunE never runs
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() with no arguments returned nil, want an arg-count error")
+		}
+		if got := out.String(); !strings.Contains(got, "Usage:") {
+			t.Errorf("malformed invocation lost its usage block:\n%s", got)
+		}
+	})
+}
+
 func TestEscalateHelpDoesNotPointAtTildeGt(t *testing.T) {
 	if strings.Contains(escalateCmd.Long, "~/gt/settings") {
 		t.Error("escalate help documents ~/gt/settings, which is not where the config lives")
