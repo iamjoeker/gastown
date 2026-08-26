@@ -1515,7 +1515,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 
 	// Derived last: reconcile and the MQ checks can still flip the verdict above,
 	// and the permitted witness action must track the verdict actually reported.
-	status.WitnessAction = witnessActionFor(status.Verdict)
+	status.WitnessAction = witnessActionFor(status.Verdict, status.State)
 
 	// Recorded from the final status, not from `disposition`: reconcile above can
 	// still change the verdict, and the journal must agree with what this command
@@ -1703,8 +1703,24 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
-		fmt.Println("  No work at risk. Reclaim the slot by restarting — the sandbox is preserved:")
-		fmt.Printf("    gt session restart %s/%s\n", rigName, polecatName)
+		if polecat.StateEligibleForPoolReuse(status.State) {
+			// No command offered, because there is no action to take. The
+			// previous text here named a restart, and a reader following it
+			// spent a healthy polecat to reclaim a slot that was never occupied
+			// (gt-t6k2).
+			fmt.Printf("  No work at risk, and state=%s is ALREADY eligible for pool reuse — the\n", status.State)
+			fmt.Println("  next `gt sling` can take this polecat as it stands. Nothing to reclaim,")
+			fmt.Println("  so nothing to do.")
+			fmt.Println()
+			fmt.Println("  Do NOT restart it to \"reclaim the slot\". The reuse gate re-reads this")
+			fmt.Println("  state on every sling, so a restart cannot improve it — and the fresh")
+			fmt.Println("  session primes, finds an empty hook, and runs `gt done`, which is where a")
+			fmt.Println("  fork-mode polecat with an already-closed bead parks at agent_state=stuck")
+			fmt.Println("  and needs `gt polecat clear-state` by hand (gt-j9uv, gt-gubw).")
+		} else {
+			fmt.Println("  No work at risk. Reclaim the slot by restarting — the sandbox is preserved:")
+			fmt.Printf("    gt session restart %s/%s\n", rigName, polecatName)
+		}
 		if stalePushFailed {
 			fmt.Println()
 			fmt.Println("  The agent bead still records push_failed=true, which this run's own git")
