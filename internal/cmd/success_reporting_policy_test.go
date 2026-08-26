@@ -108,7 +108,9 @@ var knownVoidDeliveryReporters = []string{
 	"internal/daemon.notifyWitnessOfOrphanedWork",
 	"internal/refinery.notifyConvoyCompletion",
 	"internal/refinery.notifyDeaconConvoyFeeding",
-	"internal/refinery.notifyWorkerRejected",
+	// internal/refinery.notifyWorkerRejected converted in gt-sfcl: it now
+	// returns a NotifyReport, and `gt mq reject --notify` prints what actually
+	// happened instead of "Worker notified via mail" from the flag alone.
 
 	// The two below were found BY this rule rather than by the gt-9tpw sweep, and
 	// are the sharpest instances in the list: notifyMayorSchedulerOpen tries a

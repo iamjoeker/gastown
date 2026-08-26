@@ -427,7 +427,7 @@ func init() {
 
 	// Reject flags
 	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required unless --stdin)")
-	mqRejectCmd.Flags().BoolVar(&mqRejectNotify, "notify", false, "Send mail notification to worker")
+	mqRejectCmd.Flags().BoolVar(&mqRejectNotify, "notify", false, "Tell the worker: nudge their session, falling back to durable mail if it is gone (the summary reports which, or that neither landed)")
 	mqRejectCmd.Flags().BoolVar(&mqRejectStdin, "stdin", false, "Read reason from stdin (avoids shell quoting issues)")
 
 	// Status flags
@@ -595,10 +595,7 @@ func runMQReject(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Worker: %s\n", result.MR.Worker)
 	fmt.Printf("  Reason: %s\n", mqRejectReason)
 	printRejectedIssueLine(result)
-
-	if mqRejectNotify {
-		fmt.Printf("  %s\n", style.Dim.Render("Worker notified via mail"))
-	}
+	printRejectNotifyLine(result)
 
 	return nil
 }
@@ -652,6 +649,79 @@ func printRejectedIssueLine(result *refinery.RejectResult) {
 	}
 	report := rejectedIssueReportFor(result)
 	fmt.Printf("  Issue:  %s %s\n", result.SourceIssueID, style.Dim.Render(report.Note))
+	if report.Action != "" {
+		fmt.Printf("  %s\n", style.Warning.Render(report.Action))
+	}
+}
+
+// rejectNotifyReport is the notification outcome of a rejection, as plain text.
+type rejectNotifyReport struct {
+	// Note is the line body; empty when --notify was not requested.
+	Note string
+	// Failed marks a notice that did NOT reach the worker, so the line is
+	// printed as a warning rather than dimmed.
+	Failed bool
+	// Action is an operator instruction, empty when nothing needs doing by hand.
+	Action string
+}
+
+// rejectNotifyReportFor describes what the notification half of a rejection
+// ACTUALLY did.
+//
+// The old line ("Worker notified via mail") was printed from the --notify flag
+// alone. It was wrong three ways at once: no mail was ever sent (the path
+// nudges), a failing nudge only reached a log line above the summary, and a
+// worker whose tmux session did not exist at all still read as notified. That
+// is the worst case to get wrong, because reject leaves the source issue HOOKED
+// to that worker — an unreachable polecat holding a hooked bead waits forever
+// for a merge that was already rejected (gt-sfcl).
+func rejectNotifyReportFor(result *refinery.RejectResult) rejectNotifyReport {
+	n := result.Notify
+	switch n.Outcome {
+	case refinery.NotifyNotRequested:
+		return rejectNotifyReport{}
+	case refinery.NotifyNudged:
+		return rejectNotifyReport{
+			Note: fmt.Sprintf("Worker notified: nudged %s", n.Target),
+		}
+	case refinery.NotifyMailed:
+		return rejectNotifyReport{
+			Note: fmt.Sprintf("Worker notified by mail (no live session: %v) - %s",
+				n.NudgeErr, n.Target),
+		}
+	case refinery.NotifySkipped:
+		return rejectNotifyReport{
+			Note:   fmt.Sprintf("Worker NOT notified: %s", n.SkipReason),
+			Failed: true,
+			Action: fmt.Sprintf("Tell them by hand: gt mail send %s -s 'MR rejected: %s' -m '...'",
+				n.Target, result.MR.IssueID),
+		}
+	default:
+		return rejectNotifyReport{
+			Note: fmt.Sprintf("Worker NOT notified: nudge: %v; mail: %v",
+				n.NudgeErr, n.MailErr),
+			Failed: true,
+			Action: fmt.Sprintf("Tell them by hand: gt mail send %s -s 'MR rejected: %s' -m '...'",
+				n.Target, result.MR.IssueID),
+		}
+	}
+}
+
+// printRejectNotifyLine reports the notification outcome.
+//
+// The rejection itself still succeeded when the notice did not land, so the
+// exit status stays 0 — a caller must not re-reject on this. The failure is
+// made unmissable in the summary block instead, where the old success line was.
+func printRejectNotifyLine(result *refinery.RejectResult) {
+	report := rejectNotifyReportFor(result)
+	if report.Note == "" {
+		return
+	}
+	if report.Failed {
+		fmt.Printf("  %s\n", style.Warning.Render("✗ "+report.Note))
+	} else {
+		fmt.Printf("  %s\n", style.Dim.Render(report.Note))
+	}
 	if report.Action != "" {
 		fmt.Printf("  %s\n", style.Warning.Render(report.Action))
 	}
