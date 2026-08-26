@@ -387,6 +387,83 @@ func TestLiveReferencesSeesThisProcess(t *testing.T) {
 	}
 }
 
+// TestLiveEvidenceOutranksYouth pins the classifier's precedence: a directory
+// that is both fresh and held by a running process is reported LIVE, not
+// young. Both statuses refuse removal, so this is not about what gets deleted
+// today — it is about the sweep reporting the stronger and more specific fact
+// it already has, and about any future check that reads "not young" as
+// "eligible" meeting liveness first (gt-5q6u).
+func TestLiveEvidenceOutranksYouth(t *testing.T) {
+	root := t.TempDir()
+	fresh := mkWorkDir(t, root, "go-build2674671939", 4096, 0)
+
+	res, err := Scan(Options{Dir: root, MinAge: time.Hour, liveRefs: refsTo(fresh)})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if got := byPath(t, res, fresh).Status; got != StatusLive {
+		t.Errorf("status = %q, want %q (age must not preempt process evidence)", got, StatusLive)
+	}
+
+	// Control. Without this the verdict above would also be produced by a
+	// classifier that never consulted the process table at all — the fixture
+	// has to be one the age check WOULD have claimed.
+	res, err = Scan(Options{Dir: root, MinAge: time.Hour, liveRefs: noRefs})
+	if err != nil {
+		t.Fatalf("Scan (control): %v", err)
+	}
+	if got := byPath(t, res, fresh).Status; got != StatusYoung {
+		t.Fatalf("control status = %q, want %q: the fixture is not young, so the "+
+			"live verdict above proves nothing about precedence", got, StatusYoung)
+	}
+}
+
+// TestWriteDuringInspectionReadsAsLiveNotYoung is the reported failure in
+// deterministic form. The sweep snapshots its clock before it walks, so a tree
+// the Go driver is still compiling into can carry an mtime AFTER that snapshot;
+// the age then measures as zero or negative and the directory reads as merely
+// young. The stale clock is simulated here rather than raced for.
+func TestWriteDuringInspectionReadsAsLiveNotYoung(t *testing.T) {
+	root := t.TempDir()
+	// Modified "in the future" as far as the sweep's snapshot is concerned:
+	// exactly what a build writing into $WORK during the walk produces.
+	written := mkWorkDir(t, root, "go-build1056130938", 2048, 0)
+	stale := func() time.Time { return time.Now().Add(-time.Minute) }
+
+	res, err := Scan(Options{
+		// A near-zero quiet period is what the real gt-5q6u case uses: age is
+		// deliberately given no say, so a "young" verdict can only come from an
+		// age that undershot zero.
+		Dir: root, MinAge: time.Nanosecond,
+		now: stale, liveRefs: refsTo(written),
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	c := byPath(t, res, written)
+	if c.Status != StatusLive {
+		t.Errorf("status = %q (%s), want %q", c.Status, c.Reason, StatusLive)
+	}
+	if c.Age < 0 {
+		t.Errorf("Age = %s, want it clamped to zero: a tree cannot have been quiet "+
+			"for less than no time", c.Age)
+	}
+
+	// Control: the same impossible age with nothing holding the directory must
+	// still refuse it, and must not read as old enough to reclaim.
+	res, err = Scan(Options{
+		Dir: root, MinAge: time.Nanosecond,
+		now: stale, liveRefs: noRefs,
+	})
+	if err != nil {
+		t.Fatalf("Scan (control): %v", err)
+	}
+	if got := byPath(t, res, written).Status; got == StatusReclaimable {
+		t.Errorf("control status = %q: a directory written to during the walk is "+
+			"not reclaimable", got)
+	}
+}
+
 // TestSweepSkipsWorkDirOfARunningBuild joins the two halves: the real procfs
 // scanner protecting a real directory whose path a live process names. This
 // test binary runs from inside its own go-build work directory, so that
