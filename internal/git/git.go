@@ -1208,7 +1208,7 @@ func (g *Git) CleanDefaultBranchBaseRef(remote, defaultBranch string) string {
 
 // MergeTargetDefaultBranchBaseRef returns the ref that default-branch work on
 // this rig is actually merged into — the base to measure a branch against, to
-// rebase it onto, and to record as its pre-verified base.
+// rebase it onto, and to take its pre-verified base's merge-base with.
 //
 // gt-lj2n: CleanDefaultBranchBaseRef's premise is that a fork's default branch
 // is a stale subset of upstream's, so upstream is the truer base. That is false
@@ -2860,6 +2860,20 @@ func (g *Git) CommitMeta(ref string) (*CommitIdentity, error) {
 		CommitterEmail: strings.TrimSpace(parts[4]),
 		CommittedAt:    committedAt,
 	}, nil
+}
+
+// MergeBase returns the best common ancestor of two commits. For a submitted
+// branch and its target that is the commit the branch was actually built on,
+// which is the question callers usually mean when they reach for the target's
+// current tip instead. The two coincide only while nothing has landed since the
+// branch was cut, so the tip is a correct answer exactly when it is a redundant
+// one.
+func (g *Git) MergeBase(a, b string) (string, error) {
+	out, err := g.run("merge-base", a, b)
+	if err != nil {
+		return "", fmt.Errorf("merge-base %s %s: %w", a, b, err)
+	}
+	return strings.TrimSpace(out), nil
 }
 
 // IsAncestor checks if ancestor is an ancestor of descendant.

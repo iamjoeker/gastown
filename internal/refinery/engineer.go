@@ -222,10 +222,14 @@ type MRInfo struct {
 	BlockedBy       string     // Task ID blocking this MR
 
 	// Pre-verification fields (Phase 3: polecat-owned rebasing)
-	// When set, the refinery can skip gates if VerifiedBase matches target HEAD.
-	PreVerified     bool      // Polecat ran full gates after rebasing onto target
-	PreVerifiedAt   time.Time // When verification completed
-	PreVerifiedBase string    // Target branch SHA at verification time
+	// When set, the refinery may skip gates — but the branch's real merge-base
+	// with the target decides that, not these fields; see
+	// decidePreVerifiedFastPath (gt-eygw).
+	PreVerified   bool      // Polecat ran full gates after rebasing onto target
+	PreVerifiedAt time.Time // When verification completed
+	// PreVerifiedBase is the polecat's account of the commit its gates ran
+	// against: the branch's merge-base with the target.
+	PreVerifiedBase string
 
 	// Raw data for agent-side queue health analysis (ZFC: agent decides, Go transports)
 	UpdatedAt          time.Time // When the MR was last updated
@@ -1405,23 +1409,24 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	_, _ = fmt.Fprintf(e.output, "  Source: %s\n", mr.SourceIssue)
 
 	// Phase 3: Check pre-verification fast-path.
-	// If the polecat already rebased onto the target and ran gates, and the target
-	// hasn't moved since, we can skip running gates entirely (~5s merge).
-	skipGates := false
-	if mr.PreVerified && mr.PreVerifiedBase != "" {
-		_, _ = fmt.Fprintf(e.output, "  Pre-verified: yes (base=%s)\n", mr.PreVerifiedBase[:min(8, len(mr.PreVerifiedBase))])
-		// Check if target HEAD still matches the verified base
-		targetHead, err := e.git.Rev("origin/" + mr.Target)
-		if err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not resolve origin/%s HEAD: %v (falling through to normal gates)\n", mr.Target, err)
-		} else if targetHead == mr.PreVerifiedBase {
-			_, _ = fmt.Fprintln(e.output, "[Engineer] Pre-verification valid — target unchanged, skipping gates (fast-path)")
-			skipGates = true
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Pre-verification stale — target moved (%s → %s), running gates normally\n",
-				mr.PreVerifiedBase[:min(8, len(mr.PreVerifiedBase))], targetHead[:min(8, len(targetHead))])
-		}
+	// If the polecat already rebased onto the target and ran gates, and the branch
+	// is still built on the target's head, we can skip running gates (~5s merge).
+	// The MR's own account of its base is required but does not decide — see
+	// decidePreVerifiedFastPath (gt-eygw).
+	if mr.PreVerified && strings.TrimSpace(mr.PreVerifiedBase) != "" {
+		_, _ = fmt.Fprintf(e.output, "  Pre-verified: claimed base=%s\n", shortSHA(strings.TrimSpace(mr.PreVerifiedBase)))
 	}
+	// Kept out of the interface value so a nil *git.Git reaches the decision as
+	// a nil interface rather than as a typed nil that panics on first use.
+	var pvGit preVerifyGit
+	if e.git != nil {
+		pvGit = e.git
+	}
+	decision := decidePreVerifiedFastPath(pvGit, mr)
+	if decision.Log != "" {
+		_, _ = fmt.Fprint(e.output, decision.Log)
+	}
+	skipGates := decision.SkipGates
 
 	// Use the shared merge logic
 	return e.doMerge(ctx, mr, skipGates)

@@ -2124,13 +2124,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if donePreVerified {
 				description += "\npre_verified: true"
 				description += fmt.Sprintf("\npre_verified_at: %s", time.Now().UTC().Format(time.RFC3339))
-				// Capture current clean target HEAD as the verified base.
-				// The polecat rebased onto this SHA before running gates.
+				// Record the base the gates actually ran against — the branch's
+				// merge-base with the target — not the target's current tip
+				// (gt-eygw). See resolvePreVerifiedBase for why the tip was a
+				// self-fulfilling value.
 				verifiedBaseRef := g.MergeTargetBaseRef("origin", defaultBranch, target)
-				if verifiedBase, baseErr := g.Rev(verifiedBaseRef); baseErr == nil {
-					description += fmt.Sprintf("\npre_verified_base: %s", verifiedBase)
+				if pvb, baseErr := resolvePreVerifiedBase(g, verifiedBaseRef, commitSHA); baseErr == nil {
+					description += fmt.Sprintf("\npre_verified_base: %s", pvb.Base)
+					if !pvb.OnTargetTip() {
+						// Say it here rather than let the refinery discover it:
+						// the polecat is the only one who can still cheaply fix
+						// it, by rebasing and re-running its gates.
+						style.PrintWarning("gates ran against %s but %s is now at %s — the refinery will re-run gates for this MR",
+							shortSHA(pvb.Base), verifiedBaseRef, shortSHA(pvb.TargetTip))
+					}
 				} else {
-					style.PrintWarning("could not resolve %s for pre-verified base: %v (pre-verification data incomplete)", verifiedBaseRef, baseErr)
+					style.PrintWarning("could not measure the pre-verified base against %s: %v (pre-verification data incomplete)", verifiedBaseRef, baseErr)
 				}
 			}
 
