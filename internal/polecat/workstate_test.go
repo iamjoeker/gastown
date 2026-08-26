@@ -386,6 +386,96 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, Branch: "polecat/chrome/gt-0g5r"},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: ReuseStatusPreserved},
 		},
+		{
+			// gt-n3jq, TRANSCRIBED FROM THE LIVE POLECAT, not constructed:
+			// gastown/deathclaw at 2026-08-26T14:2x, session gone, gt-sfcl still
+			// HOOKED in the issue store, MR gt-wisp-ep0m open — and its agent bead
+			// reading exit_type: COMPLETED / mr_id: gt-wisp-ep0m /
+			// last_source_issue: gt-sfcl / completion_time: 2026-08-26T14:03:30Z.
+			//
+			// The row above it in this table is the SAME polecat one bead earlier
+			// and asserts escalate. Both cannot be right, and the difference is the
+			// completion record: gt done left gt-sfcl hooked ON PURPOSE, because
+			// the refinery closes the source bead on merge (gt-429i), so "still
+			// holding work" is what every successful polecat looks like for the
+			// whole time its MR is in flight.
+			name: "completion record covering the held work restores leave-alone",
+			in: WorkstateInput{
+				State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent,
+				AssignedWorkBead: "gt-sfcl", ActiveMR: "gt-wisp-ep0m", ActiveMRBlocker: "active_mr=gt-wisp-ep0m status=open",
+				CompletionCoverage: "completion_record=exit_type=COMPLETED mr_id=gt-wisp-ep0m last_source_issue=gt-sfcl completion_time=2026-08-26T14:03:30Z",
+			},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{
+				"active_mr=gt-wisp-ep0m status=open",
+				"session_presence=absent (tmux has-session found no session) — not a stall: completion_record=exit_type=COMPLETED mr_id=gt-wisp-ep0m last_source_issue=gt-sfcl completion_time=2026-08-26T14:03:30Z",
+			}},
+		},
+		{
+			// The same waiver reached through the OTHER two held-work fields, so
+			// this cannot be a fix that only works on the road the live case took.
+			// gt-9f67 wrote three cases for exactly this reason and it applies with
+			// equal force to its exemption.
+			name: "completion record covering a hook and a listed blocker also restores leave-alone",
+			in: WorkstateInput{
+				State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent,
+				HookBead: "gt-sfcl", ActiveWorkBlocker: "assigned_work=gt-sfcl status=hooked", ActiveWorkCountsTowardCapacity: true,
+				ActiveMR: "gt-wisp-ep0m", ActiveMRBlocker: "active_mr=gt-wisp-ep0m status=open",
+				CompletionCoverage: "completion_record=exit_type=COMPLETED mr_id=gt-wisp-ep0m last_source_issue=gt-sfcl",
+			},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{
+				"active_mr=gt-wisp-ep0m status=open",
+				"assigned_work=gt-sfcl status=hooked",
+				"has work on hook (gt-sfcl)",
+				"session_presence=absent (tmux has-session found no session) — not a stall: completion_record=exit_type=COMPLETED mr_id=gt-wisp-ep0m last_source_issue=gt-sfcl",
+			}},
+		},
+		{
+			// THE CONTROL THAT KEEPS gt-9f67 ALIVE. Identical to the row above in
+			// every field the verdict reads except the coverage, which is what a
+			// polecat that DIED holding its work has: nothing. It must still
+			// escalate, or this fix has quietly reverted the bead it builds on.
+			name: "dead session holding work with no completion record still escalates",
+			in: WorkstateInput{
+				State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent,
+				AssignedWorkBead: "gt-sfcl", ActiveMR: "gt-wisp-ep0m", ActiveMRBlocker: "active_mr=gt-wisp-ep0m status=open",
+			},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: WorkstateReasonStalledPendingMR, NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{
+				"session_presence=absent (tmux has-session found no session) while work is still attached (issue store holds gt-sfcl hooked to this polecat)",
+				"active_mr=gt-wisp-ep0m status=open",
+			}},
+		},
+		{
+			// Coverage waives the PRESENCE precondition and nothing else. A
+			// completed polecat whose push failed still has work outside the queue,
+			// and a waiver that swallowed that would turn this fix into the
+			// false-success defect gt-n3jq is the mirror of.
+			name: "completion record does not waive push_failed",
+			in: WorkstateInput{
+				State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent,
+				AssignedWorkBead: "gt-sfcl", PushFailed: true, ActiveMR: "gt-wisp-ep0m", ActiveMRBlocker: "active_mr=gt-wisp-ep0m status=open",
+				CompletionCoverage: "completion_record=exit_type=COMPLETED mr_id=gt-wisp-ep0m last_source_issue=gt-sfcl",
+			},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "push-failed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{
+				"push_failed=true",
+				"active_mr=gt-wisp-ep0m status=open",
+			}},
+		},
+		{
+			// The waiver is a fact about a DEAD session, so it must not appear over
+			// a live one. Printing "not a stall" next to a polecat that is sitting
+			// right there generating would be a confident sentence about a
+			// condition that is not present — the shape this whole file is about.
+			name: "the waiver line is not printed for a live session",
+			in: WorkstateInput{
+				State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionPresent,
+				HookBead: "gt-sfcl", ActiveMR: "gt-wisp-ep0m", ActiveMRBlocker: "active_mr=gt-wisp-ep0m status=open",
+				CompletionCoverage: "completion_record=exit_type=COMPLETED mr_id=gt-wisp-ep0m last_source_issue=gt-sfcl",
+			},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{
+				"active_mr=gt-wisp-ep0m status=open",
+				"has work on hook (gt-sfcl)",
+			}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -765,5 +855,74 @@ func TestHandedOffState(t *testing.T) {
 		if got := HandedOffState(state, true); got != state {
 			t.Fatalf("HandedOffState(%q, true) = %q, want it unchanged", state, got)
 		}
+	}
+}
+
+func TestCompletionCoverage(t *testing.T) {
+	// The live record, copied field-for-field off gastown/deathclaw's agent bead
+	// while the polecat was reading NEEDS_RECOVERY / escalate (gt-n3jq).
+	live := CompletionRecord{
+		ExitType:        "COMPLETED",
+		MRID:            "gt-wisp-ep0m",
+		LastSourceIssue: "gt-sfcl",
+		CompletionTime:  "2026-08-26T14:03:30Z",
+	}
+
+	// The positive control runs FIRST and its result is required below, so a
+	// predicate that can only ever return "" cannot pass this test by refusing
+	// everything — which is what a coverage check that never fires would do, and
+	// it would look exactly like a careful one.
+	got := CompletionCoverage(live, "gt-wisp-ep0m", "gt-sfcl")
+	if got == "" {
+		t.Fatal("the measured record covering its own MR and its own bead returned no coverage")
+	}
+	// The evidence has to name what was matched. A bare bool would let the
+	// waiver decide a verdict and leave the reader no way to audit it.
+	for _, want := range []string{"COMPLETED", "gt-wisp-ep0m", "gt-sfcl", "2026-08-26T14:03:30Z"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("coverage %q omits %q", got, want)
+		}
+	}
+
+	refusals := []struct {
+		name     string
+		rec      CompletionRecord
+		citedMR  string
+		heldWork []string
+	}{
+		// The polecat DIED holding its work: no record at all. This is gt-9f67's
+		// case and it must keep escalating.
+		{"no record", CompletionRecord{}, "gt-wisp-ep0m", []string{"gt-sfcl"}},
+		// Exits that are not completions. ESCALATED and DEFERRED both end a
+		// session and neither means the work reached the queue.
+		{"escalated", CompletionRecord{ExitType: "ESCALATED", MRID: "gt-wisp-ep0m", LastSourceIssue: "gt-sfcl"}, "gt-wisp-ep0m", []string{"gt-sfcl"}},
+		{"deferred", CompletionRecord{ExitType: "DEFERRED", MRID: "gt-wisp-ep0m", LastSourceIssue: "gt-sfcl"}, "gt-wisp-ep0m", []string{"gt-sfcl"}},
+		// A completion that made no MR covers no MR. gt done takes this road on
+		// purpose against a closed source issue (gt-7qm/gt-46rk), and that is the
+		// stranded-branch signature, not a hand-off.
+		{"completed with no mr", CompletionRecord{ExitType: "COMPLETED", LastSourceIssue: "gt-sfcl"}, "gt-wisp-ep0m", []string{"gt-sfcl"}},
+		// A record from an EARLIER episode. The callers find the cited MR by
+		// branch, so a stale mr_id cannot match — this is what stops a reused
+		// slot from inheriting the last occupant's completion.
+		{"stale mr", live, "gt-wisp-newer", []string{"gt-sfcl"}},
+		// Completed some other bead. Says nothing about the one attached now.
+		{"covers a different bead", live, "gt-wisp-ep0m", []string{"gt-9tpw"}},
+		// Covers one of two attached beads. Partial coverage is not coverage:
+		// the uncovered one is exactly the work nobody has accounted for.
+		{"covers only one of two held beads", live, "gt-wisp-ep0m", []string{"gt-sfcl", "gt-9tpw"}},
+		// Nothing to cover. A surface that could not name the held work does not
+		// get to waive a precondition about it — "I could not name it" is not
+		// "there is none", which is the reading this whole area keeps producing.
+		{"no held work named", live, "gt-wisp-ep0m", nil},
+		{"held work named only as empty strings", live, "gt-wisp-ep0m", []string{"", "  "}},
+		// No MR is being cited, so there is no leave-alone road to waive onto.
+		{"no cited mr", live, "", []string{"gt-sfcl"}},
+	}
+	for _, tt := range refusals {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CompletionCoverage(tt.rec, tt.citedMR, tt.heldWork...); got != "" {
+				t.Fatalf("CompletionCoverage() = %q, want no coverage", got)
+			}
+		})
 	}
 }

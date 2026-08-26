@@ -457,6 +457,97 @@ func TestBuildPolecatInventoryItemDeadSessionUnderOpenMR(t *testing.T) {
 	}
 }
 
+// TestBuildPolecatInventoryItemCompletionRecordCoversHookedWork is the gt-n3jq
+// regression, and it corrects the premise of the test directly above.
+//
+// That test's second control passes `nil` for the hooked bead and calls it "what
+// `gt done` leaves behind". It is not. `gt done` clears the AGENT BEAD's
+// hook_bead; the issue store's hooked bead it leaves open ON PURPOSE, because
+// the refinery closes the source on merge (gt-429i). So the real steady state of
+// a polecat that just succeeded is the FIRST fixture — session gone, bead still
+// hooked, MR open — and gt-9f67 escalates every one of them for as long as its
+// MR is in flight.
+//
+// Measured on gastown/deathclaw, which had run `gt done --pre-verified` and
+// authored the commit that landed as 4392fa4db:
+//
+//	Cleanup Status:  clean          Verdict:        NEEDS_RECOVERY
+//	Active MR:       gt-wisp-ep0m   Witness action: escalate
+//
+// What separates it from the polecat that DIED holding work is not any bead
+// state — those are identical — but the completion record the survivor wrote and
+// the casualty did not.
+func TestBuildPolecatInventoryItemCompletionRecordCoversHookedWork(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	hooked := &beads.Issue{ID: "gt-0g5r", Status: string(beads.IssueStatusHooked), Assignee: "gastown/polecats/chrome"}
+	openIndex := func() *polecatBranchMRIndex {
+		return &polecatBranchMRIndex{
+			openMR:    map[string]string{"polecat/chrome/gt-0g5r": "gt-wisp-1cmci"},
+			submitted: map[string]bool{"polecat/chrome/gt-0g5r": true},
+		}
+	}
+	completedFields := func() *beads.AgentFields {
+		return &beads.AgentFields{
+			AgentState:    string(beads.AgentStateIdle),
+			CleanupStatus: string(polecat.CleanupClean),
+			Branch:        "polecat/chrome/gt-0g5r",
+			// The completion metadata gt done writes on its way out (gt-x7t9).
+			ExitType:        "COMPLETED",
+			MRID:            "gt-wisp-1cmci",
+			LastSourceIssue: "gt-0g5r",
+			CompletionTime:  "2026-08-26T14:03:30Z",
+		}
+	}
+
+	survived := buildPolecatInventoryItem("gastown", "chrome", completedFields(), hooked, polecatSessionSet{}, openIndex())
+	if survived.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR — this polecat wrote its own completion record for this bead and this MR: %+v",
+			survived.Disposition.Verdict, survived.Disposition)
+	}
+	// The dead session is still NAMED, with the reason it is not being read as a
+	// stall. A waived precondition that leaves no trace is the same reading
+	// problem gt-9f67 was filed about, pointed the other way.
+	if !slices.ContainsFunc(survived.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "session_presence=absent") && strings.Contains(b, "completion_record=")
+	}) {
+		t.Fatalf("blockers %v must name the dead session and the record that waives it", survived.Disposition.Blockers)
+	}
+
+	// CONTROL 1 — the casualty. Byte-identical except that no completion record
+	// was ever written, which is precisely what "died mid-work" leaves behind.
+	// It must still escalate, or this reverts gt-9f67.
+	casualty := buildPolecatInventoryItem("gastown", "chrome", &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupClean),
+		Branch:        "polecat/chrome/gt-0g5r",
+	}, hooked, polecatSessionSet{}, openIndex())
+	if casualty.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — no completion record covers this hook: %+v",
+			casualty.Disposition.Verdict, casualty.Disposition)
+	}
+
+	// CONTROL 2 — a record from an EARLIER episode. The slot was reused and the
+	// new occupant died; the old record names the old episode's MR, which no
+	// branch lookup on the current branch can return. Escalate.
+	stale := completedFields()
+	stale.MRID = "gt-wisp-previous"
+	inherited := buildPolecatInventoryItem("gastown", "chrome", stale, hooked, polecatSessionSet{}, openIndex())
+	if inherited.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — the record names a different MR: %+v",
+			inherited.Disposition.Verdict, inherited.Disposition)
+	}
+
+	// CONTROL 3 — a record that completed a DIFFERENT bead than the one still
+	// attached. Completing something is not completing this.
+	otherBead := completedFields()
+	otherBead.LastSourceIssue = "gt-9tpw"
+	mismatched := buildPolecatInventoryItem("gastown", "chrome", otherBead, hooked, polecatSessionSet{}, openIndex())
+	if mismatched.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — the record covers gt-9tpw, not the hooked gt-0g5r: %+v",
+			mismatched.Disposition.Verdict, mismatched.Disposition)
+	}
+}
+
 // TestBuildPolecatInventoryItemResolvesRecordedActiveMR is the gt-hx10
 // regression.
 //

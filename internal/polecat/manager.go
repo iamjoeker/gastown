@@ -2608,6 +2608,28 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 			ApplyBranchMRToWorkstateInput(&input, mr.ID, !beads.IssueStatus(mr.Status).IsTerminal())
 		}
 	}
+	// Last, so it matches against the MR this gate would actually cite. Set on
+	// this surface too, for the reason gt-9f67 set SessionPresence on all three:
+	// the exemption and the precondition it exempts must travel together, or the
+	// gate and check-recovery diverge on the same polecat again.
+	//
+	// It is currently inert here by construction — this gate sets neither
+	// AssignedWorkBead nor ActiveWorkBlocker, and HookBead only when the hook is
+	// unsafe — so sessionAbsentHoldingWork has almost nothing to fire on. That is
+	// exactly why it is wired now rather than when it first matters: the day
+	// someone gives this gate the issue-store lookup, the precondition arrives
+	// with its exemption already attached.
+	//
+	// workIssue and sourceHint are NOT passed as held work. Both fall back to
+	// fields.LastSourceIssue, which is half of the record being matched.
+	if err == nil && fields != nil {
+		input.CompletionCoverage = CompletionCoverage(CompletionRecord{
+			ExitType:        fields.ExitType,
+			MRID:            fields.MRID,
+			LastSourceIssue: fields.LastSourceIssue,
+			CompletionTime:  fields.CompletionTime,
+		}, input.ActiveMR, input.HookBead)
+	}
 	return input
 }
 

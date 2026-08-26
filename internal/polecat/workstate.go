@@ -203,6 +203,82 @@ const (
 	ReuseStatusClean     = "idle-clean"
 )
 
+// ExitTypeCompleted is the exit_type `gt done` records on a polecat's agent bead
+// when its completion sequence ran all the way through. Duplicated from the
+// command layer rather than imported because internal/cmd imports this package.
+const ExitTypeCompleted = "COMPLETED"
+
+// CompletionRecord is the completion metadata `gt done` writes to the polecat's
+// own agent bead at the end of its run: exit_type, mr_id, branch,
+// last_source_issue, completion_time (gt-x7t9).
+//
+// It is the only durable, POSITIVE evidence anywhere that a session ended in
+// completion rather than in death. Nothing else writes it, and
+// ResetAgentBeadForReuse clears it when the slot is recycled.
+type CompletionRecord struct {
+	ExitType        string
+	MRID            string
+	LastSourceIssue string
+	CompletionTime  string
+}
+
+// CompletionCoverage reports whether the polecat's own completion record covers
+// the work still attached to it and the merge request about to be cited against
+// it, and returns the evidence for saying so. Empty means it does not — which is
+// the answer for every caller that cannot read the record at all.
+//
+// citedMR is the MR this verdict is about to name. heldWork is every bead ID the
+// calling surface believes the polecat still holds; pass the issue-store and
+// hook lookups, NEVER anything derived from the record itself, or this compares
+// a field against its own source and passes for free (gt-eygw's shape).
+//
+// All three bindings are required, and each closes a different road:
+//
+//   - exit_type=COMPLETED, because ESCALATED and DEFERRED are exits too and
+//     neither means the work reached the queue.
+//   - mr_id equals the cited MR, because the callers find that MR BY BRANCH.
+//     A record left over from an earlier episode names that episode's MR, and no
+//     branch lookup on the current branch can return it.
+//   - last_source_issue equals every held bead, because a record that completed
+//     some OTHER bead says nothing about the one still attached now.
+//
+// At least one held bead is required. Returning coverage with nothing to cover
+// would waive the precondition on a polecat whose held work the surface could
+// not name, and "I could not name it" is not "there is none".
+func CompletionCoverage(rec CompletionRecord, citedMR string, heldWork ...string) string {
+	if !strings.EqualFold(strings.TrimSpace(rec.ExitType), ExitTypeCompleted) {
+		return ""
+	}
+	mrID := strings.TrimSpace(rec.MRID)
+	if mrID == "" || mrID != strings.TrimSpace(citedMR) {
+		return ""
+	}
+	source := strings.TrimSpace(rec.LastSourceIssue)
+	if source == "" {
+		return ""
+	}
+	covered := false
+	for _, held := range heldWork {
+		held = strings.TrimSpace(held)
+		if held == "" {
+			continue
+		}
+		if held != source {
+			return ""
+		}
+		covered = true
+	}
+	if !covered {
+		return ""
+	}
+	evidence := fmt.Sprintf("completion_record=exit_type=%s mr_id=%s last_source_issue=%s",
+		ExitTypeCompleted, mrID, source)
+	if at := strings.TrimSpace(rec.CompletionTime); at != "" {
+		evidence += " completion_time=" + at
+	}
+	return evidence
+}
+
 // sessionAbsentHoldingWork reports the gt-9f67 signature: `tmux has-session`
 // RAN and found no session, and the polecat is nonetheless still holding work.
 //
@@ -216,10 +292,7 @@ const (
 // Still-holding-work, because a dead session on its own is the NORMAL end state
 // of every polecat that ever finished. `gt done` pushes, submits, and exits, so
 // "no session + open MR + no hook" is what success looks like and must keep
-// reading PENDING_MR. What does not happen on that road is the hook surviving:
-// gt done clears it. A hook (or an assigned work bead) still attached to a
-// polecat with no session is the polecat's own record that it never got to the
-// end of its own completion sequence.
+// reading PENDING_MR.
 //
 // The callers carry that work in THREE different fields — `gt polecat list` in
 // ActiveWorkBlocker, check-recovery in HookBead, and the issue store's own
@@ -227,8 +300,36 @@ const (
 // fewer is not a smaller version of this fix, it is a fix that does not fire:
 // the polecat this was measured on (gastown/deathclaw, gt-y39t hooked, session
 // gone) had only the third one set.
+//
+// STILL-HOLDING-WORK IS NOT PROOF THE SEQUENCE WAS CUT SHORT, and this predicate
+// was written believing it was: "gt done clears it". gt done clears the AGENT
+// BEAD's hook_bead, and the third field is not that. AssignedWorkBead is the
+// ISSUE STORE's hooked bead, and `gt done` leaves that one open ON PURPOSE when
+// it submits an MR — "the refinery closes it on merge" (gt-429i). So the normal
+// post-completion window is: session gone, hook_bead cleared, issue store still
+// hooked, MR queued. The predicate fires on every polecat that succeeds, for the
+// whole time its MR is in flight, and routes it to escalate (gt-n3jq).
+//
+// It was validated on that very case. gastown/deathclaw held gt-y39t hooked with
+// its session gone, and deathclaw had run `gt done --pre-verified` and AUTHORED
+// the commit that landed as 4392fa4db — the flip to NEEDS_RECOVERY/escalate
+// recorded as evidence the fix worked was a false alarm on a healthy polecat.
+//
+// So the missing half is supplied where it actually lives, and only as positive
+// evidence: the polecat's own completion record, matched to THIS episode's MR
+// and THIS episode's bead (see CompletionCoverage). A polecat that wrote one is
+// a polecat that reached the end of its own completion sequence — the thing
+// gt-9f67 wanted the hook to stand in for, read from the field that means it.
+//
+// Everything gt-9f67 catches, it still catches. A polecat that DIED holding work
+// wrote no completion record for that work, so it has no coverage, so the
+// precondition stands and it still escalates. Coverage is empty for every caller
+// that cannot read the record, which is the conservative direction.
 func sessionAbsentHoldingWork(in WorkstateInput) bool {
 	if in.SessionPresence != SessionAbsent {
+		return false
+	}
+	if in.CompletionCoverage != "" {
 		return false
 	}
 	holdsHook := in.HookBead != "" && !in.PartialSpawnWithoutDurableHook
@@ -312,6 +413,23 @@ type WorkstateInput struct {
 	// currently allows it, which is a much larger change than the one this bead
 	// asks for.
 	AssignedWorkBead string
+
+	// CompletionCoverage is the evidence, in the polecat's OWN completion record,
+	// that the session ending was completion and that the record covers the work
+	// still attached and the merge request about to be cited. Empty means no such
+	// evidence — including for every caller that never read the record.
+	//
+	// Produce it with CompletionCoverage(); do not assemble the string by hand.
+	// The point of routing it through one constructor is that a surface cannot
+	// claim coverage without having matched the record to this episode's MR and
+	// this episode's bead, and cannot claim it without saying what it matched.
+	//
+	// Consumed by exactly one predicate — sessionAbsentHoldingWork — where it
+	// supplies the half gt-9f67 inferred from a cleared hook and gt-429i had
+	// already made untrue. It is also REPORTED wherever it decides, because a
+	// waived precondition that leaves no trace is the same reading problem as an
+	// unexplained one.
+	CompletionCoverage string
 
 	// PausedAgentState is the agent bead's agent_state when that state is a
 	// deliberate pause (beads.AgentState.IsPaused: stuck, awaiting-gate, paused,
@@ -585,6 +703,14 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 		if in.HookBead != "" && !in.PartialSpawnWithoutDurableHook {
 			d.Blockers = append(d.Blockers, "has work on hook ("+in.HookBead+")")
+		}
+		// Say out loud that the session is gone and why that is not being read as
+		// a stall. Without this line the reader sees leave-alone over a polecat
+		// with no session and no account of it — which is the reading gt-9f67 was
+		// filed about, and it stays wrong even when the verdict is right.
+		if in.SessionPresence == SessionAbsent && in.CompletionCoverage != "" {
+			d.Blockers = append(d.Blockers,
+				"session_presence=absent (tmux has-session found no session) — not a stall: "+in.CompletionCoverage)
 		}
 		return d
 	}

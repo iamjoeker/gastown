@@ -345,6 +345,23 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		}
 	}
 
+	// Computed here, after the branch-index fallback above has settled which MR
+	// this item cites, and set on this surface as well as check-recovery so the
+	// two cannot answer the same polecat differently (gt-9f67's own rule).
+	//
+	// The held-work IDs come from the issue store and the agent bead's hook slot.
+	// fields.LastSourceIssue is deliberately NOT among them: it is half of the
+	// record being matched, and comparing it against itself would grant coverage
+	// to every polecat that ever completed anything.
+	if fields != nil {
+		input.CompletionCoverage = polecat.CompletionCoverage(polecat.CompletionRecord{
+			ExitType:        fields.ExitType,
+			MRID:            fields.MRID,
+			LastSourceIssue: fields.LastSourceIssue,
+			CompletionTime:  fields.CompletionTime,
+		}, item.ActiveMR, item.Issue, strings.TrimSpace(fields.HookBead))
+	}
+
 	// A dead session with work still attached is "stalled" only until you ask
 	// whether the work is in the queue. This surface has the answer already — it
 	// indexed the rig's merge requests once for the whole listing — so ask before

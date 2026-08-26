@@ -1474,6 +1474,22 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr) {
 		openMRProven = true
 	}
+	// AFTER the merge-queue facts, because status.ActiveMR is what this verdict
+	// will cite and applyMQFactsToWorkstateInput is where it settles — the agent
+	// bead's own active_mr is cleared by `gt done`, so the cited MR is the one
+	// found by branch. Matching the record against a field that has not been
+	// filled in yet would refuse coverage on every polecat.
+	if fields != nil {
+		input.CompletionCoverage = polecat.CompletionCoverage(polecat.CompletionRecord{
+			ExitType:        fields.ExitType,
+			MRID:            fields.MRID,
+			LastSourceIssue: fields.LastSourceIssue,
+			CompletionTime:  fields.CompletionTime,
+		}, status.ActiveMR, input.HookBead, input.AssignedWorkBead)
+		if input.CompletionCoverage != "" {
+			status.Diagnostics = append(status.Diagnostics, input.CompletionCoverage)
+		}
+	}
 	// Same promotion `gt polecat list` applies, from the same helper and the same
 	// bar of evidence. Doing it in one surface and not the other is how the two
 	// came to print contradictory dispositions for the same polecat (gt-mkpm).
