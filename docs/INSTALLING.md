@@ -378,6 +378,43 @@ stale shadow binary does not run the repair step first.
 If `command -v gt` points at a different install channel than the one you just
 updated, fix your PATH before continuing.
 
+### Identifying which commit a binary was built from
+
+Build provenance is stamped at link time by `make build`. Ask for it directly:
+
+```bash
+gt version --commit        # full gastown sha, or the literal "unknown"
+```
+
+`--commit` answers only from the link-time stamp. A binary built any other way
+— `go install`, a bare `go build`, a release artifact built without the
+makefile — reports `unknown`, and `gt version` says so in prose:
+
+```
+gt version 1.2.1 (dev: build commit unknown — not stamped by 'make build')
+```
+
+**`unknown` is the useful answer, not a failure.** It is deliberate that no sha
+is offered in its place. Go's own `vcs.revision` build stamping is taken from
+whichever git repository encloses the build directory, and inside a Gas Town
+tree that is frequently *not* the gastown repo — a gastown worktree nested under
+the town checkout gets stamped with the **town repo's HEAD**, a sha that does
+not exist in the gastown repo at all. Such a sha still resolves somewhere, so an
+ancestry test against it succeeds and answers confidently wrong. `gt version`
+reports it only as unverified context, never as this binary's commit (gt-5mvj).
+
+For the same reason no part of the version string is derived from the working
+directory. The output is identical from every directory; if two invocations of
+one binary ever disagree, that is a bug.
+
+To check a binary against the source repo, use `gt stale`, which refuses to
+compare when the binary's commit is not present in the gastown repo rather than
+guessing.
+
+When a binary is unstamped, or when you need to confirm a specific fix is live,
+**verify by behaviour**: invoke the changed code path and observe the new
+behaviour. That is the only check no metadata can spoof.
+
 ## Uninstalling
 
 ```bash

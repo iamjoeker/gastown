@@ -39,6 +39,15 @@ type buildBranchRef struct {
 }
 
 // resolveCommitHash gets the commit hash from build info or the Commit variable.
+//
+// vcs.revision is NOT trustworthy on its own: Go stamps it from whichever git
+// repository encloses the build directory, which inside a Gas Town tree is
+// often the town repo rather than gastown. CheckStaleBinary is safe against
+// that only because it verifies the hash resolves in the source repo before
+// comparing anything (see the resolveGitCommit call below, which turns a
+// foreign sha into Skipped rather than a wrong verdict). Do not remove that
+// check, and do not surface this value to users as the binary's build commit —
+// see internal/cmd.resolveCommitHash for the provenance distinction. (gt-5mvj)
 func resolveCommitHash() string {
 	if Commit != "" {
 		return Commit

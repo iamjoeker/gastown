@@ -10,14 +10,25 @@ E2E_RUN_FLAGS ?= --rm
 E2E_BUILD_RETRIES ?= 1
 E2E_RUN_RETRIES ?= 1
 
-# Get version info for ldflags
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Get version info for ldflags.
+#
+# Every git call is pinned with -C to the directory holding THIS makefile, so
+# the stamp always describes the gastown source tree being compiled — never
+# whatever repository the caller happened to be standing in (`make -C`,
+# `make -f`, a build driven from the town repo). Deriving provenance from an
+# ambient repo is exactly the defect gt-5mvj filed against `gt version`.
+SRC_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+SRC_GIT := git -C $(SRC_DIR)
+
+VERSION := $(shell $(SRC_GIT) describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT := $(shell $(SRC_GIT) rev-parse HEAD 2>/dev/null || echo "")
+BRANCH := $(shell $(SRC_GIT) symbolic-ref --short HEAD 2>/dev/null || echo "")
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 LDFLAGS := -s -w \
            -X github.com/steveyegge/gastown/internal/cmd.Version=$(VERSION) \
            -X github.com/steveyegge/gastown/internal/cmd.Commit=$(COMMIT) \
+           -X github.com/steveyegge/gastown/internal/cmd.Branch=$(BRANCH) \
            -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$(BUILD_TIME) \
            -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1
 
@@ -70,22 +81,41 @@ endif
 # check-forward-only: Ensure HEAD is a descendant of the currently installed binary's commit.
 # Prevents rebuilding to an older or diverged commit, which caused a crash loop where
 # the replaced binary broke session startup hooks → witness respawned → loop every 1-2 min.
+#
+# The binary's commit comes from `gt version --commit`, which reports only a
+# link-time stamp and prints "unknown" otherwise. The older `@sha` scrape is
+# kept as a fallback because this target runs against the *installed* binary,
+# which may predate --commit; it is only accepted when it looks like a sha, so
+# an "unknown flag" usage message cannot be mistaken for one. Note the scrape
+# was itself unreliable: with no branch stamped there is no `@` in the line, so
+# it silently yielded nothing and the downgrade guard skipped. (gt-5mvj)
 check-forward-only:
 ifndef SKIP_FORWARD_CHECK
-	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@'); \
+	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --commit 2>/dev/null | head -1); \
+	case "$$BINARY_COMMIT" in \
+		unknown|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; \
+		*) BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@') ;; \
+	esac; \
 	if [ -n "$$BINARY_COMMIT" ] && [ "$$BINARY_COMMIT" != "unknown" ]; then \
-		HEAD_COMMIT=$$(git rev-parse HEAD 2>/dev/null); \
-		if [ "$$BINARY_COMMIT" = "$$HEAD_COMMIT" ] || [ "$$(git rev-parse --short HEAD)" = "$$BINARY_COMMIT" ]; then \
+		RESOLVED=$$($(SRC_GIT) rev-parse --verify --quiet --end-of-options "$$BINARY_COMMIT^{commit}" 2>/dev/null); \
+		if [ -z "$$RESOLVED" ]; then \
+			echo "ERROR: installed binary reports commit $$BINARY_COMMIT, which does not exist in $(SRC_DIR)"; \
+			echo "Its provenance cannot be checked against this repo, so forward-only cannot be proven."; \
+			echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)."; \
+			exit 1; \
+		fi; \
+		HEAD_COMMIT=$$($(SRC_GIT) rev-parse HEAD 2>/dev/null); \
+		if [ "$$RESOLVED" = "$$HEAD_COMMIT" ]; then \
 			echo "Binary is already at HEAD, nothing to do"; \
 			exit 1; \
 		fi; \
-		if ! git merge-base --is-ancestor "$$BINARY_COMMIT" HEAD 2>/dev/null; then \
-			echo "ERROR: HEAD ($$(git rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)"; \
+		if ! $(SRC_GIT) merge-base --is-ancestor "$$RESOLVED" HEAD 2>/dev/null; then \
+			echo "ERROR: HEAD ($$($(SRC_GIT) rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)"; \
 			echo "This would be a DOWNGRADE. Refusing to rebuild."; \
 			echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)."; \
 			exit 1; \
 		fi; \
-		echo "Forward-only check passed: $$BINARY_COMMIT → $$(git rev-parse --short HEAD)"; \
+		echo "Forward-only check passed: $$BINARY_COMMIT → $$($(SRC_GIT) rev-parse --short HEAD)"; \
 	else \
 		echo "Warning: cannot determine installed binary commit, skipping forward check"; \
 	fi

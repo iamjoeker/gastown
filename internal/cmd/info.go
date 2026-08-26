@@ -39,11 +39,17 @@ Examples:
 			"build":   Build,
 		}
 
-		if commit := resolveCommitHash(); commit != "" {
+		// Only a link-time stamp identifies the build; anything else would be a
+		// sha from whatever repo enclosed the build dir. Report it as unknown
+		// rather than as this binary's commit. (gt-5mvj)
+		commit, provenance := resolveCommitHash()
+		if provenance == provenanceStamped {
 			info["commit"] = version.ShortCommit(commit)
-		}
-		if branch := resolveBranch(); branch != "" {
-			info["branch"] = branch
+			if branch := resolveBranch(); branch != "" {
+				info["branch"] = branch
+			}
+		} else {
+			info["commit"] = "unknown"
 		}
 
 		if jsonFlag {
@@ -54,12 +60,14 @@ Examples:
 		}
 
 		fmt.Printf("Gas Town v%s (%s)\n", Version, Build)
-		if commit, ok := info["commit"].(string); ok {
+		if provenance == provenanceStamped {
 			if branch, ok := info["branch"].(string); ok {
-				fmt.Printf("  %s@%s\n", branch, commit)
+				fmt.Printf("  %s@%s\n", branch, version.ShortCommit(commit))
 			} else {
-				fmt.Printf("  %s\n", commit)
+				fmt.Printf("  %s\n", version.ShortCommit(commit))
 			}
+		} else {
+			fmt.Printf("  build commit unknown (not stamped by 'make build')\n")
 		}
 		fmt.Println("\nUse 'gt info --whats-new' to see recent changes")
 	},
