@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -259,7 +260,7 @@ type mqPostMergeManager interface {
 }
 
 type mqPostMergeGit interface {
-	VerifyPushedCommitReachableFromPushTarget(remote, branch, commit string) error
+	VerifyCommitLandedOnPushTarget(remote, branch, commit string) (git.MergeProof, error)
 	ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead string) (string, error)
 	HasOpenPullRequest(ref git.PullRequestRef) bool
 	Rev(ref string) (string, error)
@@ -676,8 +677,8 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("post-merge proof: %w", err)
 	}
 
-	result, branchCleanup, err := runVerifiedMQPostMerge(mgr, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
-	return reportMQPostMerge(os.Stdout, result, branchCleanup, err)
+	result, proof, branchCleanup, err := runVerifiedMQPostMerge(mgr, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
+	return reportMQPostMerge(os.Stdout, result, proof, branchCleanup, err)
 }
 
 // reportMQPostMerge prints the per-step outcome of a post-merge run and returns
@@ -689,7 +690,7 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 // finished steps and says nothing at all about the branch — the one outstanding
 // step was visible only by going and looking at the ref. So print the steps that
 // did land even on failure, and name the one that did not. (gt-yog2)
-func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, branchCleanup mqPostMergeBranchCleanup, cleanupErr error) error {
+func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, proof git.MergeProof, branchCleanup mqPostMergeBranchCleanup, cleanupErr error) error {
 	if result == nil || result.MR == nil {
 		if cleanupErr != nil {
 			return fmt.Errorf("post-merge cleanup: %w", cleanupErr)
@@ -705,6 +706,9 @@ func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, branchClea
 	fmt.Fprintf(w, "%s Post-merge: %s\n", marker, mr.ID)
 	fmt.Fprintf(w, "  Branch: %s\n", mr.Branch)
 	fmt.Fprintf(w, "  Worker: %s\n", mr.Worker)
+	if line := describeMergeProof(proof, mr); line != "" {
+		fmt.Fprintf(w, "  %s %s\n", style.Success.Render("✓"), line)
+	}
 
 	if result.MRClosed {
 		fmt.Fprintf(w, "  %s MR closed (merged)\n", style.Success.Render("✓"))
@@ -755,43 +759,80 @@ func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, branchClea
 	return nil
 }
 
-func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPostMergeGit, mrID string, skipBranchDelete bool) (*refinery.PostMergeResult, mqPostMergeBranchCleanup, error) {
+// describeMergeProof renders how the landing was proven, so the record says
+// which evidence carried it rather than only that something did. A rebased
+// landing is proven by content under a rewritten sha, and the operator reading
+// this later needs to be able to tell that apart from plain containment.
+func describeMergeProof(proof git.MergeProof, mr *refinery.MergeRequest) string {
+	target := strings.TrimSpace(mr.TargetBranch)
+	commit := shortSHA(strings.TrimSpace(mr.CommitSHA))
+	switch proof.Method {
+	case git.MergeProofSHA:
+		return fmt.Sprintf("Merge proof: %s contains submitted head %s", target, commit)
+	case git.MergeProofContent:
+		detail := fmt.Sprintf("Merge proof: %s carries the content of submitted head %s under a rewritten sha (rebased landing)", target, commit)
+		if proof.TargetTip != "" {
+			detail += fmt.Sprintf("; target tip %s", shortSHA(proof.TargetTip))
+		}
+		if proof.Evidence != "" {
+			detail += fmt.Sprintf("; evidence %s", proof.Evidence)
+		}
+		return detail
+	default:
+		return ""
+	}
+}
+
+func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPostMergeGit, mrID string, skipBranchDelete bool) (*refinery.PostMergeResult, git.MergeProof, mqPostMergeBranchCleanup, error) {
 	mr, err := mgr.FindMRForPostMerge(mrID)
 	if err != nil {
-		return nil, mqPostMergeBranchCleanup{}, err
+		return nil, git.MergeProof{}, mqPostMergeBranchCleanup{}, err
 	}
-	if err := verifyMQPostMergeProof(rigGit, mr); err != nil {
-		return nil, mqPostMergeBranchCleanup{}, err
+	proof, err := verifyMQPostMergeProof(rigGit, mr)
+	if err != nil {
+		return nil, git.MergeProof{}, mqPostMergeBranchCleanup{}, err
 	}
 
 	result, err := mgr.PostMergeMR(mr)
 	if err != nil {
-		return result, mqPostMergeBranchCleanup{}, err
+		return result, proof, mqPostMergeBranchCleanup{}, err
 	}
 
 	branchCleanup, err := cleanupMQPostMergeBranch(rigPath, rigGit, result.MR, skipBranchDelete)
-	return result, branchCleanup, err
+	return result, proof, branchCleanup, err
 }
 
-func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {
+// verifyMQPostMergeProof proves the MR's work is on its target and returns how.
+//
+// The refusals below distinguish two things the operator has to respond to
+// differently. "did not land" is a statement about the work: it is not there, do
+// not close anything. "cannot be proven" is a statement about this check: it
+// could not read what it needed, and the MR may be perfectly fine. Naming the MR
+// as the problem in both cases reads as "this MR is bad" and is wrong in the
+// second (gt-umq0).
+func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) (git.MergeProof, error) {
 	if mr == nil {
-		return fmt.Errorf("merge proof failed: merge request is missing")
+		return git.MergeProof{}, fmt.Errorf("merge proof failed: merge request is missing")
 	}
 	target := strings.TrimSpace(mr.TargetBranch)
 	if target == "" {
-		return fmt.Errorf("merge proof failed for MR %s: missing target branch", mr.ID)
+		return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: missing target branch", mr.ID)
 	}
 	if source := strings.TrimSpace(mr.Branch); source != "" && source == target {
-		return fmt.Errorf("merge proof failed for MR %s: source branch %s matches target branch", mr.ID, source)
+		return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: source branch %s matches target branch", mr.ID, source)
 	}
 	commit := strings.TrimSpace(mr.CommitSHA)
 	if commit == "" {
-		return fmt.Errorf("merge proof failed for MR %s: missing submitted commit_sha", mr.ID)
+		return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: missing submitted commit_sha", mr.ID)
 	}
-	if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w", mr.ID, target, commit, err)
+	proof, err := rigGit.VerifyCommitLandedOnPushTarget("origin", target, commit)
+	if err == nil {
+		return proof, nil
 	}
-	return nil
+	if errors.Is(err, git.ErrMergeProofUnprovable) {
+		return git.MergeProof{}, fmt.Errorf("merge proof for MR %s could not be established (the MR itself may be fine): %w", mr.ID, err)
+	}
+	return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: %s carries neither submitted head %s nor its content: %w", mr.ID, target, commit, err)
 }
 
 func cleanupMQPostMergeBranch(rigPath string, rigGit mqPostMergeGit, mr *refinery.MergeRequest, skipBranchDelete bool) (mqPostMergeBranchCleanup, error) {

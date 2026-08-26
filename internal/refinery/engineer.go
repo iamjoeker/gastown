@@ -1446,9 +1446,14 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) bool {
 	} else {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Released merge slot\n")
 	}
-	if err := e.verifyMRInfoPostMergeProof(mr); err != nil {
+	proof, err := e.verifyMRInfoPostMergeProof(mr)
+	if err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Post-merge proof failed for %s: %v\n", mr.ID, err)
 		return false
+	}
+	if proof.Method == git.MergeProofContent {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Post-merge proof for %s: %s carries the content of %s under a rewritten sha (rebased landing, evidence %s)\n",
+			mr.ID, strings.TrimSpace(mr.Target), shortSHA(strings.TrimSpace(mr.CommitSHA)), proof.Evidence)
 	}
 
 	// Update and close the MR bead
@@ -1625,28 +1630,36 @@ func requirePullRequestHead(pr *git.PullRequestInfo, expectedHead string) error 
 	return nil
 }
 
-func (e *Engineer) verifyMRInfoPostMergeProof(mr *MRInfo) error {
+// verifyMRInfoPostMergeProof proves the MR's work reached its target, by sha
+// containment or — for the sequential-rebase landings this engineer performs
+// itself, which rewrite the sha by construction — by content. See
+// git.VerifyCommitLandedOnPushTarget (gt-umq0).
+func (e *Engineer) verifyMRInfoPostMergeProof(mr *MRInfo) (git.MergeProof, error) {
 	if mr == nil {
-		return fmt.Errorf("merge request is missing")
+		return git.MergeProof{}, fmt.Errorf("merge request is missing")
 	}
 	if e.git == nil {
-		return fmt.Errorf("git client is missing")
+		return git.MergeProof{}, fmt.Errorf("git client is missing")
 	}
 	target := strings.TrimSpace(mr.Target)
 	if target == "" {
-		return fmt.Errorf("missing target branch")
+		return git.MergeProof{}, fmt.Errorf("missing target branch")
 	}
 	if source := strings.TrimSpace(mr.Branch); source != "" && source == target {
-		return fmt.Errorf("source branch %s matches target branch", source)
+		return git.MergeProof{}, fmt.Errorf("source branch %s matches target branch", source)
 	}
 	commit := strings.TrimSpace(mr.CommitSHA)
 	if commit == "" {
-		return fmt.Errorf("missing submitted commit_sha")
+		return git.MergeProof{}, fmt.Errorf("missing submitted commit_sha")
 	}
-	if err := e.git.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("target %s does not contain submitted head %s: %w", target, commit, err)
+	proof, err := e.git.VerifyCommitLandedOnPushTarget("origin", target, commit)
+	if err == nil {
+		return proof, nil
 	}
-	return nil
+	if errors.Is(err, git.ErrMergeProofUnprovable) {
+		return git.MergeProof{}, fmt.Errorf("could not establish whether %s carries submitted head %s (the MR itself may be fine): %w", target, commit, err)
+	}
+	return git.MergeProof{}, fmt.Errorf("target %s carries neither submitted head %s nor its content: %w", target, commit, err)
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.

@@ -1949,7 +1949,11 @@ func (g *Git) ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead
 		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and has no target branch to verify it against",
 			branch, shortSHA(tip), shortSHA(recordedHead))
 	}
-	if err := g.VerifyPushedCommitReachableFromPushTarget(remote, target, tip); err != nil {
+	// Contained by sha OR by content, for the same reason the merge proof itself
+	// accepts both: a landing that rebased carries the branch's work under
+	// rewritten shas, and refusing the delete there strands a branch whose work
+	// is provably on the target (gt-umq0).
+	if _, err := g.VerifyCommitLandedOnPushTarget(remote, target, tip); err != nil {
 		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and that head is not contained in %s: %w",
 			branch, shortSHA(tip), shortSHA(recordedHead), target, err)
 	}
@@ -2573,6 +2577,110 @@ func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit s
 		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s)", shortSHA(commit), remote, branch, shortSHA(tip))
 	}
 	return nil
+}
+
+// MergeProofMethod names how a landing was proven.
+type MergeProofMethod string
+
+const (
+	// MergeProofSHA is the strong form: the target literally contains the
+	// submitted commit, so the landing was a fast-forward or a merge.
+	MergeProofSHA MergeProofMethod = "sha_containment"
+	// MergeProofContent is the rebase form: the target does not contain the
+	// submitted sha because the landing rewrote it, but the work that sha
+	// carried is demonstrably present on the target.
+	MergeProofContent MergeProofMethod = "content_equivalence"
+)
+
+// MergeProof records how VerifyCommitLandedOnPushTarget proved a landing, so a
+// caller can report the evidence rather than a bare "verified".
+type MergeProof struct {
+	Method MergeProofMethod
+	// Evidence names the underlying content check that carried a
+	// MergeProofContent proof: "merge_tree_noop" or "cherry" (patch-id).
+	Evidence string
+	// TargetTip is the target head the proof was taken against.
+	TargetTip string
+}
+
+// ErrMergeProofUnprovable means the question could not be answered — the
+// submitted commit is unreadable here, or the target could not be fetched or
+// compared. It is NOT a statement that the work is missing, and it wants a
+// different operator response from one.
+var ErrMergeProofUnprovable = errors.New("merge proof unprovable")
+
+// ErrCommitNotLanded means the question was answered and the answer is no: the
+// target carries neither the submitted commit nor its content.
+var ErrCommitNotLanded = errors.New("commit not landed on target")
+
+// VerifyCommitLandedOnPushTarget proves that the work of commit is on the push
+// target branch, and reports which proof carried it.
+//
+// Sha containment is the strong form and is tried first. It is also, on its own,
+// unable to describe the refinery's own prescribed workflow: MRs are merged one
+// at a time with sequential rebasing, and a rebase rewrites the sha, so from the
+// second MR of any batch onward the submitted sha is by construction absent from
+// the target however cleanly the work landed. Measured on two MRs fifteen
+// minutes apart with nothing wrong with either, the only difference being
+// whether another MR happened to land in between — queue timing, not submission
+// quality (gt-umq0). A check that refuses correct work trains its operators to
+// route around it.
+//
+// So when containment fails the same question is put to the CONTENT: is this
+// commit's work already represented on the target? Merging it into the fetched
+// target in the object store answers that directly — if the merge changes
+// nothing, the target already has it — with patch-id equality (`git cherry`) as
+// the fallback when the merge cannot be computed.
+//
+// The merge-tree form is deliberately the first content check rather than
+// patch-id, because patch-id hashes context lines: a rebase across an adjacent
+// change legitimately alters it while leaving the merge a no-op. Reaching for
+// patch-id first would refuse exactly the busy-queue landings this exists for.
+//
+// Absence of proof is reported apart from proof of absence:
+// ErrMergeProofUnprovable when the comparison could not be made, ErrCommitNotLanded
+// when it was made and the work is not there.
+func (g *Git) VerifyCommitLandedOnPushTarget(remote, branch, commit string) (MergeProof, error) {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return MergeProof{}, fmt.Errorf("%w: empty commit for %s/%s", ErrMergeProofUnprovable, remote, branch)
+	}
+	containErr := g.VerifyPushedCommitReachableFromPushTarget(remote, branch, commit)
+	if containErr == nil {
+		return MergeProof{Method: MergeProofSHA}, nil
+	}
+
+	// Nothing can be said about the content of a commit this repository cannot
+	// read. cat-file -e rather than rev-parse: a full 40-hex sha rev-parses to
+	// itself whether or not the object exists.
+	if _, err := g.run("cat-file", "-e", commit+"^{commit}"); err != nil {
+		return MergeProof{}, fmt.Errorf("%w: commit %s is not readable here, so its content cannot be compared against %s/%s (containment said: %v)",
+			ErrMergeProofUnprovable, shortSHA(commit), remote, branch, containErr)
+	}
+
+	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
+	if err != nil {
+		return MergeProof{}, fmt.Errorf("%w: unable to fetch %s/%s to compare content: %v", ErrMergeProofUnprovable, remote, branch, err)
+	}
+	defer cleanup()
+
+	status, err := g.preservationOfRefAgainstRef(commit, fetched)
+	if err != nil {
+		return MergeProof{}, fmt.Errorf("%w: unable to compare commit %s against %s/%s: %v",
+			ErrMergeProofUnprovable, shortSHA(commit), remote, branch, err)
+	}
+	tip, _ := g.Rev(fetched)
+	tip = strings.TrimSpace(tip)
+	if !status.Preserved {
+		return MergeProof{}, fmt.Errorf("%w: commit %s has %d commit(s) that %s/%s carries neither by sha nor by content (target tip %s)",
+			ErrCommitNotLanded, shortSHA(commit), status.UnpreservedPatchCount, remote, branch, shortSHA(tip))
+	}
+	// An "ancestor" verdict here means containment held after all and the read
+	// above failed for some transient reason; report the proof that is true.
+	if status.Evidence == "ancestor" {
+		return MergeProof{Method: MergeProofSHA, TargetTip: tip}, nil
+	}
+	return MergeProof{Method: MergeProofContent, Evidence: status.Evidence, TargetTip: tip}, nil
 }
 
 func parseLSRemoteTip(out, branch string) string {
