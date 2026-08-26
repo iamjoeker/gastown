@@ -1918,6 +1918,43 @@ func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error 
 	return err
 }
 
+// ResolveMergedBranchDeleteHead returns the head value a merged-branch delete
+// should lease against, or "" when the remote branch is already gone.
+//
+// recordedHead (an MR's submitted commit_sha) goes stale by design. Resolving a
+// conflict by merging the target INTO the branch advances the branch head after
+// the MR was created — the refinery workflow actively instructs resolvers to do
+// this — and git then rejects the delete with "stale info". The recorded sha was
+// only ever a proxy for the property that matters, that the branch is contained
+// in target, so when the proxy no longer matches, re-establish the property
+// directly against the current head rather than failing on the proxy. (gt-yog2)
+//
+// Returns an error when the current head is NOT contained in target: that head
+// carries work the merge did not take, and deleting the branch would lose it.
+func (g *Git) ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead string) (string, error) {
+	tip, err := g.PushRemoteBranchTip(remote, branch)
+	if err != nil {
+		return "", fmt.Errorf("read remote branch tip: %w", err)
+	}
+	tip = strings.TrimSpace(tip)
+	if tip == "" {
+		return "", nil
+	}
+	if tip == strings.TrimSpace(recordedHead) {
+		return tip, nil
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and has no target branch to verify it against",
+			branch, shortSHA(tip), shortSHA(recordedHead))
+	}
+	if err := g.VerifyPushedCommitReachableFromPushTarget(remote, target, tip); err != nil {
+		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and that head is not contained in %s: %w",
+			branch, shortSHA(tip), shortSHA(recordedHead), target, err)
+	}
+	return tip, nil
+}
+
 // HasOpenPR checks whether the given branch has an open pull request on GitHub.
 // Errors and ambiguous branch lookups protect the branch from deletion.
 func (g *Git) HasOpenPR(branch string) bool {

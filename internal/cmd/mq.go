@@ -216,7 +216,15 @@ This command consolidates post-merge steps into a single atomic operation:
 	 1. Verify the target branch contains the submitted source head
 	 2. Close the MR bead (status: merged)
 	 3. Close the source issue
-	 4. Delete the remote polecat branch at the submitted head (unless --skip-branch-delete)
+	 4. Delete the remote polecat branch (unless --skip-branch-delete)
+
+The delete is leased against the branch's head as it stands now, not the sha
+recorded at submission: a branch refreshed to resolve a conflict has moved on,
+and that head is verified contained in the target before the branch goes.
+
+Steps 2-4 are not one transaction. When the branch delete fails, the steps that
+did land are printed and the outstanding one is named — re-running reports the
+earlier steps as already done and cannot tell you about the branch.
 
 Designed for use by the refinery formula after a successful merge to main.
 The branch name is read from the MR bead, so no manual branch argument is needed.
@@ -235,7 +243,7 @@ type mqPostMergeManager interface {
 
 type mqPostMergeGit interface {
 	VerifyPushedCommitReachableFromPushTarget(remote, branch, commit string) error
-	PushRemoteBranchTip(remote, branch string) (string, error)
+	ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead string) (string, error)
 	HasOpenPullRequest(ref git.PullRequestRef) bool
 	Rev(ref string) (string, error)
 	DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error
@@ -243,6 +251,10 @@ type mqPostMergeGit interface {
 }
 
 type mqPostMergeBranchCleanup struct {
+	// Attempted records that the branch-cleanup step ran at all, which is what
+	// separates a cleanup failure (MR and issue already closed, branch left
+	// behind) from a failure before either was touched.
+	Attempted     bool
 	Branch        string
 	NoBranch      bool
 	Skipped       bool
@@ -251,6 +263,10 @@ type mqPostMergeBranchCleanup struct {
 	AlreadyGone   bool
 	RemoteDeleted bool
 	LocalDeleted  bool
+	// RefreshedHead is the branch head the delete was leased against when it
+	// differs from the MR's recorded commit_sha — the branch was refreshed
+	// after submission and that head was verified contained in the target.
+	RefreshedHead string
 }
 
 var mqStatusCmd = &cobra.Command{
@@ -643,40 +659,79 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 	}
 
 	result, branchCleanup, err := runVerifiedMQPostMerge(mgr, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
-	if err != nil {
-		return fmt.Errorf("post-merge cleanup: %w", err)
+	return reportMQPostMerge(os.Stdout, result, branchCleanup, err)
+}
+
+// reportMQPostMerge prints the per-step outcome of a post-merge run and returns
+// the error the command should exit with.
+//
+// Branch cleanup runs after the MR and the source issue are closed, and is not
+// part of that transaction: a failure there leaves cleanup half done. Returning
+// only the error hid that, because re-running reports "already closed" for the
+// finished steps and says nothing at all about the branch — the one outstanding
+// step was visible only by going and looking at the ref. So print the steps that
+// did land even on failure, and name the one that did not. (gt-yog2)
+func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, branchCleanup mqPostMergeBranchCleanup, cleanupErr error) error {
+	if result == nil || result.MR == nil {
+		if cleanupErr != nil {
+			return fmt.Errorf("post-merge cleanup: %w", cleanupErr)
+		}
+		return nil
 	}
 
 	mr := result.MR
-	fmt.Printf("%s Post-merge: %s\n", style.Bold.Render("✓"), mr.ID)
-	fmt.Printf("  Branch: %s\n", mr.Branch)
-	fmt.Printf("  Worker: %s\n", mr.Worker)
+	marker := style.Bold.Render("✓")
+	if cleanupErr != nil {
+		marker = style.Warning.Render("⚠")
+	}
+	fmt.Fprintf(w, "%s Post-merge: %s\n", marker, mr.ID)
+	fmt.Fprintf(w, "  Branch: %s\n", mr.Branch)
+	fmt.Fprintf(w, "  Worker: %s\n", mr.Worker)
 
 	if result.MRClosed {
-		fmt.Printf("  %s MR closed (merged)\n", style.Success.Render("✓"))
+		fmt.Fprintf(w, "  %s MR closed (merged)\n", style.Success.Render("✓"))
 	}
 	if result.SourceIssueClosed {
-		fmt.Printf("  %s Source issue closed: %s\n", style.Success.Render("✓"), result.SourceIssueID)
+		fmt.Fprintf(w, "  %s Source issue closed: %s\n", style.Success.Render("✓"), result.SourceIssueID)
 	} else if result.SourceIssueNotFound {
-		fmt.Printf("  %s Source issue: %s %s\n", style.Dim.Render("○"), result.SourceIssueID, style.Dim.Render("(already closed or not found)"))
+		fmt.Fprintf(w, "  %s Source issue: %s %s\n", style.Dim.Render("○"), result.SourceIssueID, style.Dim.Render("(already closed or not found)"))
 	}
 
-	if branchCleanup.NoBranch {
-		fmt.Printf("  %s No branch name in MR (skipping branch delete)\n", style.Dim.Render("○"))
-	} else if branchCleanup.Skipped {
-		fmt.Printf("  %s Branch delete skipped (--skip-branch-delete)\n", style.Dim.Render("○"))
-	} else if branchCleanup.Disabled {
-		fmt.Printf("  %s Branch delete disabled by config\n", style.Dim.Render("○"))
-	} else if branchCleanup.OpenPR {
-		fmt.Printf("  %s Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", style.Dim.Render("○"), mr.Branch)
-	} else if branchCleanup.AlreadyGone {
-		fmt.Printf("  %s Remote branch already absent: %s\n", style.Dim.Render("○"), mr.Branch)
-	} else if branchCleanup.RemoteDeleted {
-		fmt.Printf("  %s Deleted remote branch: %s\n", style.Success.Render("✓"), mr.Branch)
+	branch := strings.TrimSpace(branchCleanup.Branch)
+	if branch == "" {
+		branch = strings.TrimSpace(mr.Branch)
+	}
+
+	switch {
+	case cleanupErr != nil && !branchCleanup.Attempted:
+		// Failed before branch cleanup ran (a merge-proof or MR-close failure):
+		// the branch is untouched by design, so do not claim it is outstanding.
+		return fmt.Errorf("post-merge cleanup: %w", cleanupErr)
+	case cleanupErr != nil:
+		fmt.Fprintf(w, "  %s Remote branch NOT deleted: %s\n", style.Error.Render("✗"), branch)
+		fmt.Fprintf(w, "  %s\n", style.Warning.Render(fmt.Sprintf(
+			"Outstanding: %s still needs deleting (the steps above are done — re-running will not report this).", branch)))
+		return fmt.Errorf("post-merge cleanup incomplete for %s (MR and source issue closed; remote branch %s outstanding): %w", mr.ID, branch, cleanupErr)
+	case branchCleanup.NoBranch:
+		fmt.Fprintf(w, "  %s No branch name in MR (skipping branch delete)\n", style.Dim.Render("○"))
+	case branchCleanup.Skipped:
+		fmt.Fprintf(w, "  %s Branch delete skipped (--skip-branch-delete)\n", style.Dim.Render("○"))
+	case branchCleanup.Disabled:
+		fmt.Fprintf(w, "  %s Branch delete disabled by config\n", style.Dim.Render("○"))
+	case branchCleanup.OpenPR:
+		fmt.Fprintf(w, "  %s Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", style.Dim.Render("○"), branch)
+	case branchCleanup.AlreadyGone:
+		fmt.Fprintf(w, "  %s Remote branch already absent: %s\n", style.Dim.Render("○"), branch)
+	case branchCleanup.RemoteDeleted && branchCleanup.RefreshedHead != "":
+		fmt.Fprintf(w, "  %s Deleted remote branch: %s %s\n", style.Success.Render("✓"), branch,
+			style.Dim.Render(fmt.Sprintf("(refreshed to %s after submission; verified contained in %s)",
+				shortSHA(branchCleanup.RefreshedHead), strings.TrimSpace(mr.TargetBranch))))
+	case branchCleanup.RemoteDeleted:
+		fmt.Fprintf(w, "  %s Deleted remote branch: %s\n", style.Success.Render("✓"), branch)
 	}
 
 	if branchCleanup.LocalDeleted {
-		fmt.Printf("  %s Deleted local branch: %s\n", style.Success.Render("✓"), mr.Branch)
+		fmt.Fprintf(w, "  %s Deleted local branch: %s\n", style.Success.Render("✓"), branch)
 	}
 
 	return nil
@@ -722,7 +777,7 @@ func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) er
 }
 
 func cleanupMQPostMergeBranch(rigPath string, rigGit mqPostMergeGit, mr *refinery.MergeRequest, skipBranchDelete bool) (mqPostMergeBranchCleanup, error) {
-	cleanup := mqPostMergeBranchCleanup{}
+	cleanup := mqPostMergeBranchCleanup{Attempted: true}
 	if mr == nil {
 		return cleanup, fmt.Errorf("remote branch delete: merge request is missing")
 	}
@@ -748,23 +803,35 @@ func cleanupMQPostMergeBranch(rigPath string, rigGit mqPostMergeGit, mr *refiner
 
 	// Deleting a branch with an open PR causes GitHub to auto-close the PR as
 	// "closed" (not "merged"), destroying the PR audit trail. (gas-fk4)
+	leaseHead := expectedHead
 	if rigGit.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: cleanup.Branch, HeadSHA: expectedHead}) {
 		cleanup.OpenPR = true
 	} else {
-		remoteTip, err := rigGit.PushRemoteBranchTip("origin", cleanup.Branch)
+		// Lease against the branch's head as it stands now, not the sha recorded
+		// at submission: a branch refreshed to resolve a conflict has moved on,
+		// and leasing against the stale sha makes git reject the delete as
+		// "stale info". The resolver proves the current head is contained in the
+		// target before returning it, which is the safety property the recorded
+		// sha stood in for. (gt-yog2)
+		resolvedHead, err := rigGit.ResolveMergedBranchDeleteHead("origin", cleanup.Branch, strings.TrimSpace(mr.TargetBranch), expectedHead)
 		if err != nil {
-			return cleanup, fmt.Errorf("remote branch delete %s: read remote branch tip: %w", cleanup.Branch, err)
+			return cleanup, fmt.Errorf("remote branch delete %s: %w", cleanup.Branch, err)
 		}
-		if strings.TrimSpace(remoteTip) == "" {
+		if resolvedHead == "" {
 			cleanup.AlreadyGone = true
-		} else if err := rigGit.DeleteRemoteBranchIfAt("origin", cleanup.Branch, expectedHead); err != nil {
-			return cleanup, fmt.Errorf("remote branch delete %s at %s: %w", cleanup.Branch, expectedHead, err)
 		} else {
+			leaseHead = resolvedHead
+			if resolvedHead != expectedHead {
+				cleanup.RefreshedHead = resolvedHead
+			}
+			if err := rigGit.DeleteRemoteBranchIfAt("origin", cleanup.Branch, leaseHead); err != nil {
+				return cleanup, fmt.Errorf("remote branch delete %s at %s: %w", cleanup.Branch, leaseHead, err)
+			}
 			cleanup.RemoteDeleted = true
 		}
 	}
 
-	if deleteMQPostMergeLocalBranchIfAt(rigGit, cleanup.Branch, expectedHead) {
+	if deleteMQPostMergeLocalBranchIfAt(rigGit, cleanup.Branch, leaseHead) {
 		cleanup.LocalDeleted = true
 	}
 	return cleanup, nil

@@ -3461,6 +3461,151 @@ func TestDeleteRemoteBranchIfAtRejectsChangedBranch(t *testing.T) {
 	}
 }
 
+// commitFileTo writes, commits and pushes a file on the current branch and
+// returns the resulting head.
+func commitFileTo(t *testing.T, g *Git, dir, branch, name, body string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	if err := g.Add(name); err != nil {
+		t.Fatalf("Add %s: %v", name, err)
+	}
+	if err := g.Commit(name + ": " + body); err != nil {
+		t.Fatalf("Commit %s: %v", name, err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push %s: %v", branch, err)
+	}
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+	return head
+}
+
+// The branch a resolver refreshed (merging the target INTO it to clear a
+// conflict) no longer points at the sha the MR recorded, so a lease taken on
+// that sha is rejected as "stale info". Resolving the head at cleanup time
+// deletes the branch that the recorded sha could not. (gt-yog2)
+func TestResolveMergedBranchDeleteHeadFollowsRefreshedBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	branch := "polecat/refresh/gt-yog2"
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	recordedHead := commitFileTo(t, g, localDir, branch, "work.txt", "polecat work")
+
+	// Another MR lands on the target while this one waits.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	commitFileTo(t, g, localDir, mainBranch, "other.txt", "someone else")
+
+	// The resolver refreshes the branch: target merged INTO it, ancestry
+	// preserved, submitted head not rewritten.
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch for refresh: %v", err)
+	}
+	if err := g.MergeNoFF(mainBranch, "merge "+mainBranch+" into "+branch); err != nil {
+		t.Fatalf("MergeNoFF into branch: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push refreshed branch: %v", err)
+	}
+	refreshedHead, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev refreshed head: %v", err)
+	}
+	if refreshedHead == recordedHead {
+		t.Fatal("fixture did not refresh the branch head")
+	}
+
+	// The refinery then lands the branch.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main to land: %v", err)
+	}
+	if err := g.MergeNoFF(branch, "land "+branch); err != nil {
+		t.Fatalf("MergeNoFF land: %v", err)
+	}
+	if err := g.Push("origin", mainBranch, false); err != nil {
+		t.Fatalf("Push main: %v", err)
+	}
+
+	// Control: the old behaviour still fails here, so a pass below is the fix
+	// and not a fixture that stopped reproducing the bug.
+	if err := g.DeleteRemoteBranchIfAt("origin", branch, recordedHead); err == nil {
+		t.Fatal("lease on the recorded sha was accepted; fixture no longer reproduces gt-yog2")
+	}
+
+	head, err := g.ResolveMergedBranchDeleteHead("origin", branch, mainBranch, recordedHead)
+	if err != nil {
+		t.Fatalf("ResolveMergedBranchDeleteHead: %v", err)
+	}
+	if head != refreshedHead {
+		t.Fatalf("resolved head = %s, want refreshed head %s", head, refreshedHead)
+	}
+	if err := g.DeleteRemoteBranchIfAt("origin", branch, head); err != nil {
+		t.Fatalf("DeleteRemoteBranchIfAt at resolved head: %v", err)
+	}
+	exists, err := g.RemoteBranchExists("origin", branch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists: %v", err)
+	}
+	if exists {
+		t.Fatal("branch should be gone after deleting at the resolved head")
+	}
+}
+
+// Containment in the target is the property the recorded sha stood in for, so a
+// head the target never took must keep its branch.
+func TestResolveMergedBranchDeleteHeadRejectsUnmergedHead(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	branch := "polecat/unmerged/gt-yog2"
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	recordedHead := commitFileTo(t, g, localDir, branch, "work.txt", "submitted")
+	commitFileTo(t, g, localDir, branch, "work.txt", "never merged")
+
+	if _, err := g.ResolveMergedBranchDeleteHead("origin", branch, mainBranch, recordedHead); err == nil {
+		t.Fatal("ResolveMergedBranchDeleteHead accepted a head the target does not contain")
+	}
+	exists, err := g.RemoteBranchExists("origin", branch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists: %v", err)
+	}
+	if !exists {
+		t.Fatal("branch should survive an unverifiable head")
+	}
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+}
+
+func TestResolveMergedBranchDeleteHeadReportsAbsentBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	head, err := g.ResolveMergedBranchDeleteHead("origin", "polecat/never-existed", mainBranch, "abc123")
+	if err != nil {
+		t.Fatalf("ResolveMergedBranchDeleteHead for absent branch: %v", err)
+	}
+	if head != "" {
+		t.Fatalf("resolved head = %q, want \"\" for an absent branch", head)
+	}
+}
+
 // TestPushRemoteBranchExists_NoPushURL verifies that PushRemoteBranchExists
 // falls back to RemoteBranchExists when no custom push URL is configured.
 func TestPushRemoteBranchExists_NoPushURL(t *testing.T) {

@@ -34,14 +34,16 @@ func (m *fakeMQPostMergeManager) PostMergeMR(mr *refinery.MergeRequest) (*refine
 }
 
 type fakeMQPostMergeGit struct {
-	verifyErr error
-	openPR    bool
-	deleteErr error
-	remoteTip string
-	localHead string
-	tipErr    error
+	verifyErr  error
+	openPR     bool
+	deleteErr  error
+	remoteTip  string
+	localHead  string
+	tipErr     error
+	resolveErr error
 
 	verifiedCommits []string
+	resolvedTargets []string
 	deletedBranches []string
 	deletedHeads    []string
 	localDeleted    []string
@@ -56,8 +58,21 @@ func (g *fakeMQPostMergeGit) HasOpenPullRequest(git.PullRequestRef) bool {
 	return g.openPR
 }
 
-func (g *fakeMQPostMergeGit) PushRemoteBranchTip(_, _ string) (string, error) {
-	return g.remoteTip, g.tipErr
+// ResolveMergedBranchDeleteHead mirrors the real resolver's contract: the
+// current remote tip wins over the recorded sha, "" means the branch is gone,
+// and an error means the tip could not be proved contained in the target.
+func (g *fakeMQPostMergeGit) ResolveMergedBranchDeleteHead(_, _, target, recordedHead string) (string, error) {
+	g.resolvedTargets = append(g.resolvedTargets, target)
+	if g.tipErr != nil {
+		return "", g.tipErr
+	}
+	if g.remoteTip == "" {
+		return "", nil
+	}
+	if g.remoteTip != recordedHead && g.resolveErr != nil {
+		return "", g.resolveErr
+	}
+	return g.remoteTip, nil
 }
 
 func (g *fakeMQPostMergeGit) Rev(string) (string, error) {
@@ -218,6 +233,123 @@ func TestRunVerifiedMQPostMerge_MissingRemoteBranchIsIdempotentAfterProof(t *tes
 	}
 	if len(rigGit.deletedBranches) != 0 {
 		t.Fatalf("remote branch delete attempted for missing branch: %v", rigGit.deletedBranches)
+	}
+}
+
+// A branch refreshed after MR creation — the normal conflict-resolution path,
+// where the resolver merges the target INTO the branch — must still be deleted.
+// Leasing against the recorded commit_sha made git reject the delete as "stale
+// info" and stranded the branch. (gt-yog2)
+func TestRunVerifiedMQPostMerge_RefreshedBranchDeletesAtCurrentHead(t *testing.T) {
+	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
+	refreshedHead := "8d1adabb99887766"
+	rigGit := &fakeMQPostMergeGit{remoteTip: refreshedHead, localHead: refreshedHead}
+
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	if err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if len(rigGit.deletedHeads) != 1 || rigGit.deletedHeads[0] != refreshedHead {
+		t.Fatalf("delete lease heads = %v, want [%s] (not the recorded %s)", rigGit.deletedHeads, refreshedHead, mgr.mr.CommitSHA)
+	}
+	if !cleanup.RemoteDeleted || cleanup.RefreshedHead != refreshedHead {
+		t.Fatalf("cleanup = %+v, want RemoteDeleted with RefreshedHead %s", cleanup, refreshedHead)
+	}
+	if len(rigGit.resolvedTargets) != 1 || rigGit.resolvedTargets[0] != mgr.mr.TargetBranch {
+		t.Fatalf("resolve targets = %v, want [%s]", rigGit.resolvedTargets, mgr.mr.TargetBranch)
+	}
+	if !cleanup.LocalDeleted || len(rigGit.localDeleted) != 1 {
+		t.Fatalf("local delete = cleanup=%+v local=%v", cleanup, rigGit.localDeleted)
+	}
+}
+
+// The ancestry check is the safety property the recorded sha stood in for, so a
+// refreshed head that is NOT contained in the target keeps its branch.
+func TestRunVerifiedMQPostMerge_RefreshedHeadNotContainedFailsClosed(t *testing.T) {
+	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
+	rigGit := &fakeMQPostMergeGit{
+		remoteTip:  "8d1adabb99887766",
+		localHead:  "8d1adabb99887766",
+		resolveErr: errors.New("not contained in main"),
+	}
+
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "remote branch delete") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want remote branch delete failure", err)
+	}
+	if !strings.Contains(err.Error(), "not contained in main") {
+		t.Fatalf("error %q does not name the ancestry failure", err)
+	}
+	if len(rigGit.deletedBranches) != 0 {
+		t.Fatalf("remote branch deleted despite unverified head: %v", rigGit.deletedBranches)
+	}
+	if len(rigGit.localDeleted) != 0 {
+		t.Fatalf("local branch deleted despite unverified head: %v", rigGit.localDeleted)
+	}
+	if !cleanup.Attempted {
+		t.Fatalf("cleanup.Attempted = false, cleanup=%+v", cleanup)
+	}
+}
+
+// A branch-delete failure lands after the MR and source issue are already
+// closed. The report must say which steps landed and name the one that did not,
+// because re-running reports "already closed" and says nothing about the branch.
+func TestReportMQPostMerge_PartialCleanupNamesOutstandingStep(t *testing.T) {
+	mr := testMQPostMergeMR()
+	result := &refinery.PostMergeResult{MR: mr, MRClosed: true, SourceIssueClosed: true, SourceIssueID: mr.IssueID}
+	cleanup := mqPostMergeBranchCleanup{Attempted: true, Branch: mr.Branch}
+
+	var out strings.Builder
+	err := reportMQPostMerge(&out, result, cleanup, errors.New("stale info"))
+	if err == nil {
+		t.Fatal("reportMQPostMerge returned nil for a failed branch delete")
+	}
+	for _, want := range []string{mr.ID, mr.Branch, "outstanding"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+	text := out.String()
+	for _, want := range []string{"MR closed", "Source issue closed", "NOT deleted", "Outstanding", mr.Branch} {
+		if !strings.Contains(text, want) {
+			t.Errorf("report output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+// A failure BEFORE branch cleanup ran leaves the branch untouched by design, so
+// the report must not report it as outstanding work.
+func TestReportMQPostMerge_PreCleanupFailureClaimsNoOutstandingBranch(t *testing.T) {
+	mr := testMQPostMergeMR()
+	result := &refinery.PostMergeResult{MR: mr}
+
+	var out strings.Builder
+	err := reportMQPostMerge(&out, result, mqPostMergeBranchCleanup{}, errors.New("close failed"))
+	if err == nil {
+		t.Fatal("reportMQPostMerge returned nil for a failed post-merge")
+	}
+	if strings.Contains(err.Error(), "outstanding") || strings.Contains(out.String(), "Outstanding") {
+		t.Fatalf("pre-cleanup failure reported branch as outstanding: err=%v out=%s", err, out.String())
+	}
+}
+
+func TestReportMQPostMerge_RefreshedDeleteIsReported(t *testing.T) {
+	mr := testMQPostMergeMR()
+	result := &refinery.PostMergeResult{MR: mr, MRClosed: true}
+	cleanup := mqPostMergeBranchCleanup{
+		Attempted:     true,
+		Branch:        mr.Branch,
+		RemoteDeleted: true,
+		RefreshedHead: "8d1adabb99887766",
+	}
+
+	var out strings.Builder
+	if err := reportMQPostMerge(&out, result, cleanup, nil); err != nil {
+		t.Fatalf("reportMQPostMerge: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Deleted remote branch") || !strings.Contains(text, "refreshed") {
+		t.Fatalf("report output does not report the refreshed head:\n%s", text)
 	}
 }
 

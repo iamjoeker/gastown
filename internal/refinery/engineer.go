@@ -1487,19 +1487,31 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) bool {
 		// be closed via gh pr merge (showing "merged"), not via branch deletion
 		// (which shows "closed" and destroys the PR audit trail).
 		expectedHead := strings.TrimSpace(mr.CommitSHA)
+		// Lease the delete against the branch's head as it stands now. A branch
+		// refreshed to resolve a conflict has moved past the sha recorded at
+		// submission, and leasing against that stale sha makes git reject the
+		// delete as "stale info", stranding the branch. The resolver proves the
+		// current head is contained in the target first. (gt-yog2)
+		leaseHead := expectedHead
 		remoteDeleteSafe := true
 		if isPolecat {
 			if e.git.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: expectedHead}) {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", mr.Branch)
-			} else if err := e.git.DeleteRemoteBranchIfAt("origin", mr.Branch, expectedHead); err != nil {
+			} else if resolvedHead, err := e.git.ResolveMergedBranchDeleteHead("origin", mr.Branch, strings.TrimSpace(mr.Target), expectedHead); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
+				remoteDeleteSafe = false
+			} else if resolvedHead == "" {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Remote branch already absent: %s\n", mr.Branch)
+			} else if err := e.git.DeleteRemoteBranchIfAt("origin", mr.Branch, resolvedHead); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
 				remoteDeleteSafe = false
 			} else {
+				leaseHead = resolvedHead
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
 			}
 		}
 		if remoteDeleteSafe {
-			if err := e.deleteLocalBranchIfAt(mr.Branch, expectedHead); err != nil {
+			if err := e.deleteLocalBranchIfAt(mr.Branch, leaseHead); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete local branch %s: %v\n", mr.Branch, err)
 			} else {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted local branch: %s\n", mr.Branch)
