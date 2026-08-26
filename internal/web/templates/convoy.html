@@ -87,11 +87,15 @@
                     <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{if .Summary.HooksUnavailable}}?{{else}}{{.Summary.HookCount}}{{end}}</span>
+                    <!-- "N+" not "N": a count short by a store that could not be
+                         read, or that filled its whole row allowance, is a floor.
+                         The panel headers already say this; the banner is where
+                         the operator actually forms their impression. -->
+                    <span class="stat-value">{{if .Summary.HooksUnavailable}}?{{else}}{{.Summary.HookCount}}{{if .Summary.HooksPartial}}+{{end}}{{end}}</span>
                     <span class="stat-label">🪝 Hooks</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{if .Summary.IssuesUnavailable}}?{{else}}{{.Summary.IssueCount}}{{end}}</span>
+                    <span class="stat-value">{{if .Summary.IssuesUnavailable}}?{{else}}{{.Summary.IssueCount}}{{if .Summary.IssuesPartial}}+{{end}}{{end}}</span>
                     <span class="stat-label">📋 Work</span>
                 </div>
                 <div class="stat">
@@ -122,6 +126,18 @@
                 {{end}}
                 {{if .Summary.MergeQueueUnavailable}}
                 <span class="alert-item alert-red">🔀 merge queue unreadable</span>
+                {{end}}
+                <!-- A short count is a quieter failure than an unreadable one,
+                     so it is yellow rather than red — but it is still the
+                     difference between "✓ All clear" and a number to distrust. -->
+                {{if .Summary.HooksPartial}}
+                <span class="alert-item alert-yellow">🪝 hooks count is a floor</span>
+                {{end}}
+                {{if .Summary.IssuesPartial}}
+                <span class="alert-item alert-yellow">📋 work count is a floor</span>
+                {{end}}
+                {{if .Summary.MergeQueuePartial}}
+                <span class="alert-item alert-yellow">🔀 merge queue count is a floor</span>
                 {{end}}
                 {{if .Summary.MailUnavailable}}
                 <span class="alert-item alert-red">✉️ mail unreadable</span>
@@ -543,7 +559,7 @@
             <div class="panel" id="mail-panel">
                 <div class="panel-header">
                     <h2>✉️ Mail</h2>
-                    <span class="count" id="mail-count">{{if .MailUnavailable}}?{{else}}{{len .Mail}}{{end}}</span>
+                    <span class="count" id="mail-count">{{if .MailUnavailable}}?{{else}}{{len .Mail}}{{if .MailTruncated}}+{{end}}{{end}}</span>
                     <div class="mail-tabs">
                         <button class="mail-tab active" data-tab="inbox">Inbox</button>
                         <button class="mail-tab" data-tab="all">All Traffic</button>
@@ -572,6 +588,9 @@
                             <p>This is NOT "no mail" — the dashboard could not read it.</p>
                         </div>
                         {{else if .Mail}}
+                        {{if .MailTruncated}}
+                        <p class="truncation-notice">⚠️ Showing the most recent {{len .Mail}} messages — the count is a floor, not the town's whole mail</p>
+                        {{end}}
                         <table class="mail-all-table">
                             <thead>
                                 <tr>

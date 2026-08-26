@@ -53,7 +53,13 @@ type ConvoyData struct {
 	// MailUnavailable holds the reason the mail query failed, or "" when it
 	// succeeded. A town whose bd cannot be reached has not gone quiet.
 	MailUnavailable string
-	Rigs            []RigRow
+	// MailTruncated is true when the mail query filled its whole row allowance
+	// and so may have had more to give. Unlike the other panels this cap is
+	// deliberate — the panel is "recent mail", and the town root holds hundreds
+	// of message beads — but a deliberate cap still produces a number that is a
+	// floor, and the panel used to print it as a total.
+	MailTruncated bool
+	Rigs          []RigRow
 	// RigsUnavailable holds the reason the rig list could not be read, or ""
 	// when it was read — including when the town genuinely has no rigs
 	// registered, which is a real zero rather than an unknown one.
@@ -250,6 +256,30 @@ type DashboardSummary struct {
 	// calm "0 Hooks / 0 Work" for a town whose beads are simply unreachable.
 	HooksUnavailable  bool
 	IssuesUnavailable bool
+
+	// HooksPartial and IssuesPartial are the *other* half of the same fact, and
+	// the one the codebase had not reached: the union answered, but not fully.
+	// A store errored, or filled its whole row allowance, or was never asked —
+	// so the stat beside them is a floor and the banner renders it "N+".
+	//
+	// A failed read was already distinguishable from a real zero; a TRUNCATED
+	// read was not. It arrives as an ordinary number in the same visual language
+	// as a measured one, which is the more dangerous of the two: an operator who
+	// sees "?" knows to go look, and an operator who sees "50" does not.
+	//
+	// They are set only when the panel is otherwise readable. A stat with no
+	// source at all already renders "?", and "0+" would be a floor drawn from
+	// nothing read — the two markers must not stack.
+	HooksPartial  bool
+	IssuesPartial bool
+
+	// MergeQueuePartial says some rigs answered the merge-queue query and some
+	// did not. The banner prints no merge-queue number, so this is alert-only —
+	// and that is precisely why it is here. The panel already renders its own
+	// "+", but an operator whose banner says "✓ All clear" never scrolls down to
+	// read it, and "merge queue empty" is the most consequential thing this
+	// dashboard can wrongly imply.
+	MergeQueuePartial bool
 
 	// These four panels print no stat in the banner, so they are alert-only.
 	// They are here because HasAlerts is what decides between "✓ All clear" and

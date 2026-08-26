@@ -54,6 +54,11 @@ type MockConvoyFetcher struct {
 	// HooksFailedStores names stores whose hooked-bead query failed, so the
 	// handler's partial-union caveat can be driven from a test.
 	HooksFailedStores []string
+	// HooksTruncatedStores and IssuesTruncatedStores name stores that filled
+	// their whole row allowance. Separate levers from the *FailedStores ones
+	// because a truncated read is the case the banner used to render as a
+	// complete one, and a test that can only fail a store cannot reach it.
+	HooksTruncatedStores []string
 	// HooksError and IssuesError are the whole-query failure of a union panel,
 	// which leaves no StoreResult to name failed stores with.
 	HooksError  error
@@ -62,9 +67,16 @@ type MockConvoyFetcher struct {
 	MayorError  error
 	Issues      []IssueRow
 	// IssuesFailedStores is the same lever for the backlog union.
-	IssuesFailedStores []string
-	Activity           []ActivityRow
-	ActivityError      error
+	IssuesFailedStores    []string
+	IssuesTruncatedStores []string
+	// IssuesReadStores names stores that answered. It is what keeps a mock with
+	// no rows and a failed store from reading as "no store answered at all":
+	// Unreadable() is the "?" render, and a truncation test needs the panel to
+	// be readable so the "+" render is the one under test.
+	IssuesReadStores []string
+	HooksReadStores  []string
+	Activity         []ActivityRow
+	ActivityError    error
 	// Error is the convoy fetch's error.
 	Error error
 }
@@ -110,7 +122,12 @@ func (m *MockConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 }
 
 func (m *MockConvoyFetcher) FetchHooks() (StoreResult[HookRow], error) {
-	return StoreResult[HookRow]{Rows: m.Hooks, FailedStores: m.HooksFailedStores}, m.HooksError
+	return StoreResult[HookRow]{
+		Rows:            m.Hooks,
+		FailedStores:    m.HooksFailedStores,
+		TruncatedStores: m.HooksTruncatedStores,
+		ReadStores:      m.HooksReadStores,
+	}, m.HooksError
 }
 
 func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
@@ -118,7 +135,12 @@ func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 }
 
 func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
-	return StoreResult[IssueRow]{Rows: m.Issues, FailedStores: m.IssuesFailedStores}, m.IssuesError
+	return StoreResult[IssueRow]{
+		Rows:            m.Issues,
+		FailedStores:    m.IssuesFailedStores,
+		TruncatedStores: m.IssuesTruncatedStores,
+		ReadStores:      m.IssuesReadStores,
+	}, m.IssuesError
 }
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
@@ -2115,4 +2137,178 @@ func TestConvoyHandler_WorkersFailureChannelsStayDistinct(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConvoyHandler_BannerMarksTruncatedCountsAsFloors is the acceptance test
+// for gt-skzk.2. The *Unavailable family already made a FAILED read look
+// different from a real zero; a read that SUCCEEDS but comes back short had no
+// render at all, and reached the operator as an ordinary number.
+//
+// The two subtests are one test: the marker has to appear for a store that
+// filled its allowance AND stay away for one that did not. A marker that is
+// always on is decoration, and decoration on a monitoring surface is worse than
+// nothing because it trains the reader to ignore it.
+func TestConvoyHandler_BannerMarksTruncatedCountsAsFloors(t *testing.T) {
+	rows := func(n int) ([]IssueRow, []HookRow) {
+		issues := make([]IssueRow, 0, n)
+		hooks := make([]HookRow, 0, n)
+		for i := 0; i < n; i++ {
+			issues = append(issues, IssueRow{ID: fmt.Sprintf("gt-i%d", i), Title: "work", Priority: 3})
+			hooks = append(hooks, HookRow{ID: fmt.Sprintf("gt-h%d", i), Title: "hooked", Agent: "nux"})
+		}
+		return issues, hooks
+	}
+
+	t.Run("store above the cap renders a floor", func(t *testing.T) {
+		issues, hooks := rows(3)
+		mock := &MockConvoyFetcher{
+			Convoys:               []ConvoyRow{},
+			Issues:                issues,
+			IssuesReadStores:      []string{"town", "gastown"},
+			IssuesTruncatedStores: []string{"town"},
+			Hooks:                 hooks,
+			HooksReadStores:       []string{"town", "gastown"},
+			HooksTruncatedStores:  []string{"town"},
+		}
+
+		body := renderDashboard(t, mock)
+
+		for _, want := range []string{
+			`<span class="stat-value">3+</span>`,
+			"work count is a floor",
+			"hooks count is a floor",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("a capped read must not render as a measured count: missing %q", want)
+			}
+		}
+		// The banner's verdict has to move with it. "All clear" over a number
+		// the dashboard knows is short is the exact false assurance the
+		// *Unavailable flags were added to prevent, one degree quieter.
+		if strings.Contains(body, "✓ All clear") {
+			t.Error(`banner said "All clear" over counts it knows are floors`)
+		}
+	})
+
+	t.Run("store below the cap renders a bare count", func(t *testing.T) {
+		issues, hooks := rows(3)
+		mock := &MockConvoyFetcher{
+			Convoys:          []ConvoyRow{},
+			Issues:           issues,
+			IssuesReadStores: []string{"town", "gastown"},
+			Hooks:            hooks,
+			HooksReadStores:  []string{"town", "gastown"},
+		}
+
+		body := renderDashboard(t, mock)
+
+		if !strings.Contains(body, `<span class="stat-value">3</span>`) {
+			t.Error("a complete read must render as a plain number")
+		}
+		for _, unwanted := range []string{
+			`<span class="stat-value">3+</span>`,
+			"count is a floor",
+		} {
+			if strings.Contains(body, unwanted) {
+				t.Errorf("marker fired on a complete read, so it discriminates nothing: found %q", unwanted)
+			}
+		}
+	})
+}
+
+// TestConvoyHandler_UnreadableBeatsPartial pins the precedence between the two
+// markers. Every store failing makes the union both unreadable AND partial, and
+// rendering both would print "0+" — a floor drawn from nothing read — beside an
+// alert saying the count is a floor. "?" says strictly more, so it wins alone.
+func TestConvoyHandler_UnreadableBeatsPartial(t *testing.T) {
+	mock := &MockConvoyFetcher{
+		Convoys:            []ConvoyRow{},
+		IssuesFailedStores: []string{"town", "gastown"},
+		HooksFailedStores:  []string{"town", "gastown"},
+	}
+
+	body := renderDashboard(t, mock)
+
+	if !strings.Contains(body, `<span class="stat-value">?</span>`) {
+		t.Error("a stat with no source at all must render ?")
+	}
+	for _, unwanted := range []string{
+		`<span class="stat-value">0+</span>`,
+		"count is a floor",
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("unreadable and partial both rendered for the same stat: found %q", unwanted)
+		}
+	}
+}
+
+// TestConvoyHandler_BannerFlagsPartialMergeQueue covers the third acceptance
+// case. The merge queue prints no number in the banner, so a rig short of the
+// count could only reach the operator as an alert — and it did not, which meant
+// a partially-read queue rendered "✓ All clear". The panel's own "+" is not a
+// substitute: an operator whose banner is green does not scroll down to it.
+func TestConvoyHandler_BannerFlagsPartialMergeQueue(t *testing.T) {
+	mock := &MockConvoyFetcher{
+		Convoys:              []ConvoyRow{},
+		MergeQueue:           []MergeQueueRow{{ID: "gt-mr1", Title: "a merge", Repo: "gastown"}},
+		MergeQueueFailedRigs: []string{"roxas"},
+		IssuesReadStores:     []string{"town"},
+		HooksReadStores:      []string{"town"},
+	}
+
+	body := renderDashboard(t, mock)
+
+	if !strings.Contains(body, "merge queue count is a floor") {
+		t.Error("a queue short by a rig must reach the banner, not just the panel")
+	}
+	if strings.Contains(body, "✓ All clear") {
+		t.Error(`banner said "All clear" over a merge queue it only partly read`)
+	}
+	// The two merge-queue failure scales must stay distinct: one rig short is
+	// not the same claim as no rig list at all.
+	if strings.Contains(body, "merge queue unreadable") {
+		t.Error("a partial queue was reported as an unreadable one")
+	}
+}
+
+// TestConvoyHandler_MailCountSaysWhenItIsCapped covers the one cap on this page
+// that is deliberate. FetchMail asks for the most recent mailFetchLimit
+// messages because the panel is "recent traffic" and the town root held 386
+// message beads when this was measured. That is a good reason for the cap and
+// no reason at all to print its result as a total.
+func TestConvoyHandler_MailCountSaysWhenItIsCapped(t *testing.T) {
+	full := make([]MailRow, 0, mailFetchLimit)
+	for i := 0; i < mailFetchLimit; i++ {
+		full = append(full, MailRow{ID: fmt.Sprintf("hq-m%d", i), Subject: "hello", From: "mayor"})
+	}
+
+	body := renderDashboard(t, &MockConvoyFetcher{Convoys: []ConvoyRow{}, Mail: full})
+	if !strings.Contains(body, fmt.Sprintf(`id="mail-count">%d+<`, mailFetchLimit)) {
+		t.Errorf("a mail query that came back exactly full must render as a floor")
+	}
+	if !strings.Contains(body, "the count is a floor") {
+		t.Error("the mail panel should say the list is the most recent slice, not all of it")
+	}
+
+	short := full[:mailFetchLimit-1]
+	body = renderDashboard(t, &MockConvoyFetcher{Convoys: []ConvoyRow{}, Mail: short})
+	if !strings.Contains(body, fmt.Sprintf(`id="mail-count">%d<`, mailFetchLimit-1)) {
+		t.Error("a mail query that came back short of the cap is a complete answer")
+	}
+}
+
+// renderDashboard serves one request against the mock and returns the HTML.
+func renderDashboard(t *testing.T, mock *MockConvoyFetcher) string {
+	t.Helper()
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	return w.Body.String()
 }

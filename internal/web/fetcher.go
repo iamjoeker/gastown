@@ -1347,10 +1347,19 @@ func parseActivityTimestamp(s string) (int64, bool) {
 	return unix, true
 }
 
+// mailFetchLimit caps the mail query. Unlike the caps on the other panels this
+// one is meant: the panel shows recent traffic, and the town root held 386
+// message beads when this was measured, nearly all of them long read.
+//
+// A deliberate cap is still a cap. len(rows) reaching it means the query came
+// back full and the panel is showing a floor, which is why the handler turns
+// this number into MailTruncated rather than letting the count render bare.
+const mailFetchLimit = 50
+
 // FetchMail fetches recent mail messages from the beads database.
 func (f *LiveConvoyFetcher) FetchMail() ([]MailRow, error) {
 	// List all message issues (mail)
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:message", "--json", "--limit=50")
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:message", "--json", fmt.Sprintf("--limit=%d", mailFetchLimit))
 	if err != nil {
 		return nil, fmt.Errorf("listing mail: %w", err)
 	}
@@ -1605,8 +1614,16 @@ func (f *LiveConvoyFetcher) FetchDogs() ([]DogRow, error) {
 // exactly when escalations are most likely to exist, and swallowing the failure
 // made the town look calmest at its worst moment (gt-edty).
 func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
-	// List open escalations
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", "--json")
+	// List open escalations.
+	//
+	// --limit=0 is load-bearing, not tidiness: `bd list` defaults to 50, so
+	// omitting the flag capped this query silently. The escalation count is a
+	// banner stat and the banner had no way to say it was short — a town with
+	// 60 open escalations would have displayed 50, in the same typeface as a
+	// measured count, and the ten it could not see are the ten nobody is
+	// coming for. An unbounded query cannot be truncated, so there is nothing
+	// to mark; the count is a true count (gt-skzk.2).
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", "--json", "--limit=0")
 	if err != nil {
 		return nil, fmt.Errorf("listing escalations: %w", err)
 	}
@@ -1732,8 +1749,10 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 // queues" are different facts, and only one of them means the panel can be
 // trusted.
 func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
-	// List queue beads
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:queue", "--json")
+	// List queue beads. --limit=0 for the same reason FetchEscalations carries
+	// it: bd's own default of 50 would cap this read with nothing on the page
+	// to say so.
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:queue", "--json", "--limit=0")
 	if err != nil {
 		return nil, fmt.Errorf("listing queues: %w", err)
 	}
