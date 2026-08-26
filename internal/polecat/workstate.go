@@ -21,6 +21,31 @@ const (
 	// would discard a pause somebody set on purpose (gt-fbgq).
 	WorkstateVerdictNeedsStateClear = "NEEDS_STATE_CLEAR"
 
+	// WorkstateVerdictNeedsLogin is the answer for a polecat whose pane
+	// demonstrably shows an auth wall: the agent has no usable credentials and
+	// is waiting on a human to run /login.
+	//
+	// It is its own verdict because every existing one is wrong for it, and the
+	// wrongest is the one it used to get. A logged-out polecat still holds a
+	// hooked bead, so the bead-derived road reported WORKING — and WORKING
+	// prescribes leave-alone. gastown/foundation was reported WORKING by both
+	// `gt rig status` and `gt polecat check-recovery` for eighteen minutes while
+	// its pane read "Not logged in · Run /login", and the same variable left the
+	// Deacon logged out for 3.27 days with nothing noticing (hq-nms9g, gt-acb1).
+	// Hooked-ness was being read as liveness.
+	//
+	// It is deliberately not NEEDS_RECOVERY: nothing is at risk in git or the
+	// queue, and the recovery vocabulary would send a reader looking for lost
+	// work that does not exist. It is deliberately not SAFE_TO_NUKE either — the
+	// polecat is holding a slot it cannot work in, and destroying it neither
+	// recovers the slot's account nor stops the next session from coming up the
+	// same way.
+	//
+	// Restart is specifically NOT the remedy, which is why this verdict routes to
+	// escalate: no restart path can supply credentials, so restarting produces
+	// another logged-out session. That is exactly the loop gt-acb1 documents.
+	WorkstateVerdictNeedsLogin = "NEEDS_LOGIN"
+
 	// WorkstateVerdictUnverified is the answer for a caller that never gathered
 	// the git and merge-queue facts (ReuseFactsMeasured false). It is not a
 	// claim that anything is wrong — it is the refusal to make a claim at all.
@@ -45,6 +70,12 @@ const (
 	// something other than idle/done/handed-off. It is a bead-derived fact and
 	// says nothing about what the pane is doing.
 	WorkstateReasonNotIdle = "not-idle"
+
+	// WorkstateReasonSessionLoggedOut means Tmux.IsLoggedOut returned positive
+	// evidence that the agent is sitting at an auth wall. Like session-busy this
+	// one HAS read the pane; unlike it, the state it names does not clear on its
+	// own.
+	WorkstateReasonSessionLoggedOut = "session-logged-out"
 )
 
 // Reuse-status strings — the vocabulary `gt polecat list` prints as
@@ -98,6 +129,7 @@ func DispositionUnmeasured(d WorkstateDisposition) bool {
 type WorkstateInput struct {
 	State                          State
 	SessionBusy                    bool
+	SessionLoggedOut               bool
 	HookBead                       string
 	CleanupStatus                  CleanupStatus
 	IgnoreCleanupStatus            bool
@@ -199,6 +231,7 @@ type WorkstateDisposition struct {
 	NeedsRecovery        bool     `json:"needs_recovery"`
 	NeedsMQSubmit        bool     `json:"needs_mq_submit"`
 	NeedsStateClear      bool     `json:"needs_state_clear,omitempty"`
+	NeedsLogin           bool     `json:"needs_login,omitempty"`
 	MQStatus             string   `json:"mq_status,omitempty"`
 	CountsTowardCapacity bool     `json:"counts_toward_capacity"`
 	ReuseStatus          string   `json:"reuse_status,omitempty"`
@@ -260,6 +293,32 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			Reason:               WorkstateReasonSessionBusy,
 			CountsTowardCapacity: true,
 			Blockers:             []string{"session_state=busy (agent mid-turn)"},
+		}
+	}
+
+	// The auth wall is read from the pane too, and it is checked here — after
+	// busy, before every bead-derived fact — because it must beat exactly one
+	// road and lose to exactly one other.
+	//
+	// It loses to SessionBusy on purpose. Both are pane reads of the same
+	// snapshot and they should be mutually exclusive (an agent at an auth wall is
+	// not generating), so reaching both means one of the two markers was matched
+	// in text rather than in the status bar. Busy is the safer of the two to
+	// believe, because its prescription is leave-alone.
+	//
+	// It beats the State road below, which is the whole point. A logged-out
+	// polecat keeps whatever lifecycle state it had when the credentials expired
+	// — usually working, since it was dispatched — so the bead-derived road
+	// reports WORKING and prescribes leave-alone, and the pane it never consulted
+	// is the only place the truth is written. That is how eighteen minutes and
+	// 3.27 days of a dead agent both read as healthy (gt-acb1, hq-nms9g).
+	if in.SessionLoggedOut {
+		return WorkstateDisposition{
+			Verdict:              WorkstateVerdictNeedsLogin,
+			Reason:               WorkstateReasonSessionLoggedOut,
+			NeedsLogin:           true,
+			CountsTowardCapacity: true,
+			Blockers:             []string{"session_state=logged-out (agent has no credentials; needs a human /login)"},
 		}
 	}
 

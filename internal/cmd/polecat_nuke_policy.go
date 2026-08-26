@@ -121,6 +121,13 @@ func witnessActionFor(verdict string) string {
 		// Not "escalate": nothing is at risk and there is nothing for the Mayor
 		// to recover — only a field the witness is permitted to clear itself.
 		return witnessActionClearState
+	case polecat.WorkstateVerdictNeedsLogin:
+		// Escalate, not restart — and this is the one verdict where the default
+		// arm below would actively make things worse. No restart path can supply
+		// credentials, so restarting a logged-out agent produces another
+		// logged-out agent; only a human at a browser clears it. Restart-first is
+		// correct for ordinary stalls and wrong for exactly this one (gt-acb1).
+		return "escalate"
 	case "PENDING_MR":
 		return "leave-alone"
 	case "UNVERIFIED":

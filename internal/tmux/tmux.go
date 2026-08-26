@@ -3678,6 +3678,92 @@ func (t *Tmux) IsBusy(session string) bool {
 	return busyFromLines(lines, readyPromptPrefixForSession(t, session))
 }
 
+// loggedOutIndicators is the single source of truth for the substrings an agent
+// TUI renders in its status region when it has no usable credentials. Same role
+// as busyIndicators, and the same fragility: it couples to upstream status text
+// and a silent rename fails closed, reporting no evidence rather than an error.
+//
+// Both markers were read off a live gastown/foundation pane one minute after a
+// `gt session restart` brought it up without CLAUDE_CONFIG_DIR (gt-acb1):
+//
+//	● Login expired · Please run /login
+//	✻ Crunched for 0s · done 8:58 PM
+//	   Not logged in · Run /login
+//
+// This state does NOT resolve on its own. It is not a transient the next poll
+// clears: the session has no credentials and will sit there until a human runs
+// /login, which is why it is worth a detector at all.
+var loggedOutIndicators = []string{"Not logged in", "Login expired"}
+
+func hasLoggedOutIndicator(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, marker := range loggedOutIndicators {
+		if strings.Contains(trimmed, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// loggedOutFromLines reports whether a pane snapshot shows an agent sitting at
+// an auth wall. It is the third reader of the anchored status region, alongside
+// busyFromLines and idleFromLines, and it is deliberately the strictest of them.
+//
+// Positive evidence only, and NO unanchored fallback — this is the one place
+// where busyFromLines' "scan the whole snapshot when no anchor is found"
+// behaviour would be wrong rather than merely conservative. Text ABOUT being
+// logged out satisfies a search FOR being logged out, and the agents most likely
+// to have "Not logged in" in their transcript are the ones investigating this
+// very defect. A whole-pane scan would report the investigator as needing a
+// human login.
+//
+// The two directions cost differently, which is what sets the bound. A false
+// negative leaves things exactly as they were before this function existed —
+// the logged-out agent goes unnoticed, which is the status quo it is trying to
+// improve on. A false positive parks a healthy polecat on a verdict whose only
+// remedy is a person at a browser. So when the pane cannot be located as an
+// agent pane, this answers no.
+//
+// One thing not established: the excerpt above is three contiguous lines lifted
+// from an incident report, not a full-height capture, so where the composer sits
+// relative to the marker is unverified. The scan therefore reuses the busy
+// scan's region — anchor, everything below, and turnBusyLookback non-empty lines
+// above — rather than assuming the marker is strictly below the composer.
+func loggedOutFromLines(lines []string, promptPrefix string) bool {
+	lines = trimTrailingBlankLines(lines)
+	anchor := statusAnchor(lines, promptPrefix)
+	if anchor < 0 {
+		return false
+	}
+	return indicatorNearAnchor(lines, anchor, hasLoggedOutIndicator)
+}
+
+// IsLoggedOut reports whether a session's pane shows positive evidence that the
+// agent has no usable credentials and is waiting on a human to run /login.
+//
+// It exists because that state was invisible to every health surface. On
+// 2026-08-25 `gt rig status` reported gastown/foundation as "working" and
+// `gt polecat check-recovery` returned WORKING for eighteen minutes while its
+// pane read "Not logged in · Run /login" — hooked-ness was being read as
+// liveness. The same variable left the Deacon logged out for 3.27 days without
+// anything noticing (hq-nms9g). Both are the same gap: no surface in this repo
+// looked at the pane for an auth wall, and a grep for these markers across every
+// .go file in the tree returned zero.
+//
+// Same one-way contract as IsBusy: true means the pane demonstrably showed the
+// auth wall at capture time; false means only that nothing proved it did. An
+// unreadable pane, a dead session, or a non-agent session all return false.
+func (t *Tmux) IsLoggedOut(session string) bool {
+	lines, err := t.CapturePaneLines(session, idleCaptureHistoryLines)
+	if err != nil {
+		return false
+	}
+	return loggedOutFromLines(lines, readyPromptPrefixForSession(t, session))
+}
+
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"

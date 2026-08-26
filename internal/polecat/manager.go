@@ -2479,7 +2479,15 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	// entitled to a reuse verdict. It is set here rather than at the end so a
 	// future early return cannot drop it and silently turn the reuse gate into a
 	// gate that refuses everything (gt-49dp).
-	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown, SessionBusy: m.SessionBusy(name), ReuseFactsMeasured: true}
+	input := WorkstateInput{
+		State:         state,
+		CleanupStatus: CleanupUnknown,
+		SessionBusy:   m.SessionBusy(name),
+		// Read alongside SessionBusy so the reuse gate and `gt polecat list`
+		// stop reporting a logged-out polecat as working (gt-acb1).
+		SessionLoggedOut:   m.SessionLoggedOut(name),
+		ReuseFactsMeasured: true,
+	}
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""
@@ -3056,6 +3064,23 @@ func (m *Manager) SessionBusy(name string) bool {
 		return false
 	}
 	return m.tmux.IsBusy(sessionName)
+}
+
+// SessionLoggedOut reports whether the polecat's tmux session is demonstrably
+// sitting at an auth wall right now, waiting on a human to run /login.
+//
+// It is the live counterpart to SessionBusy and shares its contract: positive
+// evidence only, so no tmux, no session, or an unreadable pane all return false.
+// See Tmux.IsLoggedOut for why the pane scan is anchored (gt-acb1).
+func (m *Manager) SessionLoggedOut(name string) bool {
+	if m.tmux == nil {
+		return false
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	if running, err := m.tmux.HasSession(sessionName); err != nil || !running {
+		return false
+	}
+	return m.tmux.IsLoggedOut(sessionName)
 }
 
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {

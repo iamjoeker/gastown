@@ -232,8 +232,13 @@ func TestWitnessActionFor(t *testing.T) {
 		// Not "escalate" either: nothing is at risk and there is nothing for the
 		// Mayor to recover — only a field the witness may clear itself (gt-fbgq).
 		"NEEDS_STATE_CLEAR": "clear-state",
-		"":                  "restart",
-		"SOME_NEW_STATE":    "restart",
+		// The one verdict where the default arm would actively make things worse.
+		// No restart path supplies credentials, so restarting a logged-out agent
+		// produces another logged-out agent and destroys its context on the way;
+		// only a human at a browser clears it (gt-acb1).
+		"NEEDS_LOGIN":    "escalate",
+		"":               "restart",
+		"SOME_NEW_STATE": "restart",
 	}
 
 	for verdict, want := range tests {

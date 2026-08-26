@@ -1976,6 +1976,13 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 		state      polecat.State
 		issue      string
 		hasSession bool
+		// loggedOut: the pane was read and shows an auth wall. This is NOT
+		// derivable from the two fields above — a logged-out agent's process is
+		// alive, so hasSession is true, and its bead still says working. Both
+		// inputs to the display state below therefore say "healthy" and the
+		// polecat rendered as working for eighteen minutes while it could not
+		// execute a single turn (gt-acb1).
+		loggedOut bool
 	}
 	var pInfos []polecatInfo
 	type crewInfo struct {
@@ -1997,6 +2004,7 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 				defer sessionWg.Done()
 				sessionName := session.PolecatSessionName(session.PrefixFor(rigName), p.Name)
 				pInfos[idx].hasSession = isAgentSessionHealthy(t, sessionName)
+				pInfos[idx].loggedOut = polecatMgr.SessionLoggedOut(p.Name)
 			}(i, p)
 		}
 	}
@@ -2074,6 +2082,20 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 			stateStr := string(displayState)
 			if pi.issue != "" {
 				stateStr = fmt.Sprintf("%s → %s", displayState, pi.issue)
+			}
+
+			// The auth wall outranks the reconciliation above, because it
+			// contradicts both of that reconciliation's inputs at once: the
+			// process is alive AND the bead says working, and the agent is
+			// executing nothing. Printed rather than folded into displayState so
+			// it cannot be mistaken for a lifecycle state a restart could move —
+			// no restart path supplies credentials (gt-acb1).
+			if pi.loggedOut {
+				fmt.Printf("  %s %s: %s %s\n",
+					style.Error.Render("●"), pi.name,
+					style.Error.Render("LOGGED OUT"),
+					style.Dim.Render("(needs a human /login; "+stateStr+")"))
+				continue
 			}
 
 			fmt.Printf("  %s %s: %s\n", sessionIcon, pi.name, stateStr)

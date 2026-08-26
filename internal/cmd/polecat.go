@@ -264,12 +264,16 @@ Reports whether any work is at risk. It does NOT authorize destroying the poleca
   - PENDING_MR: work is waiting on an active merge request
   - NEEDS_STATE_CLEAR: nothing is at risk, but agent_state names a deliberate pause
     (stuck, awaiting-gate, paused, escalated) that no restart can clear
+  - NEEDS_LOGIN: the pane was read and shows an auth wall. Nothing is at risk, and
+    no restart can clear this one either — restarting produces another logged-out
+    session. A human must run /login in the session (gt-acb1)
 
-Every predicate except WORKING/session-busy is read from the agent bead and from
-git, both of which 'gt done' writes BEFORE it pushes, submits the MR, and exits.
-The session check is run first, so a polecat that is still finishing is not
-reported as finished (gt-5tg). It is positive evidence only: a session that
-cannot be read is not reported as busy.
+Every predicate except WORKING/session-busy and NEEDS_LOGIN is read from the agent
+bead and from git, both of which 'gt done' writes BEFORE it pushes, submits the
+MR, and exits. The two pane checks are run first, so a polecat that is still
+finishing is not reported as finished (gt-5tg) and one that cannot authenticate is
+not reported as working (gt-acb1). Both are positive evidence only: a session that
+cannot be read is reported as neither busy nor logged out.
 
 WORKING therefore has two roads and they are not the same claim. This command
 used to print "The agent's pane shows it mid-turn" for both — a positive claim
@@ -282,14 +286,17 @@ where that evidence is not the pane it says so and gives you the pane check
 The verdict names a work-at-risk state, not an action for the caller. The
 witness_action field names what a witness may do about it: 'restart' to reclaim
 the slot (worktree and branch preserved), 'clear-state' to lift a deliberate
-pause, 'escalate' when work is at risk, or 'leave-alone' while an MR is in flight
-or the agent is mid-turn. Nuking is never among them — under the restart-first
-policy (gt-dsgp) that requires a human or Mayor identity.
+pause, 'escalate' when work is at risk or a human /login is needed, or
+'leave-alone' while an MR is in flight or the agent is mid-turn. Nuking is never
+among them — under the restart-first policy (gt-dsgp) that requires a human or
+Mayor identity.
 
 'restart' and 'clear-state' are not interchangeable. No restart path writes
 agent_state, so restarting a paused polecat leaves it paused; that is why the
 paused case gets its own verdict and its own action rather than being folded into
-the restart arm (gt-fbgq).
+the restart arm (gt-fbgq). NEEDS_LOGIN gets its own verdict for the same reason
+and a stronger one: restarting a logged-out agent does not merely fail to fix it,
+it produces another logged-out agent and destroys the context on the way.
 
 --reconcile-cleanup additionally REPAIRS stale completion state on the agent bead
 when this command's own measurement contradicts it: a dirty cleanup_status, and a
@@ -1169,12 +1176,13 @@ type RecoveryStatus struct {
 	State                polecat.State         `json:"state,omitempty"`
 	CleanupStatus        polecat.CleanupStatus `json:"cleanup_status"`
 	NeedsRecovery        bool                  `json:"needs_recovery"`
-	Verdict              string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
+	Verdict              string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, or NEEDS_LOGIN
 	WitnessAction        string                `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
 	Reason               string                `json:"reason,omitempty"`
 	Reusable             bool                  `json:"reusable"`
 	SafeToNuke           bool                  `json:"safe_to_nuke"`
 	NeedsMQSubmit        bool                  `json:"needs_mq_submit"`
+	NeedsLogin           bool                  `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
 	CountsTowardCapacity bool                  `json:"counts_toward_capacity"`
 	ReuseStatus          string                `json:"reuse_status,omitempty"`
 	Branch               string                `json:"branch,omitempty"`
@@ -1225,10 +1233,14 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// which is what let this command answer SAFE_TO_NUKE for a polecat still
 	// pushing its branch (gt-5tg). DecideWorkstate lets this outrank them.
 	input := polecat.WorkstateInput{
-		State:         p.State,
-		SessionBusy:   mgr.SessionBusy(polecatName),
-		CleanupStatus: polecat.CleanupUnknown,
-		Branch:        p.Branch,
+		State:       p.State,
+		SessionBusy: mgr.SessionBusy(polecatName),
+		// Read from the same pane, and for the same reason: a logged-out agent
+		// keeps its hooked bead and its working lifecycle state, so every fact
+		// gathered below says it is fine. Only the pane says otherwise (gt-acb1).
+		SessionLoggedOut: mgr.SessionLoggedOut(polecatName),
+		CleanupStatus:    polecat.CleanupUnknown,
+		Branch:           p.Branch,
 		// This command exists to gather the git and merge-queue facts (see
 		// loadGitState and applyMQFactsToWorkstateInput below), so its verdict
 		// is a measured one (gt-49dp).
@@ -1454,6 +1466,23 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
 		printPolecatWorkingEvidence(os.Stdout, status.Reason, rigName, polecatName)
+	case polecat.WorkstateVerdictNeedsLogin:
+		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_LOGIN"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
+		fmt.Println()
+		fmt.Printf("  %s The pane was read and the agent is sitting at an auth wall.\n", style.Warning.Render("⚠"))
+		fmt.Println("  It holds a slot it cannot work in, and it will stay there until a HUMAN")
+		fmt.Println("  runs /login in its session. Attach and log in:")
+		fmt.Printf("    gt session at %s/%s\n", rigName, polecatName)
+		fmt.Println()
+		fmt.Println("  Do NOT restart it. No restart path supplies credentials, so a restart")
+		fmt.Println("  produces another logged-out session and destroys the agent's context on")
+		fmt.Println("  the way — restart-first is correct for ordinary stalls and wrong here.")
+		fmt.Println("  After the login, wake the existing session rather than respawning it:")
+		fmt.Printf("    gt nudge %s/%s \"resume your work\"\n", rigName, polecatName)
+		fmt.Println()
+		fmt.Printf("  %s\n", style.Dim.Render("This verdict used to read WORKING, because a logged-out agent keeps its"))
+		fmt.Printf("  %s\n", style.Dim.Render("hooked bead and its lifecycle state — hooked-ness read as liveness (gt-acb1)"))
 	case "NEEDS_MQ_SUBMIT":
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
 		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
@@ -1672,6 +1701,7 @@ func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, dispositi
 	status.SafeToNuke = disposition.SafeToNuke
 	status.NeedsRecovery = disposition.NeedsRecovery
 	status.NeedsMQSubmit = disposition.NeedsMQSubmit
+	status.NeedsLogin = disposition.NeedsLogin
 	status.CountsTowardCapacity = disposition.CountsTowardCapacity
 	status.ReuseStatus = disposition.ReuseStatus
 	status.MQStatus = disposition.MQStatus

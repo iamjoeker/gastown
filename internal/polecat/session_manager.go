@@ -70,6 +70,11 @@ type SessionStartOptions struct {
 
 	// RuntimeConfigDir is resolved config directory for the runtime account.
 	// If set, this is injected as an environment variable.
+	//
+	// Leaving it empty does NOT mean "no account" — Start resolves the town's
+	// account itself in that case (see resolveSessionRuntimeConfigDir). Only a
+	// caller that has already resolved a specific account, such as
+	// `gt polecat spawn --account`, needs to set this.
 	RuntimeConfigDir string
 
 	// Agent is the agent override for this polecat session (e.g., "codex", "gemini").
@@ -316,6 +321,45 @@ func (m *SessionManager) polecatSlot(polecat string) int {
 	return slot
 }
 
+// resolveSessionRuntimeConfigDir decides which account's CLAUDE_CONFIG_DIR a
+// polecat session comes up under: the caller's, if it resolved one, otherwise
+// the town's.
+//
+// The fallback is the fix for gt-acb1. CLAUDE_CONFIG_DIR selects the account an
+// agent authenticates as, and config.AgentEnv omits the variable entirely when
+// it is empty — so a session started without it inherits whatever the parent
+// process had, which for a `gt` invoked from a human shell is nothing. Claude
+// Code then falls back to the default ~/.claude profile and the agent comes up
+// LOGGED OUT. Nothing errors, nothing retries, and only a human at a browser can
+// clear it.
+//
+// What made that a P0 rather than a papercut is which caller had the hole.
+// `gt polecat spawn` resolves an account and passes it, so scheduler-dispatched
+// polecats were fine; `gt session start`, `gt session restart` and `gt up` all
+// built a zero-valued SessionStartOptions. `gt session restart` is the
+// restart-first remedy the town reaches for when an agent stalls, so the
+// standard recovery action converted a recoverable stall into a session that
+// needed a human — and running it again produced another logged-out session.
+// Measured 2026-08-25: five normal-spawn sessions carried the variable in
+// /proc/<pane_pid>/environ, and the one created by `gt session restart` did not.
+//
+// This lives in the session manager rather than at each call site because that
+// is where every other agent's account is resolved — dog, deacon, refinery and
+// witness all call config.ResolveTownRuntimeConfigDir inside their own managers
+// and cannot be got wrong by a caller. Polecat was the one manager that trusted
+// its callers, and three of its four callers did not know they had been trusted.
+// A rule enforced once per call site has the same shape as the defect.
+//
+// An empty result is still legal and still means "leave CLAUDE_CONFIG_DIR
+// unset": a town with no mayor/accounts.json and no CLAUDE_CONFIG_DIR in the
+// environment resolves to empty and must keep behaving exactly as it did.
+func resolveSessionRuntimeConfigDir(townRoot, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return config.ResolveTownRuntimeConfigDir(townRoot)
+}
+
 // Start creates and starts a new session for a polecat.
 func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if !m.hasPolecat(polecat) {
@@ -386,6 +430,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	}
 
+	// Resolve the account this session must authenticate as. See
+	// resolveSessionRuntimeConfigDir for why the caller is not trusted to supply it.
+	runtimeConfigDir := resolveSessionRuntimeConfigDir(townRoot, opts.RuntimeConfigDir)
+
 	// Ensure runtime settings exist in the shared polecats parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
@@ -450,7 +498,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		Rig:              m.rig.Name,
 		AgentName:        polecat,
 		TownRoot:         townRoot,
-		RuntimeConfigDir: opts.RuntimeConfigDir,
+		RuntimeConfigDir: runtimeConfigDir,
 		Agent:            opts.Agent,
 		SessionName:      sessionID,
 	})
@@ -471,8 +519,8 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		envVars["GT_AGENT"] = runtimeConfig.ResolvedAgent
 	}
 	// Custom agent config dir env (e.g., GEMINI_CONFIG_DIR) for non-Claude agents.
-	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && opts.RuntimeConfigDir != "" {
-		envVars[runtimeConfig.Session.ConfigDirEnv] = opts.RuntimeConfigDir
+	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && runtimeConfigDir != "" {
+		envVars[runtimeConfig.Session.ConfigDirEnv] = runtimeConfigDir
 	}
 
 	// Create session with command and env vars via -e flags so the initial

@@ -198,6 +198,43 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-busy", Reusable: false, SafeToNuke: false, CountsTowardCapacity: true},
 		},
 		{
+			// gt-acb1: the reported case. A `gt session restart` brought the
+			// session up without CLAUDE_CONFIG_DIR, so the agent is logged out —
+			// but it still holds its hooked bead and its lifecycle state is still
+			// working, so every bead-derived fact says it is fine. This used to
+			// come out WORKING / leave-alone, which is why it ran for eighteen
+			// minutes with two health surfaces calling it healthy.
+			name: "logged-out session outranks a bead that still says working",
+			in:   WorkstateInput{State: StateWorking, SessionLoggedOut: true, CleanupStatus: CleanupClean, HookBead: "gt-hooked"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsLogin, Reason: "session-logged-out", NeedsLogin: true, CountsTowardCapacity: true, Blockers: []string{"session_state=logged-out (agent has no credentials; needs a human /login)"}},
+		},
+		{
+			// The auth wall is not a work-at-risk state, so it must not be
+			// reusable or safe to nuke either: the polecat holds a slot it cannot
+			// work in, and destroying it neither supplies credentials nor stops
+			// the next session coming up the same way.
+			name: "logged-out session is never reusable or safe to nuke",
+			in:   WorkstateInput{State: StateIdle, SessionLoggedOut: true, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, MRSubmitted: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsLogin, Reason: "session-logged-out", NeedsLogin: true, Reusable: false, SafeToNuke: false, CountsTowardCapacity: true},
+		},
+		{
+			// Busy wins. Both are pane reads of the same snapshot and should be
+			// mutually exclusive on a real pane, so reaching both means one
+			// marker matched text rather than the status bar — and busy is the
+			// safer of the two to believe, because it prescribes leave-alone.
+			name: "a busy session outranks a logged-out reading of the same pane",
+			in:   WorkstateInput{State: StateWorking, SessionBusy: true, SessionLoggedOut: true, CleanupStatus: CleanupClean},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-busy", CountsTowardCapacity: true, Blockers: []string{"session_state=busy (agent mid-turn)"}},
+		},
+		{
+			// The absent-evidence direction, same contract as SessionBusy: an
+			// unreadable or missing pane leaves the flag false and every existing
+			// verdict must survive untouched.
+			name: "unknown login state leaves the safe verdict alone",
+			in:   WorkstateInput{State: StateIdle, SessionLoggedOut: false, CleanupStatus: CleanupClean, Branch: "main"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-clean"},
+		},
+		{
 			name: "stalled active work preserves blocker",
 			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean, ActiveWorkBlocker: "assigned_work=gt-open status=open", ActiveWorkCountsTowardCapacity: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"assigned_work=gt-open status=open"}},
