@@ -41,6 +41,8 @@ var (
 	mailSearchSubject bool
 	mailSearchBody    bool
 	mailSearchArchive bool
+	mailSearchSent    bool
+	mailSearchAll     bool
 	mailSearchJSON    bool
 
 	// Announces flags
@@ -414,28 +416,43 @@ Examples:
 var mailSearchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search messages by content",
-	Long: `Search inbox for messages matching a pattern.
+	Long: `Search your mail for messages containing some text.
 
 SYNTAX:
   gt mail search <query> [flags]
 
-The query is a regular expression pattern. Search is case-insensitive by default.
+The query is literal text, not a regular expression: "." matches a dot and
+nothing else. Matching is case-insensitive.
+
+SCOPE — this is what a zero means:
+  The inbox is always searched. Your inbox holds OPEN mail only, and archiving
+  a message closes it, so an inbox-only search stops finding a message the
+  moment you archive it. Widen with:
+
+  --archive   also search mail you received and archived
+  --sent      also search mail you sent
+  --all       both of the above
+
+  Every run prints the scope it searched, so a result of 0 says which stores
+  were consulted rather than leaving you to assume it covered everything.
 
 FLAGS:
   --from <sender>   Filter by sender address (substring match)
   --subject         Only search subject lines
   --body            Only search message body
-  --archive         Include archived (closed) messages
+  --archive         Also search archived mail
+  --sent            Also search sent mail
+  --all             Search inbox, archived, and sent
   --json            Output as JSON
 
 By default, searches both subject and body text.
 
 Examples:
-  gt mail search "urgent"                    # Find messages with "urgent"
-  gt mail search "status.*check" --subject   # Regex in subjects only
+  gt mail search "urgent"                    # Inbox only
+  gt mail search "deadlock" --all            # Inbox + archived + sent
+  gt mail search "checkpoint" --sent         # Did I already report this?
   gt mail search "error" --from witness      # From witness, containing "error"
-  gt mail search "handoff" --archive         # Include archived messages
-  gt mail search "" --from mayor/            # All messages from mayor`,
+  gt mail search "" --from mayor/ --all      # Every message from mayor`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMailSearch,
 }
@@ -538,7 +555,9 @@ func init() {
 	mailSearchCmd.Flags().StringVar(&mailSearchFrom, "from", "", "Filter by sender address")
 	mailSearchCmd.Flags().BoolVar(&mailSearchSubject, "subject", false, "Only search subject lines")
 	mailSearchCmd.Flags().BoolVar(&mailSearchBody, "body", false, "Only search message body")
-	mailSearchCmd.Flags().BoolVar(&mailSearchArchive, "archive", false, "Include archived messages")
+	mailSearchCmd.Flags().BoolVar(&mailSearchArchive, "archive", false, "Also search archived mail")
+	mailSearchCmd.Flags().BoolVar(&mailSearchSent, "sent", false, "Also search mail you sent")
+	mailSearchCmd.Flags().BoolVar(&mailSearchAll, "all", false, "Search inbox, archived, and sent mail")
 	mailSearchCmd.Flags().BoolVar(&mailSearchJSON, "json", false, "Output as JSON")
 
 	// Announces flags

@@ -217,6 +217,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gt mail search` can reach archived and sent mail, and always says what it
+  searched** (gt-7gvk). The search was scoped to the inbox, so it answered 0 for
+  every term the moment the inbox was empty — including terms in mail read
+  minutes earlier. The reported control: archive a message whose body repeatedly
+  names the polecat `brahmin`, then `gt mail search brahmin` one minute later →
+  `0 message(s)`. A command whose positive control fails carries no information,
+  and this one sat under a class of self-check: an agent reporting a recurring
+  observation across patrol cycles had no way to ask whether an earlier cycle had
+  already reported it, and would re-report indefinitely with no signal that it
+  was duplicating.
+
+  The cause is that archiving does not move a message anywhere the inbox query
+  can see. `gt mail archive` CLOSES the message bead where it stands, and a
+  closed bead is exactly what the inbox query filters out. What Search read
+  instead was `archive.jsonl` — a flat file whose only writer in the tree is the
+  dog dispatch path, so an agent archiving its own mail filed it somewhere Search
+  never looked. Measured: exactly one `archive.jsonl` exists in this town, at the
+  town root, and the gastown rig's beads directory has none.
+
+  Where that file DOES exist the failure inverted, and nobody had reported this
+  half. It belongs to a beads DIRECTORY, not to an identity, and was read
+  unfiltered. Measured from a polecat whose inbox held one message:
+  `gt mail search polecat` → **56832 results, 0 of them addressed to the
+  searching identity** — 23922 for `deacon/dogs/alpha`, 13342 bravo, 10303
+  charlie, 9264 delta — under a header reading "Search results for
+  gastown/polecats/fury". Controls: a nonsense term returned 0 and a string from
+  that one real inbox message returned 1, so the matcher discriminated and the
+  56832 was leakage. It now returns 1.
+
+  `--archive` was a third defect on its own: declared, bound with the help text
+  "Include archived messages", and read nowhere. Verified over every `.go` file
+  by a traversal that does not honour `.gitignore` — 2 hits, the declaration and
+  the binding, 0 readers.
+
+  Archived mail is now the closed message beads (assignee and CC, issues and
+  wisps) plus the flat file filtered to this recipient. The bead query asks for
+  `--all` and tests status in Go rather than asking bd for `--status closed`,
+  because status and pinning are independent: on the live store `--status closed`
+  returned 1864 message beads and `--status closed --pinned` a further 53 that
+  the first query did not include. New `--sent` searches mail this identity sent,
+  selected by the `from:` label the send path already stamps on every message —
+  a surface that did not exist at all. `--all` takes both.
+
+  Every run now prints the scope it searched AND names the stores it did not,
+  with the flag that would include them, the same shape `gt mq list` uses.
+  Naming the exclusion is the load-bearing half: a reader told only what was
+  covered still has to know the full set of stores to work out what is missing,
+  and the reader who most needs telling is the one who does not. A store that
+  cannot be read is named as unavailable rather than silently dropped, and the
+  matches from the stores that did answer are still returned. `--json` grew the
+  same envelope, because a bare empty array cannot distinguish "no such message"
+  from "the store holding it was never read". The reported case, re-measured:
+  `beads/witness` searching `brahmin` returns 1 on the inbox, 18 with
+  `--archive`, 21 with `--sent`, 38 with `--all`.
+
+  Two smaller corrections came with it. The help said the query was a regular
+  expression and gave a regex example; the code has escaped the query with
+  `QuoteMeta` since the ReDoS fix, so it is literal text, and a user who believes
+  a regex ran will misread a 0. Sent mail that was CC'd back to the sender is in
+  two stores at once and is now reported once.
+
 - **`gt stale` reads the build branch from the remote, and the rebuild loop can
   now heal itself** (gt-ympl, gt-side of hq-cak50). Staleness was computed
   against `$GT_ROOT/gastown/mayor/rig` — a working clone. Its `main` moves only
