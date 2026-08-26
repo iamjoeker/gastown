@@ -1284,6 +1284,38 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							return fmt.Errorf("cannot close %s with --skip-verify: %w", issueID, noteErr)
 						}
 						closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: none (non-code close, no work to verify)", closeReason, defaultBranch)
+					} else if doneCleanupStatus == "clean" && !isNoMergeTask {
+						// gt-ewip: the report-only exit, which the zero-commit guard
+						// above grants by name and this block then took back.
+						//
+						// --cleanup-status=clean is what a polecat passes when its task
+						// produced findings rather than code. Below, that polecat is
+						// treated as one closing on a landed commit: on an ordinary rig
+						// the close survived only because verifying HEAD against
+						// origin/<default> is vacuous when HEAD IS origin/<default> —
+						// it "passed" and wrote a stranger's sha onto the bead as proof
+						// of work, the gt-r5p defect wearing a green checkmark. On a
+						// fork-backed rig the same close hit an outright refusal whose
+						// one suggested remedy, the fork PR flow, needs a commit to
+						// open a PR with. So a report-only polecat had no legal exit at
+						// all: it could not submit, and it could not close.
+						//
+						// No commit represents this work, so record none — the same
+						// shape as the --skip-verify arm above. This is deliberately a
+						// weaker outcome than a refusal: report-only work is
+						// legitimate, and the sleepwalking polecat it could be confused
+						// with is caught by the zero-commit guard above, which refuses
+						// everyone who did not arrive here by --cleanup-status=clean.
+						//
+						// A lost annotation is a warning, not fatal, unlike gt-290c's
+						// skip-verify case: there the comment is the only durable
+						// record of the bypass, while here the close reason itself
+						// carries "commit_sha: none". Refusing on a failed comment
+						// write would rebuild the dead end this arm exists to remove.
+						if noteErr := noteVerifiedPushSkipped(g, bd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, "", "report-only no-MR close (--cleanup-status=clean)"); noteErr != nil {
+							style.PrintWarning("%v", noteErr)
+						}
+						closeReason = fmt.Sprintf("%s\nreport_only: true\ntarget_branch: %s\ncommit_sha: none (report-only close, no code to verify)", closeReason, defaultBranch)
 					} else if !isNoMergeTask {
 						if g.ForkBackedRemote("origin") {
 							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead\n%s",
