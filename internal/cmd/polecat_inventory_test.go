@@ -210,8 +210,15 @@ func TestBuildPolecatInventoryItemSurfacesRefusedMR(t *testing.T) {
 	if !item.Disposition.NeedsMQSubmit || item.Disposition.SafeToNuke || item.Disposition.Reusable {
 		t.Fatalf("refused polecat must not read safe/reusable: %+v", item.Disposition)
 	}
-	if item.Disposition.MQStatus != "refused_closed_source" {
-		t.Fatalf("mq_status = %q, want refused_closed_source", item.Disposition.MQStatus)
+	// gt-mkpm: this surface consults no merge queue, so it says so. The verdict
+	// and every flag above are unchanged — only the words admit that the question
+	// "does the branch still hold unsubmitted work?" was never asked here.
+	if item.Disposition.MQStatus != "refused_closed_source_unchecked" {
+		t.Fatalf("mq_status = %q, want refused_closed_source_unchecked", item.Disposition.MQStatus)
+	}
+	if item.Disposition.ReuseStatus != polecat.ReuseStatusMQUnchecked {
+		t.Fatalf("reuse_status = %q, want %q — the did-not-look road must not wear the measured string",
+			item.Disposition.ReuseStatus, polecat.ReuseStatusMQUnchecked)
 	}
 
 	// Control: the same polecat without the refusal record is the ordinary
@@ -285,6 +292,78 @@ func TestBuildPolecatInventoryItemRescueMRClearsRefusal(t *testing.T) {
 	}
 	if merged.Disposition.SafeToNuke || merged.Disposition.Reusable {
 		t.Fatalf("a surface that ran no git check must not authorize anything: %+v", merged.Disposition)
+	}
+}
+
+// TestBuildPolecatInventoryItemHandedOff is the gt-mkpm regression.
+//
+// gastown/chrome: session gone, work bead still hooked, MR gt-wisp-1cmci OPEN in
+// the refinery queue, refinery up. `gt polecat list` said "stalled" — the word
+// for a session that died mid-work. beads/ace read the same way on a different
+// rig, observed by a different witness, and BOTH flipped to "done" on the merge
+// of their own MR with nothing else changed. So the divergence window is exactly
+// the in-flight-MR window: it opens when the polecat hands off and closes when
+// the refinery lands the work, which is precisely when a witness is most likely
+// to be looking. A third observer took a reading inside the window and filed it
+// as evidence for an unrelated pool-leak bead.
+func TestBuildPolecatInventoryItemHandedOff(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	fields := &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupClean),
+		Branch:        "polecat/chrome/gt-0g5r",
+	}
+	hooked := &beads.Issue{ID: "gt-0g5r", Status: string(beads.IssueStatusHooked), Assignee: "gastown/polecats/chrome"}
+	openIndex := &polecatBranchMRIndex{
+		openMR:    map[string]string{"polecat/chrome/gt-0g5r": "gt-wisp-1cmci"},
+		submitted: map[string]bool{"polecat/chrome/gt-0g5r": true},
+	}
+
+	// Sessions is empty: the session is gone. That plus a hooked bead is what
+	// used to be enough to print "stalled".
+	item := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, openIndex)
+
+	if item.State != polecat.StateHandedOff {
+		t.Fatalf("state = %q, want %q — its work is sitting in the queue", item.State, polecat.StateHandedOff)
+	}
+	// The MR must be NAMED, not merely implied by the state word. This is what a
+	// reader quotes, and "stalled" carried no pointer to the thing in flight.
+	if !slices.ContainsFunc(item.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "gt-wisp-1cmci")
+	}) {
+		t.Fatalf("blockers %v must name the in-flight MR", item.Disposition.Blockers)
+	}
+	// Not a waiver: the hook is still set and still reported. Handed-off changes
+	// the WORD, not what blocks.
+	if !slices.ContainsFunc(item.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "gt-0g5r")
+	}) {
+		t.Fatalf("blockers %v must still name the hooked bead", item.Disposition.Blockers)
+	}
+	if item.Disposition.SafeToNuke || item.Disposition.Reusable {
+		t.Fatalf("handed-off must never read safe or reusable: %+v", item.Disposition)
+	}
+
+	// THE CONTROL, and it is the arm that matters: a polecat whose session died
+	// with NO merge request for its branch is genuinely stalled and must keep
+	// saying so. Promoting on absence of evidence would be the same defect
+	// pointing the other way — and this direction talks a witness out of looking
+	// at a polecat that really did die.
+	noMRIndex := &polecatBranchMRIndex{openMR: map[string]string{}, submitted: map[string]bool{}}
+	stalled := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, noMRIndex)
+	if stalled.State != polecat.StateStalled {
+		t.Fatalf("state = %q, want stalled — no MR was found for this branch", stalled.State)
+	}
+	if stalled.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("a truly stalled polecat must still need recovery: %+v", stalled.Disposition)
+	}
+
+	// Second control: an UNCONSULTED queue (nil index) is not proof of anything
+	// either. This is the reading every surface gets when the merge-queue listing
+	// fails, and it must fall back to stalled rather than to the success word.
+	unconsulted := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, nil)
+	if unconsulted.State != polecat.StateStalled {
+		t.Fatalf("state = %q, want stalled — the queue was never consulted", unconsulted.State)
 	}
 }
 

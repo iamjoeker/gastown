@@ -40,9 +40,24 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			// gt-46rk. This is the surface-independent half of the fix: the
 			// refusal is a bead fact, so it fires even where no git or
 			// merge-queue lookup ever ran (MQCheckRequired false).
+			//
+			// gt-mkpm: and it says so. Everything that DECIDES is identical to
+			// the checked case below — same verdict, same flags, same capacity —
+			// but the words name the caller's gap instead of naming a remedy the
+			// caller is in no position to prescribe.
 			name: "recorded mr refusal needs mq submit without any queue lookup",
 			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRRefused: true},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-refused-closed-source", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "refused_closed_source", CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"mq_status=refused_closed_source (gt done made no MR: source issue was closed)"}},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-refused-unchecked", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "refused_closed_source_unchecked", CountsTowardCapacity: true, ReuseStatus: ReuseStatusMQUnchecked, Blockers: []string{"mq_status=refused_closed_source_unchecked (gt done made no MR: source issue was closed; no merge-queue check was run here, so whether the branch still holds unsubmitted work is UNKNOWN)"}},
+		},
+		{
+			// The consulted road, pinned because the STRING above depends on it:
+			// a refusal whose queue WAS consulted and still has work outstanding
+			// must not come out wearing the unchecked vocabulary. It reaches the
+			// MQCheckRequired block first and is a finding about the polecat, so
+			// it gets the verdict-shaped string and mq_status=not_submitted.
+			name: "consulted mr refusal with work outstanding keeps the measured vocabulary",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRRefused: true, MQCheckRequired: true, HasSubmittableWork: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsMQSubmit, Reason: "mq-not-submitted", NeedsRecovery: true, NeedsMQSubmit: true, MQStatus: "not_submitted", CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"mq_status=not_submitted"}},
 		},
 		{
 			name: "mr refusal is discharged by an mr that now exists",
@@ -186,6 +201,44 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			name: "stalled active work preserves blocker",
 			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean, ActiveWorkBlocker: "assigned_work=gt-open status=open", ActiveWorkCountsTowardCapacity: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"assigned_work=gt-open status=open"}},
+		},
+		{
+			// gt-mkpm / hq-qm7bt. This is the input that produced "Cleanup
+			// refused by an unknown recovery predicate": NEEDS_RECOVERY with an
+			// empty blocker list, which the renderer had nothing to print. The
+			// predicate was never unknown — the state IS the predicate — so it
+			// must appear in the blockers.
+			name: "not-idle with no other blocker names the state it refused on",
+			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"polecat_state=stalled (lifecycle state is not idle; no other blocker was recorded)"}},
+		},
+		{
+			// The handed-off window: the session is gone and an open MR for the
+			// branch was found. Before gt-mkpm this bailed out at the not-idle
+			// arm as NEEDS_RECOVERY with no blockers, and the list surface
+			// printed "stalled" — the word for the failure case — over a polecat
+			// that had SUCCEEDED, for exactly as long as the MR was in flight.
+			name: "handed off with an open mr is pending, not stalled",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{"active_mr=gt-wisp-1cmci status=open"}},
+		},
+		{
+			// The two surfaces record still-attached work in DIFFERENT fields:
+			// the list surface in ActiveWorkBlocker, check-recovery in HookBead.
+			// Both must survive into a PENDING_MR verdict, or the two disagree
+			// again about the same polecat — which is the bead's title.
+			name: "pending mr reports the hook check-recovery gathered",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, HookBead: "gt-0g5r", ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{"active_mr=gt-wisp-1cmci status=open", "has work on hook (gt-0g5r)"}},
+		},
+		{
+			// Handed-off is not a waiver. It routes like StateDone — through the
+			// real predicates — so work genuinely at risk still surfaces, and the
+			// still-hooked bead that chrome carried is NAMED rather than being
+			// flattened into a bare "stalled".
+			name: "handed off still reports work at risk alongside the mr",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open", ActiveWorkBlocker: "assigned_work=gt-0g5r status=hooked", ActiveWorkCountsTowardCapacity: true, PushFailed: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "push-failed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"push_failed=true", "assigned_work=gt-0g5r status=hooked", "active_mr=gt-wisp-1cmci status=open"}},
 		},
 	}
 
@@ -482,4 +535,89 @@ func containsBlocker(blockers []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestUnmeasuredVocabularyIsDisjoint is the acceptance test for gt-mkpm: a
+// reader of one surface must be able to tell a measured blocker from an
+// unmeasured one, from the output alone.
+//
+// The bug was not a wrong verdict. Both roads block, deliberately and
+// identically — "suppressed only by proof, never by silence" (gt-46rk). The bug
+// was that they printed the SAME WORD, so a string meaning "this caller did not
+// look" read as a finding about the polecat, and two witnesses spent a night
+// measuring four remedies "failing" to clear a condition that was recomputed
+// from scratch on every listing and had no stored state to clear.
+func TestUnmeasuredVocabularyIsDisjoint(t *testing.T) {
+	// The did-not-look road: a recorded MR refusal reaching a surface that runs
+	// no merge-queue check. This is exactly what `gt polecat list` produced.
+	unmeasured := DecideWorkstate(WorkstateInput{
+		State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/ghoul", MRRefused: true,
+	})
+	// The looked-and-found road: a caller that ran the check and found work
+	// outside the queue.
+	measured := DecideWorkstate(WorkstateInput{
+		State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/ghoul",
+		MQCheckRequired: true, HasSubmittableWork: true, ReuseFactsMeasured: true,
+	})
+
+	// Both still block, and both still count. The fix is words only — if this
+	// arm ever fails, the rendering fix has quietly become a policy change.
+	for name, d := range map[string]WorkstateDisposition{"unmeasured": unmeasured, "measured": measured} {
+		if d.Verdict != WorkstateVerdictNeedsMQSubmit || !d.NeedsRecovery || !d.NeedsMQSubmit || d.SafeToNuke || d.Reusable || !d.CountsTowardCapacity {
+			t.Fatalf("%s road stopped blocking: %+v", name, d)
+		}
+	}
+
+	if unmeasured.ReuseStatus == measured.ReuseStatus {
+		t.Fatalf("did-not-look and looked-and-found share reuse_status %q — the whole defect", unmeasured.ReuseStatus)
+	}
+	if unmeasured.ReuseStatus != ReuseStatusMQUnchecked {
+		t.Fatalf("unmeasured reuse_status = %q, want %q", unmeasured.ReuseStatus, ReuseStatusMQUnchecked)
+	}
+	if measured.ReuseStatus != ReuseStatusRecoveryNeeded {
+		t.Fatalf("measured reuse_status = %q, want %q", measured.ReuseStatus, ReuseStatusRecoveryNeeded)
+	}
+	if unmeasured.MQStatus == measured.MQStatus || unmeasured.Reason == measured.Reason {
+		t.Fatalf("mq_status/reason still collide: %+v vs %+v", unmeasured, measured)
+	}
+
+	// The blocker line is what gets quoted into a bead, so it has to carry the
+	// gap by itself, without the reuse_status next to it.
+	if !containsBlocker(unmeasured.Blockers, "no merge-queue check was run") {
+		t.Fatalf("unmeasured blockers %q must say the check did not run", unmeasured.Blockers)
+	}
+
+	// And the predicate surfaces use to footnote a listing must agree.
+	if !DispositionUnmeasured(unmeasured) {
+		t.Fatal("DispositionUnmeasured must be true for the did-not-look road")
+	}
+	if DispositionUnmeasured(measured) {
+		t.Fatal("DispositionUnmeasured must be false for a measured finding")
+	}
+	// The control: the OTHER unmeasured road must also be caught, or the
+	// predicate is matching one literal rather than a category.
+	nothingGathered := DecideWorkstate(WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "main"})
+	if nothingGathered.ReuseStatus != ReuseStatusUnverified || !DispositionUnmeasured(nothingGathered) {
+		t.Fatalf("idle-unverified must count as unmeasured: %+v", nothingGathered)
+	}
+}
+
+func TestHandedOffState(t *testing.T) {
+	if got := HandedOffState(StateStalled, true); got != StateHandedOff {
+		t.Fatalf("stalled + proven open MR = %q, want %q", got, StateHandedOff)
+	}
+	// Proof, not absence of doubt. An unconsulted queue leaves the polecat
+	// stalled: claiming handed-off from silence is the same defect pointing the
+	// other way, and this direction is the one that talks a witness out of
+	// looking at a polecat that really did die.
+	if got := HandedOffState(StateStalled, false); got != StateStalled {
+		t.Fatalf("stalled + no proof = %q, want %q", got, StateStalled)
+	}
+	// Only stalled is promoted. Nothing else is a candidate — a live working
+	// session with an open MR is still working.
+	for _, state := range []State{StateWorking, StateIdle, StateDone, StateZombie, StateReviewNeeded, StateStuck} {
+		if got := HandedOffState(state, true); got != state {
+			t.Fatalf("HandedOffState(%q, true) = %q, want it unchanged", state, got)
+		}
+	}
 }

@@ -18,6 +18,7 @@ Polecats use these primary operating states:
 | **Working** | Actively doing assigned work | Normal operation after `gt sling` |
 | **Idle** | Available before assignment | Spawned or explicitly prepared for work |
 | **Done** | Work completed and session retired | After `gt done` completes successfully |
+| **Handed-off** | Session gone, work sitting in the merge queue | `gt done` submitted an MR the refinery has not merged yet |
 | **Stalled** | Session stopped mid-work | Interrupted, crashed, or timed out without being nudged |
 | **Zombie** | Completed work but failed to exit | `gt done` failed during cleanup |
 
@@ -45,8 +46,24 @@ No idle reuse in the happy path. Polecats move: IDLE -> WORKING -> DONE.
 - **Working** = actively executing. Session alive, hook set, doing work.
 - **Idle** = not yet assigned and safe to use.
 - **Done** = work done, session killed, waiting for cleanup/refinery outcome.
+- **Handed-off** = succeeded. Session gone, and an OPEN merge request for its
+  branch was found. Leave it alone until the refinery lands the work.
 - **Stalled** = supposed to be working, but stopped. Needs Witness intervention.
 - **Zombie** = finished work, tried to exit, but cleanup failed. Stuck in limbo.
+
+**Handed-off and Stalled are the same observation separated by one lookup** — a
+dead session with work still attached — and until gt-mkpm they were the same
+word. For the whole in-flight-MR window, a polecat that had SUCCEEDED rendered
+as "stalled", the word for the failure case. That window opens when the polecat
+hands off and closes when the refinery merges, which is exactly when a witness
+is most likely to be looking; measured on two rigs by three observers, and one
+of them filed a reading taken inside it as evidence for an unrelated bug.
+
+`gt polecat list` reports **handed-off** only where it positively found an open
+MR for that branch. Where the queue could not be consulted it still says
+**stalled** — claiming success from silence would be the same defect pointing
+the other way, and that direction talks a witness out of looking at a polecat
+that really did die.
 
 ## The Retired Completion Model
 

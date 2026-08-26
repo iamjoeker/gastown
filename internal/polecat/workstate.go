@@ -29,6 +29,70 @@ const (
 	WorkstateVerdictUnverified = "UNVERIFIED"
 )
 
+// Reason strings. They are named because callers RENDER prose off them, and the
+// two WORKING reasons rest on completely different evidence: session-busy read
+// the pane, not-idle read the agent bead. `gt polecat check-recovery` printed
+// "The agent's pane shows it mid-turn" for both, which is a claim about a pane
+// that the not-idle road never looked at — twice measured wrong on a parked
+// session, once measured right on a live one, with nothing in the output telling
+// the two apart (gt-mkpm).
+const (
+	// WorkstateReasonSessionBusy means Tmux.IsBusy returned positive evidence
+	// that the agent is generating right now. This one HAS read the pane.
+	WorkstateReasonSessionBusy = "session-busy"
+
+	// WorkstateReasonNotIdle means the lifecycle state carried in the input was
+	// something other than idle/done/handed-off. It is a bead-derived fact and
+	// says nothing about what the pane is doing.
+	WorkstateReasonNotIdle = "not-idle"
+)
+
+// Reuse-status strings — the vocabulary `gt polecat list` prints as
+// "reuse: <status>" and the reuse gate records.
+//
+// They are named here because two of them mean "nobody looked" and the rest
+// mean "somebody looked and found this", and for a while the two categories
+// shared a string. idle-recovery-needed was the value for BOTH "measured and
+// blocked" and "a recorded MR refusal reached a surface that never consults the
+// queue" — a verdict-shaped phrase naming a remedy that, on the second road,
+// is not needed and cannot be performed. Two witnesses spent a night treating
+// it as a stuck state, measured four remedies "failing" to clear it, and
+// scoped a P1 on the misreading (gt-mkpm).
+const (
+	// ReuseStatusRecoveryNeeded: a blocker was found. Something must be repaired.
+	ReuseStatusRecoveryNeeded = "idle-recovery-needed"
+
+	// ReuseStatusMQUnchecked: gt done recorded that it made no merge request,
+	// and the caller never consulted the merge queue to find out whether the
+	// branch still holds work that needs submitting. Conservative like
+	// idle-recovery-needed — the verdict and every flag are identical — but it
+	// names the caller's gap rather than a defect in the polecat, so it cannot
+	// be quoted out of a listing as a finding about the polecat.
+	ReuseStatusMQUnchecked = "idle-mq-unchecked"
+
+	// ReuseStatusUnverified: no git or merge-queue facts were gathered at all.
+	ReuseStatusUnverified = "idle-unverified"
+
+	// ReuseStatusPROpen: work is in the merge queue. Preserve until it lands.
+	ReuseStatusPROpen = "idle-pr-open"
+
+	// ReuseStatusStatePaused: only a deliberate agent_state pause stands.
+	ReuseStatusStatePaused = "idle-state-paused"
+
+	// ReuseStatusPreserved / ReuseStatusClean: measured, nothing blocking.
+	ReuseStatusPreserved = "idle-preserved"
+	ReuseStatusClean     = "idle-clean"
+)
+
+// DispositionUnmeasured reports whether this disposition was reached WITHOUT the
+// facts that would settle it, as opposed to by finding something. Both roads
+// present as a blocking verdict, and a reader cannot tell them apart from the
+// verdict alone — which is what this predicate exists to let surfaces say out
+// loud instead of leaving to the reader (gt-mkpm).
+func DispositionUnmeasured(d WorkstateDisposition) bool {
+	return d.ReuseStatus == ReuseStatusUnverified || d.ReuseStatus == ReuseStatusMQUnchecked
+}
+
 // WorkstateInput contains the lifecycle, git, and merge-queue facts needed to
 // classify a polecat consistently across list, recovery, witness, and capacity.
 type WorkstateInput struct {
@@ -193,26 +257,47 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if in.SessionBusy {
 		return WorkstateDisposition{
 			Verdict:              WorkstateVerdictWorking,
-			Reason:               "session-busy",
+			Reason:               WorkstateReasonSessionBusy,
 			CountsTowardCapacity: true,
 			Blockers:             []string{"session_state=busy (agent mid-turn)"},
 		}
 	}
 
-	if in.ActiveMRBlocker != "" && !in.PushFailed && !in.MRFailed && in.State == StateDone {
-		return WorkstateDisposition{
+	if in.ActiveMRBlocker != "" && !in.PushFailed && !in.MRFailed && (in.State == StateDone || in.State == StateHandedOff) {
+		d := WorkstateDisposition{
 			Verdict:     WorkstateVerdictPendingMR,
 			Reason:      "active-mr-open",
-			ReuseStatus: "idle-pr-open",
+			ReuseStatus: ReuseStatusPROpen,
 			Blockers:    []string{in.ActiveMRBlocker},
 		}
+		// The verdict is decided by the MR, but a hook or an assigned work bead
+		// is still a fact about this polecat and the caller gathered it. Dropping
+		// it left the reader with an MR pointer and no hint that work was still
+		// attached — exactly the shape gastown/chrome was in, which is what made
+		// "stalled" look plausible in the first place. The two surfaces carry it
+		// in different fields (the list in ActiveWorkBlocker, check-recovery in
+		// HookBead), so report both or they disagree again (gt-mkpm).
+		if in.ActiveWorkBlocker != "" {
+			d.Blockers = append(d.Blockers, in.ActiveWorkBlocker)
+		}
+		if in.HookBead != "" && !in.PartialSpawnWithoutDurableHook {
+			d.Blockers = append(d.Blockers, "has work on hook ("+in.HookBead+")")
+		}
+		return d
 	}
 
 	// StateDone (agent_state=done, seen before a polecat's own idle transition
 	// lands) falls through to the real predicate checks below instead of
 	// bailing out here — otherwise a merged/clean polecat gets NEEDS_RECOVERY
 	// with no blockers, disagreeing with git-state for no reason (gt-check-recovery-bug).
-	if in.State != StateIdle && in.State != StateDone {
+	//
+	// StateHandedOff falls through for the same reason and with a stronger claim
+	// behind it: callers only assign it where an open MR for this polecat's
+	// branch was positively found, so the session ending was completion, not
+	// death. Bailing out here is what rendered a polecat whose work was in the
+	// queue as "stalled" — the word for the failure case — for the whole
+	// in-flight window (gt-mkpm).
+	if in.State != StateIdle && in.State != StateDone && in.State != StateHandedOff {
 		verdict := WorkstateVerdictNeedsRecovery
 		needsRecovery := true
 		if in.State == StateWorking {
@@ -221,12 +306,20 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 		d := WorkstateDisposition{
 			Verdict:              verdict,
-			Reason:               "not-idle",
+			Reason:               WorkstateReasonNotIdle,
 			NeedsRecovery:        needsRecovery,
 			CountsTowardCapacity: true,
 		}
 		if in.ActiveWorkBlocker != "" {
 			d.Blockers = append(d.Blockers, in.ActiveWorkBlocker)
+		} else {
+			// The state IS the evidence here, so name it. With no blocker at all
+			// this verdict reached `gt polecat check-recovery`'s empty-blockers
+			// arm and printed "Cleanup refused by an unknown recovery predicate"
+			// — a refusal that cannot say what it refused on is unactionable by
+			// construction, and the predicate was never unknown to the code
+			// (hq-qm7bt, gt-mkpm).
+			d.Blockers = append(d.Blockers, "polecat_state="+string(in.State)+" (lifecycle state is not idle; no other blocker was recorded)")
 		}
 		return d
 	}
@@ -312,13 +405,13 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 		if mrOnly {
 			d.Verdict = WorkstateVerdictPendingMR
-			d.ReuseStatus = "idle-pr-open"
+			d.ReuseStatus = ReuseStatusPROpen
 			return d
 		}
 		d.Verdict = WorkstateVerdictNeedsRecovery
 		d.NeedsRecovery = true
 		d.CountsTowardCapacity = capacityBlocked
-		d.ReuseStatus = "idle-recovery-needed"
+		d.ReuseStatus = ReuseStatusRecoveryNeeded
 		return d
 	}
 
@@ -329,7 +422,7 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.NeedsRecovery = true
 			d.MQStatus = "unknown"
 			d.CountsTowardCapacity = true
-			d.ReuseStatus = "idle-recovery-needed"
+			d.ReuseStatus = ReuseStatusRecoveryNeeded
 			d.Blockers = append(d.Blockers, "mq_status=unknown")
 			return d
 		} else if !in.HasSubmittableWork || in.MQNotRequired {
@@ -343,7 +436,7 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.NeedsMQSubmit = true
 			d.MQStatus = "not_submitted"
 			d.CountsTowardCapacity = true
-			d.ReuseStatus = "idle-recovery-needed"
+			d.ReuseStatus = ReuseStatusRecoveryNeeded
 			d.Blockers = append(d.Blockers, "mq_status=not_submitted")
 			return d
 		}
@@ -365,13 +458,42 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		resolved := checked && (!in.HasSubmittableWork || in.MQNotRequired)
 		if !resolved {
 			d.Verdict = WorkstateVerdictNeedsMQSubmit
-			d.Reason = "mq-refused-closed-source"
 			d.NeedsRecovery = true
 			d.NeedsMQSubmit = true
-			d.MQStatus = "refused_closed_source"
 			d.CountsTowardCapacity = true
-			d.ReuseStatus = "idle-recovery-needed"
-			d.Blockers = append(d.Blockers, "mq_status=refused_closed_source (gt done made no MR: source issue was closed)")
+			// The two roads out of here are conservative in the same direction
+			// and for opposite reasons, and until gt-mkpm they rendered as the
+			// same string.
+			//
+			// checked: the queue WAS consulted and the branch still holds work
+			// nothing has taken. That is a finding about the polecat.
+			//
+			// !checked: nobody consulted the queue. The refusal is a bead fact
+			// that fires on surfaces too cheap to look (MQCheckRequired false),
+			// which is deliberate — a surface that never looked does not get to
+			// conclude the work is safe (gt-46rk) — but it is a statement about
+			// the CALLER's gap, and printing "idle-recovery-needed" for it named
+			// a remedy that on this road is not needed and cannot be performed.
+			// Everything that decides stays identical; only the words change.
+			//
+			// The checked arm is currently unreachable: every road on which the
+			// queue WAS consulted returns from the MQCheckRequired block above
+			// (not_submitted, lookup_failed) or discharges the refusal via
+			// `resolved`. It is written out anyway rather than collapsed into an
+			// assumption, because the assumption is exactly what would go stale
+			// if that ordering ever moved — and a stale assumption here renders
+			// as a confident wrong string, which is the defect this splits.
+			if checked {
+				d.Reason = "mq-refused-closed-source"
+				d.MQStatus = "refused_closed_source"
+				d.ReuseStatus = ReuseStatusRecoveryNeeded
+				d.Blockers = append(d.Blockers, "mq_status=refused_closed_source (gt done made no MR: source issue was closed)")
+			} else {
+				d.Reason = "mq-refused-unchecked"
+				d.MQStatus = "refused_closed_source_unchecked"
+				d.ReuseStatus = ReuseStatusMQUnchecked
+				d.Blockers = append(d.Blockers, "mq_status=refused_closed_source_unchecked (gt done made no MR: source issue was closed; no merge-queue check was run here, so whether the branch still holds unsubmitted work is UNKNOWN)")
+			}
 			return d
 		}
 	}
@@ -391,7 +513,7 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		d.Verdict = WorkstateVerdictNeedsStateClear
 		d.Reason = "agent-state-paused"
 		d.NeedsStateClear = true
-		d.ReuseStatus = "idle-state-paused"
+		d.ReuseStatus = ReuseStatusStatePaused
 		d.Blockers = append(d.Blockers, pausedBlocker)
 		return d
 	}
@@ -411,7 +533,7 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if !in.ReuseFactsMeasured {
 		d.Verdict = WorkstateVerdictUnverified
 		d.Reason = "reuse-facts-unmeasured"
-		d.ReuseStatus = "idle-unverified"
+		d.ReuseStatus = ReuseStatusUnverified
 		if pausedBlocker != "" {
 			d.Blockers = append(d.Blockers, pausedBlocker)
 		}
@@ -423,9 +545,9 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	d.SafeToNuke = true
 	d.Reason = "reusable"
 	if strings.HasPrefix(in.Branch, "polecat/") {
-		d.ReuseStatus = "idle-preserved"
+		d.ReuseStatus = ReuseStatusPreserved
 	} else {
-		d.ReuseStatus = "idle-clean"
+		d.ReuseStatus = ReuseStatusClean
 	}
 	return d
 }

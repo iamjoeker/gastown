@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/testguard"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -67,17 +69,28 @@ var polecatListCmd = &cobra.Command{
 
 In the transient model, polecats exist only while working. The list shows
 all polecats with their states:
-  - working: Actively working on an issue
-  - done: Completed work, waiting for cleanup
-  - stuck: Needs assistance
+  - working:    Actively working on an issue
+  - done:       Completed work, waiting for cleanup
+  - handed-off: Session gone and an OPEN merge request for its branch was found —
+                the work is in the refinery's queue. This is a SUCCESS state
+  - stalled:    Session died with work still attached and NO open MR for it
+  - stuck:      Needs assistance
 
-This surface reads beads only — it never runs git or consults the merge queue.
-A polecat that nothing blocks therefore reports verdict UNVERIFIED and
+This surface reads agent beads and one merge-queue listing per rig. It never
+runs git. A polecat that nothing blocks therefore reports verdict UNVERIFIED and
 reuse_status idle-unverified: nothing is known to be wrong with it, and nothing
 was checked. Use 'gt polecat check-recovery <rig>/<name>' for a measured verdict
 before acting. (Until gt-49dp this surface printed the same 'idle-preserved'
 string the reuse gate prints for polecats it has cleared, including for polecats
 'gt sling' went on to refuse.)
+
+Two reuse_status values mean "nobody looked", and they never share a string with
+a value that means "somebody looked and found this" (gt-mkpm):
+  - idle-unverified:   no git or merge-queue facts were gathered
+  - idle-mq-unchecked: gt done recorded that it made no MR, and no merge-queue
+                       check ran here to say whether that still matters
+Both block exactly as hard as idle-recovery-needed. Neither is a finding about
+the polecat, and neither should be quoted into a bead as one.
 
 Examples:
   gt polecat list greenplace
@@ -243,18 +256,28 @@ var polecatCheckRecoveryCmd = &cobra.Command{
 
 Reports whether any work is at risk. It does NOT authorize destroying the polecat:
   - SAFE_TO_NUKE: no work at risk — cleanup_status is 'clean', active_mr is terminal, AND work submitted to merge queue
-  - WORKING: the agent's pane shows it mid-turn; bead state is not yet meaningful
+  - WORKING: the polecat is not finished. Read the 'reason' field for what that
+    rests on: 'session-busy' read the pane and found the agent generating;
+    'not-idle' read the agent bead and did NOT look at the pane
   - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
   - NEEDS_RECOVERY: cleanup_status, active_mr, or fallback git predicates require recovery
   - PENDING_MR: work is waiting on an active merge request
   - NEEDS_STATE_CLEAR: nothing is at risk, but agent_state names a deliberate pause
     (stuck, awaiting-gate, paused, escalated) that no restart can clear
 
-Every predicate except WORKING is read from the agent bead and from git, both of
-which 'gt done' writes BEFORE it pushes, submits the MR, and exits. WORKING is
-checked first and from the live session, so a polecat that is still finishing is
-not reported as finished (gt-5tg). It is positive evidence only: a session that
-cannot be read is not reported as working.
+Every predicate except WORKING/session-busy is read from the agent bead and from
+git, both of which 'gt done' writes BEFORE it pushes, submits the MR, and exits.
+The session check is run first, so a polecat that is still finishing is not
+reported as finished (gt-5tg). It is positive evidence only: a session that
+cannot be read is not reported as busy.
+
+WORKING therefore has two roads and they are not the same claim. This command
+used to print "The agent's pane shows it mid-turn" for both — a positive claim
+about a pane the bead-derived road never consulted, measured wrong twice in one
+evening on parked polecats and right once on a live one, with nothing in the
+output telling them apart. Each verdict now names the evidence it rests on, and
+where that evidence is not the pane it says so and gives you the pane check
+(gt-mkpm).
 
 The verdict names a work-at-risk state, not an action for the caller. The
 witness_action field names what a witness may do about it: 'restart' to reclaim
@@ -672,6 +695,11 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			stateStr = style.Warning.Render(stateStr)
 		case polecat.StateDone:
 			stateStr = style.Success.Render(stateStr)
+		case polecat.StateHandedOff:
+			// Deliberately not error-styled: this polecat succeeded and its work
+			// is in the queue. It rendered as red "stalled" for the whole
+			// in-flight window before gt-mkpm.
+			stateStr = style.Info.Render(stateStr)
 		case polecat.StateZombie:
 			stateStr = style.Error.Render(stateStr)
 		default:
@@ -697,7 +725,47 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	printPolecatListMeasurementFooter(os.Stdout, allPolecats)
+
 	return nil
+}
+
+// printPolecatListMeasurementFooter names, in the output itself, how many rows
+// carry a blocking-looking status that no measurement stands behind.
+//
+// This surface runs no git. That is deliberate and documented in the source —
+// "now the operative difference between this surface and the reuse gate rather
+// than a silent one" — but the awareness lived in a comment and never reached
+// stdout, so a reader had no way to tell a measured blocker from an unmeasured
+// one without opening the source or running a second command. Two witnesses
+// scoped a P1 on a string they read as a finding (gt-mkpm).
+func printPolecatListMeasurementFooter(w io.Writer, items []PolecatListItem) {
+	unmeasured := 0
+	var example PolecatListItem
+	for _, p := range items {
+		if !polecat.DispositionUnmeasured(polecat.WorkstateDisposition{ReuseStatus: p.ReuseStatus}) {
+			continue
+		}
+		if unmeasured == 0 {
+			example = p
+		}
+		unmeasured++
+	}
+	if unmeasured == 0 {
+		return
+	}
+	noun := "polecats"
+	if unmeasured == 1 {
+		noun = "polecat"
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%s\n", style.Dim.Render(fmt.Sprintf(
+		"%d of %d %s above were decided WITHOUT a git check — this surface runs none.",
+		unmeasured, len(items), noun)))
+	fmt.Fprintf(w, "%s\n", style.Dim.Render(
+		"Nothing is known to be wrong with them and nothing was ruled out. For a measured verdict:"))
+	fmt.Fprintf(w, "%s\n", style.Dim.Render(fmt.Sprintf(
+		"    gt polecat check-recovery %s/%s", example.Rig, example.Name)))
 }
 
 func runPolecatAdd(cmd *cobra.Command, args []string) error {
@@ -1087,8 +1155,13 @@ func getGitStateWithTargets(worktreePath string, targets []string) (*GitState, e
 
 // RecoveryStatus represents whether a polecat needs recovery or is safe to nuke.
 type RecoveryStatus struct {
-	Rig                  string                `json:"rig"`
-	Polecat              string                `json:"polecat"`
+	Rig     string `json:"rig"`
+	Polecat string `json:"polecat"`
+	// State is the lifecycle state this verdict was decided from. Reported
+	// because the two polecat surfaces disagreed and neither output said what it
+	// had decided from, so a reader could not tell which one to believe
+	// (gt-mkpm).
+	State                polecat.State         `json:"state,omitempty"`
 	CleanupStatus        polecat.CleanupStatus `json:"cleanup_status"`
 	NeedsRecovery        bool                  `json:"needs_recovery"`
 	Verdict              string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
@@ -1156,6 +1229,10 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// is a measured one (gt-49dp).
 		ReuseFactsMeasured: true,
 	}
+	// Set only where an open MR for this polecat was actually looked up and read
+	// back open. It promotes a detected "stalled" to "handed-off" below, so it
+	// must never be set from a fail-closed "could not rule one out".
+	openMRProven := false
 	var gitState *GitState
 	var gitErr error
 	gitStateLoaded := false
@@ -1247,6 +1324,10 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			}
 			if activeMRAssessment.Pending {
 				input.ActiveMRBlocker = activeMRAssessment.Reason
+				// Proven-open, not merely not-ruled-out: Stale covers the
+				// missing/terminal MR, and an unverified or errored lookup never
+				// sets MRStatus at all (gt-mkpm).
+				openMRProven = openMRProven || (!activeMRAssessment.Stale && activeMRAssessment.MRStatus != "")
 			}
 		}
 		input.PartialSpawnWithoutDurableHook = partialSpawn
@@ -1267,7 +1348,14 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	status.CleanupStatus = input.CleanupStatus
-	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr)
+	if applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr) {
+		openMRProven = true
+	}
+	// Same promotion `gt polecat list` applies, from the same helper and the same
+	// bar of evidence. Doing it in one surface and not the other is how the two
+	// came to print contradictory dispositions for the same polecat (gt-mkpm).
+	input.State = polecat.HandedOffState(input.State, openMRProven)
+	status.State = input.State
 	// push_failed is set from the exit status of one `git push`, and a rebase makes
 	// a non-fast-forward rejection there expected rather than fatal — so this
 	// command, which HAS just measured the worktree, gets to say when the flag is
@@ -1334,6 +1422,9 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 
 	// Human-readable output
 	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Recovery Status: %s/%s", rigName, polecatName)))
+	if status.State != "" {
+		fmt.Printf("  State:           %s\n", status.State)
+	}
 	fmt.Printf("  Cleanup Status:  %s\n", status.CleanupStatus)
 	if status.Branch != "" {
 		fmt.Printf("  Branch:          %s\n", status.Branch)
@@ -1357,9 +1448,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("WORKING"))
 		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
 		fmt.Println()
-		fmt.Println("  The agent's pane shows it mid-turn. Bead state can say 'done' a minute or")
-		fmt.Println("  two before the session actually exits — this verdict reflects the session.")
-		fmt.Println("  Leave it alone and re-check once the pane is quiet.")
+		printPolecatWorkingEvidence(os.Stdout, status.Reason, rigName, polecatName)
 	case "NEEDS_MQ_SUBMIT":
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
 		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
@@ -1389,7 +1478,13 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 				}
 			}
 		} else {
-			fmt.Printf("  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
+			// Reachable only if a future predicate returns NEEDS_RECOVERY with no
+			// blocker at all. Name the reason rather than calling the predicate
+			// unknown: it was never unknown to the code, and an unnamed refusal
+			// is unactionable by construction (hq-qm7bt, gt-mkpm).
+			fmt.Printf("  %s Cleanup refused, and this verdict carried no blocker to name.\n", style.Warning.Render("⚠"))
+			fmt.Printf("    reason=%s state=%s — please report this output; it is a reporting bug.\n",
+				orUnknownRecoveryField(status.Reason), orUnknownRecoveryField(string(status.State)))
 		}
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
 	case polecat.WorkstateVerdictNeedsStateClear:
@@ -1446,6 +1541,46 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func orUnknownRecoveryField(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "<unset>"
+	}
+	return s
+}
+
+// printPolecatWorkingEvidence renders the WORKING verdict's prose from the
+// evidence that verdict actually rests on.
+//
+// There are two roads to WORKING and they are not the same claim. session-busy
+// read the pane (Tmux.IsBusy) and found the agent generating. not-idle read the
+// AGENT BEAD and found a lifecycle state of working — it never looked at a pane.
+// Both printed "The agent's pane shows it mid-turn", which on the second road is
+// a positive claim about a surface the command did not consult.
+//
+// Measured three times in one evening: false on gastown/crater (parked, no
+// interrupt line, empty composer, "Churned for 13m 51s", had exited DEFERRED 14
+// minutes earlier), false on gastown/brahmin (parked; a re-run a minute later
+// gave NEEDS_RECOVERY and named push_failed), true on gastown/foundation
+// (genuinely mid-turn). Same sentence all three times, with nothing in the
+// output separating them — and its prescription is leave-alone, which on the
+// brahmin instance argued for NOT acting on an unhealthy polecat (gt-mkpm).
+func printPolecatWorkingEvidence(w io.Writer, reason, rigName, polecatName string) {
+	if reason == polecat.WorkstateReasonSessionBusy {
+		fmt.Fprintln(w, "  Evidence: the tmux pane was read and the agent is generating right now.")
+		fmt.Fprintln(w, "  Bead state can say 'done' a minute or two before the session actually exits —")
+		fmt.Fprintln(w, "  this verdict reflects the session, and outranks the bead.")
+		fmt.Fprintln(w, "  Leave it alone and re-check once the pane is quiet.")
+		return
+	}
+	fmt.Fprintf(w, "  Evidence: the AGENT BEAD says working (reason=%s). The pane was NOT measured busy.\n",
+		orUnknownRecoveryField(reason))
+	fmt.Fprintln(w, "  A polecat that has finished and parked reads exactly like this, so do not take")
+	fmt.Fprintln(w, "  leave-alone from this verdict alone. Read the pane yourself:")
+	fmt.Fprintf(w, "    tmux capture-pane -p -t %s | grep -c 'esc to interrupt'\n",
+		session.PolecatSessionName(session.PrefixFor(rigName), polecatName))
+	fmt.Fprintln(w, "  0 = parked (nudge or restart it), >0 = genuinely mid-turn (leave it alone).")
+}
+
 func applyGitStateToWorkstateInput(input *polecat.WorkstateInput, worktreePath string, gitState *GitState, gitErr error) {
 	if gitErr != nil {
 		input.GitCheckFailed = true
@@ -1467,9 +1602,12 @@ func applyGitStateToWorkstateInput(input *polecat.WorkstateInput, worktreePath s
 	}
 }
 
-func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *RecoveryStatus, bd *beads.Beads, beadTerminal bool, worktreePath string, targetRefs []string, targetRefLookupFailed bool, gitState *GitState, gitErr error) {
+// applyMQFactsToWorkstateInput folds the merge-queue facts into the input and
+// reports whether it PROVED an open MR exists for this polecat's branch — the
+// one fact that separates a handed-off polecat from a stalled one (gt-mkpm).
+func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *RecoveryStatus, bd *beads.Beads, beadTerminal bool, worktreePath string, targetRefs []string, targetRefLookupFailed bool, gitState *GitState, gitErr error) (openMRProven bool) {
 	if status.Branch == "" {
-		return
+		return false
 	}
 	input.MQCheckRequired = true
 	input.AssignedBeadTerminal = beadTerminal
@@ -1479,7 +1617,7 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 		input.MQLookupFailed = true
 	}
 	if !input.HasSubmittableWork || input.MQNotRequired {
-		return
+		return false
 	}
 	// A terminal source bead used to skip this lookup, on the theory that a
 	// closed bead has nothing left to submit. But the closed bead is exactly the
@@ -1492,13 +1630,15 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	mr, mrErr := bd.FindMRForBranchAny(status.Branch)
 	if mrErr != nil {
 		input.MQLookupFailed = true
-		return
+		return false
 	}
 	if mr == nil {
-		return
+		return false
 	}
-	polecat.ApplyBranchMRToWorkstateInput(input, mr.ID, !beads.IssueStatus(mr.Status).IsTerminal())
+	mrOpen := !beads.IssueStatus(mr.Status).IsTerminal()
+	polecat.ApplyBranchMRToWorkstateInput(input, mr.ID, mrOpen)
 	status.ActiveMR = input.ActiveMR
+	return mrOpen
 }
 
 // recordNeedsMQSubmitObservation journals the needs_mq_submit transitions for

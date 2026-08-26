@@ -886,3 +886,82 @@ func runCmd(t *testing.T, dir, name string, args ...string) {
 		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
 	}
 }
+
+// TestPolecatWorkingEvidenceNamesItsSource is the gt-mkpm regression on the
+// remedy surface.
+//
+// check-recovery is what agents are told to reach for when `gt polecat list` is
+// untrustworthy, and its WORKING arm printed "The agent's pane shows it
+// mid-turn" on BOTH roads to that verdict — including the one that reads the
+// agent bead and never looks at a pane. Measured wrong twice in one evening
+// (gastown/crater, parked with no interrupt line and "Churned for 13m 51s";
+// gastown/brahmin, parked, and a re-run a minute later gave NEEDS_RECOVERY and
+// named push_failed) and right once (gastown/foundation, genuinely mid-turn).
+// The same sentence, three times, with nothing separating the cases — and its
+// prescription is leave-alone, which on the brahmin instance argued for NOT
+// acting on an unhealthy polecat.
+func TestPolecatWorkingEvidenceNamesItsSource(t *testing.T) {
+	setupPolecatTestRegistry(t)
+
+	var measured bytes.Buffer
+	printPolecatWorkingEvidence(&measured, polecat.WorkstateReasonSessionBusy, "gastown", "foundation")
+	if !strings.Contains(measured.String(), "pane was read") {
+		t.Fatalf("session-busy must say the pane was read:\n%s", measured.String())
+	}
+
+	var beadDerived bytes.Buffer
+	printPolecatWorkingEvidence(&beadDerived, polecat.WorkstateReasonNotIdle, "gastown", "crater")
+	got := beadDerived.String()
+	// The retracted claim must be gone from this road. Matched
+	// case-insensitively and on the CONTENT phrase, not on a heading: the
+	// sentence is prose and could legitimately be reworded, but any wording that
+	// still asserts what the pane shows is the defect.
+	if strings.Contains(strings.ToLower(got), "pane shows it mid-turn") {
+		t.Fatalf("bead-derived WORKING must not assert what the pane shows:\n%s", got)
+	}
+	if !strings.Contains(got, "AGENT BEAD") || !strings.Contains(got, "NOT measured busy") {
+		t.Fatalf("bead-derived WORKING must name what it did read:\n%s", got)
+	}
+	// And it must hand over the discriminator that disagreed correctly all five
+	// times this bead recorded, rather than leaving the reader to know it.
+	if !strings.Contains(got, "esc to interrupt") {
+		t.Fatalf("bead-derived WORKING must give the pane check:\n%s", got)
+	}
+	// The control: the two roads must actually differ. If they ever converge
+	// again, the assertions above can both pass on identical text.
+	if got == measured.String() {
+		t.Fatal("both roads to WORKING print the same prose again — that is the whole defect")
+	}
+}
+
+// TestPolecatListMeasurementFooter pins the acceptance criterion of gt-mkpm: a
+// reader of `gt polecat list` alone can tell a measured blocker from an
+// unmeasured one, without consulting source and without running a second
+// command.
+func TestPolecatListMeasurementFooter(t *testing.T) {
+	var out bytes.Buffer
+	printPolecatListMeasurementFooter(&out, []PolecatListItem{
+		{Rig: "gastown", Name: "ghoul", ReuseStatus: polecat.ReuseStatusMQUnchecked},
+		{Rig: "gastown", Name: "synth", ReuseStatus: polecat.ReuseStatusRecoveryNeeded},
+		{Rig: "gastown", Name: "crater", ReuseStatus: polecat.ReuseStatusUnverified},
+	})
+	got := out.String()
+	if !strings.Contains(got, "2 of 3") {
+		t.Fatalf("footer must count only the unmeasured rows:\n%s", got)
+	}
+	if !strings.Contains(got, "gt polecat check-recovery gastown/ghoul") {
+		t.Fatalf("footer must name the surface that measures, on a real row:\n%s", got)
+	}
+
+	// The control, and it is the one that keeps the footer meaningful: a listing
+	// where every verdict was earned prints nothing. A footer that always fires
+	// is a footer readers stop seeing.
+	var quiet bytes.Buffer
+	printPolecatListMeasurementFooter(&quiet, []PolecatListItem{
+		{Rig: "gastown", Name: "synth", ReuseStatus: polecat.ReuseStatusRecoveryNeeded},
+		{Rig: "gastown", Name: "dag", ReuseStatus: polecat.ReuseStatusPreserved},
+	})
+	if quiet.String() != "" {
+		t.Fatalf("a fully measured listing must print no footer:\n%s", quiet.String())
+	}
+}

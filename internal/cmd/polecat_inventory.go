@@ -289,6 +289,12 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 	// classifier the recovery and reuse paths use: a terminal MR only stops
 	// blocking when its source issue is proven terminal too, and an unconsulted
 	// queue stays blocking as status=unverified.
+	//
+	// openMRProven tracks the STRONG half of ActiveMRBlocker: an MR bead that was
+	// looked up and read back open. ActiveMRBlocker is deliberately fail-closed
+	// and also carries status=unverified and lookup_error, which prove nothing —
+	// so the handed-off promotion below keys on this instead (gt-mkpm).
+	openMRProven := false
 	if item.ActiveMR != "" {
 		assessment := polecat.AssessActiveMR(mrIndex.issueReader(), polecat.ActiveMRInput{
 			ActiveMR:        item.ActiveMR,
@@ -296,10 +302,12 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		})
 		if assessment.Pending {
 			input.ActiveMRBlocker = assessment.Reason
+			openMRProven = !assessment.Stale && assessment.MRStatus != ""
 		}
 	}
 	if input.ActiveMRBlocker == "" {
 		if openMR := mrIndex.openMRFor(item.Branch); openMR != "" {
+			openMRProven = true
 			// An open MR nobody recorded on this agent bead — the rescue-submit case
 			// (gt-46rk). The branch it points at is the only copy of that work, and
 			// the polecat would otherwise read SAFE_TO_NUKE right up until recycling
@@ -311,6 +319,13 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 			input.ActiveMRBlocker = "active_mr=" + openMR + " status=open source=branch-index"
 		}
 	}
+
+	// A dead session with work still attached is "stalled" only until you ask
+	// whether the work is in the queue. This surface has the answer already — it
+	// indexed the rig's merge requests once for the whole listing — so ask before
+	// printing the word for the failure case over a polecat that succeeded
+	// (gt-mkpm).
+	item.State = polecat.HandedOffState(item.State, openMRProven)
 
 	input.State = item.State
 	item.Disposition = polecat.DecideWorkstate(input)
