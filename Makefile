@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install sync-plugins check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -152,10 +152,48 @@ install: check-up-to-date build
 			echo "Daemon restarted." || \
 			echo "Warning: daemon restart failed (start manually with: gt daemon start)"; \
 	fi
-	@# Sync plugins from build repo to town runtime directories.
-	@# Prevents drift when plugin fixes merge but runtime dirs are stale.
-	@$(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
-		echo "Plugins synced." || true
+	@$(MAKE) --no-print-directory sync-plugins
+
+# sync-plugins: Deploy this checkout's plugins into the town runtime directory.
+#
+# Plugins EXECUTE from <townRoot>/plugins/, never from this repo, so landing a
+# plugin fix on main does not deploy it — this copy is the only thing that
+# does. A fix split across Go and shell therefore deploys in two halves at two
+# different times: the Go half rides the binary, the shell half rides nothing.
+#
+# It hangs off BOTH install paths deliberately. It used to hang off `install`
+# alone — and `install` is the path a HUMAN takes. The only path that runs by
+# itself is rebuild-gt's hourly `safe-install`, which had no sync at all, so
+# the automated deploy path was the one with the hole in it. Measured
+# 2026-08-26: seven plugins in the town differed from main and rebuild-gt's
+# executing copy was dated 2026-08-02, missing both guards merged since.
+#
+# This does NOT deploy itself, and the reason is worth stating so nobody waits
+# for it. rebuild-gt reaches this recipe only through `make safe-install` in the
+# rig checkout, and `check-up-to-date` exits 1 whenever that checkout differs
+# from its upstream. Measured 2026-08-26: the rig checkout was 12 commits behind
+# origin/main, and the plugin copy executing in the town is the 2026-08-02 one,
+# which predates the step that fast-forwards it. So the checkout cannot advance
+# on its own, safe-install cannot complete, and this recipe is unreachable until
+# someone fast-forwards that checkout once by hand. After that one bootstrap the
+# loop closes: the sync below replaces the town's plugin copies with current
+# ones, including rebuild-gt's, and every later cycle carries both halves.
+#
+# Failure warns rather than fails: the binary is already in place by the time
+# this runs, and a non-zero exit here would report the install itself as broken.
+# But the REASON is printed. It was previously sent to /dev/null under
+# `|| true`, which made a sync that could not run look exactly like a sync that
+# ran and found nothing to do.
+sync-plugins:
+	@if [ ! -x $(INSTALL_DIR)/$(BINARY) ]; then \
+		echo "Warning: $(INSTALL_DIR)/$(BINARY) is not executable; plugins NOT synced" >&2; \
+	elif out=$$($(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>&1); then \
+		echo "$$out"; \
+	else \
+		echo "Warning: plugin sync failed; the town keeps executing the plugins it already had" >&2; \
+		echo "$$out" | sed 's/^/  /' >&2; \
+		echo "  Retry with: $(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins" >&2; \
+	fi
 
 # safe-install: Replace binary WITHOUT restarting daemon or killing sessions.
 # Use this for automated rebuilds (e.g., rebuild-gt plugin). Sessions pick up
@@ -174,6 +212,9 @@ safe-install: check-up-to-date check-forward-only build
 	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
 	@$(MAKE) --no-print-directory check-install-path
+	@# The binary is only half the deploy. Plugins run from the town, not from
+	@# here, and this is the automated path — if it does not sync, nothing does.
+	@$(MAKE) --no-print-directory sync-plugins
 	@echo "Sessions will pick up new binary on next cycle."
 
 # check-version-tag: Verify that if HEAD is tagged vX.Y.Z, the Version constant
@@ -222,6 +263,7 @@ test-nested-modules:
 
 test-makefile:
 	bash scripts/check-install-path_test.sh
+	bash scripts/sync-plugins_test.sh
 	bash -n plugins/stuck-agent-dog/run.sh
 	bash -n plugins/stuck-agent-dog/run_test.sh
 	bash plugins/stuck-agent-dog/run_test.sh
