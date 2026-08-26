@@ -371,6 +371,14 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	issues = live
 
 	if escalateListJSON {
+		// A nil slice marshals to `null`, and `null` is not a measured zero — it
+		// is what a parser sees when the query died, when the filter dropped
+		// everything, and when there genuinely are no open escalations, with no
+		// way to tell the three apart. Errors already return early above, so the
+		// only honest empty answer here is an empty array (gt-qee3).
+		if issues == nil {
+			issues = []*beads.Issue{}
+		}
 		out, _ := json.MarshalIndent(issues, "", "  ")
 		fmt.Println(string(out))
 		// The JSON shape stays a plain array of the open escalations, so the
@@ -399,6 +407,16 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		fields := beads.ParseEscalationFields(issue.Description)
 		emoji := severityEmoji(fields.Severity)
 
+		// The rendered status is a PROJECTION, not issues.status. Every row this
+		// list prints is status='open' by construction — the query filters on it
+		// — so an "[acked]" row disagrees with the table by design, and anyone
+		// reconciling the two finds a mismatch that is not a data problem
+		// (gt-qee3). Ack state lives in the bare "acked" label, written by
+		// `gt escalate ack`. Note the near-miss: mail delivery writes
+		// "delivery:acked" + "delivery-acked-by:<agent>" when a recipient's inbox
+		// receives the copy, and that is NOT an acknowledgement of the
+		// escalation — it must not be read here, or every delivered escalation
+		// would render as handled the moment it was sent.
 		status := issue.Status
 		if beads.HasLabel(issue, "acked") {
 			status = "acked"

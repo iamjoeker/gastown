@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -582,16 +583,24 @@ func newEscalationStub(t *testing.T) *escalationStub {
 
 	// Subcommand is the first non-flag arg (bd may be called as
 	// `bd --allow-stale show <id> --json`); the ID is the next non-flag arg.
+	// The pinned suffix matters: `bd list --status=open` is silently
+	// `--no-pinned`, so the two halves are genuinely different result sets and a
+	// stub that cannot tell them apart cannot show a caller losing one (gt-qee3).
+	// It falls back to the unsuffixed fixture, which is what every test that does
+	// not care about pinning registers.
 	script := `#!/bin/sh
 sub=""
 id=""
 label=""
+pin=""
 for arg in "$@"; do
   case "$arg" in
     --label=*)
       if [ -z "$label" ]; then label="${arg#--label=}"; fi
       continue
       ;;
+    --pinned) pin="-pinned"; continue ;;
+    --no-pinned) pin="-nopinned"; continue ;;
     -*) continue ;;
   esac
   if [ -z "$sub" ]; then sub="$arg"; continue; fi
@@ -604,8 +613,14 @@ case "$sub" in
     if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi
     ;;
   list)
-    f="` + dir + `/list-$(printf '%s' "$label" | tr ':/' '__').json"
-    if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi
+    base="` + dir + `/list-$(printf '%s' "$label" | tr ':/' '__')"
+    if [ -n "$pin" ] && [ -f "$base$pin.json" ]; then
+      cat "$base$pin.json"
+    elif [ -f "$base.json" ]; then
+      cat "$base.json"
+    else
+      echo '[]'
+    fi
     ;;
   *)
     printf '%s\n' "$*" >> "` + logPath + `"
@@ -647,6 +662,33 @@ func (s *escalationStub) list(label string, issues ...*Issue) {
 	name := strings.NewReplacer(":", "_", "/", "_").Replace(label)
 	if err := os.WriteFile(filepath.Join(s.dir, "list-"+name+".json"), data, 0644); err != nil {
 		s.t.Fatalf("write list fixture %s: %v", label, err)
+	}
+}
+
+// listSplit registers what `bd list --label=<label>` returns for each half of
+// the pinned split: `--no-pinned` (bd's silent default) and `--pinned`.
+//
+// Registering only one half is what production does to a caller that asks only
+// once, so a caller that still asks once sees the unpinned half and nothing
+// else.
+func (s *escalationStub) listSplit(label string, unpinned, pinned []*Issue) {
+	s.t.Helper()
+	s.listVariant(label, "-nopinned", unpinned)
+	s.listVariant(label, "-pinned", pinned)
+}
+
+func (s *escalationStub) listVariant(label, suffix string, issues []*Issue) {
+	s.t.Helper()
+	if issues == nil {
+		issues = []*Issue{}
+	}
+	data, err := json.Marshal(issues)
+	if err != nil {
+		s.t.Fatalf("marshal list fixture %s%s: %v", label, suffix, err)
+	}
+	name := strings.NewReplacer(":", "_", "/", "_").Replace(label)
+	if err := os.WriteFile(filepath.Join(s.dir, "list-"+name+suffix+".json"), data, 0644); err != nil {
+		s.t.Fatalf("write list fixture %s%s: %v", label, suffix, err)
 	}
 }
 
@@ -1026,6 +1068,78 @@ func TestListEscalationsWithStranded_ReportsTheHiddenCopies(t *testing.T) {
 	// anything in neither is hidden with no signal at all.
 	if len(open)+len(strandedCopies) != 2 {
 		t.Errorf("open(%d) + stranded(%d) must account for all 2 open escalation beads", len(open), len(strandedCopies))
+	}
+}
+
+// --- Pinned escalations (gt-qee3) --------------------------------------------
+//
+// `bd list --status=open` is silently `--no-pinned`: measured on hq 2026-08-26,
+// the default returned 686 open issues, `--pinned` returned 3 more, and SQL
+// confirmed 686/3. `gt escalate list` therefore printed "No escalations found"
+// while three escalations sat open — including a HIGH — and `--all` rendered all
+// of them, which is what made the renderer look healthy while the filter was not.
+func TestListEscalationsWithStranded_IncludesPinnedEscalations(t *testing.T) {
+	stub := newEscalationStub(t)
+	stub.bead(escalationRecord("hq-wisp-open"))
+	stub.bead(escalationRecord("hq-wisp-pinned"))
+
+	unpinned := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	pinned := escalationCopy("hq-pinned", "hq-wisp-pinned", "mayor/")
+	stub.listSplit("gt:escalation", []*Issue{unpinned}, []*Issue{pinned})
+
+	b := New(t.TempDir())
+	open, strandedCopies, err := b.ListEscalationsWithStranded()
+	if err != nil {
+		t.Fatalf("ListEscalationsWithStranded: %v", err)
+	}
+	if len(strandedCopies) != 0 {
+		t.Errorf("stranded = %v, want none: both records are open", issueIDs(strandedCopies))
+	}
+	got := issueIDs(open)
+	sort.Strings(got)
+	if strings.Join(got, ",") != "hq-live,hq-pinned" {
+		t.Errorf("open = %v, want both hq-live and hq-pinned: pinning an escalation must not delete it from the list", got)
+	}
+}
+
+// The union must not double-count. Nothing distinguishes the two queries at the
+// bd level but the flag, so a store that answers both with the same row — or a
+// bd whose default starts including pinned issues — must still render it once.
+func TestListEscalationsWithStranded_UnionDoesNotDuplicate(t *testing.T) {
+	stub := newEscalationStub(t)
+	stub.bead(escalationRecord("hq-wisp-open"))
+
+	live := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	// One fixture, no pinned suffix: the stub returns it to BOTH halves.
+	stub.list("gt:escalation", live)
+
+	b := New(t.TempDir())
+	open, _, err := b.ListEscalationsWithStranded()
+	if err != nil {
+		t.Fatalf("ListEscalationsWithStranded: %v", err)
+	}
+	if got := issueIDs(open); strings.Join(got, ",") != "hq-live" {
+		t.Errorf("open = %v, want [hq-live] exactly once", got)
+	}
+}
+
+// Duplicate suppression reads the same open-escalation query. A pinned
+// escalation missing from it does not merely go unseen — it stops matching its
+// own fingerprint, so the identical escalation re-fires on every raise.
+func TestListEscalationsByFingerprint_FindsPinnedEscalations(t *testing.T) {
+	stub := newEscalationStub(t)
+	stub.bead(escalationRecord("hq-wisp-pinned"))
+
+	pinned := escalationCopy("hq-pinned", "hq-wisp-pinned", "mayor/")
+	stub.listSplit("gt:escalation", nil, []*Issue{pinned})
+
+	b := New(t.TempDir())
+	got, err := b.ListEscalationsByFingerprint("escalation-fp:abc123")
+	if err != nil {
+		t.Fatalf("ListEscalationsByFingerprint: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "hq-pinned" {
+		t.Errorf("ListEscalationsByFingerprint = %v, want [hq-pinned]: a pinned duplicate must still suppress", issueIDs(got))
 	}
 }
 

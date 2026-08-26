@@ -631,38 +631,75 @@ func (b *Beads) ListEscalations() ([]*Issue, error) {
 // resolved, and nobody reconciled the halves", never "resolved". Returning the
 // set lets the caller say so and name the reconcile.
 func (b *Beads) ListEscalationsWithStranded() (open, stranded []*Issue, err error) {
-	out, err := b.run("list", "--label=gt:escalation", "--status=open", "--json")
+	issues, err := b.listOpenEscalationIssues()
 	if err != nil {
 		return nil, nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
 	open, stranded = b.partitionResolvedEscalations(filterEscalationRecords(issues))
 	return open, stranded, nil
 }
 
+// listOpenEscalationIssues runs the open-escalation query, including the pinned
+// escalations `bd list --status=open` leaves out.
+//
+// `bd list` has no "include pinned" flag. It has `--pinned` (pinned ONLY) and
+// `--no-pinned` (exclude them), and its DEFAULT is exactly `--no-pinned`:
+// measured on the hq store 2026-08-26, `bd list --status=open --limit 0`
+// returned 686 issues, `--no-pinned` returned the same 686, `--pinned` returned
+// 3, and `SELECT pinned, COUNT(*) ... WHERE status='open' GROUP BY pinned`
+// returned 686/3. So a pinned open issue is not in the default result set at
+// all, and nothing says so.
+//
+// All three pinned issues in that measurement were escalations, and `gt escalate
+// list` printed "No escalations found" while they sat open — the P0 in gt-qee3.
+// Pinning is what an operator does to an escalation to keep it in view; with a
+// single default query that act deletes it from the one surface whose whole job
+// is to show what is live. `--all` was unaffected because it bypasses this
+// query, which is what made the renderer look healthy while the filter was not.
+//
+// The two result sets are unioned rather than switched between, so this stays
+// correct if bd's default ever changes to include pinned issues.
+func (b *Beads) listOpenEscalationIssues(extraFilters ...string) ([]*Issue, error) {
+	base := append([]string{"list", "--label=gt:escalation", "--status=open"}, extraFilters...)
+
+	var all []*Issue
+	seen := make(map[string]bool)
+	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
+		args := append(append([]string{}, base...), pinnedFilter, "--json")
+		out, err := b.run(args...)
+		if err != nil {
+			return nil, err
+		}
+
+		var issues []*Issue
+		if err := json.Unmarshal(out, &issues); err != nil {
+			return nil, fmt.Errorf("parsing bd list output: %w", err)
+		}
+		for _, issue := range issues {
+			if issue == nil || seen[issue.ID] {
+				continue
+			}
+			seen[issue.ID] = true
+			all = append(all, issue)
+		}
+	}
+	return all, nil
+}
+
 // ListEscalationsByFingerprint returns open escalation beads matching a stable fingerprint label.
+//
+// This is the duplicate-suppression probe, so a pinned escalation missing from
+// it does not merely go unseen: it re-fires as a fresh escalation on every
+// raise. See listOpenEscalationIssues for why the pinned half has to be asked
+// for separately.
 func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue, error) {
 	if fingerprintLabel == "" {
 		return nil, nil
 	}
-	out, err := b.run("list",
-		"--label=gt:escalation",
-		"--label="+fingerprintLabel,
-		"--status=open",
-		"--json",
-	)
+	issues, err := b.listOpenEscalationIssues("--label=" + fingerprintLabel)
 	if err != nil {
 		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
 	kept, _ := b.partitionResolvedEscalations(filterEscalationRecords(issues))
@@ -671,19 +708,9 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
 func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
-	out, err := b.run("list",
-		"--label=gt:escalation",
-		"--label=severity:"+severity,
-		"--status=open",
-		"--json",
-	)
+	issues, err := b.listOpenEscalationIssues("--label=severity:" + severity)
 	if err != nil {
 		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
 	kept, _ := b.partitionResolvedEscalations(filterEscalationRecords(issues))
