@@ -350,7 +350,7 @@ func TestTrackConvoyFailures_Integration(t *testing.T) {
 	// No convoys for it
 	mock.execResults["dep list gt-task-a --direction=up --type=tracks --json"] = mockExecResult{output: "[]"}
 
-	trackConvoyFailures(mock.toBdCli(), "/tmp", result)
+	trackConvoyFailures(mock.toBdCli(), "/tmp", result, scanEffects{})
 
 	// Should have queried only gt-task-a (not gt-task-b, empty, or submitted idle)
 	if len(mock.execCalls) != 1 {
@@ -395,7 +395,7 @@ func TestTrackConvoyFailures_MountainZombie(t *testing.T) {
 	}{{Labels: []string{}}})
 	mock.execResults["show gt-mtn-task --json"] = mockExecResult{output: string(issueShow)}
 
-	trackConvoyFailures(mock.toBdCli(), "/tmp", result)
+	trackConvoyFailures(mock.toBdCli(), "/tmp", result, scanEffects{})
 
 	if len(result.ConvoyFailures) != 1 {
 		t.Fatalf("expected 1 convoy failure, got %d", len(result.ConvoyFailures))

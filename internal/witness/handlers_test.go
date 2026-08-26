@@ -2399,7 +2399,7 @@ func TestProcessDiscoveredCompletion_PhaseComplete(t *testing.T) {
 		Exit:        "PHASE_COMPLETE",
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, scanEffects{})
 	if discovery.Action != "phase-complete" {
 		t.Errorf("Action = %q, want %q", discovery.Action, "phase-complete")
 	}
@@ -2413,7 +2413,7 @@ func TestProcessDiscoveredCompletion_NoMR(t *testing.T) {
 		MRFailed:    true, // Prevents fallback MR lookup
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, scanEffects{})
 	if !strings.Contains(discovery.Action, "acknowledged-idle") {
 		t.Errorf("Action = %q, want to contain %q", discovery.Action, "acknowledged-idle")
 	}
@@ -2426,7 +2426,7 @@ func TestProcessDiscoveredCompletion_EscalatedNoMR(t *testing.T) {
 		Exit:        "ESCALATED",
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, scanEffects{})
 	if !strings.Contains(discovery.Action, "acknowledged-idle") {
 		t.Errorf("Action = %q, want to contain %q for ESCALATED exit", discovery.Action, "acknowledged-idle")
 	}
@@ -2816,7 +2816,7 @@ func TestHandleZombieRestart_SkipsWhenBranchAlreadyMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z, scanEffects{})
 
 	// Action must reflect the archive decision; must NOT be a "restarted*" action.
 	if !strings.Contains(z.Action, "work-already-merged") {
@@ -2845,7 +2845,7 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z, scanEffects{})
 
 	// Should NOT take the archive path.
 	if strings.Contains(z.Action, "work-already-merged") {

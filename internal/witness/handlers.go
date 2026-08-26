@@ -1423,6 +1423,21 @@ const (
 	restartBusy
 )
 
+// String names the verdict for reporting. It is what `gt patrol scan --dry-run`
+// prints per candidate, and it is a structured field rather than a phrase inside
+// the Action prose so that a caller can test the decision itself instead of
+// grepping for a sentence that may be reworded (gt-3516).
+func (a restartAction) String() string {
+	switch a {
+	case restartSessionGone:
+		return "session-gone"
+	case restartBusy:
+		return "busy"
+	default:
+		return "proceed"
+	}
+}
+
 // Readability constants for decideRestart's veto argument. Only verdicts
 // derived from bead metadata pass vetoBusySessions; see decideRestart.
 const (
@@ -1474,7 +1489,9 @@ func decideRestart(p sessionProbe, sessionName string, vetoIfBusy bool) restartA
 // Returning (ZombieResult{}, false) for a session that has gone away means the
 // caller drops the verdict entirely, since the polecat exited on its own.
 func applyRestart(p sessionProbe, sessionName string, vetoIfBusy bool, zombie ZombieResult, restart func() error, failPrefix string) (ZombieResult, bool) {
-	switch decideRestart(p, sessionName, vetoIfBusy) {
+	verdict := decideRestart(p, sessionName, vetoIfBusy)
+	zombie.RestartVerdict = verdict.String()
+	switch verdict {
 	case restartSessionGone:
 		return ZombieResult{}, false
 	case restartBusy:
@@ -1789,6 +1806,12 @@ type ZombieResult struct {
 	WasActive      bool   // true if evidence of recent work (active state or hooked bead)
 	Action         string // "restarted", "escalated", "cleanup-wisp-created", "auto-nuked" (explicit nuke only)
 	BeadRecovered  bool   // true if hooked bead was reset to open for re-dispatch
+	// RestartVerdict is what the decision-time probe concluded for a verdict that
+	// would otherwise restart this session: "proceed", "busy", or "session-gone".
+	// Empty when the classification reached no restart decision. This is the
+	// thing `--dry-run` exists to expose: the guard's conclusion, reportable
+	// without a live polecat having to be at risk to produce it (gt-3516).
+	RestartVerdict string
 	Error          error
 }
 
@@ -1830,6 +1853,15 @@ type DetectZombiePolecatsResult struct {
 //   - If git state is dirty (unpushed/uncommitted work): report cleanup_status,
 //     create cleanup wisp (witness agent decides escalation policy, gt-5rne)
 func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Router) *DetectZombiePolecatsResult {
+	return DetectZombiePolecatsWithOptions(bd, workDir, rigName, router, ScanOptions{})
+}
+
+// DetectZombiePolecatsWithOptions is DetectZombiePolecats with the sweep's
+// permissions made explicit. Under ScanOptions.DryRun the detection is identical
+// — same probes, same classifications, same restart verdicts — and every action
+// it reports is one it declined to take (gt-3516).
+func DetectZombiePolecatsWithOptions(bd *BdCli, workDir, rigName string, router *mail.Router, opts ScanOptions) *DetectZombiePolecatsResult {
+	eff := opts.effects()
 	result := &DetectZombiePolecatsResult{}
 
 	townRoot, err := workspace.Find(workDir)
@@ -1908,13 +1940,13 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 				continue
 			}
 
-			if zombie, found := detectZombieLiveSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, witCfg, snap); found {
+			if zombie, found := detectZombieLiveSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, witCfg, snap, eff); found {
 				result.Zombies = append(result.Zombies, zombie)
 			}
 			continue // Either handled or not a zombie
 		}
 
-		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap); found {
+		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap, eff); found {
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
@@ -1922,7 +1954,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 	// Mountain-Eater Layer 1 (gt-cfq): Track polecat failures for convoy-tracked issues.
 	// For each zombie with an active hook_bead (polecat failed without completing work),
 	// check if the issue belongs to a convoy and track the failure.
-	trackConvoyFailures(bd, workDir, result)
+	trackConvoyFailures(bd, workDir, result, eff)
 
 	return result
 }
@@ -1932,7 +1964,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats, restarts their
 // sessions to preserve worktrees and branches.
-func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot, eff scanEffects) (ZombieResult, bool) {
 	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot
 	// instead of calling getAgentBeadState multiple times per code path.
 	snapState, snapHook := "", ""
@@ -1990,7 +2022,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		// session minutes old, so this verdict does not get to act on a pane that
 		// shows a turn in flight (gt-nof6).
 		return applyRestart(t, sessionName, vetoBusySessions, zombie, func() error {
-			return RestartPolecatSession(workDir, rigName, polecatName)
+			return eff.restartSession(workDir, rigName, polecatName)
 		}, "restart-stuck-session-failed")
 	}
 
@@ -2009,7 +2041,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		// time, and a pane whose agent died mid-turn keeps rendering the busy
 		// footer of its last frame, which would strand this case forever (gt-nof6).
 		return applyRestart(t, sessionName, restartEvenIfBusy, zombie, func() error {
-			return RestartPolecatSession(workDir, rigName, polecatName)
+			return eff.restartSession(workDir, rigName, polecatName)
 		}, "restart-agent-dead-session-failed")
 	}
 
@@ -2029,7 +2061,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		// still working through the rest of gt done reads as bead-closed here.
 		// The bead status is metadata; the pane is not (gt-nof6).
 		return applyRestart(t, sessionName, vetoBusySessions, zombie, func() error {
-			return RestartPolecatSession(workDir, rigName, polecatName)
+			return eff.restartSession(workDir, rigName, polecatName)
 		}, "restart-bead-closed-failed")
 	}
 
@@ -2037,7 +2069,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	// but fail before exiting the polecat session. If successful MR evidence exists
 	// and the hook is either gone or still open, nudge the live session to finish
 	// instead of letting it sit idle forever.
-	if zombie, found := detectSubmittedStillRunning(bd, workDir, polecatName, sessionName, t, hb, snap, witCfg.HeartbeatStartupGraceD()); found {
+	if zombie, found := detectSubmittedStillRunning(bd, workDir, polecatName, sessionName, t, hb, snap, witCfg.HeartbeatStartupGraceD(), eff); found {
 		return zombie, true
 	}
 
@@ -2064,7 +2096,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	return ZombieResult{}, false
 }
 
-func detectSubmittedStillRunning(bd *BdCli, workDir, polecatName, sessionName string, t *tmux.Tmux, hb *polecat.SessionHeartbeat, snap *agentBeadSnapshot, staleThreshold time.Duration) (ZombieResult, bool) {
+func detectSubmittedStillRunning(bd *BdCli, workDir, polecatName, sessionName string, t *tmux.Tmux, hb *polecat.SessionHeartbeat, snap *agentBeadSnapshot, staleThreshold time.Duration, eff scanEffects) (ZombieResult, bool) {
 	snapState, snapHook := "", ""
 	if snap != nil {
 		snapState, snapHook = snap.AgentState, snap.HookBead
@@ -2092,7 +2124,7 @@ func detectSubmittedStillRunning(bd *BdCli, workDir, polecatName, sessionName st
 		Action:         fmt.Sprintf("nudged-exit-submitted-session (idle=%v, hook_status=%s)", age.Round(time.Second), hookStatus),
 	}
 	msg := fmt.Sprintf("RECOVERY_NEEDED: gt done appears submitted (hook=%s, cleanup_status=clean), but this session is still running with no fresh heartbeat for %v. If work is already submitted, exit now; otherwise run gt done again.", hookStatusForNudge(snapHook), age.Round(time.Second))
-	if err := t.NudgeSession(sessionName, msg); err != nil {
+	if err := eff.nudgeSession(t, sessionName, msg); err != nil {
 		zombie.Error = err
 		zombie.Action = fmt.Sprintf("nudge-exit-submitted-session-failed: %v", err)
 	}
@@ -2150,7 +2182,7 @@ func hasSuccessfulSubmissionEvidence(snap *agentBeadSnapshot) bool {
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats with dead sessions,
 // restarts them to preserve worktrees and branches.
-func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot, eff scanEffects) (ZombieResult, bool) {
 	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot.
 	snapState, snapHook := "", ""
 	if snap != nil {
@@ -2208,7 +2240,7 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := eff.restartSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
 		}
@@ -2274,7 +2306,7 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	// gt-dsgp: Restart instead of nuking. For dirty state, escalate AND restart.
 	// gt-2gra: Use snapshot's cleanup status instead of calling getCleanupStatus.
 	cleanupStatus := snap.cleanupStatus()
-	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie)
+	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie, eff)
 	return zombie, true
 }
 
@@ -2300,7 +2332,7 @@ func isZombieState(agentState beads.AgentState, hookBead string) bool {
 // wisp ID) ensures exactly one patrol proceeds with the restart.
 //
 // gt-qnp: If Mayor ACP session is active, vetoes automatic cleanup to allow Mayor review.
-func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult) {
+func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult, eff scanEffects) {
 	zombie.CleanupStatus = cleanupStatus
 	skipRestart := false
 
@@ -2311,7 +2343,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	// Instead archive the polecat — its work is done.
 	if merged, err := verifyBranchAlreadyMerged(workDir, rigName, polecatName); err == nil && merged {
 		zombie.Action = "archived-work-already-merged (aa-apw)"
-		if nukeErr := NukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
+		if nukeErr := eff.nukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
 			zombie.Error = fmt.Errorf("archive: %w", nukeErr)
 			zombie.Action = fmt.Sprintf("archive-failed-work-already-merged: %v", nukeErr)
 		}
@@ -2326,7 +2358,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 			zombie.Action = fmt.Sprintf("cleanup-deferred-acp (cleanup_status=%s, existing-wisp=%s)", cleanupStatus, existingWisp)
 			return
 		}
-		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
+		wispID, wispErr := eff.createCleanupWisp(bd, workDir, polecatName, hookBead, "")
 		if wispErr != nil {
 			zombie.Error = wispErr
 		}
@@ -2353,7 +2385,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 		// No existing wisp — create one as the atomic interlock (gt-7vs1).
 		// Previous code checked then created, allowing two concurrent patrols to
 		// both see "no wisp" and create duplicates. Now we create first, then dedup.
-		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
+		wispID, wispErr := eff.createCleanupWisp(bd, workDir, polecatName, hookBead, "")
 		if wispErr != nil {
 			zombie.Error = fmt.Errorf("cleanup wisp: %w", wispErr)
 			zombie.Action = fmt.Sprintf("restarted-dirty (cleanup_status=%s, wisp-failed)", cleanupStatus)
@@ -2370,13 +2402,13 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 			if wispID != allWisps[0] {
 				// Lost the race — close our duplicate and skip restart to avoid
 				// disrupting the session the winning patrol is starting.
-				_, _ = bd.Exec(workDir, "close", wispID, "--reason=duplicate: concurrent patrol race (gt-7vs1)")
+				eff.closeBead(bd, workDir, wispID, "duplicate: concurrent patrol race (gt-7vs1)")
 				zombie.Action = fmt.Sprintf("already-tracked (cleanup_status=%s, existing-wisp=%s, closed-dup=%s)", cleanupStatus, allWisps[0], wispID)
 				skipRestart = true
 			} else {
 				// Won the race — clean up the other patrol's duplicate(s).
 				for _, w := range allWisps[1:] {
-					_, _ = bd.Exec(workDir, "close", w, "--reason=duplicate: concurrent patrol race (gt-7vs1)")
+					eff.closeBead(bd, workDir, w, "duplicate: concurrent patrol race (gt-7vs1)")
 				}
 				zombie.Action = fmt.Sprintf("restarted-dirty (cleanup_status=%s, wisp=%s)", cleanupStatus, wispID)
 			}
@@ -2390,7 +2422,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 
 	// Restart regardless of cleanup state — the worktree is preserved.
-	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+	if err := eff.restartSession(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
 		} else {
@@ -2442,6 +2474,15 @@ type DetectStalledPolecatsResult struct {
 // bypass permissions) without screen-scraping pane content. This avoids coupling
 // to third-party TUI strings that can change with any Claude Code update.
 func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult {
+	return DetectStalledPolecatsWithOptions(workDir, rigName, ScanOptions{})
+}
+
+// DetectStalledPolecatsWithOptions is DetectStalledPolecats with the sweep's
+// permissions made explicit. Under ScanOptions.DryRun a stall is still detected
+// and reported, but the blind key sequence that would dismiss the dialog is not
+// sent (gt-3516).
+func DetectStalledPolecatsWithOptions(workDir, rigName string, opts ScanOptions) *DetectStalledPolecatsResult {
+	eff := opts.effects()
 	result := &DetectStalledPolecatsResult{}
 
 	// Find town root for path resolution and session naming
@@ -2529,7 +2570,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			PolecatName: polecatName,
 			StallType:   "startup-stall",
 		}
-		if err := t.DismissStartupDialogsBlind(sessionName); err != nil {
+		if err := eff.dismissStartupDialogs(t, sessionName); err != nil {
 			stalled.Action = "escalated"
 			stalled.Error = fmt.Errorf("blind dismiss failed: %w", err)
 		} else {
@@ -2584,6 +2625,16 @@ type DiscoverCompletionsResult struct {
 // This implements 'Discover Don't Track' (PRIMING.md principle #4): the witness
 // observes completion state from beads each cycle rather than relying on mail.
 func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router) *DiscoverCompletionsResult {
+	return DiscoverCompletionsWithOptions(bd, workDir, rigName, router, ScanOptions{})
+}
+
+// DiscoverCompletionsWithOptions is DiscoverCompletions with the sweep's
+// permissions made explicit. Under ScanOptions.DryRun the completion metadata is
+// read and routed exactly as it would be, but no cleanup wisp is created, no
+// nudge is sent, and the metadata is left in place for the live run to consume
+// (gt-3516).
+func DiscoverCompletionsWithOptions(bd *BdCli, workDir, rigName string, router *mail.Router, opts ScanOptions) *DiscoverCompletionsResult {
+	eff := opts.effects()
 	result := &DiscoverCompletionsResult{}
 
 	townRoot, err := workspace.Find(workDir)
@@ -2643,12 +2694,12 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 		}
 
 		// Route based on exit type and MR presence
-		processDiscoveredCompletion(bd, workDir, rigName, payload, &discovery)
+		processDiscoveredCompletion(bd, workDir, rigName, payload, &discovery, eff)
 
 		// Clear completion metadata only after successful processing. If cleanup
 		// wisp creation/update failed, leave metadata for the next patrol retry.
 		if discovery.Error == nil {
-			if err := clearCompletionMetadata(bd, workDir, agentBeadID); err != nil {
+			if err := eff.clearCompletionMetadata(bd, workDir, agentBeadID); err != nil {
 				result.Errors = append(result.Errors,
 					fmt.Errorf("clearing completion metadata for %s: %w", polecatName, err))
 			}
@@ -2663,7 +2714,7 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 // processDiscoveredCompletion routes a discovered completion through the same
 // logic as HandlePolecatDone, creating cleanup wisps and sending MERGE_READY
 // as appropriate. This is the bead-based equivalent of POLECAT_DONE mail handling.
-func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *PolecatDonePayload, discovery *CompletionDiscovery) {
+func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *PolecatDonePayload, discovery *CompletionDiscovery, eff scanEffects) {
 	if payload.Exit == string(ExitTypePhaseComplete) {
 		discovery.Action = "phase-complete"
 		return
@@ -2681,7 +2732,7 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 			mayorSession := session.MayorSessionName()
 			t := tmux.NewTmux()
 			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, alarm.MayorMessage)
+				_ = eff.nudgeSession(t, mayorSession, alarm.MayorMessage)
 			}
 		}
 		return
@@ -2708,20 +2759,20 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	}
 
 	if hasMR {
-		wispID, err := createCleanupWisp(bd, workDir, payload.PolecatName, payload.IssueID, payload.Branch)
+		wispID, err := eff.createCleanupWisp(bd, workDir, payload.PolecatName, payload.IssueID, payload.Branch)
 		if err != nil {
 			discovery.Error = fmt.Errorf("creating cleanup wisp: %w", err)
 			return
 		}
 		discovery.WispCreated = wispID
 
-		if err := UpdateCleanupWispState(bd, workDir, wispID, "merge-requested"); err != nil {
+		if err := eff.updateCleanupWispState(bd, workDir, wispID, "merge-requested"); err != nil {
 			discovery.Error = fmt.Errorf("updating wisp state: %w", err)
 		}
 
 		// Nudge refinery to check merge queue (no permanent mail needed).
 		townRoot, _ := workspace.Find(workDir)
-		if nudgeErr := nudgeRefinery(townRoot, rigName); nudgeErr != nil {
+		if nudgeErr := eff.nudgeRefinery(townRoot, rigName); nudgeErr != nil {
 			if discovery.Error == nil {
 				discovery.Error = fmt.Errorf("nudging refinery: %w (non-fatal)", nudgeErr)
 			}
@@ -2730,7 +2781,7 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 		discovery.Action = fmt.Sprintf("merge-ready-nudged (MR=%s, wisp=%s)", payload.MRID, wispID)
 
 		// Notify Mayor that a slot is open even with pending MR — polecat is idle. (GH#2727)
-		notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
+		eff.notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
 		return
 	}
 
@@ -2738,7 +2789,7 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	discovery.Action = fmt.Sprintf("acknowledged-idle (exit=%s)", payload.Exit)
 
 	// Notify Mayor that a slot is open (bead-based discovery path). (GH#2727)
-	notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
+	eff.notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
 }
 
 // agentBeadSnapshot holds all fields from a single bd show --json call for an agent bead.

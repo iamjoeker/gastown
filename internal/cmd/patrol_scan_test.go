@@ -294,7 +294,7 @@ func TestRunPatrolScanPhaseAbandonsHungPhaseWithProgressDisabled(t *testing.T) {
 // that into an all-clear — the reading that gets believed is the wrong one.
 func TestPatrolScanHumanSummaryFlagsIncompleteScan(t *testing.T) {
 	out := captureStdout(t, func() {
-		if err := outputPatrolScanHuman("gastown",
+		if err := outputPatrolScanHuman("gastown", false,
 			&witness.DetectZombiePolecatsResult{}, &witness.DetectStalledPolecatsResult{}, nil,
 			nil, []string{"completion discovery timed out after 3m0s"}); err != nil {
 			t.Fatalf("outputPatrolScanHuman: %v", err)
@@ -313,7 +313,7 @@ func TestPatrolScanHumanSummaryFlagsIncompleteScan(t *testing.T) {
 
 func TestPatrolScanHumanSummaryStillReportsAllClear(t *testing.T) {
 	out := captureStdout(t, func() {
-		if err := outputPatrolScanHuman("gastown",
+		if err := outputPatrolScanHuman("gastown", false,
 			&witness.DetectZombiePolecatsResult{}, &witness.DetectStalledPolecatsResult{},
 			&witness.DiscoverCompletionsResult{}, nil, nil); err != nil {
 			t.Fatalf("outputPatrolScanHuman: %v", err)
