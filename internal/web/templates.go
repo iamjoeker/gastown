@@ -99,7 +99,14 @@ type ConvoyData struct {
 	// reason turns that into a stated one, so the banner never claims "Detached"
 	// on the strength of a tmux it could not reach.
 	MayorUnavailable string
-	Issues           []IssueRow
+	// Issues is the part of the backlog this page renders, highest priority
+	// first — up to issuesDisplayLimit rows.
+	Issues []IssueRow
+	// IssueCount is how large the backlog actually is, which is what the panel
+	// displays as its number. len(Issues) is a page size and cannot be used for
+	// it: pinned to a cap, the number stops falling when work is closed, and
+	// that is the whole of gt-eolg. It is a floor when IssuesWarning is set.
+	IssueCount int
 	// IssuesWarning is the same caveat for the backlog union.
 	IssuesWarning string
 	// IssuesUnavailable is the same "no source answered" reason for the backlog

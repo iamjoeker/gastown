@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"net/http"
@@ -1753,6 +1754,52 @@ func TestConvoyHandler_PartialStoreNotices(t *testing.T) {
 	}
 	if !strings.Contains(body, `1+</span>`) {
 		t.Error("Incomplete Hooks count should render with a '+' suffix")
+	}
+}
+
+// TestConvoyHandler_WorkCountIsTheBacklogNotThePage asserts the Work number is
+// the size of the backlog, not the size of the list under it (gt-eolg). A page
+// that renders a capped slice and counts the slice reports the cap: the number
+// stops falling when work is closed, which is exactly what an operator reads it
+// for.
+func TestConvoyHandler_WorkCountIsTheBacklogNotThePage(t *testing.T) {
+	const backlog = issuesDisplayLimit + 43
+
+	issues := make([]IssueRow, 0, backlog)
+	for i := 0; i < backlog; i++ {
+		issues = append(issues, IssueRow{ID: fmt.Sprintf("gt-%d", i), Title: "work", Priority: 3})
+	}
+
+	mock := &MockConvoyFetcher{Convoys: []ConvoyRow{}, Issues: issues}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := w.Body.String()
+
+	if want := fmt.Sprintf(`<span class="count">%d</span>`, backlog); !strings.Contains(body, want) {
+		t.Errorf("Work count should be the whole backlog: missing %q", want)
+	}
+	if unwanted := fmt.Sprintf(`<span class="count">%d</span>`, issuesDisplayLimit); strings.Contains(body, unwanted) {
+		t.Errorf("Work count rendered the page size %d instead of the backlog %d", issuesDisplayLimit, backlog)
+	}
+	if want := fmt.Sprintf("Showing %d of %d", issuesDisplayLimit, backlog); !strings.Contains(body, want) {
+		t.Errorf("A shortened list must say how much of the backlog it is showing: missing %q", want)
+	}
+	// The rows really are capped — the count being honest is not a licence to
+	// render the whole backlog into the page.
+	if got := strings.Count(body, `class="issue-row`); got != issuesDisplayLimit {
+		t.Errorf("rendered %d issue rows, want %d", got, issuesDisplayLimit)
+	}
+	// A complete union is not a floor, so no "+" and no partial-results notice.
+	if strings.Contains(body, fmt.Sprintf(`<span class="count">%d+</span>`, backlog)) {
+		t.Error("a complete backlog must not render as a floor")
 	}
 }
 

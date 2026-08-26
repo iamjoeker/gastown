@@ -182,6 +182,14 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// issuesDisplayLimit caps how many backlog rows the Work panel renders. It is
+// a page-size, and it is deliberately not the count shown beside the panel:
+// conflating the two is what made the old Work count unable to fall when work
+// was closed (gt-eolg). Rows are sorted highest priority first before the trim,
+// so what a shortened list drops is the least urgent end of the backlog, and
+// the page says how many it dropped.
+const issuesDisplayLimit = 200
+
 // fetchAndRender runs all 14 fetchers in parallel and renders the template.
 // Returns the rendered HTML bytes, or nil on template error.
 func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []byte {
@@ -394,6 +402,16 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		mergeQueueErr:    mergeQueueErr,
 	})
 
+	// The backlog is counted whole and rendered in part. They are separate
+	// numbers on purpose: the panel's count is what an operator judges progress
+	// by, and it has to be able to fall when work is closed, which a count of
+	// the rows that fit on a page cannot do (gt-eolg).
+	allIssues := enrichIssuesWithAssignees(issues.Rows, hooks.Rows)
+	shownIssues := allIssues
+	if len(shownIssues) > issuesDisplayLimit {
+		shownIssues = shownIssues[:issuesDisplayLimit]
+	}
+
 	data := ConvoyData{
 		Convoys: convoys,
 		// A failed query is reported, never rendered as an empty panel: zero
@@ -424,7 +442,8 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		HooksUnavailable:       unionUnavailable(hooksErr, hooks.UnavailableReason()),
 		Mayor:                  mayor,
 		MayorUnavailable:       unavailableMessage(mayorErr),
-		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
+		Issues:                 shownIssues,
+		IssueCount:             len(allIssues),
 		IssuesWarning:          issues.Warning(),
 		IssuesUnavailable:      unionUnavailable(issuesErr, issues.UnavailableReason()),
 		Activity:               activity,

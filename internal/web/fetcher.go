@@ -2041,17 +2041,40 @@ func stripModelSuffix(model string) string {
 	return model
 }
 
-// issuesPerStoreLimit caps how many raw beads each store contributes to the
-// Work panel, per status listed.
+// issuesPerStoreLimit is a SAFETY CAP on the backlog fetch. It is not the size
+// of the panel, and it must stay far above any real store's backlog.
 //
-// The town-root-only query this replaced asked for 50. Keeping 50 PER STORE
-// rather than 50 shared is deliberate: the stores are wildly uneven (521 open
-// beads in the town root against 65 in the gastown rig when measured), so a
-// shared budget would be spent by the town root before a single rig was read
-// and the panel would stay blind. See perStoreLimit.
-const issuesPerStoreLimit = 50
+// It used to be 50 per store, and the number the dashboard showed was the size
+// of that sample presented as the size of the backlog. Measured 2026-08-25, the
+// gastown rig held 59 non-internal open beads against a cap of 50, so it
+// contributed exactly 50 whether it held 51 or 500: closing a bead only slid
+// the next one into the sampled window, and the Work count could not fall until
+// the store dropped below 50. The town root failed the other way — 28 of the 50
+// rows it contributed were gt:message, fetched, counted against the cap and
+// only then hidden, so it displayed 22 of its 186 real work items and NEW MAIL
+// PUSHED WORK OUT OF THE SAMPLE. The displayed number fell as the backlog rose
+// (gt-eolg).
+//
+// A cap this high is affordable because the panel reads six scalar fields and
+// asks bd for nothing else: --brief took the town root's unlimited open query
+// from 2.4MB/0.80s to 414KB/0.09s, the same cost as the 50-row query it
+// replaces. A store that returns this many rows is still recorded in
+// TruncatedStores, which is what keeps the count an explicit floor rather than
+// a wrong number.
+//
+// It is set far above the largest store measured (the town root, 620 open beads
+// including its mail) rather than just above it, because the cost of the fetch
+// scales with the rows a store actually holds and not with the cap: raising it
+// is free until the day it is needed, and the day it is needed is the day the
+// count would otherwise start lying again.
+const issuesPerStoreLimit = 5000
 
-// FetchIssues returns open issues (the backlog) from every store.
+// FetchIssues returns open and hooked issues (the backlog) from every store.
+//
+// Rows is the whole backlog, not a page of it. The caller decides how much of
+// it to render; len(Rows) is the count an operator can act on, and it falls
+// when work is closed. Trimming for display belongs at the render site so the
+// two numbers stay visibly distinct.
 //
 // Issues are per-rig data: measured against this town, the town root held 521
 // open beads while the rigs held 65, 7 and 2 that this panel never showed.
@@ -2074,6 +2097,11 @@ func (f *LiveConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 	// The town root is mostly gt:message rows, so a store can fill its whole
 	// allowance and still show almost nothing — that is a truncated store, and
 	// filtering first would have hidden it.
+	//
+	// This also keeps isInternal the single authority on what counts as work.
+	// Excluding the gt: labels in the bd query would be cheaper, but then the
+	// count and the rows would answer to two different predicates, and any drift
+	// between them would be invisible on the page.
 	result := mapStoreRows(open.merge(hooked), func(b issueBead) (IssueRow, bool) {
 		if b.isInternal() {
 			return IssueRow{}, false
@@ -2101,10 +2129,16 @@ func (f *LiveConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 
 // issueBead is one bead as the backlog panel reads it from bd, before the
 // panel decides whether to display it.
+//
+// Type is tagged issue_type because that is the key `bd list --json` emits;
+// there is no "type" key in its output at all. Tagged "type", the field decoded
+// as "" on every bead ever fetched, which made the type arm of isInternal
+// unreachable — a merge-request bead carrying no gt: label counted as work and
+// nothing showed it.
 type issueBead struct {
 	ID        string   `json:"id"`
 	Title     string   `json:"title"`
-	Type      string   `json:"type"`
+	Type      string   `json:"issue_type"`
 	Priority  int      `json:"priority"`
 	Labels    []string `json:"labels"`
 	CreatedAt string   `json:"created_at"`
@@ -2167,8 +2201,13 @@ func (b issueBead) row() IssueRow {
 // Unlike the query it replaced, a bd failure is an error rather than a silently
 // skipped list: the resolver names the store that could not answer, so a store
 // that broke stops looking like a store that was empty.
+//
+// --brief drops the free-form text (description, design, notes, payload), none
+// of which issueBead reads. It is what makes a backlog-sized limit affordable:
+// on the town root's open beads it is the difference between 2.4MB in 0.80s and
+// 414KB in 0.09s.
 func (f *LiveConvoyFetcher) listIssueBeads(storeDir, status string, limit int) ([]issueBead, error) {
-	stdout, err := f.runBdCmd(storeDir, "list", "--status="+status, "--json", fmt.Sprintf("--limit=%d", limit))
+	stdout, err := f.runBdCmd(storeDir, "list", "--status="+status, "--json", "--brief", fmt.Sprintf("--limit=%d", limit))
 	if err != nil {
 		return nil, fmt.Errorf("listing %s beads: %w", status, err)
 	}

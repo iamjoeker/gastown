@@ -968,7 +968,9 @@
             <div class="panel" id="work-panel">
                 <div class="panel-header">
                     <h2>📋 Work</h2>
-                    <span class="count">{{if .IssuesUnavailable}}?{{else}}{{len .Issues}}{{if .IssuesWarning}}+{{end}}{{end}}</span>
+                    <!-- IssueCount, not len .Issues: the list below is a page of the
+                         backlog and the number is the size of it. -->
+                    <span class="count">{{if .IssuesUnavailable}}?{{else}}{{.IssueCount}}{{if .IssuesWarning}}+{{end}}{{end}}</span>
                     <button class="new-issue-btn" onclick="openIssueModal()">+ New</button>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
@@ -982,7 +984,10 @@
                     {{if .IssuesUnavailable}}
                     <p class="truncation-notice">⚠️ Work backlog unavailable: {{.IssuesUnavailable}}</p>
                     {{else if .IssuesWarning}}
-                    <p class="truncation-notice">⚠️ Work backlog {{.IssuesWarning}} — count is incomplete</p>
+                    <p class="truncation-notice">⚠️ Work backlog {{.IssuesWarning}} — count is a floor</p>
+                    {{end}}
+                    {{if lt (len .Issues) .IssueCount}}
+                    <p class="truncation-notice">Showing {{len .Issues}} of {{.IssueCount}}, highest priority first — the count is the whole backlog</p>
                     {{end}}
                     <!-- Issues List View -->
                     <div id="issues-list">
