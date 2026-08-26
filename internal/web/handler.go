@@ -190,12 +190,31 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // the page says how many it dropped.
 const issuesDisplayLimit = 200
 
-// fetchAndRender runs all 14 fetchers in parallel and renders the template.
+// fetchAndRender collects the dashboard's data and renders the template.
 // Returns the rendered HTML bytes, or nil on template error.
 func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []byte {
 	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
 	defer cancel()
 
+	data := h.collectDashboard(ctx, expandPanel)
+
+	var buf bytes.Buffer
+	if err := h.template.ExecuteTemplate(&buf, "convoy.html", data); err != nil {
+		log.Printf("dashboard: template execution failed: %v", err)
+		return nil
+	}
+
+	return buf.Bytes()
+}
+
+// collectDashboard runs all 14 fetchers in parallel and assembles the page's
+// data, including the banner summary.
+//
+// It is split from the render so the assembled state can be examined as values
+// rather than as HTML. Whether a panel is reporting a problem is decided here,
+// in fields; a test that greps the rendered page for a word can only find the
+// alarms that fired, never establish that a healthy town raised none (gt-skzk.3).
+func (h *ConvoyHandler) collectDashboard(ctx context.Context, expandPanel string) ConvoyData {
 	// Each panel's error is kept, not just logged. A log line is a record for
 	// whoever reads the server's output later; the operator reading the page
 	// sees only the rows, and rows alone cannot say "I could not look"
@@ -466,13 +485,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		CSRFToken:              h.csrfToken,
 	}
 
-	var buf bytes.Buffer
-	if err := h.template.ExecuteTemplate(&buf, "convoy.html", data); err != nil {
-		log.Printf("dashboard: template execution failed: %v", err)
-		return nil
-	}
-
-	return buf.Bytes()
+	return data
 }
 
 // summaryInput is what the banner is computed from: each panel's rows AND
