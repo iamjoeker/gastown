@@ -731,6 +731,87 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 	return m.addLabel(id, "read")
 }
 
+// ReadResult reports which path a read took.
+type ReadResult int
+
+const (
+	// ReadKeptOpen means the message was marked read and left in the work
+	// queue: something is still owed, so only the sender's answer or an
+	// explicit `gt mail archive` closes it.
+	ReadKeptOpen ReadResult = iota
+	// ReadClosed means reading consumed the message and the bead was closed.
+	ReadClosed
+)
+
+// MarkReadConsumed marks a message read, closing it when reading consumes it
+// and leaving it open otherwise. Pass an already-fetched msg to reuse it; nil
+// fetches one.
+//
+// This is the read path the CLI should call. MarkRead (always closes) and
+// MarkReadOnly (never closes) are the two halves it chooses between, and
+// neither is right on its own: MarkRead run over an inbox closes unanswered
+// questions, and MarkReadOnly is why 520 acknowledged messages were still
+// sitting open in the work queue (gt-qffl).
+//
+// Closing needs three things to be true, beyond ConsumedByReading's judgement
+// of the message itself. All three fail closed, which here means falling back
+// to the pre-existing mark-read-only behaviour — never an error, never a
+// message lost:
+//
+//   - Beads mode. Legacy mailboxes have no bead to close.
+//   - This mailbox is the addressee, not a CC. A CC copy is a second view of
+//     ONE bead, so closing it would clear the addressee's obligation on their
+//     behalf; a CC'd reader clears its own copy with DismissCC. Same rule
+//     DeleteWithResult follows.
+//   - The bead is open. The inbox deliberately lists hooked mail (handoff
+//     context is auto-hooked on arrival), and handoff is a type reading
+//     consumes — so without this check, `gt mail mark-read --all` would close
+//     the very bead `gt hook` reads the successor's context out of.
+func (m *Mailbox) MarkReadConsumed(id string, msg *Message) (ReadResult, error) {
+	if m.legacy {
+		return ReadKeptOpen, m.markReadLegacy(id)
+	}
+
+	if msg == nil {
+		fetched, err := m.Get(id)
+		if err != nil {
+			// A message that cannot be read cannot be judged. Marking it read
+			// is what the caller asked for and is not destructive, so let the
+			// mark-read-only path report its own outcome rather than failing
+			// the read over a classification we could not make.
+			return ReadKeptOpen, m.markReadOnlyBeads(id)
+		}
+		msg = fetched
+	}
+
+	if !m.consumesOnRead(msg) {
+		return ReadKeptOpen, m.markReadOnlyBeads(id)
+	}
+
+	// markReadBeads acks delivery and then closes, in that order: the ack is
+	// what records that this identity received it, and it must land before the
+	// bead stops being open.
+	if err := m.markReadBeads(id); err != nil {
+		return ReadKeptOpen, err
+	}
+	return ReadClosed, nil
+}
+
+// consumesOnRead reports whether THIS mailbox reading msg consumes it. See
+// MarkReadConsumed for why each condition is here.
+func (m *Mailbox) consumesOnRead(msg *Message) bool {
+	if msg == nil {
+		return false
+	}
+	if m.IsCCOnly(msg) {
+		return false
+	}
+	if msg.Status != "open" {
+		return false
+	}
+	return ConsumedByReading(msg)
+}
+
 // addLabel adds a label to a message bead, resolving the beads directory from
 // the bead ID prefix and falling back to the home DB for cross-rig IDs.
 //

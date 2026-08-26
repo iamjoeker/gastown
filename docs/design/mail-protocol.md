@@ -271,6 +271,52 @@ Both fail closed: an unset or unrecognised type is never safe to auto-close,
 because an unset type is precisely what a writer that forgot to stamp one
 produces, and those are indistinguishable from real questions.
 
+**Pass a `*Message`, not a type, when deciding to auto-close.**
+`mail.ConsumedByReading(msg)` is the predicate to use — `SafeToCloseOnRead` on
+its own is not enough, for the reason in the next section.
+
+### What reading a message does to it
+
+Reading marks a message read. Whether it also **closes** it — takes it out of
+the recipient's work queue — depends on whether anything is still owed:
+
+| | outcome |
+|---|---|
+| automated traffic with a stamped, reply-free type | closed |
+| everything else | marked read, stays open |
+
+`gt mail read` says which happened; a bulk `gt mail mark-read` reports the split
+("Marked 12 messages as read (7 closed, 5 still owed a reply or an archive)").
+A message left open is cleared by answering it or by `gt mail archive`.
+
+Closing requires **three** things, not one (`mail.ConsumedByReading` plus
+`Mailbox.MarkReadConsumed`):
+
+1. **The type was stamped.** A missing `msg-type` label is not the same as
+   `msg-type:notification`, even though both read back as `notification`
+   through `Message.Type` — use `Message.RawType` when the difference matters.
+2. **The stamped type says a read consumes it** — `notification`, `reply` or
+   `handoff`.
+3. **For `notification`, the subject is automated traffic**: `Convoy complete:`,
+   `SCHEDULER_OPEN`, `MERGED`, `LIFECYCLE:`. `reply` and `handoff` need no such
+   corroboration.
+
+That third condition looks redundant and is not. Until gt-do5c every message
+was typed by a DEFAULT rather than by its sender, so for the beads already on
+the store `notification` means *nobody said*, not *no reply possible* — and
+sampling found real questions among them (gt-ac1l). The subject is a second,
+independent signal that works on mail already written, which no change to the
+send path can.
+
+The reader also has to be entitled to close: a **CC copy** is a second view of
+one bead (clear it with `gt mail archive`, which dismisses just your copy), and
+a **hooked** bead is somebody's `gt hook` context.
+
+**If you are blocked on an answer, send `--type query`.** A question sent under
+the default type is indistinguishable from a "convoy complete", which is how
+the mayor's inbox reached 375 unread with a HIGH escalation unactioned for
+3.7 days.
+
 ### Subject Line
 
 - **Type prefix**: Uppercase, identifies message type

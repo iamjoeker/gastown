@@ -158,11 +158,40 @@ type Message struct {
 	// Read indicates if the message has been read (closed in beads).
 	Read bool `json:"read"`
 
+	// Status is the underlying bead status ("open", "hooked", "pinned",
+	// "closed", ...). Populated on the read path only; empty on a message
+	// being composed.
+	//
+	// Read is not a substitute for it. Read collapses every non-closed status
+	// to "unread", but the inbox deliberately lists hooked mail alongside open
+	// mail (handoff context is auto-hooked), and closing a hooked bead takes it
+	// out from under `gt hook`. Close-on-read needs to tell those apart, and
+	// before this field there was nothing on Message that could (gt-qffl).
+	Status string `json:"status,omitempty"`
+
 	// Priority is the message priority.
 	Priority Priority `json:"priority"`
 
 	// Type indicates the message type (task, escalation, scavenge, notification, reply).
+	//
+	// This is the LENIENT reading: ParseMessageType coerces an absent or
+	// unrecognised msg-type label to TypeNotification so an old bead still
+	// loads. Do not use it to decide whether a message may be auto-closed —
+	// use RawType, which preserves the distinction.
 	Type MessageType `json:"type"`
+
+	// RawType is the msg-type label exactly as stored: "" when the writer
+	// stamped no type at all, and the unrecognised string when it stamped one
+	// this build does not know. Populated on the read path only.
+	//
+	// MessageType.SafeToCloseOnRead promises to fail closed on an unset type,
+	// but that promise was unreachable through Type: ToMessage runs the label
+	// through ParseMessageType first, so "" arrives at the predicate already
+	// rewritten to TypeNotification. Measured on the hq store, every
+	// POLECAT_DIED mail is stamped `msg-type:` with an empty value — and those
+	// carry resling instructions the mayor has to act on. Reading the raw label
+	// is what keeps them out of the auto-close set.
+	RawType string `json:"-"`
 
 	// Delivery specifies how the message is delivered (queue or interrupt).
 	// Queue: agent checks periodically. Interrupt: inject into session.
@@ -505,8 +534,10 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		Body:            bm.Description,
 		Timestamp:       bm.CreatedAt,
 		Read:            bm.Status == "closed" || bm.HasLabel("read"),
+		Status:          bm.Status,
 		Priority:        priority,
 		Type:            msgType,
+		RawType:         bm.msgType,
 		ThreadID:        bm.threadID,
 		ReplyTo:         bm.replyTo,
 		Wisp:            bm.Wisp,

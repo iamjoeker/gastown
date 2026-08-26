@@ -267,10 +267,12 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting message: %w", err)
 	}
 
-	// Mark as read when viewed (adds "read" label, does not close/archive).
-	// Handoff messages are preserved via the hook mechanism, so marking
-	// read here is safe — hooked mail is found via gt hook, not the inbox.
-	if err := mailbox.MarkReadOnly(msgID); err != nil {
+	// Mark as read when viewed. Automated traffic that owes nothing back is
+	// closed here; anything that might still be owed keeps its "read" label and
+	// stays in the work queue (gt-qffl). Reuse the message already fetched
+	// above rather than paying for a second lookup.
+	readResult, err := mailbox.MarkReadConsumed(msgID, msg)
+	if err != nil {
 		// Non-fatal: message was retrieved, just couldn't mark
 		style.PrintWarning("could not mark message as read: %v", err)
 	} else {
@@ -331,6 +333,14 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 
 	if msg.Body != "" {
 		fmt.Printf("\n%s\n", msg.Body)
+	}
+
+	// Say which of the two things happened. "Marked as read" reads identically
+	// whether the bead closed or is still sitting in the work queue, and that
+	// ambiguity is most of why nobody noticed 520 acknowledged messages had
+	// never closed (gt-qffl).
+	if readResult == mail.ReadClosed {
+		fmt.Printf("\n%s\n", style.Dim.Render("(closed — automated notice, nothing owed back)"))
 	}
 
 	// Ack after output (non-fatal).
@@ -713,15 +723,23 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		marked := 0
+		closed := 0
 		for _, msg := range messages {
-			if err := mailbox.MarkReadOnly(msg.ID); err != nil {
+			// Pass the message we already listed: this loop runs over a whole
+			// inbox, and re-fetching each one would turn a bulk mark into N
+			// extra bd subprocesses.
+			result, err := mailbox.MarkReadConsumed(msg.ID, msg)
+			if err != nil {
 				style.PrintWarning("could not mark %s as read: %v", msg.ID, err)
-			} else {
-				marked++
-				clearNudgesForMessage(address, msg.ID, msg.ThreadID)
+				continue
 			}
+			marked++
+			if result == mail.ReadClosed {
+				closed++
+			}
+			clearNudgesForMessage(address, msg.ID, msg.ThreadID)
 		}
-		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		printMarkReadSummary(marked, closed)
 		return nil
 	}
 
@@ -734,14 +752,19 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 
 	// Mark all specified messages as read
 	marked := 0
+	closed := 0
 	var errors []string
 	for _, msgID := range args {
-		if err := mailbox.MarkReadOnly(msgID); err != nil {
+		result, err := mailbox.MarkReadConsumed(msgID, nil)
+		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
-		} else {
-			marked++
-			clearNudgesForMessage(address, msgID, "")
+			continue
 		}
+		marked++
+		if result == mail.ReadClosed {
+			closed++
+		}
+		clearNudgesForMessage(address, msgID, "")
 	}
 
 	// Report results
@@ -754,12 +777,31 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to mark %d messages", len(errors))
 	}
 
+	if len(args) == 1 && closed == 1 {
+		fmt.Printf("%s Message marked as read and closed\n", style.Bold.Render("✓"))
+		return nil
+	}
 	if len(args) == 1 {
 		fmt.Printf("%s Message marked as read\n", style.Bold.Render("✓"))
-	} else {
-		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		return nil
 	}
+	printMarkReadSummary(marked, closed)
 	return nil
+}
+
+// printMarkReadSummary reports a bulk mark-read, naming how many beads closed.
+//
+// The count of closed beads is the whole point of the line. Before gt-qffl this
+// path printed "Marked N messages as read" over an operation that closed
+// nothing, so an inbox could be marked read every day and still grow without
+// bound — 520 messages on the hq store were read, acknowledged, and open.
+func printMarkReadSummary(marked, closed int) {
+	if closed == 0 {
+		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		return
+	}
+	fmt.Printf("%s Marked %d messages as read (%d closed, %d still owed a reply or an archive)\n",
+		style.Bold.Render("✓"), marked, closed, marked-closed)
 }
 
 func runMailMarkUnread(cmd *cobra.Command, args []string) error {
