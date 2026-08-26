@@ -61,6 +61,24 @@ func (s polecatSessionSet) lookup(rigName, polecatName string) (string, bool) {
 	return sessionName, ok
 }
 
+// liveness translates this listing into the tri-state DecideWorkstate consumes.
+//
+// A nil set is the only thing that maps to Unknown, and that is precise rather
+// than cautious: both production callers abort outright when `tmux
+// list-sessions` fails, so a non-nil set is always a real enumeration and an
+// absent polecat is a real absence. Nil reaches here only from a caller that
+// never enumerated at all, and it must not be read as "every polecat is dead" —
+// which is exactly what an empty map would say (gt-9f67).
+func (s polecatSessionSet) presence(rigName, polecatName string) polecat.SessionPresence {
+	if s == nil {
+		return polecat.SessionPresenceUnknown
+	}
+	if _, running := s.lookup(rigName, polecatName); running {
+		return polecat.SessionPresent
+	}
+	return polecat.SessionAbsent
+}
+
 func (s polecatSessionSet) namesForRig(rigName string) []string {
 	if len(s) == 0 {
 		return nil
@@ -217,7 +235,14 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		SessionName:    sessionName,
 	}
 
-	input := polecat.WorkstateInput{State: polecat.StateIdle}
+	input := polecat.WorkstateInput{
+		State: polecat.StateIdle,
+		// This surface already had the session listing — it is where
+		// SessionRunning above comes from — and still classified without it,
+		// because the classifier had no field to put it in. That is how a polecat
+		// with no session read PENDING_MR / leave-alone here (gt-9f67).
+		SessionPresence: sessions.presence(rigName, polecatName),
+	}
 	if fields != nil {
 		item.CleanupStatus = strings.TrimSpace(fields.CleanupStatus)
 		item.ActiveMR = strings.TrimSpace(fields.ActiveMR)

@@ -367,6 +367,96 @@ func TestBuildPolecatInventoryItemHandedOff(t *testing.T) {
 	}
 }
 
+// TestBuildPolecatInventoryItemDeadSessionUnderOpenMR is the gt-9f67
+// regression, and it runs on the SAME fixture as the gt-mkpm test above.
+//
+// That is the point of it. gt-mkpm established that a polecat whose session is
+// gone with its work in the queue must be called "handed-off" and not "stalled",
+// and that is still right — nothing here changes the word. What gt-mkpm did not
+// separate is the two ways a polecat arrives in that shape, because in every
+// bead fact they are identical:
+//
+//	ran gt done   -> hook CLEARED on the way out, open MR is the trace of success
+//	died mid-work -> hook STILL SET, open MR was submitted on its behalf
+//
+// The second is the one gastown/chrome was in, and PENDING_MR / leave-alone told
+// a witness to leave a dead agent alone for as long as its MR was in flight. The
+// submission that produced that MR is itself the standing remedy for a convoy
+// deadlock, so the remedy for one defect was arming the other.
+//
+// The word stays handed-off. The VERDICT stops being leave-alone.
+func TestBuildPolecatInventoryItemDeadSessionUnderOpenMR(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	fields := &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupClean),
+		Branch:        "polecat/chrome/gt-0g5r",
+	}
+	hooked := &beads.Issue{ID: "gt-0g5r", Status: string(beads.IssueStatusHooked), Assignee: "gastown/polecats/chrome"}
+	openIndex := func() *polecatBranchMRIndex {
+		return &polecatBranchMRIndex{
+			openMR:    map[string]string{"polecat/chrome/gt-0g5r": "gt-wisp-1cmci"},
+			submitted: map[string]bool{"polecat/chrome/gt-0g5r": true},
+		}
+	}
+
+	// An enumerated session listing that does not contain this polecat. Both
+	// production callers abort outright when `tmux list-sessions` fails, so a
+	// non-nil set is a real enumeration and this absence is a real absence.
+	dead := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, openIndex())
+
+	if dead.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — the session is gone and the hook is still set: %+v",
+			dead.Disposition.Verdict, dead.Disposition)
+	}
+	if dead.Disposition.Reason != polecat.WorkstateReasonStalledPendingMR {
+		t.Fatalf("reason = %q, want %q", dead.Disposition.Reason, polecat.WorkstateReasonStalledPendingMR)
+	}
+	// The dead session must be NAMED. A verdict that escalates for the right
+	// reason but reports only the hook sends the reader looking for a stuck bead
+	// instead of a dead agent, and every one of the three readings in gt-9f67
+	// omitted the session entirely.
+	if !slices.ContainsFunc(dead.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "session_presence=absent")
+	}) {
+		t.Fatalf("blockers %v must name the dead session", dead.Disposition.Blockers)
+	}
+	// gt-mkpm's requirements are unchanged: the word, and both other blockers.
+	if dead.State != polecat.StateHandedOff {
+		t.Fatalf("state = %q, want %q — its work really is sitting in the queue", dead.State, polecat.StateHandedOff)
+	}
+	for _, want := range []string{"gt-wisp-1cmci", "gt-0g5r"} {
+		if !slices.ContainsFunc(dead.Disposition.Blockers, func(b string) bool {
+			return strings.Contains(b, want)
+		}) {
+			t.Fatalf("blockers %v must still name %s", dead.Disposition.Blockers, want)
+		}
+	}
+
+	// THE CONTROL, and it isolates exactly one field. A nil session set is the
+	// UNMEASURED road — nobody enumerated, so nothing has been shown about
+	// whether this agent is alive. Every other input is byte-identical to the
+	// case above, and the verdict must go back to leave-alone.
+	//
+	// Without this arm the test above would pass just as well if the guard fired
+	// on the hook alone, which would revert gt-mkpm.
+	unmeasured := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, nil, openIndex())
+	if unmeasured.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR — liveness was never measured, so nothing was ruled out: %+v",
+			unmeasured.Disposition.Verdict, unmeasured.Disposition)
+	}
+
+	// Second control: a polecat that DID complete. Same dead session, same open
+	// MR, no hook — which is what `gt done` leaves behind, and what the whole
+	// reuse pool looks like in its steady state. It must stay leave-alone, or
+	// every finished polecat escalates.
+	completed := buildPolecatInventoryItem("gastown", "chrome", fields, nil, polecatSessionSet{}, openIndex())
+	if completed.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR — a cleared hook is what completion looks like: %+v",
+			completed.Disposition.Verdict, completed.Disposition)
+	}
+}
+
 // TestBuildPolecatInventoryItemResolvesRecordedActiveMR is the gt-hx10
 // regression.
 //

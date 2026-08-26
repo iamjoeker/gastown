@@ -2485,7 +2485,14 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		SessionBusy:   m.SessionBusy(name),
 		// Read alongside SessionBusy so the reuse gate and `gt polecat list`
 		// stop reporting a logged-out polecat as working (gt-acb1).
-		SessionLoggedOut:   m.SessionLoggedOut(name),
+		SessionLoggedOut: m.SessionLoggedOut(name),
+		// And whether there is a session at all, for the same reason both of
+		// those exist: they answer "is it doing something", never "is it there".
+		// Nothing in the reuse verdict changes — a polecat holding work is
+		// already not reusable — but the gate now refuses it for the reason that
+		// is true (no session) rather than for the MR that is masking it, so this
+		// surface and check-recovery cannot diverge again (gt-9f67).
+		SessionPresence:    m.SessionPresenceFor(name),
 		ReuseFactsMeasured: true,
 	}
 	agentID := m.agentBeadID(name)
@@ -3109,6 +3116,36 @@ func (m *Manager) SessionLiveness(name string, window time.Duration) tmux.Livene
 		return tmux.LivenessReading{}
 	}
 	return m.tmux.Liveness(sessionName, window)
+}
+
+// SessionPresenceFor reports whether the polecat's tmux session EXISTS. It is a
+// different question from SessionLiveness above, which asks what a session that
+// exists is doing — and every one of that function's four readings requires a
+// session to read.
+//
+// It is also not a third bool alongside SessionBusy and SessionLoggedOut, and
+// that difference is the point. Those two carry positive evidence only: no tmux,
+// no session, and an unreadable pane all return false, so the answer a caller
+// most needs here — "the agent is GONE" — is the one they cannot express.
+// SessionLiveness collapses the same distinction, returning its zero value for
+// both "no session" and "could not read", so it cannot supply this either.
+//
+// This returns SessionAbsent only when HasSession actually ran and said no, and
+// SessionPresenceUnknown when there is no tmux client or the check errored, so a
+// failed probe can never be mistaken for a dead agent (gt-9f67).
+func (m *Manager) SessionPresenceFor(name string) SessionPresence {
+	if m.tmux == nil {
+		return SessionPresenceUnknown
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	running, err := m.tmux.HasSession(sessionName)
+	if err != nil {
+		return SessionPresenceUnknown
+	}
+	if running {
+		return SessionPresent
+	}
+	return SessionAbsent
 }
 
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {

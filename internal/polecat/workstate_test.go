@@ -264,6 +264,13 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			// the list surface in ActiveWorkBlocker, check-recovery in HookBead.
 			// Both must survive into a PENDING_MR verdict, or the two disagree
 			// again about the same polecat — which is the bead's title.
+			//
+			// SessionPresence is deliberately unset here, and that is now what
+			// this case is about as much as the hook is. This is the UNMEASURED
+			// road: nobody ran `tmux has-session`, so nothing has been shown
+			// about whether the agent is alive, and leave-alone — the
+			// non-destructive answer — stays right. The measured-dead variant of
+			// this exact input is the gt-9f67 case below and answers differently.
 			name: "pending mr reports the hook check-recovery gathered",
 			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, HookBead: "gt-0g5r", ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{"active_mr=gt-wisp-1cmci status=open", "has work on hook (gt-0g5r)"}},
@@ -276,6 +283,108 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			name: "handed off still reports work at risk alongside the mr",
 			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open", ActiveWorkBlocker: "assigned_work=gt-0g5r status=hooked", ActiveWorkCountsTowardCapacity: true, PushFailed: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "push-failed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"push_failed=true", "assigned_work=gt-0g5r status=hooked", "active_mr=gt-wisp-1cmci status=open"}},
+		},
+		{
+			// THE gt-9f67 CASE. Byte-for-byte the "pending mr reports the hook"
+			// input above plus one field: `tmux has-session` was actually run and
+			// said the session is gone. That one fact turns the answer from
+			// leave-alone into escalate, which is the whole finding — the verdict
+			// tracked the MR and the hook and never consulted liveness at all.
+			//
+			// gastown/chrome went stalled -> handed-off -> SAFE_TO_NUKE across
+			// three readings with the session dead at every one of them and
+			// nothing about the polecat changing. This is the middle reading, the
+			// one that told a witness to leave a dead polecat alone indefinitely.
+			name: "measured-dead session holding work refuses leave-alone",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, HookBead: "gt-0g5r", ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: WorkstateReasonStalledPendingMR, NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"session_presence=absent (tmux has-session found no session) while work is still attached", "has work on hook (gt-0g5r)", "active_mr=gt-wisp-1cmci status=open"}},
+		},
+		{
+			// The same signature as the list surface records it. The two surfaces
+			// put still-attached work in different fields and a guard that read
+			// only one of them would fix check-recovery and leave `gt polecat
+			// list` saying the opposite about the same polecat (gt-mkpm).
+			name: "measured-dead session holding assigned work refuses leave-alone",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, ActiveWorkBlocker: "assigned_work=gt-0g5r status=hooked", ActiveWorkCountsTowardCapacity: true, ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: WorkstateReasonStalledPendingMR, NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"session_presence=absent (tmux has-session found no session) while work is still attached", "assigned_work=gt-0g5r status=hooked", "active_mr=gt-wisp-1cmci status=open"}},
+		},
+		{
+			// THE ROAD THE LIVE CASE ACTUALLY TOOK, and the one a narrower guard
+			// would have missed entirely.
+			//
+			// gastown/deathclaw: gt-y39t at status HOOKED, assigned to it in the
+			// issue store, session gone, MR gt-wisp-67mp open. Its agent bead's
+			// hook_bead field was EMPTY, so check-recovery fed no hook into the
+			// classifier and reported exactly one blocker — the MR. A guard
+			// reading HookBead and ActiveWorkBlocker alone would have passed its
+			// own tests and changed nothing about the polecat it was written for.
+			//
+			// The bead must be named in the blockers on this road too: it is the
+			// only one carrying an ID here, so without it the verdict says work is
+			// attached and nothing says which work.
+			name: "measured-dead session holding issue-store work refuses leave-alone",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, AssignedWorkBead: "gt-y39t", ActiveMR: "gt-wisp-67mp", ActiveMRBlocker: "active_mr=gt-wisp-67mp status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: WorkstateReasonStalledPendingMR, NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"session_presence=absent (tmux has-session found no session) while work is still attached (issue store holds gt-y39t hooked to this polecat)", "active_mr=gt-wisp-67mp status=open"}},
+		},
+		{
+			// AssignedWorkBead blocks NOTHING on its own. It is consumed by the
+			// dead-session precondition and by nothing else, so a polecat whose
+			// issue store holds work but whose session was never measured keeps
+			// whatever verdict it had. Widening it into a general blocker would
+			// refuse cleanup on surfaces that currently allow it — a much larger
+			// change than this bead asks for, and one nobody has measured.
+			name: "issue-store work alone does not block an unmeasured session",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, AssignedWorkBead: "gt-y39t", Branch: "polecat/deathclaw/gt-y39t"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: ReuseStatusPreserved},
+		},
+		{
+			// THE CONTROL THAT MATTERS MOST, because getting it wrong jams the
+			// whole pool: a dead session is the NORMAL end state of every polecat
+			// that ever succeeded. `gt done` pushes, submits, clears the hook and
+			// exits, so "no session + open MR + no work attached" is what
+			// completion looks like. It must still read PENDING_MR / leave-alone.
+			//
+			// This is also the discriminator, stated as a test: what separates the
+			// case above from this one is not the dead session — both are dead —
+			// but the work still attached to it.
+			name: "measured-dead session with no work attached is still a hand-off",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{"active_mr=gt-wisp-1cmci status=open"}},
+		},
+		{
+			// A live session is not the signature either, and this arm is here so
+			// the guard cannot be satisfied by "not alive" — which is what a bool
+			// would have collapsed Alive, Unknown and Dead into.
+			name: "live session holding work under an open mr is left alone",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionPresent, HookBead: "gt-0g5r", ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: ReuseStatusPROpen, Blockers: []string{"active_mr=gt-wisp-1cmci status=open", "has work on hook (gt-0g5r)"}},
+		},
+		{
+			// The guard adds a blocker; it must never eat one. A polecat can be
+			// dead, hooked, carrying an open MR and carrying push_failed at the
+			// same time, and returning early on the dead session would have
+			// dropped push_failed from the output — replacing one incomplete
+			// picture with another.
+			name: "the dead-session blocker joins the others rather than replacing them",
+			in:   WorkstateInput{State: StateHandedOff, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, HookBead: "gt-0g5r", PushFailed: true, ActiveMR: "gt-wisp-1cmci", ActiveMRBlocker: "active_mr=gt-wisp-1cmci status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: WorkstateReasonStalledPendingMR, NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"session_presence=absent (tmux has-session found no session) while work is still attached", "has work on hook (gt-0g5r)", "push_failed=true", "active_mr=gt-wisp-1cmci status=open"}},
+		},
+		{
+			// No MR, no leave-alone road to guard — so the reason must NOT be the
+			// pending-MR one. A dead idle polecat with a hook already escalates on
+			// hook-still-set, and naming a pending MR that does not exist would be
+			// a confident sentence about nothing.
+			name: "dead session holding work without an mr keeps its own reason",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, HookBead: "gt-0g5r"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "hook-still-set", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: ReuseStatusRecoveryNeeded, Blockers: []string{"has work on hook (gt-0g5r)"}},
+		},
+		{
+			// A dead session with nothing attached and nothing else blocking is
+			// the reuse pool's steady state. If this stopped reading SAFE_TO_NUKE
+			// every finished polecat would hold its slot forever.
+			name: "dead session with nothing attached stays reusable",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, SessionPresence: SessionAbsent, Branch: "polecat/chrome/gt-0g5r"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: ReuseStatusPreserved},
 		},
 	}
 

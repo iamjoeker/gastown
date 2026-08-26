@@ -1192,16 +1192,32 @@ type RecoveryStatus struct {
 	// because the two polecat surfaces disagreed and neither output said what it
 	// had decided from, so a reader could not tell which one to believe
 	// (gt-mkpm).
-	State         polecat.State         `json:"state,omitempty"`
-	CleanupStatus polecat.CleanupStatus `json:"cleanup_status"`
-	NeedsRecovery bool                  `json:"needs_recovery"`
-	Verdict       string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, NEEDS_LOGIN, or SUSPECT_STALL
-	WitnessAction string                `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
-	Reason        string                `json:"reason,omitempty"`
-	Reusable      bool                  `json:"reusable"`
-	SafeToNuke    bool                  `json:"safe_to_nuke"`
-	NeedsMQSubmit bool                  `json:"needs_mq_submit"`
-	NeedsLogin    bool                  `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
+	State polecat.State `json:"state,omitempty"`
+	// SessionPresence is what `tmux has-session` said about this polecat, and it
+	// is reported unconditionally — on every verdict, including the ones it did
+	// not decide.
+	//
+	// It is separate from Liveness below and answers a different question:
+	// Liveness says what a session that EXISTS is doing, and every one of its
+	// readings presupposes there is a pane to read. This says whether there is
+	// one at all.
+	//
+	// Reported because the complaint in gt-9f67 is not only that the wrong
+	// verdict came out; it is that three readings of a polecat with no session
+	// produced three different verdicts and NOT ONE of them mentioned the
+	// session. A reader had no way to notice the omission from the output, and
+	// four of them did not. Whether it is present, absent, or unknown, the answer
+	// now travels with the verdict that was reached in spite of it.
+	SessionPresence polecat.SessionPresence `json:"session_presence,omitempty"`
+	CleanupStatus   polecat.CleanupStatus   `json:"cleanup_status"`
+	NeedsRecovery   bool                    `json:"needs_recovery"`
+	Verdict         string                  `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, NEEDS_LOGIN, or SUSPECT_STALL
+	WitnessAction   string                  `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
+	Reason          string                  `json:"reason,omitempty"`
+	Reusable        bool                    `json:"reusable"`
+	SafeToNuke      bool                    `json:"safe_to_nuke"`
+	NeedsMQSubmit   bool                    `json:"needs_mq_submit"`
+	NeedsLogin      bool                    `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
 
 	// Liveness is what the pane says the agent is DOING — working,
 	// blocking-wait, logged-out, parked, or turn-in-flight — as opposed to what
@@ -1257,6 +1273,13 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		Branch:  p.Branch,
 		Issue:   p.Issue,
 	}
+	// Captured before anything can rewrite status.Issue. mgr.Get answers it by
+	// querying the issue store for hooked beads assigned to this polecat, which
+	// is the strongest "this polecat still holds work" fact available anywhere —
+	// and below, status.Issue can also be FILLED IN from last_source_issue or
+	// from an MR's source, neither of which is held work. Reading the field after
+	// that point would be reading a different question's answer (gt-9f67).
+	heldWorkBead := p.Issue
 	beadTerminal := isAssignedBeadTerminal(bd, status.Issue)
 	workTerminal := beadTerminal
 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
@@ -1271,8 +1294,16 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// keeps its hooked bead and its working lifecycle state, so every fact
 		// gathered below says it is fine. Only the pane says otherwise (gt-acb1).
 		SessionLoggedOut: mgr.SessionLoggedOut(polecatName),
-		CleanupStatus:    polecat.CleanupUnknown,
-		Branch:           p.Branch,
+		// Both reads above are pane scrapes that answer "is this agent doing
+		// something", and both stay silent when the answer is that there is no
+		// agent. That left this command with no fact for the plainest question a
+		// destructive verdict has to answer, and it reached SAFE_TO_NUKE and
+		// PENDING_MR on a polecat whose session was gone at every sample point
+		// without ever asking (gt-9f67). `tmux has-session` is the check that was
+		// right each time the verdict was not.
+		SessionPresence: mgr.SessionPresenceFor(polecatName),
+		CleanupStatus:   polecat.CleanupUnknown,
+		Branch:          p.Branch,
 		// This command exists to gather the git and merge-queue facts (see
 		// loadGitState and applyMQFactsToWorkstateInput below), so its verdict
 		// is a measured one (gt-49dp).
@@ -1432,6 +1463,14 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	status.CleanupStatus = input.CleanupStatus
+	status.SessionPresence = input.SessionPresence
+	// Set once workTerminal is settled: a hooked bead that has since reached a
+	// terminal status is not work anybody still holds, and passing it on would
+	// escalate a polecat whose bead was closed out from under it. This feeds only
+	// the dead-session precondition; it blocks nothing by itself.
+	if !workTerminal {
+		input.AssignedWorkBead = heldWorkBead
+	}
 	if applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr) {
 		openMRProven = true
 	}
@@ -1509,6 +1548,11 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if status.State != "" {
 		fmt.Printf("  State:           %s\n", status.State)
 	}
+	// Printed next to State, and never suppressed. State is a bead-and-queue
+	// derivation — "handed-off" is assigned from an open MR — and this is the
+	// direct measurement it can contradict. Side by side, "handed-off" over
+	// "absent" is legible as the conflict it is (gt-9f67).
+	fmt.Printf("  Session:         %s\n", recoverySessionPresenceLabel(status.SessionPresence))
 	fmt.Printf("  Cleanup Status:  %s\n", status.CleanupStatus)
 	if status.Branch != "" {
 		fmt.Printf("  Branch:          %s\n", status.Branch)
@@ -1676,6 +1720,23 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// recoverySessionPresenceLabel renders the liveness measurement for a human,
+// including the case where there was none.
+//
+// "unknown" is spelled out rather than left blank on purpose: a blank field
+// reads as "fine, nothing to report", and the whole finding in gt-9f67 is that a
+// missing liveness answer was invisible to four readers in a row.
+func recoverySessionPresenceLabel(l polecat.SessionPresence) string {
+	switch l {
+	case polecat.SessionPresent:
+		return "present (tmux has-session)"
+	case polecat.SessionAbsent:
+		return "absent (tmux has-session found no session)"
+	default:
+		return "unknown (tmux has-session did not run or could not answer)"
+	}
 }
 
 func orUnknownRecoveryField(s string) string {

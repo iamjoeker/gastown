@@ -115,6 +115,55 @@ const (
 	// apart from a snap judgement, and a snap judgement on this signal is wrong
 	// most of the time (gt-y39t).
 	WorkstateReasonSessionSuspectStall = "session-suspect-stall"
+
+	// WorkstateReasonStalledPendingMR means `tmux has-session` returned NO
+	// SESSION for a polecat that is still holding work, while a merge request
+	// for its branch is open. The MR is real; the hand-off it implies is not.
+	//
+	// It is its own reason because the two roads into a pending MR look
+	// identical in every bead fact and mean opposite things. A polecat that ran
+	// `gt done` clears its hook on the way out, so the open MR is the last trace
+	// of a session that ENDED IN COMPLETION — leave-alone is right. A polecat
+	// that DIED still holds its hook, and an MR submitted on its behalf (the
+	// standing remedy for a convoy deadlock) produces the same open MR over a
+	// session that ended in death — leave-alone is wrong, and it is wrong for as
+	// long as the MR is in flight, which is exactly the window a witness is most
+	// likely to be looking in (gt-9f67).
+	WorkstateReasonStalledPendingMR = "stalled-session-pending-mr"
+)
+
+// SessionPresence is what a direct `tmux has-session` on the polecat's session
+// returned: does a session EXIST at all.
+//
+// It is deliberately named apart from SessionLiveness, which asks what a
+// session that exists is DOING (working, blocking-wait, logged-out, parked).
+// Every one of those readings presupposes a pane to read, and that function
+// returns its zero value for both "no session" and "could not read the pane".
+// The two questions had one word between them, and one of them had no field.
+//
+// It is a TRI-STATE on purpose. The other session inputs here (SessionBusy,
+// SessionLoggedOut, SessionSuspectStall) are bools carrying positive evidence
+// only, so "no session", "nobody asked" and "tmux errored" all arrive as false
+// and are indistinguishable — which is fine for those, whose whole contract is
+// "believe me only when I say yes", and fatal for this one, whose entire value
+// is in the NEGATIVE answer. A bool would make an absent session look exactly
+// like an unmeasured one, which is the shape of the defect this field fixes.
+//
+// Only SessionAbsent decides anything below. Unknown never does: a surface that
+// did not look, or looked and could not tell, must not have its silence read as
+// proof the agent is gone.
+type SessionPresence string
+
+const (
+	// SessionPresenceUnknown is the zero value: nobody ran the check, or the
+	// check itself failed. It is not evidence in either direction.
+	SessionPresenceUnknown SessionPresence = ""
+
+	// SessionPresent means the session exists right now.
+	SessionPresent SessionPresence = "present"
+
+	// SessionAbsent means the check RAN and the session does not exist.
+	SessionAbsent SessionPresence = "absent"
 )
 
 // Reuse-status strings — the vocabulary `gt polecat list` prints as
@@ -154,6 +203,38 @@ const (
 	ReuseStatusClean     = "idle-clean"
 )
 
+// sessionAbsentHoldingWork reports the gt-9f67 signature: `tmux has-session`
+// RAN and found no session, and the polecat is nonetheless still holding work.
+//
+// Both halves are required, and each is doing a distinct job.
+//
+// Absent-and-measured, because Unknown is the answer a caller gets when it never
+// looked or when tmux itself failed, and treating either as "the agent is gone"
+// would route healthy polecats to escalation on no evidence — the same defect
+// this fixes, pointed the other way.
+//
+// Still-holding-work, because a dead session on its own is the NORMAL end state
+// of every polecat that ever finished. `gt done` pushes, submits, and exits, so
+// "no session + open MR + no hook" is what success looks like and must keep
+// reading PENDING_MR. What does not happen on that road is the hook surviving:
+// gt done clears it. A hook (or an assigned work bead) still attached to a
+// polecat with no session is the polecat's own record that it never got to the
+// end of its own completion sequence.
+//
+// The callers carry that work in THREE different fields — `gt polecat list` in
+// ActiveWorkBlocker, check-recovery in HookBead, and the issue store's own
+// hooked-bead lookup in AssignedWorkBead — so all three are checked. Reading
+// fewer is not a smaller version of this fix, it is a fix that does not fire:
+// the polecat this was measured on (gastown/deathclaw, gt-y39t hooked, session
+// gone) had only the third one set.
+func sessionAbsentHoldingWork(in WorkstateInput) bool {
+	if in.SessionPresence != SessionAbsent {
+		return false
+	}
+	holdsHook := in.HookBead != "" && !in.PartialSpawnWithoutDurableHook
+	return holdsHook || in.ActiveWorkBlocker != "" || in.AssignedWorkBead != ""
+}
+
 // DispositionUnmeasured reports whether this disposition was reached WITHOUT the
 // facts that would settle it, as opposed to by finding something. Both roads
 // present as a blocking verdict, and a reader cannot tell them apart from the
@@ -169,6 +250,7 @@ type WorkstateInput struct {
 	State            State
 	SessionBusy      bool
 	SessionLoggedOut bool
+	SessionPresence  SessionPresence
 
 	// SessionSuspectStall is the two-sample pane measurement described at
 	// WorkstateVerdictSuspectStall: the agent's clock climbed while its token
@@ -209,6 +291,27 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
+
+	// AssignedWorkBead is the ISSUE STORE's answer to "what hooked, non-terminal
+	// work does this polecat hold" — the bead found by querying for hooked issues
+	// assigned to it, not a field copied off its agent bead.
+	//
+	// It exists because the two are not the same fact and can disagree, and the
+	// disagreement is silent. gastown/deathclaw held gt-y39t at status HOOKED,
+	// assigned to gastown/polecats/deathclaw, with its session gone — and
+	// check-recovery reported one blocker, the open MR, because the only hook
+	// surface it fed into this classifier was the agent bead's hook_bead field,
+	// which was empty. The lifecycle detection HAD read the issue store (that is
+	// where its "stalled" came from, and the whole reason an MR could promote it
+	// to "handed-off"), and then the answer went nowhere (gt-9f67).
+	//
+	// It is consumed by exactly one predicate — sessionAbsentHoldingWork — and
+	// deliberately blocks nothing on its own. A polecat holding hooked work with
+	// a LIVE session is a working polecat, which the State road already handles;
+	// promoting this to a general blocker would refuse cleanup on a surface that
+	// currently allows it, which is a much larger change than the one this bead
+	// asks for.
+	AssignedWorkBead string
 
 	// PausedAgentState is the agent bead's agent_state when that state is a
 	// deliberate pause (beads.AgentState.IsPaused: stuck, awaiting-gate, paused,
@@ -300,7 +403,7 @@ type WorkstateDisposition struct {
 // that one display string is a projection over thirteen of them and the
 // projection hides which one is set. Two rigs reached it by different roads and
 // a fix validated on one looked like a fix for both (gt-uapr). This function is
-// the only producer of the string — grep it and you will find these four sites,
+// the only producer of the string — grep it and you will find these five sites,
 // no more:
 //
 //	(a) the general blocker tail, when at least one of these blocked and the
@@ -317,6 +420,8 @@ type WorkstateDisposition struct {
 //	(b) mq-lookup-failed          MQCheckRequired && MQLookupFailed
 //	(c) mq-not-submitted          MQCheckRequired, submittable work, no MR
 //	(d) mq-refused-closed-source  MRRefused && !MRSubmitted, unresolved
+//	(e) stalled-session-pending-mr  an open MR over a MEASURED-absent session that
+//	    is still holding work — see sessionAbsentHoldingWork
 //
 // PausedAgentState is deliberately NOT on that list: it produces
 // "idle-state-paused" / NEEDS_STATE_CLEAR, and folding it in here is what sent a
@@ -415,7 +520,53 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
-	if in.ActiveMRBlocker != "" && !in.PushFailed && !in.MRFailed && (in.State == StateDone || in.State == StateHandedOff) {
+	// Liveness is a PRECONDITION of the leave-alone verdict below, not another
+	// fact weighed against it.
+	//
+	// Everything from here down is bead-derived and queue-derived, and an open
+	// merge request is the strongest of those facts: it promotes a detected
+	// "stalled" to "handed-off" and takes the whole road to PENDING_MR /
+	// leave-alone. That promotion's only evidence is the MR. It never asks
+	// whether the polecat is alive — and gastown/chrome oscillated
+	// stalled -> handed-off -> SAFE_TO_NUKE across three readings in which
+	// NOTHING ABOUT THE POLECAT CHANGED. `tmux has-session` said DEAD at all
+	// three (control: a live polecat, which the same probe called ALIVE), while
+	// the verdict tracked the MR and the hook (gt-9f67).
+	//
+	// The signature is narrow on purpose, because the rule it guards is a GOOD
+	// rule: restarting a polecat whose work is sitting in the queue is exactly
+	// the wrong move, and PENDING_MR prevents it. So this does not weaken it. It
+	// requires the one thing "handed off" claims and an MR cannot show — that
+	// the session ended in COMPLETION. A polecat that ran `gt done` clears its
+	// hook on the way out, so it reaches PENDING_MR here unchanged. A polecat
+	// still HOLDING WORK with NO SESSION did not complete; it died, and the MR
+	// belongs to whoever submitted on its behalf.
+	//
+	// That remedy is the one this most matters for. Submitting for a dead
+	// polecat is the standing fix for a convoy deadlock and should continue —
+	// but until now it blinded the witness to that polecat for as long as the MR
+	// was in flight, so the remedy for one defect triggered the other.
+	//
+	// ESCALATE, not restart and not leave-alone: the work is in the queue, so
+	// there is nothing to restart into, and the session is gone, so there is
+	// nobody to leave alone.
+	//
+	// It is computed here and consumed in two places — the leave-alone arm
+	// immediately below and the general blocker tail — rather than returning a
+	// verdict of its own, because returning here would DROP every other blocker
+	// the caller gathered. A polecat can be dead, holding a hook, carrying an
+	// open MR and carrying push_failed all at once; the reader needs all four.
+	// So this suppresses leave-alone and adds one blocker; it never replaces the
+	// others.
+	//
+	// An open MR is part of the signature, not incidental to it. Without one
+	// there is no leave-alone road to guard — a dead session holding work is
+	// StateStalled and already escalates — and a reason named
+	// "stalled-session-pending-mr" over a polecat with no pending MR would be a
+	// confident sentence about a thing that is not there.
+	stalledUnderPendingMR := in.ActiveMRBlocker != "" && sessionAbsentHoldingWork(in)
+
+	if in.ActiveMRBlocker != "" && !in.PushFailed && !in.MRFailed && !stalledUnderPendingMR && (in.State == StateDone || in.State == StateHandedOff) {
 		d := WorkstateDisposition{
 			Verdict:     WorkstateVerdictPendingMR,
 			Reason:      "active-mr-open",
@@ -488,6 +639,28 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		capacityBlocked = capacityBlocked || countsTowardCapacity
 	}
 
+	// FIRST, ahead of the hook it always accompanies, because block() takes the
+	// reason from whoever calls it first and this is the one that names the
+	// finding. "hook-still-set" is true of a healthy in-flight polecat too; the
+	// dead session is what makes this one a stall, and it is the fact a reader
+	// has to see to know a restart is not the remedy (gt-9f67).
+	//
+	// It also breaks the mrOnly test below by construction — two blockers, not
+	// one — which is the second road to PENDING_MR and had to be closed with the
+	// first, or the leave-alone verdict simply reappears a few lines further
+	// down.
+	if stalledUnderPendingMR {
+		blocker := "session_presence=absent (tmux has-session found no session) while work is still attached"
+		// Named here only when nothing else will name it. The hook and the
+		// active-work blockers below both carry a bead ID; AssignedWorkBead does
+		// not block on its own, so on the road where it is the ONLY evidence the
+		// reader would otherwise get a verdict about attached work with nothing
+		// saying WHICH work.
+		if in.HookBead == "" && in.ActiveWorkBlocker == "" && in.AssignedWorkBead != "" {
+			blocker += " (issue store holds " + in.AssignedWorkBead + " hooked to this polecat)"
+		}
+		block(WorkstateReasonStalledPendingMR, blocker, true)
+	}
 	if in.HookBead != "" && !in.PartialSpawnWithoutDurableHook {
 		block("hook-still-set", "has work on hook ("+in.HookBead+")", true)
 	}
