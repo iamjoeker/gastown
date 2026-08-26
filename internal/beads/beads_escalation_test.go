@@ -1597,3 +1597,184 @@ func TestParseEscalationFields_ExplicitEscalatedByWinsOverFrom(t *testing.T) {
 		})
 	}
 }
+
+// --- The stranded-copy reconcile (gt-w0z8) -----------------------------------
+//
+// gt-qee3 fixed the pinned exclusion on the escalation LIST query and left it in
+// place on the COPIES query, which is what every reconcile path walks. So the
+// list learned to name its stranded copies and print a reconcile command, and
+// that command could not clear any of them: it resolved the copy to its record,
+// found the record already closed (which is what "stranded" MEANS), listed zero
+// copies because the copy was pinned, wrote to nothing, and printed a checkmark.
+//
+// Measured on hq 2026-08-26 against the real stranded copy hq-9mxa7:
+//
+//	bd list --label=escalation:hq-wisp-51nirc --status=open              -> []
+//	bd list --label=escalation:hq-wisp-51nirc --status=open --pinned     -> hq-9mxa7
+//	bd list --label=escalation:hq-wisp-51nirc --status=open --no-pinned  -> 0
+//
+// The remedy was unreachable for the entire population it was offered to.
+
+// The pinned half of the copies query, isolated: the close is issued by the
+// RECORD's ID, so the named-bead path below cannot rescue it and only the query
+// can find the copy.
+func TestCloseEscalation_ClosesPinnedStrandedCopy(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed" // stranded is closed-record-by-definition
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(pinnedCopy)
+	// The copy answers ONLY the --pinned half, exactly as hq-9mxa7 does.
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "reconciled")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]: a pinned copy is still a copy", result.CopyIDs)
+	}
+	if !stub.hasWrite("close", "hq-c1") {
+		t.Errorf("pinned stranded copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if !result.Changed() {
+		t.Error("Changed() = false after closing a copy")
+	}
+}
+
+// The named-bead path, isolated: the copies query returns nothing at all in
+// BOTH halves, and closing by the copy's own ID must still close that copy.
+// This is the guarantee the printed reconcile command rests on — it names a
+// copy ID, so that copy is closed by construction rather than by whatever the
+// label query happens to be able to see.
+func TestCloseEscalation_ClosesTheNamedCopyWhenTheQueryMissesIt(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed"
+	strandedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(strandedCopy)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, nil) // blind query
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-c1", "mayor/", "reconciled")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]: the bead the operator named must be closed", result.CopyIDs)
+	}
+	if !stub.hasWrite("close", "hq-c1") {
+		t.Errorf("named copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// The result must name the ID the caller passed, not the record it resolved to.
+// The tell was on screen the whole time — "✓ Escalation closed: hq-wisp-51nirc"
+// after typing hq-9mxa7 — and only a reader who noticed the ID had changed
+// could have caught it.
+func TestCloseEscalation_ResultNamesTheRequestedID(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-c1", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if result.RequestedID != "hq-c1" {
+		t.Errorf("RequestedID = %q, want hq-c1", result.RequestedID)
+	}
+	if result.RecordID != "hq-wisp-r1" {
+		t.Errorf("RecordID = %q, want hq-wisp-r1", result.RecordID)
+	}
+	if !result.RecordClosed {
+		t.Error("RecordClosed = false, but the record was open and was closed by this call")
+	}
+}
+
+// A close that wrote to nothing must report that it wrote to nothing. Without a
+// negative case the success line is unfalsifiable: it was printed for two real
+// reconciles that cleared nothing, and the operator saw two green checkmarks.
+func TestCloseEscalation_ReportsANoOpAsANoOp(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed"
+	stub.bead(record)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, nil)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if result.Changed() {
+		t.Errorf("Changed() = true, but nothing was closed: %#v", result)
+	}
+	// Control: the same assertion must go the other way when there IS work.
+	// A Changed() that is always false would pass the check above.
+	if stub.hasWrite("close", "hq-wisp-r1") {
+		t.Errorf("an already-closed record must not be closed again; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// Ack and re-escalation walk the same copies query, so the pinned blindness was
+// never confined to close: an ack of a pinned escalation labelled the record and
+// left the bead the queue renders unmarked.
+func TestAckEscalation_LabelsPinnedCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(pinnedCopy)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	if err := b.AckEscalation("hq-wisp-r1", "mayor/"); err != nil {
+		t.Fatalf("AckEscalation: %v", err)
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=acked") {
+		t.Errorf("pinned copy was not marked acked; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+func TestReescalateEscalation_UpdatesPinnedCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(pinnedCopy)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	if _, err := b.ReescalateEscalation("hq-wisp-r1", "gastown/witness", 0); err != nil {
+		t.Fatalf("ReescalateEscalation: %v", err)
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=severity:critical") {
+		t.Errorf("pinned copy kept the old severity; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// A record that has been reaped is reachable only through its copies, so the
+// pinned blindness also decided whether the close could resolve the ID at all.
+func TestCloseEscalation_ResolvesReapedRecordThroughAPinnedCopy(t *testing.T) {
+	stub := newEscalationStub(t)
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-gone", "mayor/")
+	stub.bead(pinnedCopy) // no fixture for hq-wisp-gone: bd show returns []
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-gone", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-gone", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation by a reaped record ID with only a pinned copy: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
+	}
+}

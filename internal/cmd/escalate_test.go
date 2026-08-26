@@ -950,3 +950,84 @@ func TestPrintStrandedEscalations_SilentWhenNothingHidden(t *testing.T) {
 		t.Errorf("no hidden beads must print nothing, got: %q", buf.String())
 	}
 }
+
+// --- What a close reports it did (gt-w0z8) -----------------------------------
+//
+// The report used to be derived from an ID the close RESOLVED rather than from
+// a bead it WROTE TO, so it printed a checkmark for a reconcile that cleared
+// nothing — twice, in front of an operator who only caught it by re-reading the
+// state afterwards. And the ID on that checkmark was the record's, not the one
+// they typed.
+
+func TestPrintEscalateCloseReport_NamesTheIDThatWasPassed(t *testing.T) {
+	var buf strings.Builder
+	printEscalateCloseReport(&buf, &beads.EscalationCloseResult{
+		RequestedID: "hq-9mxa7",
+		RecordID:    "hq-wisp-51nirc",
+		CopyIDs:     []string{"hq-9mxa7"},
+	}, "reconciled")
+	got := buf.String()
+
+	// The operator typed hq-9mxa7. The first line must be about hq-9mxa7.
+	firstLine := strings.SplitN(got, "\n", 2)[0]
+	if !strings.Contains(firstLine, "hq-9mxa7") {
+		t.Errorf("success line must name the id that was passed, got: %q", firstLine)
+	}
+	if strings.Contains(firstLine, "hq-wisp-51nirc") {
+		t.Errorf("success line must not lead with the resolved record id, got: %q", firstLine)
+	}
+	// The record is still worth naming — just not as the thing that was closed.
+	if !strings.Contains(got, "hq-wisp-51nirc") {
+		t.Errorf("report should still disclose the escalation record, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Cleared from queue: hq-9mxa7") {
+		t.Errorf("report must name the copies it cleared, got:\n%s", got)
+	}
+}
+
+// The load-bearing negative: nothing closed, no checkmark. Every stranded copy
+// has a closed record by definition, so this is the exact shape the reconcile
+// produced for the whole population it was offered to.
+func TestPrintEscalateCloseReport_NoCheckmarkWhenNothingClosed(t *testing.T) {
+	var buf strings.Builder
+	printEscalateCloseReport(&buf, &beads.EscalationCloseResult{
+		RequestedID: "hq-9mxa7",
+		RecordID:    "hq-wisp-51nirc",
+	}, "reconciled")
+	got := buf.String()
+
+	if strings.Contains(got, "✓") {
+		t.Errorf("a close that closed nothing must not print a checkmark, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Nothing to close") {
+		t.Errorf("a no-op must say so, got:\n%s", got)
+	}
+	if !strings.Contains(got, "hq-9mxa7") {
+		t.Errorf("the no-op report must still name the id that was passed, got:\n%s", got)
+	}
+}
+
+// Control for the two above: a real close of a record by its own ID still
+// reports success, so "no checkmark" is a property of doing nothing rather than
+// of the report having lost the ability to print one.
+func TestPrintEscalateCloseReport_StillReportsARealClose(t *testing.T) {
+	var buf strings.Builder
+	printEscalateCloseReport(&buf, &beads.EscalationCloseResult{
+		RequestedID:  "hq-wisp-51nirc",
+		RecordID:     "hq-wisp-51nirc",
+		RecordClosed: true,
+		CopyIDs:      []string{"hq-9mxa7"},
+	}, "dolt restarted")
+	got := buf.String()
+
+	if !strings.Contains(got, "✓") {
+		t.Errorf("a close that closed both halves must report success, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Reason: dolt restarted") {
+		t.Errorf("report must carry the resolution, got:\n%s", got)
+	}
+	// Requested == record here, so the record line would be pure noise.
+	if strings.Contains(got, "Escalation record:") {
+		t.Errorf("record line is redundant when it is the id that was passed, got:\n%s", got)
+	}
+}

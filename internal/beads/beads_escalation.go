@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -414,20 +415,29 @@ func (b *Beads) resolveEscalation(id string) (named, record *Issue, recordID str
 }
 
 // openEscalationCopies returns the open delivered copies of an escalation record.
+//
+// This is the query every reconciliation path walks — ack, close and
+// re-escalation all act on exactly the beads it returns — so a copy it cannot
+// see is a copy those commands silently decline to touch while reporting
+// success. It must therefore ask for the pinned half too, for the reason
+// listOpenEscalationIssues spells out: `bd list --status=open` is silently
+// `--no-pinned`.
+//
+// A stranded copy is disproportionately likely to be pinned, which is what made
+// this blindness total rather than partial (gt-w0z8). Pinning is what an
+// operator does to an escalation to keep it in view, and "record closed, copy
+// open" is precisely the state a half-applied close leaves behind — so the
+// population the reconcile command exists for is the population it could not
+// see. Measured on hq 2026-08-26 against the stranded copy hq-9mxa7:
+// `bd list --label=escalation:hq-wisp-51nirc --status=open` returned [], the
+// same query with `--pinned` returned hq-9mxa7, and `--no-pinned` returned 0.
+// So `gt escalate close hq-9mxa7` found no copies, closed nothing, and printed
+// a green checkmark.
 func (b *Beads) openEscalationCopies(recordID string) ([]*Issue, error) {
 	if recordID == "" {
 		return nil, nil
 	}
-	out, err := b.run("list", "--label="+EscalationLinkLabelPrefix+recordID, "--status=open", "--json")
-	if err != nil {
-		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
-	}
-	return issues, nil
+	return b.listOpenIssuesIncludingPinned("--label=" + EscalationLinkLabelPrefix + recordID)
 }
 
 // AckEscalation acknowledges an escalation bead.
@@ -483,8 +493,21 @@ func (b *Beads) AckEscalation(id, ackedBy string) error {
 
 // EscalationCloseResult reports every bead a CloseEscalation touched.
 type EscalationCloseResult struct {
-	RecordID string   // the escalation record (an ephemeral wisp, normally)
-	CopyIDs  []string // delivered mail copies closed alongside it
+	RequestedID  string   // the ID the caller passed, which is not always RecordID
+	RecordID     string   // the escalation record (an ephemeral wisp, normally)
+	RecordClosed bool     // this call closed the record (false: already closed, or reaped)
+	CopyIDs      []string // delivered mail copies closed alongside it
+}
+
+// Changed reports whether this close actually closed anything.
+//
+// A close of an escalation whose record is already closed and whose copies are
+// all closed is a no-op, and a no-op that prints a success banner is worse than
+// a failure: the operator has no signal at all. The stranded population is
+// closed-record-by-definition, so without this the reconcile command's success
+// line was unfalsifiable for the entire population it was offered to (gt-w0z8).
+func (r *EscalationCloseResult) Changed() bool {
+	return r != nil && (r.RecordClosed || len(r.CopyIDs) > 0)
 }
 
 // CloseEscalation closes an escalation with a resolution reason.
@@ -497,22 +520,29 @@ type EscalationCloseResult struct {
 // Closing an escalation whose record is already closed is not an error: it
 // reconciles the copies that an earlier record-only close left stranded.
 func (b *Beads) CloseEscalation(id, closedBy, reason string) (*EscalationCloseResult, error) {
-	_, record, recordID, err := b.resolveEscalation(id)
+	named, record, recordID, err := b.resolveEscalation(id)
 	if err != nil {
 		return nil, err
 	}
 
-	result := &EscalationCloseResult{RecordID: recordID}
+	result := &EscalationCloseResult{RequestedID: id, RecordID: recordID}
 	if record != nil {
-		if err := b.closeEscalationRecord(record, closedBy, reason); err != nil {
+		closed, err := b.closeEscalationRecord(record, closedBy, reason)
+		if err != nil {
 			return nil, fmt.Errorf("closing escalation record %s: %w", record.ID, err)
 		}
+		result.RecordClosed = closed
 	}
 
-	copies, err := b.openEscalationCopies(recordID)
-	if err != nil {
-		return result, fmt.Errorf("escalation record %s closed, but its delivered copies could not be listed and may stay in the queue: %w", recordID, err)
-	}
+	copies, listErr := b.openEscalationCopies(recordID)
+	// The bead the operator NAMED is closed whether or not the label query
+	// returned it. The query is the thing that was blind here, and a close that
+	// depends entirely on it can fail exactly the way it did — quietly, and only
+	// for the copies anyone would bother naming (gt-w0z8). Adding the named bead
+	// directly means `gt escalate close <copy-id>` closes that copy by
+	// construction, so the reconcile the list prints cannot become a no-op again
+	// through some later property of the query.
+	copies = withNamedCopy(copies, named, record)
 
 	var failures []string
 	for _, copied := range copies {
@@ -525,20 +555,44 @@ func (b *Beads) CloseEscalation(id, closedBy, reason string) (*EscalationCloseRe
 		}
 		result.CopyIDs = append(result.CopyIDs, copied.ID)
 	}
+
+	if listErr != nil {
+		msg := fmt.Sprintf("escalation %s: its delivered copies could not be listed, so some may stay in the queue: %v", recordID, listErr)
+		if len(failures) > 0 {
+			msg += "; additionally " + strings.Join(failures, "; ")
+		}
+		return result, errors.New(msg)
+	}
 	if len(failures) > 0 {
-		return result, fmt.Errorf("escalation record %s closed, but %s and will stay in the queue: %s",
+		return result, fmt.Errorf("escalation %s: %s and will stay in the queue: %s",
 			recordID, pluralCopies(len(failures), "could not be closed"), strings.Join(failures, "; "))
 	}
 
 	return result, nil
 }
 
+// withNamedCopy adds the bead the caller named to the set of copies to close,
+// unless it is the record, is already closed, or the list already has it.
+func withNamedCopy(copies []*Issue, named, record *Issue) []*Issue {
+	if named == nil || strings.EqualFold(named.Status, "closed") {
+		return copies
+	}
+	if record != nil && named.ID == record.ID {
+		return copies
+	}
+	if slices.ContainsFunc(copies, func(issue *Issue) bool { return issue != nil && issue.ID == named.ID }) {
+		return copies
+	}
+	return append(copies, named)
+}
+
 // closeEscalationRecord writes the resolution onto the escalation record and
 // closes it. A record that is already closed is left alone so the caller can
-// still reconcile its copies.
-func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) error {
+// still reconcile its copies; the bool reports whether this call closed it, so
+// the caller can tell a reconcile from a no-op.
+func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) (bool, error) {
 	if strings.EqualFold(issue.Status, "closed") {
-		return nil
+		return false, nil
 	}
 
 	// Parse existing fields
@@ -556,7 +610,7 @@ func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) err
 		Description: &description,
 		AddLabels:   []string{"resolved"},
 	}); err != nil {
-		return err
+		return false, err
 	}
 
 	// Close the issue. --force because escalation records are routinely pinned
@@ -565,8 +619,10 @@ func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) err
 	// not deletion, and a pinned+closed row is still purge-protected. Without
 	// this, protecting escalations made every escalation in the town
 	// un-closeable through the command that exists to close them.
-	_, err := target.run("close", issue.ID, "--force", "--reason="+reason)
-	return scrubForceAdvice(err)
+	if _, err := target.run("close", issue.ID, "--force", "--reason="+reason); err != nil {
+		return false, scrubForceAdvice(err)
+	}
+	return true, nil
 }
 
 // closeEscalationCopy closes one delivered escalation mail bead.
@@ -693,7 +749,23 @@ func (b *Beads) ListEscalationsWithStranded() (open, stranded []*Issue, err erro
 // The two result sets are unioned rather than switched between, so this stays
 // correct if bd's default ever changes to include pinned issues.
 func (b *Beads) listOpenEscalationIssues(extraFilters ...string) ([]*Issue, error) {
-	base := append([]string{"list", "--label=gt:escalation", "--status=open"}, extraFilters...)
+	return b.listOpenIssuesIncludingPinned(append([]string{"--label=gt:escalation"}, extraFilters...)...)
+}
+
+// listOpenIssuesIncludingPinned runs an open-issue bd query as both halves of
+// bd's silent pinned split and returns the union, deduped by ID.
+//
+// It exists so no escalation query can be written that asks only once. The
+// pinned exclusion was fixed on the list query and not on the copies query, and
+// the second blindness was invisible for exactly as long as it took someone to
+// run the reconcile the first fix had started printing (gt-qee3 → gt-w0z8) —
+// two callers of the same broken shape, fixed one at a time. There is now one
+// place to fix, and one place a third caller can reach for.
+//
+// The two result sets are unioned rather than switched between, so this stays
+// correct if bd's default ever changes to include pinned issues.
+func (b *Beads) listOpenIssuesIncludingPinned(filters ...string) ([]*Issue, error) {
+	base := append([]string{"list", "--status=open"}, filters...)
 
 	var all []*Issue
 	seen := make(map[string]bool)

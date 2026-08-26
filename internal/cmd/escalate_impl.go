@@ -532,20 +532,56 @@ func runEscalateClose(cmd *cobra.Command, args []string) error {
 	// Log to activity feed
 	_ = events.LogFeed(events.TypeEscalationClosed, closedBy, map[string]interface{}{
 		"escalation_id": result.RecordID,
+		"requested_id":  result.RequestedID,
 		"closed_by":     closedBy,
 		"reason":        escalateCloseReason,
+		"record_closed": result.RecordClosed,
 		"copies_closed": strings.Join(result.CopyIDs, ","),
 	})
 
-	fmt.Printf("%s Escalation closed: %s\n", style.Bold.Render("✓"), result.RecordID)
-	fmt.Printf("  Reason: %s\n", escalateCloseReason)
+	printEscalateCloseReport(os.Stdout, result, escalateCloseReason)
+	return nil
+}
+
+// printEscalateCloseReport renders what a close actually did.
+//
+// Every line here is derived from a bead this close WROTE TO, never from an ID
+// it merely resolved. The old report was the latter: it printed
+// "✓ Escalation closed: <result.RecordID>" unconditionally, so a close that
+// wrote to nothing still produced a checkmark, and the ID on it was not even
+// the one the operator typed (gt-w0z8).
+func printEscalateCloseReport(w io.Writer, result *beads.EscalationCloseResult, reason string) {
+	// A close that closed nothing must not print a checkmark. The whole stranded
+	// population has a closed record by definition, so a success line derived
+	// from "we resolved an ID" was true of every no-op this command could
+	// produce — the operator had no signal to distinguish them.
+	if !result.Changed() {
+		fmt.Fprintf(w, "Nothing to close: %s is already closed.\n", result.RequestedID)
+		if result.RecordID != result.RequestedID {
+			fmt.Fprintf(w, "  Escalation record %s is closed too, and no open delivered copy is linked to it.\n", result.RecordID)
+		}
+		return
+	}
+
+	// The ID on the success line is the one the operator PASSED. Printing the
+	// resolved record ID instead is how a close that touched nothing they named
+	// read as a success: the tell was there — ✓ Escalation closed: hq-wisp-51nirc
+	// after typing hq-9mxa7 — but only to someone who noticed the ID had changed.
+	fmt.Fprintf(w, "%s Escalation closed: %s\n", style.Bold.Render("✓"), result.RequestedID)
+	fmt.Fprintf(w, "  Reason: %s\n", reason)
+	if result.RecordID != result.RequestedID {
+		if result.RecordClosed {
+			fmt.Fprintf(w, "  Escalation record: %s (closed)\n", result.RecordID)
+		} else {
+			fmt.Fprintf(w, "  Escalation record: %s (was already closed)\n", result.RecordID)
+		}
+	}
 	// The delivered copies are what the queue renders, so say plainly that they
 	// went with it — a close that only touched the record used to report success
 	// while leaving the escalation live in the Mayor's queue (gt-4xl).
 	if len(result.CopyIDs) > 0 {
-		fmt.Printf("  Cleared from queue: %s\n", strings.Join(result.CopyIDs, ", "))
+		fmt.Fprintf(w, "  Cleared from queue: %s\n", strings.Join(result.CopyIDs, ", "))
 	}
-	return nil
 }
 
 func runEscalateStale(cmd *cobra.Command, args []string) error {
