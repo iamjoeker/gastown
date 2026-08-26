@@ -2243,12 +2243,16 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// When a polecat re-submits after fixing a gate failure, the old MR
 			// (same branch, different SHA) is stale. Close it so the refinery
 			// doesn't process the old submission.
+			//
+			// Scoped to the branch this submission actually replaces (gt-fe1e).
+			// `gt done` is the path almost every MR is created on, so the same
+			// rule applied only in `gt mq submit` would be inert here — the
+			// four undercounted merges came off polecat branches. See
+			// mq_supersede.go for why mergeability is not probed at this end.
 			if issueID != "" {
 				if oldMRs, findErr := bd.FindOpenMRsForIssue(issueID); findErr == nil {
-					for _, old := range oldMRs {
-						if old.ID == mrID {
-							continue // skip the one we just created
-						}
+					plan := planSupersede(oldMRs, mrID, branch)
+					for _, oldID := range plan.Supersede {
 						reason := fmt.Sprintf("superseded by %s", mrID)
 						// Force: MR wisps are pinned (gt-31nn), and `bd close`
 						// refuses a pinned bead without --force. The pin exists
@@ -2257,12 +2261,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						// `gt mq submit` and the refinery already apply
 						// (gt-6dp, gt-obth). Without this the supersede fails on
 						// every re-submit and the stale MR stays in the queue.
-						if closeErr := bd.ForceCloseWithReason(reason, old.ID); closeErr != nil {
-							style.PrintWarning("could not supersede old MR %s: %v", old.ID, closeErr)
+						if closeErr := bd.ForceCloseWithReason(reason, oldID); closeErr != nil {
+							style.PrintWarning("could not supersede old MR %s: %v", oldID, closeErr)
 							continue
 						}
-						fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), old.ID)
+						fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), oldID)
 					}
+					fmt.Print(supersedeKeptNotice(plan, branch))
 				}
 			}
 

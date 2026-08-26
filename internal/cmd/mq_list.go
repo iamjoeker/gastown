@@ -182,6 +182,9 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			// Extend JSON with verification results
 			type verifiedIssue struct {
 				*beads.Issue
+				// Declared here, not embedded — see closeReasonCarriers.
+				CloseReason   string `json:"close_reason"`
+				MRCloseReason string `json:"mr_close_reason"`
 				BranchExists  *bool  `json:"branch_exists,omitempty"`
 				BranchEmpty   *bool  `json:"branch_empty,omitempty"`
 				CommitsAhead  *int   `json:"commits_ahead,omitempty"`
@@ -194,6 +197,7 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			var verified []verifiedIssue
 			for _, s := range scored {
 				vi := verifiedIssue{Issue: s.issue}
+				vi.CloseReason, vi.MRCloseReason = closeReasonCarriers(s.issue, s.fields)
 				if s.fields != nil && s.fields.Branch != "" {
 					vi.GitState = string(s.branchState)
 					switch s.branchState {
@@ -234,7 +238,19 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			}
 			return outputJSON(verified)
 		}
-		return outputJSON(filtered)
+		type listedIssue struct {
+			*beads.Issue
+			// Declared here, not embedded — see closeReasonCarriers.
+			CloseReason   string `json:"close_reason"`
+			MRCloseReason string `json:"mr_close_reason"`
+		}
+		listed := make([]listedIssue, 0, len(scored))
+		for _, s := range scored {
+			li := listedIssue{Issue: s.issue}
+			li.CloseReason, li.MRCloseReason = closeReasonCarriers(s.issue, s.fields)
+			listed = append(listed, li)
+		}
+		return outputJSON(listed)
 	}
 
 	// Human-readable output.
@@ -675,6 +691,53 @@ func calculateMRScore(issue *beads.Issue, fields *beads.MRFields, now time.Time)
 	}
 
 	return refinery.ScoreMRWithDefaults(input)
+}
+
+// closeReasonCarriers reads why an MR is closed from BOTH of the places that
+// answer, for `gt mq list --json`.
+//
+// `gt mq list --json` is the natural instrument for auditing merge records and
+// it could not see the field the audit turns on: the projection carried neither
+// carrier, so the auditor who found gt-fe1e had to fall back to `bd show --json`
+// per row and nearly missed 3 of 4 findings.
+//
+// The two carriers are written by different code and they DISAGREE:
+//
+//	close_reason     the bead's own column. `bd close --reason` and
+//	                 ForceCloseWithReason write it, so a supersede lands here.
+//	mr_close_reason  the `close_reason:` line inside the MR description. The
+//	                 refinery writes it, and only onto an OPEN MR — so an MR
+//	                 superseded mid-merge has "superseded by X" in the first and
+//	                 nothing at all in the second.
+//
+// Reading either alone undercounts, which is the whole finding, so both are
+// emitted and NEITHER is omitempty. An absent key and an empty one are the same
+// bytes to a reader, and "this MR records no outcome" is exactly the state that
+// must not be indistinguishable from "this tool does not report outcomes".
+//
+// The `owner` column is deliberately NOT projected alongside these, though the
+// audit named it: measured over all 338 closed beads in this town's store it
+// holds one value, the git config email, on 338 of 338 rows. Under a name that
+// reads like "who owns this MR" that is a discriminator that cannot
+// discriminate. `created_by` is the field that carries the actor, and this
+// listing already emits it.
+//
+// The callers declare `close_reason` as their OWN field rather than embedding a
+// struct that carries it. beads.Issue is embedded and now has a `close_reason`
+// tag of its own; two embedded fields claiming one JSON name sit at the same
+// depth, and encoding/json resolves that tie by dropping BOTH — silently, with
+// no error, producing a projection that emits neither carrier. A field declared
+// on the outer struct is shallower, so it wins outright. Checked, not reasoned:
+// the embedded form was written first and measured emitting no close_reason at
+// all.
+func closeReasonCarriers(issue *beads.Issue, fields *beads.MRFields) (closeReason, mrCloseReason string) {
+	if issue != nil {
+		closeReason = strings.TrimSpace(issue.CloseReason)
+	}
+	if fields != nil {
+		mrCloseReason = strings.TrimSpace(fields.CloseReason)
+	}
+	return closeReason, mrCloseReason
 }
 
 // mrBranchState is the result of verifying an MR's branch in git.

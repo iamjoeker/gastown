@@ -1463,7 +1463,9 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) bool {
 
 	// Update and close the MR bead
 	if mr.ID != "" && !e.isSyntheticMergeMechanicsMR(mr) {
-		if err := e.closeMRWithReason(mr, string(CloseReasonMerged), result.MergeCommit); err != nil {
+		// verifyMRInfoPostMergeProof passed just above, so this is the one
+		// close in the codebase that knows from git that the branch landed.
+		if err := e.closeMergedMRWithProof(mr, result.MergeCommit); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Post-merge cleanup failed for %s: %v\n", mr.ID, err)
 			return false
 		}
@@ -1795,12 +1797,28 @@ func (e *Engineer) closeIneligibleMR(mr *MRInfo, reason string) error {
 }
 
 func (e *Engineer) closeMRWithReason(mr *MRInfo, closeReason string, mergeCommit ...string) error {
-	if mr == nil || strings.TrimSpace(mr.ID) == "" {
-		return nil
-	}
 	var commit string
 	if len(mergeCommit) > 0 {
 		commit = mergeCommit[0]
+	}
+	return e.closeMR(mr, closeReason, commit, false)
+}
+
+// closeMergedMRWithProof closes an MR the engineer has just merged AND proved
+// landed, via verifyMRInfoPostMergeProof against git.
+//
+// It is the only caller allowed to rewrite a record that was already closed —
+// the four beads/main merges with no merged-record were all superseded out from
+// under this exact path (gt-fe1e). Every other close, including the hand-run
+// `gt mq post-merge`, goes through closeMRWithReason and cannot repair
+// anything, because none of them has evidence a merge happened.
+func (e *Engineer) closeMergedMRWithProof(mr *MRInfo, mergeCommit string) error {
+	return e.closeMR(mr, string(CloseReasonMerged), mergeCommit, true)
+}
+
+func (e *Engineer) closeMR(mr *MRInfo, closeReason, commit string, mergeProven bool) error {
+	if mr == nil || strings.TrimSpace(mr.ID) == "" {
+		return nil
 	}
 	var expected *MergeRequest
 	if normalizedMRCloseReason(closeReason) == string(CloseReasonMerged) {
@@ -1812,12 +1830,20 @@ func (e *Engineer) closeMRWithReason(mr *MRInfo, closeReason string, mergeCommit
 		AgentBeadHint: mr.AgentBead,
 		MissingOK:     true,
 		ExpectedMR:    expected,
+		MergeProven:   mergeProven,
 	})
 	if err != nil {
 		return err
 	}
 	if result.Closed {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR bead: %s (%s)\n", mr.ID, closeReason)
+	}
+	if result.OutcomeCorrected {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Recorded merge on already-closed MR %s (record said %q) — gt-fe1e\n",
+			mr.ID, result.RecordedCloseReason)
+	}
+	if result.OutcomeCorrectErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: %v\n", result.OutcomeCorrectErr)
 	}
 	if result.AgentActiveMRClearErr != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", result.AgentBead, result.AgentActiveMRClearErr)

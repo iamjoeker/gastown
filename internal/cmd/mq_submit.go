@@ -304,28 +304,28 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Supersede older open MRs for the same source issue.
-		// When a new polecat reattempts an issue, the old MR (different branch)
-		// is orphaned. Close it so the queue and GitHub PRs stay clean.
+		// Supersede the older open MRs this submission actually replaces —
+		// same branch, or no branch recorded. An open MR on a DIFFERENT branch
+		// is left alone: it may still land, and closing its record is what left
+		// four merges on beads/main with no merged-record. See mq_supersede.go.
 		if issueID != "" {
 			if oldMRs, err := bd.FindOpenMRsForIssue(issueID); err == nil {
-				for _, old := range oldMRs {
-					if old.ID == mrIssue.ID {
-						continue // skip the one we just created
-					}
+				plan := planSupersede(oldMRs, mrIssue.ID, branch)
+				for _, oldID := range plan.Supersede {
 					reason := fmt.Sprintf("superseded by %s", mrIssue.ID)
 					// Force: MR beads are pinned so `bd purge` cannot destroy
 					// them (gt-6dp). The pin must not stop the merge queue from
 					// retiring its own record (gt-obth).
-					if err := bd.ForceCloseWithReason(reason, old.ID); err != nil {
-						style.PrintWarning("could not supersede old MR %s: %v", old.ID, err)
+					if err := bd.ForceCloseWithReason(reason, oldID); err != nil {
+						style.PrintWarning("could not supersede old MR %s: %v", oldID, err)
 						continue
 					}
-					fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), old.ID)
+					fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), oldID)
 
 					// Leave superseded remote branches intact. Branch deletion belongs to
 					// verified post-merge cleanup, not submit-time queue maintenance.
 				}
+				fmt.Print(supersedeKeptNotice(plan, branch))
 			}
 		}
 	}

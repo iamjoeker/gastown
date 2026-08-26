@@ -104,6 +104,7 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 		CreatedBy:          si.CreatedBy,
 		UpdatedAt:          si.UpdatedAt.Format(time.RFC3339),
 		Assignee:           si.Assignee,
+		CloseReason:        si.CloseReason,
 		Labels:             si.Labels,
 		Ephemeral:          si.Ephemeral,
 		AcceptanceCriteria: si.AcceptanceCriteria,

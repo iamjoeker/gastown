@@ -175,18 +175,31 @@ func IsFlagLikeTitle(title string) bool {
 
 // Issue represents a beads issue.
 type Issue struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Design      string   `json:"design,omitempty"`
-	Notes       string   `json:"notes,omitempty"`
-	Status      string   `json:"status"`
-	Priority    int      `json:"priority"`
-	Type        string   `json:"issue_type"`
-	CreatedAt   string   `json:"created_at"`
-	CreatedBy   string   `json:"created_by,omitempty"`
-	UpdatedAt   string   `json:"updated_at"`
-	ClosedAt    string   `json:"closed_at,omitempty"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Design      string `json:"design,omitempty"`
+	Notes       string `json:"notes,omitempty"`
+	Status      string `json:"status"`
+	Priority    int    `json:"priority"`
+	Type        string `json:"issue_type"`
+	CreatedAt   string `json:"created_at"`
+	CreatedBy   string `json:"created_by,omitempty"`
+	UpdatedAt   string `json:"updated_at"`
+	ClosedAt    string `json:"closed_at,omitempty"`
+	// CloseReason is the bead's own close_reason COLUMN, as bd reports it.
+	//
+	// It is not the same carrier as the `close_reason:` line an MR description
+	// holds (beads.MRFields.CloseReason), and the two disagree: the refinery
+	// writes the description line, `bd close --reason` and ForceCloseWithReason
+	// write this field. An MR superseded out from under a merge has
+	// "superseded by X" here and nothing at all there (gt-fe1e).
+	//
+	// bd emits it from `bd list --json`, `bd show --json` and the wisps table
+	// alike; every one of those was being unmarshalled into a struct with no
+	// field to hold it, so the audit instrument could not see the field the
+	// audit turned on.
+	CloseReason string   `json:"close_reason,omitempty"`
 	Parent      string   `json:"parent,omitempty"`
 	ExternalRef string   `json:"external_ref,omitempty"`
 	Assignee    string   `json:"assignee,omitempty"`
@@ -1444,13 +1457,13 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 
 	query := fmt.Sprintf(
 		"SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, "+
-			"w.created_at, w.updated_at, w.created_by, "+
+			"w.created_at, w.updated_at, w.created_by, w.close_reason, "+
 			"GROUP_CONCAT(al.label) as labels_csv "+
 			"FROM wisps w "+
 			"JOIN wisp_labels l ON w.id = l.issue_id "+
 			"LEFT JOIN wisp_labels al ON w.id = al.issue_id "+
 			"WHERE %s AND %s "+
-			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by",
+			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by, w.close_reason",
 		labelFilter, statusFilter)
 
 	// The wisps table is the ONLY source of MR beads: the bd list half above
@@ -1473,6 +1486,7 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 			CreatedAt   string `json:"created_at"`
 			UpdatedAt   string `json:"updated_at"`
 			CreatedBy   string `json:"created_by"`
+			CloseReason string `json:"close_reason"`
 			LabelsCSV   string `json:"labels_csv"`
 		}
 		if jsonErr := json.Unmarshal(sqlOut, &rows); jsonErr == nil {
@@ -1490,6 +1504,7 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 					CreatedAt:   row.CreatedAt,
 					UpdatedAt:   row.UpdatedAt,
 					CreatedBy:   row.CreatedBy,
+					CloseReason: row.CloseReason,
 					Ephemeral:   true,
 				}
 				if row.LabelsCSV != "" {
@@ -1596,6 +1611,13 @@ func mergeListIssueFields(detail, listed *Issue) {
 	}
 	if detail.CreatedBy == "" {
 		detail.CreatedBy = listed.CreatedBy
+	}
+	// hydrate REPLACES the listed row with the detail row, so a close_reason
+	// the wisps query resolved would be discarded whenever `bd show` did not
+	// also carry one. Both halves populate it today; carrying it over is what
+	// keeps that true if either stops.
+	if detail.CloseReason == "" {
+		detail.CloseReason = listed.CloseReason
 	}
 	if len(detail.Labels) == 0 {
 		detail.Labels = listed.Labels

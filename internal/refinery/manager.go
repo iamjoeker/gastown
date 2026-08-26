@@ -839,6 +839,13 @@ func (m *Manager) postMergeMR(b *beads.Beads, mr *MergeRequest) (*PostMergeResul
 	if closeResult.AlreadyTerminal {
 		_, _ = fmt.Fprintf(m.output, "  %s MR already closed\n", style.Dim.Render("—"))
 		result.MRClosed = true
+		// This path does NOT repair a record that says something other than
+		// merged, and must not: `gt mq post-merge <id>` is run by hand, its
+		// ExpectedMR is filled from the record it is checking, and it holds no
+		// evidence from git that anything landed. It refuses, exactly as
+		// before. The repair for a record closed out from under a real merge
+		// belongs to the engineer's landing path, which has the proof
+		// (gt-fe1e; see recordMergeOnTerminalMR).
 		if mr.CloseReason != CloseReasonMerged {
 			if mr.CloseReason == "" {
 				return result, fmt.Errorf("post-merge retry for already-closed MR %s requires close_reason=%s", mr.ID, CloseReasonMerged)
