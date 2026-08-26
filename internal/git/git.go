@@ -1913,10 +1913,57 @@ func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 }
 
 // DeleteRemoteBranchIfAt deletes a remote branch only if it still points at expectedHash.
+//
+// The "[deleted]" line and the zero exit status are not proof the ref is gone. A
+// delete was seen to print exactly that while ls-remote returned the old sha
+// immediately afterwards, with the branch's polecat already done and nothing
+// live to re-push it; an identical second delete then took, and the ref was
+// gone. Any cleanup that trusts the push report can therefore leave a live ref
+// behind while reporting success — so verify, and re-issue once. (gt-wkcz)
+//
+// The push error is subordinate to the verification: a second attempt that fails
+// because the ref is already gone has still achieved the caller's goal.
 func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error {
 	ref := "refs/heads/" + branch
-	_, err := g.runWithTimeout(pushTimeout, "push", "--force-with-lease="+ref+":"+expectedHash, remote, ":"+ref)
-	return err
+	lease := "--force-with-lease=" + ref + ":" + expectedHash
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		_, pushErr := g.runWithTimeout(pushTimeout, "push", lease, remote, ":"+ref)
+
+		tip, tipErr := g.remoteBranchDeleteTip(remote, branch)
+		if tipErr == nil && tip == "" {
+			return nil
+		}
+		if pushErr != nil {
+			return pushErr
+		}
+		if tipErr != nil {
+			lastErr = fmt.Errorf("delete of %s/%s reported success but could not be verified: %w", remote, branch, tipErr)
+			continue
+		}
+		lastErr = fmt.Errorf("delete of %s/%s reported success but the branch is still at %s", remote, branch, shortSHA(tip))
+	}
+	return lastErr
+}
+
+// remoteBranchDeleteTip reports the branch tip a delete must have cleared, read
+// from every URL the remote has, and "" when no URL still carries the ref.
+//
+// A split fetch/push origin means the delete writes to one URL while every other
+// agent reads from the other, so a ref cleared from the push URL but still
+// visible to fetchers is still live, and only checking both settles it.
+func (g *Git) remoteBranchDeleteTip(remote, branch string) (string, error) {
+	for _, target := range nonEmptyUnique([]string{g.pushTarget(remote), remote}) {
+		tip, err := g.RemoteBranchTip(target, branch)
+		if err != nil {
+			return "", err
+		}
+		if tip = strings.TrimSpace(tip); tip != "" {
+			return tip, nil
+		}
+	}
+	return "", nil
 }
 
 // ResolveMergedBranchDeleteHead returns the head value a merged-branch delete
@@ -1949,7 +1996,11 @@ func (g *Git) ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead
 		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and has no target branch to verify it against",
 			branch, shortSHA(tip), shortSHA(recordedHead))
 	}
-	if err := g.VerifyPushedCommitReachableFromPushTarget(remote, target, tip); err != nil {
+	// By work, not by sha: a refreshed branch that was then rebased onto the
+	// moving target lands under a rewritten sha, and asking for that sha by
+	// ancestry refuses to delete a branch whose every patch is on the target —
+	// the same predicate error that broke the merge proof. (gt-wkcz)
+	if _, err := g.VerifyWorkLandedOnPushTarget(remote, target, tip); err != nil {
 		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and that head is not contained in %s: %w",
 			branch, shortSHA(tip), shortSHA(recordedHead), target, err)
 	}
@@ -2573,6 +2624,73 @@ func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit s
 		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s)", shortSHA(commit), remote, branch, shortSHA(tip))
 	}
 	return nil
+}
+
+// LandedProof records how work was proved present on a target branch.
+type LandedProof struct {
+	// Rebased is true when the submitted sha itself is not on the target and the
+	// proof came from patch equality instead. Callers should say so: a merge that
+	// rewrote the sha is exactly the case an operator wants to see named.
+	Rebased bool
+	// UnmergedPatches is the number of the submitted commit's patches with no
+	// equivalent on the target. Zero on success; set on a patch-check failure so
+	// the caller can say how much of the work is missing rather than only that
+	// the sha is absent.
+	UnmergedPatches int
+}
+
+// VerifyWorkLandedOnPushTarget verifies that the work submitted at commit is on
+// the push target's branch, accepting a rebase.
+//
+// Sequential rebasing is the refinery's documented path: after every merge the
+// target moves, and the next branch MUST rebase onto that new baseline before it
+// lands. A rebase rewrites the commit, so from the second MR of a cycle onward
+// the submitted sha CANNOT be on the target — asking for it by identity or by
+// ancestry fails by construction on merges that were entirely correct, and fails
+// hardest when the queue is busiest. (gt-wkcz)
+//
+// So ancestry first — exact, cheap, and the whole answer for an MR that needed
+// no rebase — then patch equality via `git cherry`, which is what "the same work
+// landed under a different sha" actually means. A '+' line is a patch that is NOT
+// on the target; one is enough to fail, because the submitted work is then not
+// all there and the caller must not clean up behind it.
+//
+// The ancestry error is wrapped rather than replaced on every failure path: when
+// the patch check cannot run, the caller still learns the original, stricter
+// reason the proof did not pass.
+func (g *Git) VerifyWorkLandedOnPushTarget(remote, branch, commit string) (LandedProof, error) {
+	ancestryErr := g.VerifyPushedCommitReachableFromPushTarget(remote, branch, commit)
+	if ancestryErr == nil {
+		return LandedProof{}, nil
+	}
+
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return LandedProof{}, ancestryErr
+	}
+	// An absent object is not an absent patch. Without the commit in hand there
+	// is nothing to compare, and saying so beats reporting "not landed" for a
+	// question that was never asked.
+	if _, err := g.Rev(commit + "^{commit}"); err != nil {
+		return LandedProof{}, fmt.Errorf("%w; commit %s is not in this repository, so its patches could not be compared against %s/%s",
+			ancestryErr, shortSHA(commit), remote, branch)
+	}
+
+	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
+	if err != nil {
+		return LandedProof{}, fmt.Errorf("%w; patch-equality check could not fetch %s/%s: %v", ancestryErr, remote, branch, err)
+	}
+	defer cleanup()
+
+	out, err := g.Cherry(fetched, commit)
+	if err != nil {
+		return LandedProof{}, fmt.Errorf("%w; patch-equality check against %s/%s failed: %v", ancestryErr, remote, branch, err)
+	}
+	if unmerged := CountCherryUnmergedCommits(out); unmerged > 0 {
+		return LandedProof{UnmergedPatches: unmerged}, fmt.Errorf("%w; %d commit(s) of %s have no patch-equivalent on %s/%s",
+			ancestryErr, unmerged, shortSHA(commit), remote, branch)
+	}
+	return LandedProof{Rebased: true}, nil
 }
 
 func parseLSRemoteTip(out, branch string) string {

@@ -1643,8 +1643,13 @@ func (e *Engineer) verifyMRInfoPostMergeProof(mr *MRInfo) error {
 	if commit == "" {
 		return fmt.Errorf("missing submitted commit_sha")
 	}
-	if err := e.git.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("target %s does not contain submitted head %s: %w", target, commit, err)
+	proof, err := e.git.VerifyWorkLandedOnPushTarget("origin", target, commit)
+	if err != nil {
+		return fmt.Errorf("target %s does not contain submitted work %s: %w", target, commit, err)
+	}
+	if proof.Rebased {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: submitted head %s was rebased; every patch verified present on %s\n",
+			mr.ID, shortSHA(commit), target)
 	}
 	return nil
 }
