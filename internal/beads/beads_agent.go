@@ -707,7 +707,13 @@ func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error
 }
 
 // ClearAgentCompletion removes all completion metadata fields from an agent bead.
-// Called when a polecat is re-slung with new work (resets stale completion state).
+//
+// NOT wired to the re-sling path, whatever its name suggests. It was added with
+// the schema (gt-x7t9) and has never had a caller; ResetAgentBeadForReuse above
+// is what ReuseIdlePolecat actually runs, and it clears the same fields inline.
+// Recorded because "re-slinging clears it" was read off this comment while the
+// live question was what clears push_failed, and the answer was nothing (gt-uapr).
+// Either wire it up or delete it — do not cite it as a clearing path.
 func (b *Beads) ClearAgentCompletion(id string) error {
 	empty := ""
 	notFailed := false

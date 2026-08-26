@@ -268,9 +268,18 @@ agent_state, so restarting a paused polecat leaves it paused; that is why the
 paused case gets its own verdict and its own action rather than being folded into
 the restart arm (gt-fbgq).
 
+--reconcile-cleanup additionally REPAIRS stale completion state on the agent bead
+when this command's own measurement contradicts it: a dirty cleanup_status, and a
+push_failed left true by a rebase whose content is already on the remote. Neither
+is written unless the verdict is SAFE_TO_NUKE and the git checks actually ran, and
+each confirms its write by re-reading the bead. Without it, push_failed had no
+clearing path any role could run and kept a polecat reading idle-recovery-needed
+over work provably in main (gt-uapr).
+
 Examples:
   gt polecat check-recovery greenplace/Toast
-  gt polecat check-recovery greenplace/Toast --json`,
+  gt polecat check-recovery greenplace/Toast --json
+  gt polecat check-recovery greenplace/Toast --reconcile-cleanup`,
 	Args: cobra.ExactArgs(1),
 	RunE: runPolecatCheckRecovery,
 }
@@ -388,7 +397,7 @@ func init() {
 
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
-	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale dirty cleanup_status to clean when live recovery predicates prove no work is at risk")
+	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale completion state (cleanup_status, push_failed) on the agent bead when live recovery predicates prove no work is at risk")
 
 	// Stale flags
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
@@ -1278,8 +1287,20 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
 
 	if polecatCheckRecoveryReconcileCleanup {
+		// Ordered before the cleanup reconcile because push_failed is the field
+		// that gates the verdict the cleanup reconcile requires. Both fail closed
+		// by turning the verdict into NEEDS_RECOVERY, so a failure in either one
+		// stops the other rather than compounding.
+		reconcilePushFailedIfRefuted(&status, bd, agentBeadID, input, fields)
 		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
 	}
+
+	// "The bead still says push_failed and my own measurement says otherwise."
+	// Recomputed AFTER the reconcile, so it is false once the field is actually
+	// gone and true when this run was not asked to repair it. The SAFE_TO_NUKE
+	// arm below names the command, because a reader who sees the flag ignored and
+	// no way to remove it is back where gt-uapr started.
+	stalePushFailed := pushFailedReconcileCandidate(&status, input, fields)
 
 	// Derived last: reconcile and the MQ checks can still flip the verdict above,
 	// and the permitted witness action must track the verdict actually reported.
@@ -1408,6 +1429,15 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Println("  No work at risk. Reclaim the slot by restarting — the sandbox is preserved:")
 		fmt.Printf("    gt session restart %s/%s\n", rigName, polecatName)
+		if stalePushFailed {
+			fmt.Println()
+			fmt.Println("  The agent bead still records push_failed=true, which this run's own git")
+			fmt.Println("  measurement contradicts — a rebase makes a non-fast-forward rejection the")
+			fmt.Println("  expected outcome, not a lost push. Restarting will NOT remove it, and every")
+			fmt.Println("  surface that runs no git (gt polecat list among them) keeps reporting this")
+			fmt.Println("  polecat as idle-recovery-needed until it is gone. Repair the field:")
+			fmt.Printf("    gt polecat check-recovery %s/%s --reconcile-cleanup\n", rigName, polecatName)
+		}
 		fmt.Println()
 		fmt.Printf("  %s\n", style.Dim.Render("Nuking is not a witness action — it requires a human or Mayor identity"))
 		fmt.Printf("  %s\n", style.Dim.Render("(restart-first policy, gt-dsgp)"))
@@ -1615,6 +1645,100 @@ func hookBeadAssigneeForDiagnostic(beadAssignee string) string {
 
 type cleanupStatusUpdater interface {
 	UpdateAgentCleanupStatus(id string, cleanupStatus string) error
+}
+
+// pushFailedUpdater is the write half of the push_failed reconcile. It is its own
+// interface rather than an addition to cleanupStatusUpdater so the two reconciles
+// stay independently fakeable, and it demands the reader as well as the writer
+// because this reconcile confirms its own write (see below).
+type pushFailedUpdater interface {
+	UpdateAgentDescriptionFields(id string, updates beads.AgentFieldUpdates) error
+	GetAgentBead(id string) (*beads.Issue, *beads.AgentFields, error)
+}
+
+// reconcilePushFailedIfRefuted writes push_failed=false when this command has
+// MEASURED the worktree and found nothing a failed push could have lost.
+//
+// gt-3bzt taught the three measuring surfaces to IGNORE a contradicted
+// push_failed. That unblocked reuse but left the field itself set forever, and
+// the field is what the bead-only surfaces read: `gt polecat list` runs no git,
+// so it cannot refute anything, and went on reporting idle-recovery-needed for a
+// polecat whose work was provably in main. Nothing else clears it either —
+// elapsed time, the MR merging, a session restart, and a clean exit-0 park were
+// each measured ineffective, and `gt polecat clear-state` writes agent_state and
+// deliberately nothing else. So the flag outlived every remedy any role could
+// run (gt-uapr).
+//
+// This is that clearing path, and the witness already reaches it: the SLOT_OPEN
+// handler runs `gt polecat check-recovery --json --reconcile-cleanup` seconds
+// after a polecat exits (internal/witness/handlers.go), which is exactly when a
+// rebase-then-push rejection has just set the flag.
+//
+// It writes only on the same evidence that entitles this command to disregard
+// the flag in the first place — PushFailedRefuted, which requires the git checks
+// to have RUN, not merely to have returned zeros — plus a verdict of
+// SAFE_TO_NUKE, so a polecat blocked by anything else keeps its flag and its
+// recovery. An unmeasured or failed git check leaves PushFailedRefuted false and
+// nothing is written.
+func reconcilePushFailedIfRefuted(status *RecoveryStatus, updater pushFailedUpdater, agentBeadID string, input polecat.WorkstateInput, fields *beads.AgentFields) {
+	if !pushFailedReconcileCandidate(status, input, fields) {
+		return
+	}
+	if updater == nil {
+		pushFailedReconcileFailed(status, "updater unavailable")
+		return
+	}
+	cleared := false
+	if err := updater.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{PushFailed: &cleared}); err != nil {
+		pushFailedReconcileFailed(status, err.Error())
+		return
+	}
+	// Read back. This whole function exists because a field nothing clears kept
+	// a polecat out of the pool; reporting a clear that did not land would put it
+	// right back there with a diagnostic saying otherwise. The write path is a bd
+	// subprocess against Dolt and a nil error is not evidence the row changed.
+	_, after, err := updater.GetAgentBead(agentBeadID)
+	if err != nil {
+		pushFailedReconcileFailed(status, fmt.Sprintf("write reported success but the bead could not be re-read: %v", err))
+		return
+	}
+	if after == nil || after.PushFailed {
+		pushFailedReconcileFailed(status, "write reported success but the bead still reads push_failed=true")
+		return
+	}
+	// Keep the caller's in-memory view in step with the store it just changed.
+	// Anything downstream that re-reads these fields — including this command's
+	// own "is the flag still stale" check — would otherwise go on describing a
+	// polecat that no longer exists.
+	fields.PushFailed = false
+	status.Reconciled = true
+	status.Diagnostics = append(status.Diagnostics,
+		"reconciled_push_failed=false previous=true direct_git_state=safe (clean tree, no stash, 0 unpreserved patches)")
+}
+
+func pushFailedReconcileFailed(status *RecoveryStatus, detail string) {
+	status.NeedsRecovery = true
+	status.Verdict = "NEEDS_RECOVERY"
+	status.Blockers = append(status.Blockers, fmt.Sprintf("push_failed_reconcile_failed: %s", detail))
+}
+
+func pushFailedReconcileCandidate(status *RecoveryStatus, input polecat.WorkstateInput, fields *beads.AgentFields) bool {
+	if status == nil || fields == nil {
+		return false
+	}
+	if !fields.PushFailed {
+		return false
+	}
+	// Refuted by measurement, never by silence — the same bar DecideWorkstate
+	// applies before it stops letting the flag block (gt-3bzt).
+	if !input.PushFailedRefuted {
+		return false
+	}
+	// The verdict is the summary of everything else this command looked at. A
+	// polecat that still has a hook, a dirty tree, or work outside the merge
+	// queue needs recovery whatever push_failed says, and clearing the field
+	// there would shrink its blocker list without changing its situation.
+	return status.Verdict == "SAFE_TO_NUKE"
 }
 
 func reconcileCleanupStatusIfSafe(status *RecoveryStatus, updater cleanupStatusUpdater, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields) {

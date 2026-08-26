@@ -142,6 +142,36 @@ type WorkstateDisposition struct {
 }
 
 // DecideWorkstate returns the canonical disposition for a polecat.
+//
+// EVERY PREDICATE THAT CAN PRODUCE ReuseStatus "idle-recovery-needed", because
+// that one display string is a projection over thirteen of them and the
+// projection hides which one is set. Two rigs reached it by different roads and
+// a fix validated on one looked like a fix for both (gt-uapr). This function is
+// the only producer of the string — grep it and you will find these four sites,
+// no more:
+//
+//	(a) the general blocker tail, when at least one of these blocked and the
+//	    blockers are not an open MR alone:
+//	      hook-still-set      HookBead set and not a partial spawn
+//	      push-failed         PushFailed && !PushFailedRefuted
+//	      mr-failed           MRFailed
+//	      active-work         ActiveWorkBlocker set
+//	      cleanup-<status>    CleanupStatus unsafe and not ignored
+//	      git-check-failed    GitCheckFailed
+//	      git-dirty           GitDirty
+//	      git-stash           StashCount > 0
+//	      git-unpushed        UnpushedCommits > 0
+//	(b) mq-lookup-failed          MQCheckRequired && MQLookupFailed
+//	(c) mq-not-submitted          MQCheckRequired, submittable work, no MR
+//	(d) mq-refused-closed-source  MRRefused && !MRSubmitted, unresolved
+//
+// PausedAgentState is deliberately NOT on that list: it produces
+// "idle-state-paused" / NEEDS_STATE_CLEAR, and folding it in here is what sent a
+// polecat needing one field cleared down the escalation road (gt-fbgq).
+//
+// Only a caller that sets ReuseFactsMeasured reaches any of this as a claim; an
+// unmeasured one gets "idle-unverified", which is a refusal to answer rather
+// than a recovery condition (gt-49dp).
 func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	// Session liveness outranks every bead-derived fact below (gt-5tg).
 	//
