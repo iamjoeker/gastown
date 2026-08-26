@@ -1660,6 +1660,44 @@ func (b *Beads) Ready() ([]*Issue, error) {
 	return issues, nil
 }
 
+// ReadyExcludingLabels returns ready work with any bead carrying one of labels
+// dropped by the query itself rather than by the caller.
+//
+// Excluding server-side is what makes the exclusion worth anything: the CLI
+// path takes bd's default row limit, so a store whose ready set is mostly mail
+// spends that whole window on mail and the work underneath it is never
+// returned at all. Filtering the returned rows shrinks the list without
+// revealing anything the limit already cut off — and it cannot even do that
+// reliably, because `bd ready --json` omits the labels field (gt-cw1u).
+//
+// An empty labels list is exactly Ready().
+func (b *Beads) ReadyExcludingLabels(labels ...string) ([]*Issue, error) {
+	if len(labels) == 0 {
+		return b.Ready()
+	}
+
+	if b.store != nil {
+		return b.storeReadyWithFilter(beadsdk.WorkFilter{ExcludeLabels: labels})
+	}
+
+	args := []string{"ready", "--json"}
+	for _, label := range labels {
+		args = append(args, "--exclude-label", label)
+	}
+
+	out, err := b.run(args...)
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd ready output: %w", err)
+	}
+
+	return issues, nil
+}
+
 // ReadyForMol returns ready steps within a specific molecule.
 // Delegates to bd ready --mol which uses beads' canonical blocking semantics
 // (blocked_issues_cache), handling all blocking types, transitive propagation,

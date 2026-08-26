@@ -22,6 +22,7 @@ import (
 
 var readyJSON bool
 var readyRig string
+var readyIncludeMail bool
 
 var readyCmd = &cobra.Command{
 	Use:     "ready",
@@ -36,16 +37,22 @@ Aggregates ready issues from:
 Ready items have no blockers and can be worked immediately.
 Results are sorted by priority (highest first) then by source.
 
+Mail is excluded. Messages are stored as ordinary beads so they survive a
+session death, which also puts every unread message in the work queue; use
+--include-mail to see the queue the way it reads without the exclusion.
+
 Examples:
   gt ready              # Show all ready work
   gt ready --json       # Output as JSON
-  gt ready --rig=gastown  # Show only one rig`,
+  gt ready --rig=gastown  # Show only one rig
+  gt ready --include-mail # Include unread mail in the listing`,
 	RunE: runReady,
 }
 
 func init() {
 	readyCmd.Flags().BoolVar(&readyJSON, "json", false, "Output as JSON")
 	readyCmd.Flags().StringVar(&readyRig, "rig", "", "Filter to a specific rig")
+	readyCmd.Flags().BoolVar(&readyIncludeMail, "include-mail", false, "Include mail (gt:message beads) in the listing")
 	rootCmd.AddCommand(readyCmd)
 }
 
@@ -123,7 +130,7 @@ func runReady(cmd *cobra.Command, args []string) error {
 			defer wg.Done()
 			townBeadsPath := beads.GetTownBeadsPath(townRoot)
 			townBeads := beads.New(townBeadsPath)
-			issues, err := townBeads.Ready()
+			issues, err := readyIssues(townBeads)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -143,6 +150,8 @@ func runReady(cmd *cobra.Command, args []string) error {
 				filtered = filterReadyIssuesByRoute(townRoot, "town", filtered)
 				// Filter durable archival records (gt-f8td) - read, not implemented
 				filtered = filterRecordBeads(filtered, getRecordBeadIDs(townBeadsPath))
+				// Second line of defence behind the query-level mail exclusion
+				filtered = filterMailBeads(filtered)
 				// Filter identity beads (agents, roles, rigs) - not actionable work
 				src.Issues = filterIdentityBeads(filtered)
 			}
@@ -158,7 +167,7 @@ func runReady(cmd *cobra.Command, args []string) error {
 			// Use rig root path where rig-level beads are stored
 			// BeadsPath returns rig root; redirect system handles mayor/rig routing
 			rigBeads := beads.New(r.BeadsPath())
-			issues, err := rigBeads.Ready()
+			issues, err := readyIssues(rigBeads)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -178,6 +187,8 @@ func runReady(cmd *cobra.Command, args []string) error {
 				filtered = filterReadyIssuesByRoute(townRoot, r.Name, filtered)
 				// Filter durable archival records (gt-f8td) - read, not implemented
 				filtered = filterRecordBeads(filtered, getRecordBeadIDs(r.BeadsPath()))
+				// Second line of defence behind the query-level mail exclusion
+				filtered = filterMailBeads(filtered)
 				// Filter identity beads (agents, roles, rigs) - not actionable work
 				src.Issues = filterIdentityBeads(filtered)
 			}
@@ -593,6 +604,42 @@ func readyIssueRoutesToSource(townRoot, source, issueID string) bool {
 	}
 
 	return beads.GetRigNameForPrefix(townRoot, prefix) == source
+}
+
+// readyIssues fetches ready work for one source, excluding mail at the query
+// unless --include-mail was passed.
+//
+// The exclusion has to happen in the query, not in the rows it returns. The
+// ready listing takes bd's default row limit, so on a store whose ready set is
+// mostly mail the limit is spent on mail and the work underneath it never
+// arrives: measured on the hq store 2026-08-25, `bd ready -n 0` returned 605
+// rows of which 358 (59%) were gt:message, and every one of the eleven that
+// surfaced in this command was P0 — eleven of the seventeen slots at the top of
+// the queue (gt-cw1u). Dropping those rows after the fact would have shortened
+// the list without uncovering a single bead the limit had already cut off.
+func readyIssues(b *beads.Beads) ([]*beads.Issue, error) {
+	if readyIncludeMail {
+		return b.Ready()
+	}
+	return b.ReadyExcludingLabels(beads.MessageLabel)
+}
+
+// filterMailBeads removes message beads from the list.
+//
+// This backs up the query-level exclusion in readyIssues rather than replacing
+// it. `bd ready --json` omits the labels field, so on that path every row
+// arrives label-free and this filter matches nothing; it earns its place on the
+// in-process store path, which does populate labels, and on any future caller
+// that hands over rows this command did not fetch itself.
+func filterMailBeads(issues []*beads.Issue) []*beads.Issue {
+	filtered := make([]*beads.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if !readyIncludeMail && beads.IsMailBead(issue) {
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+	return filtered
 }
 
 // filterWisps removes wisp issues from the list.
