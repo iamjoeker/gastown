@@ -3,6 +3,7 @@ package witness
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -82,11 +83,56 @@ import (
 // these are shared remote refs, and emitting evidence rather than verdicts is
 // the whole design.
 
+// FOURTH, added by gt-6i5d: "active" was asserted from bead status ALONE, with
+// no session input, and that made the one class this sweep exists to catch the
+// one class it could not see.
+//
+// A polecat whose session is DEAD but whose bead is still hooked read "active —
+// still re-slingable", which is byte-identical to the row for a polecat that is
+// genuinely mid-work. beads/ace sat that way for roughly 23 hours: 67 commits
+// pushed, no MR, bead hooked, session gone. It was found by a person, and the
+// sweep reported it as needing no decision on every run in that window.
+//
+// The word "re-slingable" is what carried the mistake. It is true of the BEAD
+// and false of the SITUATION: the hook is precisely what stops the convoy
+// re-dispatching the bead to a fresh polecat, so a hooked bead over a dead
+// session is not waiting to be dispatched, it is waiting for an agent that will
+// never come back. Both halves are load-bearing and neither may simply be
+// dropped — un-hooking would re-dispatch work whose branch already exists.
+//
+// So the bucket is SPLIT rather than reclassified, and the discriminator is
+// narrow on purpose:
+//
+//	bead assigned + session present  -> active   (unchanged)
+//	bead assigned + session absent   -> stalled  (short list)
+//	bead assigned + session unknown  -> active   (unchanged; a probe that could
+//	                                              not run is not evidence)
+//
+// "Assigned" means hooked or in_progress — a bead HELD BY a named agent. An
+// open or deferred bead is not held by anybody, so no session's death can
+// strand it and the original reasoning still applies to it unchanged.
+//
+// The session state is recorded on the finding either way, so an "active"
+// verdict carries the evidence it rests on rather than asserting it.
+
 // branchHygieneEvidence is the one containment proof the git-hygiene plugin
 // acts on (plugins/git-hygiene/run.sh, "Delete merged remote branches"). Keep
 // this in step with that check: containment proved any other way is invisible
 // to hygiene, and this constant is what says so.
 const branchHygieneEvidence = "ancestor"
+
+// Session-presence strings as they appear on a finding and in JSON.
+//
+// They are strings and not polecat.SessionPresence because that type's zero
+// value is the EMPTY string, and an empty JSON value is indistinguishable from
+// a row written by a build that never looked. "unknown" is a measurement of the
+// probe; "" is an absence of one, and this sweep's whole discipline is refusing
+// to let those render the same.
+const (
+	branchSessionPresent = "present"
+	branchSessionAbsent  = "absent"
+	branchSessionUnknown = "unknown"
+)
 
 // BranchSweepClass is the verdict for one unmerged branch. The classes exist to
 // separate the cases that are cheaply explainable from the ones that need a
@@ -106,9 +152,23 @@ const (
 	// this sweep was specified, that alone cleared 4 of 7 hits.
 	BranchSweepQueued BranchSweepClass = "queued"
 
-	// BranchSweepActive means the work bead is still non-terminal, so it can
-	// still be re-slung. Nothing is stranded while a bead can be dispatched.
+	// BranchSweepActive means the work bead is still non-terminal AND nothing
+	// says the agent holding it is gone, so the work has a route forward.
+	// Nothing is stranded while a bead can be dispatched or is being worked.
 	BranchSweepActive BranchSweepClass = "active"
+
+	// BranchSweepStalled means the bead is held — hooked or in_progress — by a
+	// polecat whose tmux session was MEASURED and is not there. The branch is on
+	// the remote, no MR holds it, and the hook that would have to be cleared for
+	// the bead to be re-dispatched is the same hook nobody will now clear.
+	//
+	// It is named apart from check on purpose. A check row asks "was this
+	// superseded or stranded?", which the sweep cannot answer and which needs a
+	// rehearsal merge. This row is not that question: the work is unambiguously
+	// live and unambiguously unattended, and the guidance for check — "a short
+	// list is not lost work" — would read as reassurance exactly where none is
+	// warranted (gt-6i5d).
+	BranchSweepStalled BranchSweepClass = "stalled"
 
 	// BranchSweepReported means an open stranded-rejection report already
 	// names this issue. The forward path (gt-h1cw) got here first; re-listing
@@ -143,9 +203,9 @@ const (
 // NeedsAttention reports whether a class belongs on the short list an operator
 // actually reads. Unknown counts: an unclassifiable branch is a question, and
 // answering it silently with "fine" is the failure mode this sweep exists to
-// end.
+// end. Stalled counts for the stronger reason: it is not a question at all.
 func (c BranchSweepClass) NeedsAttention() bool {
-	return c == BranchSweepCheck || c == BranchSweepUnknown
+	return c == BranchSweepCheck || c == BranchSweepUnknown || c == BranchSweepStalled
 }
 
 // BranchSweepFinding is one branch on the remote and everything cheap that is
@@ -159,6 +219,21 @@ type BranchSweepFinding struct {
 
 	IssueID     string `json:"issue_id,omitempty"`
 	IssueStatus string `json:"issue_status,omitempty"`
+
+	// SessionPresence is what `tmux has-session` said about the polecat that
+	// owns this branch: "present", "absent", or "unknown". It is the fact the
+	// active/stalled split turns on, and it is recorded on the finding rather
+	// than only consumed, so an "active" verdict can be checked against the
+	// evidence it rests on instead of trusted (gt-6i5d).
+	//
+	// "unknown" means one of: no session probe was supplied, the branch name
+	// carries no polecat, or the probe itself failed. All three are reasons the
+	// question was not answered, and none of them is an answer.
+	//
+	// Deliberately NOT omitempty, for the same reason the constants above are
+	// strings: an absent key would read identically to a row from a build that
+	// never looked, which is the shape of the defect this field closes.
+	SessionPresence string `json:"session_presence"`
 
 	MRID          string `json:"mr_id,omitempty"`
 	MRStatus      string `json:"mr_status,omitempty"`
@@ -255,6 +330,13 @@ type BranchSweepResult struct {
 	// A failed read over-reports rather than under-reports, which is the safe
 	// direction, but the reader still has to be told which they are looking at.
 	MarksMeasured bool `json:"marks_measured"`
+
+	// SessionsMeasured is false when no session probe was supplied. Without it
+	// every branch's SessionPresence is "unknown" for a reason that has nothing
+	// to do with the branch, and a stalled count of zero says only that the
+	// question was never asked — which is exactly how the 23-hour stranding in
+	// gt-6i5d read as an all-clear.
+	SessionsMeasured bool `json:"sessions_measured"`
 }
 
 // AttentionCount is the size of the short list.
@@ -372,6 +454,21 @@ type BranchSweepBeads interface {
 	Search(opts beads.SearchOptions) ([]*beads.Issue, error)
 }
 
+// BranchSweepSessions answers whether a polecat's tmux session exists.
+//
+// It is a TRI-STATE and not a bool, and taking polecat.SessionPresence rather
+// than declaring a local bool is the whole reason this fix works: "the session
+// is gone", "nobody asked" and "tmux errored" are three different facts, and a
+// bool has room for two. Only SessionAbsent moves a branch to stalled.
+//
+// *polecat.Manager satisfies this. It is an interface so the sweep can be
+// tested without a tmux server — and so that a caller with no way to ask simply
+// passes nothing and gets "unknown" on every row, which the result says out
+// loud in SessionsMeasured.
+type BranchSweepSessions interface {
+	SessionPresenceFor(name string) polecat.SessionPresence
+}
+
 // BranchSweepOptions parameterises one sweep.
 type BranchSweepOptions struct {
 	// Remote is the remote whose push url is listed. Defaults to "origin".
@@ -397,6 +494,12 @@ type BranchSweepOptions struct {
 	//
 	// A marker only suppresses when it names the tip the sweep actually listed.
 	Superseded map[string]git.SupersededMark
+
+	// Sessions answers whether the polecat owning a branch still has a tmux
+	// session. May be nil: every row then reads "unknown", the active/stalled
+	// split cannot fire, and SessionsMeasured records that so the resulting
+	// zero is not mistaken for an all-clear.
+	Sessions BranchSweepSessions
 }
 
 const defaultPolecatRefPrefix = "refs/heads/polecat/"
@@ -445,6 +548,12 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 		result.Errors = append(result.Errors, "no beads handle: bead and MR columns are UNMEASURED")
 	}
 
+	sessions := newBranchSessions(opts.Sessions)
+	result.SessionsMeasured = sessions.available()
+	if !result.SessionsMeasured {
+		result.Errors = append(result.Errors, "no session probe: session state is UNMEASURED on every branch, so a hooked bead over a DEAD polecat is indistinguishable from one still being worked (gt-6i5d)")
+	}
+
 	// remoteDown records the first deadline kill. A remote that has stopped
 	// answering has not stopped answering for ONE branch: comparison fetches a
 	// candidate ref per branch, so the network deadline that ends the hang is
@@ -471,7 +580,7 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 		// Landed branches are returned too — the caller decides whether to
 		// show them, and their presence is what makes a zero short list
 		// interpretable rather than merely empty.
-		finding, cmpErr := classifyBranch(g, bd, remote, targets, ref, mrsByBranch, result.MRsMeasured)
+		finding, cmpErr := classifyBranch(g, bd, sessions, remote, targets, ref, mrsByBranch, result.MRsMeasured)
 		if git.IsRemoteUnresponsive(cmpErr) {
 			remoteDown = cmpErr.Error()
 			result.Errors = append(result.Errors, fmt.Sprintf(
@@ -505,6 +614,7 @@ func SweepUnmergedPolecatBranches(g BranchSweepGit, bd BranchSweepBeads, opts Br
 func classifyBranch(
 	g BranchSweepGit,
 	bd BranchSweepBeads,
+	sessions *branchSessions,
 	remote string,
 	targets []string,
 	ref git.RemoteRef,
@@ -512,7 +622,7 @@ func classifyBranch(
 	mrsMeasured bool,
 ) (BranchSweepFinding, error) {
 	branch := strings.TrimPrefix(ref.Name, "refs/heads/")
-	finding := BranchSweepFinding{Branch: branch, CommitSHA: ref.Hash}
+	finding := BranchSweepFinding{Branch: branch, CommitSHA: ref.Hash, SessionPresence: branchSessionUnknown}
 	if meta, ok := polecat.ParseBranchName(branch); ok {
 		finding.Polecat = meta.Polecat
 		finding.IssueID = meta.Issue
@@ -616,11 +726,20 @@ func classifyBranch(
 	}
 
 	if !beads.IssueStatus(finding.IssueStatus).IsTerminal() {
-		// Open, hooked, in_progress, blocked, deferred — all re-slingable, so
-		// the branch has a route back to work. Same reasoning the forward path
-		// uses to decide a rejection stranded nothing.
+		// Open, hooked, in_progress, blocked, deferred — the bead has a route
+		// back to work. Same reasoning the forward path uses to decide a
+		// rejection stranded nothing, with one exception that gt-6i5d bought at
+		// the price of a 23-hour silent stranding: the route can be blocked by
+		// the very agent that is supposed to be taking it.
+		finding.SessionPresence = sessions.presenceFor(finding.Polecat)
+		held := beads.IssueStatus(finding.IssueStatus).IsAssigned()
+		if held && finding.SessionPresence == branchSessionAbsent {
+			finding.Class = BranchSweepStalled
+			finding.Note = branchStalledNote(finding, mrsMeasured)
+			return finding, nil
+		}
 		finding.Class = BranchSweepActive
-		finding.Note = "bead is " + finding.IssueStatus + " — still re-slingable"
+		finding.Note = "bead is " + finding.IssueStatus + " — still re-slingable; " + branchSessionNote(finding, held)
 		return finding, nil
 	}
 
@@ -756,6 +875,11 @@ func notComparedFinding(ref git.RemoteRef, cause string) BranchSweepFinding {
 		CommitSHA: ref.Hash,
 		Class:     BranchSweepUnknown,
 		Err:       cause,
+		// Explicitly unknown, like every other column here. This row's whole
+		// contract is that what it does not know is left empty rather than
+		// filled with a plausible default, and "unknown" is what an unasked
+		// session question looks like when it is said out loud.
+		SessionPresence: branchSessionUnknown,
 	}
 	if meta, ok := polecat.ParseBranchName(branch); ok {
 		finding.Polecat = meta.Polecat
@@ -763,6 +887,137 @@ func notComparedFinding(ref git.RemoteRef, cause string) BranchSweepFinding {
 	}
 	finding.Note = "NOT COMPARED: the remote stopped responding earlier in this sweep (" + cause + ") — re-run when it answers"
 	return finding
+}
+
+// branchSessions probes session presence at most once per polecat.
+//
+// The cache is not premature: several branches routinely name the same polecat
+// (a recycled sandbox keeps its name across issues), and each probe is a tmux
+// round trip on a patrol cadence. Caching also makes one sweep INTERNALLY
+// CONSISTENT — without it, two rows for the same polecat could disagree because
+// a session died between them, and a listing that contradicts itself is worse
+// than one that is merely a moment stale.
+type branchSessions struct {
+	probe BranchSweepSessions
+	cache map[string]string
+}
+
+// newBranchSessions wraps a probe, tolerating a nil one.
+func newBranchSessions(probe BranchSweepSessions) *branchSessions {
+	s := &branchSessions{cache: map[string]string{}}
+	// A caller that passes a typed nil pointer gets no probe rather than a
+	// panic: the sweep must degrade to "unmeasured", which is a state it already
+	// reports honestly, not fail.
+	if probe != nil && !isNilProbe(probe) {
+		s.probe = probe
+	}
+	return s
+}
+
+func isNilProbe(probe BranchSweepSessions) bool {
+	v := reflect.ValueOf(probe)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+// available reports whether any session question can be answered at all.
+func (s *branchSessions) available() bool { return s != nil && s.probe != nil }
+
+// presenceFor returns "present", "absent" or "unknown" for a polecat.
+//
+// Everything that is not a measured answer collapses to "unknown", and that is
+// the safe direction: unknown leaves a branch classified exactly as it was
+// before this fix existed, so a probe that cannot run costs nothing but the
+// detection it was meant to add. The opposite bias would route live polecats to
+// a stalled verdict on the strength of a tmux hiccup.
+func (s *branchSessions) presenceFor(name string) string {
+	if !s.available() {
+		return branchSessionUnknown
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return branchSessionUnknown
+	}
+	if cached, ok := s.cache[name]; ok {
+		return cached
+	}
+	var presence string
+	switch s.probe.SessionPresenceFor(name) {
+	case polecat.SessionPresent:
+		presence = branchSessionPresent
+	case polecat.SessionAbsent:
+		presence = branchSessionAbsent
+	default:
+		presence = branchSessionUnknown
+	}
+	s.cache[name] = presence
+	return presence
+}
+
+// branchSessionNote is the evidence clause appended to an active verdict, so
+// the row says what it looked at rather than asserting the conclusion.
+//
+// It distinguishes the three reasons a session can be unknown, because they ask
+// for different things: no probe is a gap in the CALLER, an unnamed polecat is
+// a gap in the BRANCH NAME, and a failed probe is a gap in tmux.
+func branchSessionNote(f BranchSweepFinding, held bool) string {
+	who := f.Polecat
+	if who == "" {
+		who = "its polecat"
+	}
+	switch f.SessionPresence {
+	case branchSessionPresent:
+		return "session for " + who + " is alive"
+	case branchSessionAbsent:
+		// Reachable only when the bead is NOT held: nobody is waiting on this
+		// agent, so its death strands nothing. Say so rather than leaving a
+		// reader to wonder why an absent session did not raise the row.
+		return "session for " + who + " is GONE, but the bead is not held by it — it can still be dispatched"
+	default:
+		if !held {
+			return "session state UNMEASURED (the bead is not held by an agent, so it does not decide this row)"
+		}
+		if f.Polecat == "" {
+			return "session state UNMEASURED: no polecat name in the branch"
+		}
+		return "session state for " + who + " UNMEASURED — this row would be STALLED if that session is gone"
+	}
+}
+
+// branchStalledNote states the mechanism, not just the verdict. The remedy
+// differs by whether work was ever submitted, and the reader needs the MR
+// column's honesty about whether it was even looked at.
+func branchStalledNote(f BranchSweepFinding, mrsMeasured bool) string {
+	var b strings.Builder
+	b.WriteString("bead ")
+	b.WriteString(f.IssueID)
+	b.WriteString(" is ")
+	b.WriteString(f.IssueStatus)
+	b.WriteString(" but ")
+	if f.Polecat != "" {
+		b.WriteString(f.Polecat)
+		b.WriteString("'s")
+	} else {
+		b.WriteString("its polecat's")
+	}
+	b.WriteString(" session is GONE")
+	switch {
+	case !mrsMeasured:
+		b.WriteString(", MR state UNMEASURED")
+	case f.MRID == "":
+		b.WriteString(", no MR was ever created")
+	default:
+		b.WriteString(", MR ")
+		b.WriteString(f.MRID)
+		b.WriteString(" is ")
+		b.WriteString(f.MRStatus)
+	}
+	b.WriteString(" — pushed work with nobody to submit it, and the hook stops it being re-dispatched")
+	return b.String()
 }
 
 // branchCheckNote states what was observed, in terms that do not overclaim.
@@ -912,16 +1167,20 @@ func isBeadNotFound(err error) bool {
 // sortFindings puts the short list first, then orders by branch so repeated
 // runs are diffable.
 func sortFindings(findings []BranchSweepFinding) {
+	// Stalled sorts first: of everything on the short list it is the only class
+	// that is not a question. Check and unknown both need someone to find out
+	// something; a stalled row is already settled and needs someone to act.
 	rank := map[BranchSweepClass]int{
-		BranchSweepCheck:    0,
-		BranchSweepUnknown:  1,
-		BranchSweepReported: 2,
-		BranchSweepQueued:   3,
-		BranchSweepActive:   4,
-		BranchSweepLanded:   5,
+		BranchSweepStalled:  0,
+		BranchSweepCheck:    1,
+		BranchSweepUnknown:  2,
+		BranchSweepReported: 3,
+		BranchSweepQueued:   4,
+		BranchSweepActive:   5,
+		BranchSweepLanded:   6,
 		// Last, and it is the point: a settled branch is the one row nobody
 		// needs to read again.
-		BranchSweepSuperseded: 6,
+		BranchSweepSuperseded: 7,
 	}
 	sort.SliceStable(findings, func(i, j int) bool {
 		ri, rj := rank[findings[i].Class], rank[findings[j].Class]

@@ -53,14 +53,22 @@ an ancestor of the target may still have landed by squash or cherry-pick.
 
 Each branch is classified:
 
+  stalled   the bead is HELD by a polecat whose session is gone — nobody will
+            submit this, and the hook stops it being re-dispatched
   check     unmerged, no open MR, terminal bead, unreported — needs a decision
   unknown   could not be classified; a question, not an all-clear
   reported  an open stranded-rejection report already names this bead
   queued    an open merge request is holding it — queued, not stranded
-  active    the bead is still re-slingable, so nothing is stranded yet
+  active    the bead is re-slingable AND nothing says its agent is gone
   landed    content is already in the target
 
-Only check and unknown are the short list. The rest are shown with --all.
+stalled, check and unknown are the short list. The rest are shown with --all.
+
+active and stalled are the same bead status split by one fact: does the
+polecat's tmux session still exist. Without that fact "active" was asserted from
+bead status alone, and a dead polecat holding a hooked bead over 67 pushed
+commits read as needing no decision for 23 hours (gt-6i5d). Every active row now
+carries the session state it rests on, and a sweep that could not ask says so.
 
 A landed branch is two situations under one name, and --deletable separates
 them. Branch hygiene deletes a remote branch only when it is an ANCESTOR of the
@@ -297,10 +305,21 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 			git.SupersededRefPrefix, marksErr))
 	}
 
+	// A failure to build the polecat manager is not fatal either: the sweep
+	// degrades to "session state UNMEASURED" on every row and says so in its own
+	// errors, which is strictly better than refusing to sweep at all. It is a
+	// warning here so the reason reaches the reader, because from the output
+	// alone "no session probe" is otherwise indistinguishable between a caller
+	// that never tried and one that tried and could not.
+	sessions, sessErr := branchSweepSessions(rigName)
+	if sessErr != nil {
+		warnings = append(warnings, fmt.Sprintf("could not open a session probe for %s: %v (the active/stalled split cannot fire)", rigName, sessErr))
+	}
+
 	result, err := witness.SweepUnmergedPolecatBranches(
 		repoGit,
 		beads.New(rigPath),
-		witness.BranchSweepOptions{Remote: remote, Targets: targets, Superseded: marks},
+		witness.BranchSweepOptions{Remote: remote, Targets: targets, Superseded: marks, Sessions: sessions},
 	)
 	if err != nil {
 		return err
@@ -505,6 +524,25 @@ func markerActor() string {
 	return ""
 }
 
+// branchSweepSessions builds the probe that answers "does this polecat still
+// have a tmux session".
+//
+// It returns a nil INTERFACE rather than a nil *polecat.Manager on failure. A
+// typed nil stored in an interface is non-nil to every `!= nil` test, so the
+// sweep would believe it had a probe and call a method on nothing; the sweep
+// guards against that too, and both guards are cheap next to the failure mode
+// they prevent — a panic in a read-only patrol.
+func branchSweepSessions(rigName string) (witness.BranchSweepSessions, error) {
+	mgr, _, err := getPolecatManager(rigName)
+	if err != nil {
+		return nil, err
+	}
+	if mgr == nil {
+		return nil, fmt.Errorf("no polecat manager for rig %s", rigName)
+	}
+	return mgr, nil
+}
+
 // resolvePatrolBranchesRig decides which rig to sweep and reports where the
 // answer came from, so a wrong one is traceable rather than merely wrong.
 //
@@ -701,9 +739,24 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 			fmt.Fprintf(w, "  that is no longer the tip. They are listed on purpose — see the note on each row.\n\n")
 		}
 		counts := result.CountByClass()
-		fmt.Fprintf(w, "%s %d branch(es) need a look: %d to CHECK, %d that could not be classified.\n",
+		fmt.Fprintf(w, "%s %d branch(es) need a look: %d STALLED, %d to CHECK, %d that could not be classified.\n",
 			style.Warning.Render("⚠"), attention,
+			counts[witness.BranchSweepStalled],
 			counts[witness.BranchSweepCheck], counts[witness.BranchSweepUnknown])
+		if stalled := counts[witness.BranchSweepStalled]; stalled > 0 {
+			// Said before the check guidance and separately from it. "A short
+			// list is not a claim that work was lost" is true of a check row and
+			// false here, and a reader who meets the reassurance first carries it
+			// onto rows it does not cover.
+			fmt.Fprintf(w, "\n  %s\n", style.Error.Render(fmt.Sprintf("%d STALLED branch(es) are not a question — the work is live and unattended.", stalled)))
+			fmt.Fprintf(w, "  The bead is held by a polecat whose session was MEASURED and is gone. Nothing\n")
+			fmt.Fprintf(w, "  will submit the branch, and the hook is what stops the bead being re-dispatched,\n")
+			fmt.Fprintf(w, "  so this state does not resolve on its own. For each one:\n")
+			fmt.Fprintf(w, "    gt session status <rig>/<polecat> --json   # confirm the session is still gone\n")
+			fmt.Fprintf(w, "    gt mq submit --branch <branch> --issue <bead> --no-cleanup   # raise the MR it never did\n")
+			fmt.Fprintf(w, "  Or clear the hook and re-sling the bead, if the branch turns out to be worthless.\n")
+			fmt.Fprintf(w, "  %s\n\n", style.Dim.Render("This command does neither — it writes nothing."))
+		}
 		fmt.Fprintf(w, "  This is a short list, NOT a claim that work was lost. A branch can be unmerged\n")
 		fmt.Fprintf(w, "  because it was superseded (correctly closed, branch redundant) or because its bead\n")
 		fmt.Fprintf(w, "  closed underneath live work (stranded). Separating them needs a rehearsal merge —\n")
@@ -941,6 +994,7 @@ func shortCommit(sha string) string {
 func branchSweepSummary(result *witness.BranchSweepResult) string {
 	counts := result.CountByClass()
 	order := []witness.BranchSweepClass{
+		witness.BranchSweepStalled,
 		witness.BranchSweepCheck,
 		witness.BranchSweepUnknown,
 		witness.BranchSweepReported,
@@ -974,6 +1028,13 @@ func branchSweepSummary(result *witness.BranchSweepResult) string {
 	if !result.MarksMeasured {
 		parts = append(parts, "superseded markers UNMEASURED")
 	}
+	if !result.SessionsMeasured {
+		// Without this, "0 stalled" above is a claim the sweep did not make.
+		// The tally prints every class including the empty ones precisely so a
+		// reader can tell "measured, none" from "not looked at" — a zero from an
+		// absent probe would defeat the thing that line exists for.
+		parts = append(parts, "session state UNMEASURED (0 stalled means NOT ASKED)")
+	}
 	return strings.Join(parts, ", ")
 }
 
@@ -982,6 +1043,8 @@ func branchSweepSummary(result *witness.BranchSweepResult) string {
 // deletes it, and the table is where a reader first meets that fact.
 func renderBranchSweepClass(f witness.BranchSweepFinding) string {
 	switch f.Class {
+	case witness.BranchSweepStalled:
+		return style.Error.Render(string(f.Class))
 	case witness.BranchSweepCheck:
 		return style.Warning.Render(string(f.Class))
 	case witness.BranchSweepUnknown:
