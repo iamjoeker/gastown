@@ -40,6 +40,11 @@ type noMRCloseContext struct {
 	BranchPushedWithWork bool
 	// SkipVerify is true when --skip-verify was passed.
 	SkipVerify bool
+	// WorkLandedOnTarget is true when a commit reachable from the target names
+	// this bead — a sibling landed the work first (gt-7k3q). The polecat then
+	// has no commits of its own by design, and the ledger has something better
+	// than its branch to point at, so the no-work rule below must not fire.
+	WorkLandedOnTarget bool
 }
 
 // noMRCloseRefusal returns the reason a no-MR close must be refused, or "" when
@@ -51,7 +56,10 @@ type noMRCloseContext struct {
 //     closes. Enforce that: on a code bead it is refused, not merely annotated.
 //   - A polecat closing a code bead must have work somewhere. With no commits
 //     ahead of base and nothing on the pushed branch, there is definitionally
-//     none, so there is nothing to record and nothing to close.
+//     none, so there is nothing to record and nothing to close. The one
+//     exception is work that landed under someone else's commit
+//     (WorkLandedOnTarget, gt-7k3q): the ledger then records that commit, which
+//     is stronger evidence than the polecat's own branch, not weaker.
 func noMRCloseRefusal(c noMRCloseContext) string {
 	if c.IsNonCodeTask {
 		return ""
@@ -60,7 +68,7 @@ func noMRCloseRefusal(c noMRCloseContext) string {
 		return fmt.Sprintf("--skip-verify is an audit-only escape hatch for non-code closes; %s is a code bead "+
 			"(no no_merge/review_only flag), so its completion must be verified against a real pushed commit", c.IssueID)
 	}
-	if c.IsPolecat && !c.BranchPushedWithWork {
+	if c.IsPolecat && !c.BranchPushedWithWork && !c.WorkLandedOnTarget {
 		return fmt.Sprintf("cannot close code bead %s with no work: no commits ahead of base and no commits on the pushed branch. "+
 			"HEAD is just the base ref, so there is no commit that proves this work was done", c.IssueID)
 	}

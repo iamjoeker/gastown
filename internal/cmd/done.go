@@ -47,6 +47,12 @@ Exit statuses:
   ESCALATED      - Hit blocker, needs human intervention
   DEFERRED       - Work paused, issue still open
 
+Work a sibling already landed: run plain 'gt done'. When your branch is zero
+commits ahead and a commit on the target names your bead, the completion closes
+it as superseded and records that commit. Do NOT close the bead by hand — an
+open merge request against a closed bead is orphaned work (gt-7k3q). If nothing
+on the target names the bead, gt done refuses and exits non-zero.
+
 Examples:
   gt done                              # Submit branch, notify COMPLETED, exit session
   gt done --pre-verified               # Submit with pre-verification fast-path
@@ -1137,13 +1143,42 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
 			}
 
+			// gt-7k3q: the sibling-landed-first case. A code bead has no exit
+			// here unless gt done can tell "another polecat landed this work"
+			// apart from "this polecat wrote nothing" — zero commits ahead looks
+			// identical from both. Ask git which one it is before any refusal
+			// below fires, so the answer can open a path rather than only
+			// decorate a dead end.
+			supersededReq := supersededRequest{IssueID: issueID, BaseRef: baseRef}
+			superseded := supersededVerdict{Reason: "not checked: non-code completion"}
+			if !isNoMergeTask {
+				// Fetch first. The sibling's merge is minutes old by
+				// construction, and against an unrefreshed remote-tracking ref
+				// the search reads exactly like work that was never done — a
+				// blind zero, indistinguishable from a real one. A failed fetch
+				// is reported rather than swallowed, because it turns the
+				// refusal below into one that cannot be trusted.
+				supersededRemote := git.RemoteForRef(baseRef)
+				if supersededRemote == "" {
+					supersededRemote = "origin"
+				}
+				if fetchErr := g.Fetch(supersededRemote); fetchErr != nil {
+					style.PrintWarning("could not fetch %s before checking whether this work already landed: %v (%s may be stale)", supersededRemote, fetchErr, baseRef)
+				}
+				superseded = assessSupersededWork(g, supersededReq)
+			}
+			if superseded.Landed {
+				fmt.Printf("%s %s is already on %s as %s\n",
+					style.Bold.Render("→"), issueID, baseRef, shortSHA(superseded.Commit.SHA))
+				fmt.Printf("  %s\n", superseded.Commit.Subject)
+			}
+
 			if os.Getenv("GT_POLECAT") != "" && doneCleanupStatus != "clean" && !isNoMergeTask {
-				if !branchPushedWithWork {
+				if !branchPushedWithWork && !superseded.Landed {
 					return fmt.Errorf("cannot complete: no commits on branch ahead of %s\n"+
 						"Polecats must have at least 1 commit to submit.\n"+
-						"If the bug was already fixed upstream: gt done --status DEFERRED\n"+
-						"If you're blocked: gt done --status ESCALATED",
-						baseRef)
+						"%s",
+						baseRef, supersededRefusalHint(superseded))
 				}
 			}
 
@@ -1190,14 +1225,26 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						IsNonCodeTask:        isNoMergeTask,
 						BranchPushedWithWork: branchPushedWithWork,
 						SkipVerify:           doneSkipVerify,
+						WorkLandedOnTarget:   superseded.Landed,
 					}); refusal != "" {
 						style.PrintWarning("%s", refusal)
 						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
 						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, refusal)
-						return fmt.Errorf("cannot close %s: %s", issueID, refusal)
+						return fmt.Errorf("cannot close %s: %s\n%s", issueID, refusal, supersededRefusalHint(superseded))
 					}
 
-					if doneSkipVerify {
+					if superseded.Landed {
+						// gt-7k3q: the terminal state that did not exist. The ledger
+						// records the commit that carries the work, on the target,
+						// named by SHA and subject — not this branch's HEAD, which is
+						// only the base ref, and not the polecat's assertion that the
+						// work is done. The two checks below are skipped deliberately:
+						// the fork-mode refusal asks whether THIS branch can reach the
+						// queue (it has nothing to send), and the push verification
+						// asks whether HEAD landed (it never left). Both answer the
+						// wrong question once a sibling has already landed the work.
+						closeReason = supersededCloseReason(supersededReq, superseded)
+					} else if doneSkipVerify {
 						// Non-code close: no commit represents this work, so record none.
 						// Recording HEAD here is what put an unrelated upstream commit in
 						// the ledger as proof against gt-y20.
@@ -1214,13 +1261,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: none (non-code close, no work to verify)", closeReason, defaultBranch)
 					} else if !isNoMergeTask {
 						if g.ForkBackedRemote("origin") {
-							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead", branch, baseRef)
+							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead\n%s",
+								branch, baseRef, supersededRefusalHint(superseded))
 						}
 						if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							// A lost annotation is already reported loudly by the helper;
 							// the close is refused either way.
 							_ = noteVerifiedPushFailure(bd, cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
-							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
+							return fmt.Errorf("cannot close no-MR code bead: %w\n%s", verifyErr, supersededRefusalHint(superseded))
 						}
 						if noMRCommitSHA != "" {
 							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
@@ -2281,7 +2329,16 @@ notifyWitness:
 		}
 	}
 
-	return nil
+	// gt-7k3q: exit non-zero when gt done did not do what it was asked. Last,
+	// after every notification and cleanup above, so the exit status reports the
+	// outcome without changing it.
+	return doneExitError(doneOutcome{
+		PushFailed:    pushFailed,
+		MRFailed:      mrFailed,
+		MRRefused:     mrRefused,
+		LedgerNoteErr: ledgerNoteErr,
+		Reasons:       doneErrors,
+	})
 }
 
 // pushSubmoduleChanges detects submodules modified between baseRef

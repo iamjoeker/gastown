@@ -320,8 +320,17 @@ func TestRunDoneCreatesNoMRForClosedSourceIssue(t *testing.T) {
 	doneCleanupStatus = "unpushed"
 	doneSkipVerify = true
 	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, mrID string) error { return nil }
-	if err := runDone(nil, nil); err != nil {
-		t.Fatalf("runDone: %v", err)
+	// gt-7k3q: the refusal is correct and it is still a refusal. Every step
+	// below it runs — the stranding report, the witness mail, the retirement —
+	// and then gt done exits non-zero, because a caller that checks only the
+	// exit status must not read "no merge request was created, and the branch
+	// is not in the target" as a clean completion.
+	err := runDone(nil, nil)
+	if err == nil {
+		t.Fatal("runDone returned nil after refusing the MR; a refused submit must exit non-zero")
+	}
+	if !strings.Contains(err.Error(), "merge request creation was refused") {
+		t.Errorf("runDone error should name the refusal, got: %v", err)
 	}
 
 	log := readSubmitSourceBDLog(t, logPath)

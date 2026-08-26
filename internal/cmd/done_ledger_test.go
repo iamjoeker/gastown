@@ -231,6 +231,22 @@ func TestNoMRCloseRefusal(t *testing.T) {
 			ctx:     noMRCloseContext{IssueID: "gt-1"},
 			refused: false,
 		},
+		{
+			// gt-7k3q: a sibling landed the work first, so the polecat has no
+			// commits by design. The ledger points at the landing commit on the
+			// target, which is better evidence than this branch could offer.
+			name:    "polecat code bead superseded by work on the target closes",
+			ctx:     noMRCloseContext{IssueID: "gt-1", IsPolecat: true, WorkLandedOnTarget: true},
+			refused: false,
+		},
+		{
+			// The landed evidence answers the no-work rule, not the
+			// --skip-verify one. --skip-verify stays an audit-only escape hatch
+			// for non-code closes, and a superseded code bead does not need it.
+			name:    "skip-verify on a superseded code bead is still refused",
+			ctx:     noMRCloseContext{IssueID: "gt-1", IsPolecat: true, WorkLandedOnTarget: true, SkipVerify: true},
+			refused: true,
+		},
 	}
 
 	for _, tt := range tests {
