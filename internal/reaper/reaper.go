@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -157,9 +158,27 @@ type PurgeResult struct {
 	// because they are pinned, carry a protected label with no archive
 	// configured, or could not be archived. Reported so a purge that declines
 	// to delete says so, rather than looking like a smaller purge.
-	WispsProtected int       `json:"wisps_protected,omitempty"`
-	DryRun         bool      `json:"dry_run,omitempty"`
-	Anomalies      []Anomaly `json:"anomalies,omitempty"`
+	WispsProtected int `json:"wisps_protected,omitempty"`
+	// WispsPurgedByType breaks WispsPurged down by wisp_type, keyed 'unknown'
+	// for rows that carry none. It exists because a purge count that names no
+	// population is not a readable number (gt-mkuw).
+	//
+	// The digest was already being computed here and thrown away, so
+	// `reaper: purge 29 closed wisps from beads` was all any later reader had.
+	// On 2026-08-26 that line, three times over, was read as ~40 destroyed
+	// merge-request records and filed as a P1 second-deleter incident. Nothing
+	// was missing: the rows were molecule steps and sling-context wisps, and
+	// purgeProtectWhere makes this path STRUCTURALLY INCAPABLE of taking a
+	// merge-request or escalation row — it selects only what is neither pinned
+	// nor label-protected. The count could not say so and the breakdown can.
+	//
+	// Counted from the candidate set immediately before the delete pass. If the
+	// delete then removes a different number, that disagreement is reported as
+	// a purge_digest_mismatch anomaly rather than being smoothed over — a
+	// breakdown that does not sum to its total is worse than no breakdown.
+	WispsPurgedByType map[string]int `json:"wisps_purged_by_type,omitempty"`
+	DryRun            bool           `json:"dry_run,omitempty"`
+	Anomalies         []Anomaly      `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -1188,13 +1207,14 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	purged, archived, protected, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive)
+	counts, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
-	result.WispsPurged = purged
-	result.WispsArchived = archived
-	result.WispsProtected = protected
+	result.WispsPurged = counts.purged
+	result.WispsArchived = counts.archived
+	result.WispsProtected = counts.protected
+	result.WispsPurgedByType = counts.byType
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
 	// Purge old mail. Its anomalies are appended before the error check: a
@@ -1210,17 +1230,31 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	return result, nil
 }
 
+// purgedWispCounts is what one purge pass did to the closed-past-cutoff window.
+//
+// purged, archived and protected PARTITION that window; byType breaks purged
+// down further. It is a struct rather than the four positional ints it replaced
+// because this function's whole subject is counts that must not be confused
+// with one another, and the caller assigning them by position is where such a
+// confusion would land silently.
+type purgedWispCounts struct {
+	purged    int
+	archived  int
+	protected int
+	byType    map[string]int
+}
+
 // purgeClosedWisps deletes closed wisps past purgeAge and, when an archive is
 // configured, exports the label-protected ones before deleting those too.
 //
-// Returns (purged, archived, protected, anomalies, error). The three counts
-// partition the closed-past-cutoff window; see PurgeResult.
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver) (int, int, int, []Anomaly, error) {
+// The counts partition the closed-past-cutoff window; see PurgeResult.
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver) (purgedWispCounts, []Anomaly, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	deleteCutoff := time.Now().UTC().Add(-purgeAge)
 	var anomalies []Anomaly
+	counts := purgedWispCounts{}
 	protectWhere := purgeProtectWhere()
 
 	// Count what protection holds back, before anything is deleted. Taken from
@@ -1230,7 +1264,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	var protectedTotal int
 	protectedQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND NOT (" + protectWhere + ")"
 	if err := db.QueryRowContext(ctx, protectedQuery, deleteCutoff).Scan(&protectedTotal); err != nil {
-		return 0, 0, 0, nil, fmt.Errorf("count protected wisps: %w", err)
+		return counts, nil, fmt.Errorf("count protected wisps: %w", err)
 	}
 
 	// Retention (gt-6xwt): export the label-protected rows, then release them.
@@ -1256,39 +1290,50 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	// than re-counting keeps the partition exact when only some rows made it:
 	// an archive that exported 4 of 7 reports 4 archived and 3 protected.
 	protectedTotal -= archived
+	counts.archived = archived
+	counts.protected = protectedTotal
 
 	// Digest: count by wisp_type.
 	// No parent check — closed unprotected wisps past the delete age are purgeable.
 	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
 	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
+	//
+	// The breakdown is KEPT, not just summed. For as long as only digestTotal
+	// survived this loop, the sole trace a purge left anywhere was
+	// `reaper: purge N closed wisps from <db>` — see PurgeResult.WispsPurgedByType
+	// for what that cost (gt-mkuw).
 	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + protectWhere + " GROUP BY wtype"
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
-		return 0, archived, protectedTotal, nil, fmt.Errorf("digest query: %w", err)
+		return counts, nil, fmt.Errorf("digest query: %w", err)
 	}
 	digestTotal := 0
+	byType := map[string]int{}
 	for rows.Next() {
 		var wtype string
 		var cnt int
 		if err := rows.Scan(&wtype, &cnt); err != nil {
 			rows.Close()
-			return 0, archived, protectedTotal, nil, fmt.Errorf("digest scan: %w", err)
+			return counts, nil, fmt.Errorf("digest scan: %w", err)
 		}
 		digestTotal += cnt
+		byType[wtype] += cnt
 	}
 	rows.Close()
 
 	if digestTotal == 0 {
-		return 0, archived, protectedTotal, anomalies, nil
+		return counts, anomalies, nil
 	}
 
 	if dryRun {
-		return digestTotal, archived, protectedTotal, anomalies, nil
+		counts.purged = digestTotal
+		counts.byType = byType
+		return counts, anomalies, nil
 	}
 
 	session, err := beginWriteSession(ctx, db)
 	if err != nil {
-		return 0, archived, protectedTotal, nil, err
+		return counts, nil, err
 	}
 	defer session.release()
 
@@ -1303,7 +1348,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
-		return 0, archived, protectedTotal, anomalies, err
+		return counts, anomalies, err
 	}
 
 	if totalDeleted > 0 {
@@ -1312,9 +1357,10 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 				Type:    "sql_commit_failed",
 				Message: fmt.Sprintf("sql commit after purge failed, deletes rolled back: %v", err),
 			})
-			return 0, archived, protectedTotal, anomalies, nil
+			return counts, anomalies, nil
 		}
-		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
+		commitMsg := fmt.Sprintf("reaper: purge %d closed unprotected wisps from %s (%s)",
+			totalDeleted, dbName, FormatWispTypeDigest(byType))
 		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal — log but continue.
 			anomalies = append(anomalies, Anomaly{
@@ -1324,7 +1370,61 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		}
 	}
 
-	return totalDeleted, archived, protectedTotal, anomalies, nil
+	counts.purged = totalDeleted
+	counts.byType = byType
+	// The digest was taken from the candidate set a moment before the delete
+	// pass. If the two disagree, the breakdown no longer describes what was
+	// deleted, and saying so is the whole point of having one: a breakdown that
+	// silently fails to sum to its total is a worse instrument than none.
+	if totalDeleted != digestTotal {
+		anomalies = append(anomalies, Anomaly{
+			Type: "purge_digest_mismatch",
+			Message: fmt.Sprintf(
+				"purge digest counted %d candidates in %s but %d rows were deleted; the by-type breakdown describes the candidates, not the deletions",
+				digestTotal, dbName, totalDeleted),
+			Count: digestTotal - totalDeleted,
+		})
+	}
+
+	return counts, anomalies, nil
+}
+
+// FormatWispTypeDigest renders a wisp_type breakdown for a one-line message, as
+// "patrol 12, unknown 3", commonest first and ties broken by name so the same
+// population always renders the same string.
+//
+// It exists so a purge names a POPULATION and not just a number.
+// `reaper: purge 29 closed wisps from beads` is the entire record those
+// deletions left — wisp tables are in dolt_ignore, so the commit itself is
+// empty and its message is all there is to read afterwards. On 2026-08-26 that
+// message was read, honestly and by several agents, as ~40 destroyed
+// merge-request records; they were molecule steps, and this path cannot take a
+// merge-request row at all (purgeProtectWhere). "unprotected" plus the
+// breakdown is what lets the message refuse that reading on its own (gt-mkuw).
+//
+// Single quotes are stripped because the commit-message caller interpolates the
+// result into a SQL string literal, where one would end the literal early. No
+// wisp_type gastown writes contains one; stripping is cheaper than discovering
+// otherwise inside a DOLT_COMMIT.
+func FormatWispTypeDigest(byType map[string]int) string {
+	if len(byType) == 0 {
+		return "no types recorded"
+	}
+	types := make([]string, 0, len(byType))
+	for wispType := range byType {
+		types = append(types, wispType)
+	}
+	sort.Slice(types, func(i, j int) bool {
+		if byType[types[i]] != byType[types[j]] {
+			return byType[types[i]] > byType[types[j]]
+		}
+		return types[i] < types[j]
+	})
+	parts := make([]string, 0, len(types))
+	for _, wispType := range types {
+		parts = append(parts, fmt.Sprintf("%s %d", strings.ReplaceAll(wispType, "'", ""), byType[wispType]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // wispArchiveAuxTables are the tables whose rows go with a wisp when it is

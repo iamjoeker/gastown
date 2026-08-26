@@ -386,6 +386,16 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 		totalMailPurged += result.MailPurged
 		totalArchived += result.WispsArchived
 		totalProtected += result.WispsProtected
+		// Log WHAT was purged, not only how many. The daemon is the reaper that
+		// actually runs on a schedule, so its log and the DOLT_COMMIT message
+		// are the only two places a purge is described at all — wisp tables are
+		// dolt-ignored, so there is no diff to read afterwards. A bare count in
+		// both is how a routine sweep of molecule steps was read as ~40
+		// destroyed merge-request records (gt-mkuw).
+		if result.WispsPurged > 0 {
+			d.logger.Printf("wisp_reaper: %s: purged %d closed unprotected wisps (%s)",
+				dbName, result.WispsPurged, reaper.FormatWispTypeDigest(result.WispsPurgedByType))
+		}
 		if result.WispsArchived > 0 && archive != nil {
 			d.logger.Printf("wisp_reaper: %s: archived and released %d protected wisps to %s",
 				dbName, result.WispsArchived, archive.Location())

@@ -1503,3 +1503,122 @@ func TestStrandedMoleculeProbeBehaviour(t *testing.T) {
 			"be read, and the probe must not go silent", stranded, want)
 	}
 }
+
+// TestPurgeReportsWhatItPurgedNotJustHowMany is the acceptance test for gt-mkuw.
+//
+// The purge already computed a wisp_type digest and threw everything but the
+// total away, so the entire record one of these deletions left behind was
+// `reaper: purge 29 closed wisps from beads`. Wisp tables are in dolt_ignore,
+// so the DOLT_COMMIT is empty and its MESSAGE is the only artifact — there is
+// no diff to read afterwards, ever.
+//
+// On 2026-08-26 three such lines on the beads database (5 + 29 + 7 = 41 rows in
+// 45 minutes) were read as ~40 destroyed merge-request records and filed as a
+// P1 second-deleter incident. Nothing was missing. The rows were molecule steps
+// and sling-context wisps, and purgeProtectWhere makes this path structurally
+// incapable of taking a merge-request row at all. The count could not say so.
+//
+// The NEGATIVE CONTROL is w-mr: same status, same age, protected only by its
+// label. It must appear in NEITHER the total NOR the breakdown — a breakdown
+// that named it would be describing candidates rather than deletions, which is
+// the failure this test exists to catch.
+func TestPurgeReportsWhatItPurgedNotJustHowMany(t *testing.T) {
+	f := newFixture(t, "purge_digest")
+	now := time.Now().UTC()
+	oldClose := now.Add(-30 * 24 * time.Hour)
+
+	f.insertWisps(t,
+		wispRow{id: "w-patrol-1", status: "closed", wispType: "patrol", createdAt: oldClose, closedAt: &oldClose},
+		wispRow{id: "w-patrol-2", status: "closed", wispType: "patrol", createdAt: oldClose, closedAt: &oldClose},
+		wispRow{id: "w-patrol-3", status: "closed", wispType: "patrol", createdAt: oldClose, closedAt: &oldClose},
+		wispRow{id: "w-hb", status: "closed", wispType: "heartbeat", createdAt: oldClose, closedAt: &oldClose},
+		// wisp_type NULL. Real rows reach this state in bulk — measured on the
+		// gastown rig, 703 of 703 carried no type — so "unknown" is the label
+		// most of a real digest wears, not an edge case.
+		wispRow{id: "w-untyped", status: "closed", createdAt: oldClose, closedAt: &oldClose},
+		// NEGATIVE CONTROL: identical window, held back by its label alone.
+		wispRow{id: "w-mr", status: "closed", wispType: "merge_request", createdAt: oldClose, closedAt: &oldClose,
+			labels: []string{"gt:merge-request"}},
+	)
+
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if result.WispsPurged != 5 {
+		t.Fatalf("WispsPurged = %d, want 5", result.WispsPurged)
+	}
+
+	want := map[string]int{"patrol": 3, "heartbeat": 1, "unknown": 1}
+	if !reflect.DeepEqual(result.WispsPurgedByType, want) {
+		t.Errorf("WispsPurgedByType = %v, want %v", result.WispsPurgedByType, want)
+	}
+	if _, named := result.WispsPurgedByType["merge_request"]; named {
+		t.Errorf("WispsPurgedByType names merge_request (%v) — the protected control was not "+
+			"deleted, so a breakdown that counts it describes candidates rather than deletions",
+			result.WispsPurgedByType)
+	}
+
+	// The breakdown must sum to the total it accompanies. A partition that does
+	// not add up is what the purge_digest_mismatch anomaly is for; here there is
+	// nothing to mismatch, so the run must be clean.
+	sum := 0
+	for _, n := range result.WispsPurgedByType {
+		sum += n
+	}
+	if sum != result.WispsPurged {
+		t.Errorf("breakdown sums to %d but WispsPurged = %d", sum, result.WispsPurged)
+	}
+	if len(result.Anomalies) != 0 {
+		t.Errorf("unexpected anomalies: %+v", result.Anomalies)
+	}
+
+	// The commit message is the only durable trace. It must name the population
+	// and say the rows were unprotected, so the reading that produced gt-mkuw
+	// cannot survive contact with it.
+	commits := f.doltCommitMessages()
+	if len(commits) != 1 {
+		t.Fatalf("DOLT_COMMIT messages = %v, want exactly one", commits)
+	}
+	msg := commits[0]
+	for _, want := range []string{"unprotected", "patrol 3", "heartbeat 1", "unknown 1"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("DOLT_COMMIT message %q does not contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "merge_request") {
+		t.Errorf("DOLT_COMMIT message %q names merge_request, which this path cannot delete", msg)
+	}
+
+	if got := f.ids(t, "wisps"); !reflect.DeepEqual(got, []string{"w-mr"}) {
+		t.Errorf("surviving wisps = %v, want [w-mr] — the label-protected control must remain", got)
+	}
+}
+
+// TestFormatWispTypeDigestIsStableAndOrdered pins the rendering itself.
+//
+// Commonest first with ties broken by name, so the same population always
+// renders the same string: a message that reorders itself between runs cannot
+// be compared across two purges, which is most of what reading a digest is for.
+func TestFormatWispTypeDigestIsStableAndOrdered(t *testing.T) {
+	digest := map[string]int{"unknown": 1, "patrol": 12, "heartbeat": 12, "step": 40}
+	const want = "step 40, heartbeat 12, patrol 12, unknown 1"
+	for i := 0; i < 8; i++ {
+		if got := FormatWispTypeDigest(digest); got != want {
+			t.Fatalf("FormatWispTypeDigest run %d = %q, want %q", i, got, want)
+		}
+	}
+
+	// An empty digest must say so rather than render as "()" in the commit
+	// message, where an empty parenthesis reads as a truncated line.
+	if got := FormatWispTypeDigest(nil); got != "no types recorded" {
+		t.Errorf("FormatWispTypeDigest(nil) = %q, want %q", got, "no types recorded")
+	}
+
+	// A quote would end the SQL string literal the commit message is
+	// interpolated into. No production wisp_type carries one; the guard is here
+	// so that stays true by construction rather than by luck.
+	if got := FormatWispTypeDigest(map[string]int{"it's": 2}); strings.Contains(got, "'") {
+		t.Errorf("FormatWispTypeDigest = %q, want the single quote stripped", got)
+	}
+}

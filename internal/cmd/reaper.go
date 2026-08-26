@@ -432,6 +432,15 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				}
 				fmt.Printf("%s: %spurged %d wisps, %d mail\n",
 					r.Database, prefix, r.WispsPurged, r.MailPurged)
+				// Say WHAT was purged, not only how many. A bare count here is
+				// what got read as ~40 destroyed merge-request records on
+				// 2026-08-26; this path deletes only rows that are neither
+				// pinned nor label-protected, and the breakdown is how the
+				// output says so (gt-mkuw).
+				if len(r.WispsPurgedByType) > 0 {
+					fmt.Printf("  By wisp_type (unprotected only): %s\n",
+						reaper.FormatWispTypeDigest(r.WispsPurgedByType))
+				}
 				// Name the archive alongside the count: a deletion that reports
 				// only a number is the shape of the loss this replaced.
 				if r.WispsArchived > 0 && archive != nil {
