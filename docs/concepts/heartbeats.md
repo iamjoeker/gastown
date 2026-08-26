@@ -14,8 +14,18 @@ refreshed its session heartbeat while the file store aged past threshold).
   (`internal/deacon/heartbeat.go`).
 - **Read by:** the stuck-agent-dog plugin (parses the JSON `timestamp`, falling
   back to mtime for malformed legacy files, and cross-checks tmux activity
-  before escalating) and the Go daemon (`deacon.ReadHeartbeat`; thresholds 5m
-  stale / 20m very-stale → poke).
+  before escalating) and the Go daemon (`deacon.ReadHeartbeat`; thresholds 15m
+  stale → nudge / 20m very-stale → kill and restart, overridable via
+  `operational.deacon.heartbeat_stale_threshold` and
+  `heartbeat_very_stale_threshold`).
+- **Not a liveness measure on its own.** The Deacon stamps this file at fixed
+  points in the patrol cycle — cycle start, mid-cycle, and immediately before
+  parking in await-signal — so its age ramps from zero to the cycle length and
+  resets. Age therefore reports POSITION IN THE LOOP. Both thresholds are
+  calibrated above the longest designed park (patrol `--backoff-max`, 15m) for
+  that reason; the earlier 5m stale threshold labelled a healthy Deacon stale on
+  29 of 30 measured cycles, 50.7% of wall-clock, and had the daemon nudging a
+  working agent (gt-cbd).
 - **Also touches:** the legacy `deacon/.deacon-heartbeat` mtime file for old
   shell scripts.
 
@@ -36,7 +46,10 @@ refreshed its session heartbeat while the file store aged past threshold).
   it is older than half of the stale threshold.
 - **Read by:** Witness second-order monitoring ("who watches the watchers"):
   Witnesses check the Deacon's bead activity and alert the Mayor if it looks
-  unresponsive (>5 minutes per the patrol formula).
+  unresponsive. "Unresponsive" is the daemon's stale threshold (15m), not five
+  minutes — see the calibration note above, and prefer the `wedged` verdict from
+  `gt deacon status --json`, which requires no turn in flight and no await
+  pending on top of the age.
 - **Gotcha:** a session that never reaches `await-signal` (handoff churn,
   session limits, one very long patrol turn) leaves this label stale for
   hours even though the agent is healthy.

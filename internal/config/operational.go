@@ -65,11 +65,19 @@ const (
 )
 
 // Deacon defaults.
+//
+// DefaultDeaconHeartbeatStaleThreshold and DefaultDeaconHeartbeatVeryStale must
+// both stay above the deacon patrol's await-signal backoff-max (15m): the
+// heartbeat stamps at fixed points in the cycle, so its age measures loop
+// position, not liveness, and anything shorter fires on a Deacon that is working
+// or legitimately parked. The previous 5m stale threshold labelled a healthy
+// Deacon stale on 29 of 30 measured cycles (gt-cbd). These are the values
+// internal/deacon.HeartbeatStaleThreshold and HeartbeatVeryStaleThreshold carry.
 const (
 	DefaultDeaconPingTimeout               = 30 * time.Second
 	DefaultDeaconConsecutiveFailures       = 3
 	DefaultDeaconCooldown                  = 5 * time.Minute
-	DefaultDeaconHeartbeatStaleThreshold   = 5 * time.Minute
+	DefaultDeaconHeartbeatStaleThreshold   = 15 * time.Minute
 	DefaultDeaconHeartbeatVeryStale        = 20 * time.Minute
 	DefaultMaxRedispatches                 = 3
 	DefaultRedispatchCooldown              = 5 * time.Minute

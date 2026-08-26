@@ -1,8 +1,12 @@
 package formula
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/deacon"
 )
 
 // TestPatrolFormulasHaveBackoffLogic verifies that patrol formulas include
@@ -390,5 +394,52 @@ func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
 	}
 	if !foundMandatoryHandoff {
 		t.Error("deacon patrol formula must require gt handoff after patrol report")
+	}
+}
+
+// TestDeaconStaleThresholdCoversTheDesignedPark asserts the cross-artifact
+// invariant that gt-cbd is about: the heartbeat staleness thresholds the daemon
+// and `gt deacon status` judge against must cover the longest park the deacon
+// patrol formula is allowed to take.
+//
+// The two halves live in different files and nothing connected them. The formula
+// parks in await-signal for up to --backoff-max, and the heartbeat only stamps at
+// fixed points in the cycle, so heartbeat age ramps from zero to the cycle length
+// and resets: it reports position in the loop, not liveness. A threshold shorter
+// than the park therefore fires on a Deacon doing exactly what it was told to do.
+// Measured against a 5m stale threshold, 29 of 30 consecutive patrol cycles read
+// stale, 50.7% of wall-clock, and the daemon nudged a working agent at 6m and 7m.
+//
+// This test fails from either side — lowering a threshold, or raising the
+// formula's backoff — which is what the original defect needed and did not have.
+func TestDeaconStaleThresholdCoversTheDesignedPark(t *testing.T) {
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	m := regexp.MustCompile(`--backoff-max\s+(\S+)`).FindSubmatch(content)
+	if m == nil {
+		t.Fatal("deacon patrol formula declares no --backoff-max; the park is unbounded and no threshold can cover it")
+	}
+	backoffMax, err := time.ParseDuration(string(m[1]))
+	if err != nil {
+		t.Fatalf("parsing --backoff-max %q: %v", m[1], err)
+	}
+
+	if deacon.HeartbeatStaleThreshold < backoffMax {
+		t.Errorf("HeartbeatStaleThreshold = %s but the patrol parks for up to %s — "+
+			"a healthy Deacon sleeping its full backoff reads stale (gt-cbd)",
+			deacon.HeartbeatStaleThreshold, backoffMax)
+	}
+	if deacon.HeartbeatVeryStaleThreshold <= backoffMax {
+		t.Errorf("HeartbeatVeryStaleThreshold = %s but the patrol parks for up to %s — "+
+			"the daemon would kill and restart a Deacon that is merely asleep",
+			deacon.HeartbeatVeryStaleThreshold, backoffMax)
+	}
+	if deacon.HeartbeatVeryStaleThreshold <= deacon.HeartbeatStaleThreshold {
+		t.Errorf("HeartbeatVeryStaleThreshold (%s) must stay above HeartbeatStaleThreshold (%s), "+
+			"or the nudge tier is unreachable and every stale heartbeat goes straight to a restart",
+			deacon.HeartbeatVeryStaleThreshold, deacon.HeartbeatStaleThreshold)
 	}
 }

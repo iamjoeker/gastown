@@ -226,7 +226,9 @@ type WorkerStatusConfig struct {
 	// Default: "30m".
 	StuckThreshold string `json:"stuck_threshold,omitempty"`
 	// HeartbeatFreshThreshold is the max age for a Deacon heartbeat to be considered fresh.
-	// Default: "5m".
+	// Default: "15m", matching operational.deacon.heartbeat_stale_threshold — this
+	// grades the same signal, and a shorter window here reports a working Deacon
+	// as not-fresh on the dashboard for most of every cycle (gt-cbd).
 	HeartbeatFreshThreshold string `json:"heartbeat_fresh_threshold,omitempty"`
 	// MayorActiveThreshold is the max session inactivity for the Mayor to be considered active.
 	// Default: "5m".
@@ -238,7 +240,7 @@ func DefaultWorkerStatusConfig() *WorkerStatusConfig {
 	return &WorkerStatusConfig{
 		StaleThreshold:          "5m",
 		StuckThreshold:          "30m",
-		HeartbeatFreshThreshold: "5m",
+		HeartbeatFreshThreshold: "15m",
 		MayorActiveThreshold:    "5m",
 	}
 }
@@ -450,10 +452,14 @@ type DeaconThresholds struct {
 	// Cooldown is minimum time between force-kills of same agent (default "5m").
 	Cooldown string `json:"cooldown,omitempty"`
 
-	// HeartbeatStaleThreshold is age at which deacon heartbeat is stale (default "5m").
+	// HeartbeatStaleThreshold is age at which deacon heartbeat is stale (default "15m").
+	// Keep it above the patrol's await-signal backoff-max (15m) — the heartbeat
+	// stamps once per cycle phase, so a shorter threshold reports loop position
+	// rather than liveness (gt-cbd).
 	HeartbeatStaleThreshold string `json:"heartbeat_stale_threshold,omitempty"`
 
-	// HeartbeatVeryStaleThreshold is age at which heartbeat is very stale (default "15m").
+	// HeartbeatVeryStaleThreshold is age at which heartbeat is very stale (default "20m").
+	// This one drives kill-and-restart, so it must stay above the stale threshold.
 	HeartbeatVeryStaleThreshold string `json:"heartbeat_very_stale_threshold,omitempty"`
 
 	// MaxRedispatches is max times a bead can be re-dispatched before escalating (default 3).

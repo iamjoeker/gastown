@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/session"
@@ -76,9 +75,9 @@ func TestCheckDeaconHeartbeat_NudgeSkipRequiresALiveAwait(t *testing.T) {
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv(tmux.TestNudgeLogEnv, nudgeLog)
 
-			// Stale but not very stale: the 5–20 minute band is the one that
-			// nudges rather than kills and restarts.
-			writeDeaconHeartbeat(t, townRoot, 10*time.Minute)
+			// Stale but not very stale: that band is the one that nudges rather
+			// than kills and restarts.
+			writeDeaconHeartbeat(t, townRoot, ageStaleBand)
 
 			// The session has to exist, or the nudge path is never reached and
 			// an empty nudge log would prove nothing.
@@ -126,7 +125,7 @@ func TestCheckDeaconHeartbeat_DoesNotLogAFalsePremise(t *testing.T) {
 	writeFakePaneTmux(t, binDir, paneDir)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(tmux.TestNudgeLogEnv, nudgeLog)
-	writeDeaconHeartbeat(t, townRoot, 10*time.Minute)
+	writeDeaconHeartbeat(t, townRoot, ageStaleBand)
 	writePaneFixture(t, paneDir, session.DeaconSessionName(), stoppedPane())
 
 	defer stubProcessTable(t, nil, nil)()
@@ -142,6 +141,13 @@ func TestCheckDeaconHeartbeat_DoesNotLogAFalsePremise(t *testing.T) {
 		},
 	}
 	d.checkDeaconHeartbeat()
+
+	// Precondition: the heartbeat has to be old enough that the daemon reaches
+	// the decision at all. A fresh heartbeat returns before any of this, and the
+	// assertion below would then pass without the code under test having run.
+	if !strings.Contains(logBuf.String(), "heartbeat is stale") {
+		t.Fatalf("precondition: the daemon never judged the heartbeat, so this proves nothing:\n%s", logBuf.String())
+	}
 
 	if strings.Contains(logBuf.String(), "will fire naturally") {
 		t.Errorf("daemon logged that an await will fire with no await on the host:\n%s", logBuf.String())

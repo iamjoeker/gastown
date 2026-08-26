@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/awaitprobe"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -187,6 +188,25 @@ func DefaultHealthThresholds() HealthThresholds {
 	return HealthThresholds{
 		Stale:      HeartbeatStaleThreshold,
 		VeryStale:  HeartbeatVeryStaleThreshold,
+		CycleStall: CycleStallThreshold,
+	}
+}
+
+// HealthThresholdsFrom returns the thresholds an operator has configured under
+// operational.deacon, falling back to the compiled-in defaults for unset keys.
+// A nil config yields DefaultHealthThresholds.
+//
+// Every consumer that judges a Deacon's heartbeat should route through this
+// rather than reading the constants directly. The two config keys existed and
+// were documented as the escape hatch for a badly calibrated threshold, but
+// nothing read them: the daemon and `gt deacon status` both compared against
+// the compiled-in constants, so setting them changed nothing and failed
+// silently — the shape that left gt-cbd looking like a local misconfiguration
+// for nine days.
+func HealthThresholdsFrom(cfg *config.DeaconThresholds) HealthThresholds {
+	return HealthThresholds{
+		Stale:      cfg.HeartbeatStaleThresholdD(),
+		VeryStale:  cfg.HeartbeatVeryStaleThresholdD(),
 		CycleStall: CycleStallThreshold,
 	}
 }

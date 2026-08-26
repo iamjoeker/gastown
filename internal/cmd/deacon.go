@@ -728,7 +728,10 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 			// only visible by comparing successive observations, and whoever
 			// polls has to be the one to persist them.
 			now := time.Now()
-			th := deacon.DefaultHealthThresholds()
+			// Judge against the operator's configured thresholds, not the
+			// compiled-in ones — this surface is the one agents read before
+			// deciding a Deacon is wedged, so it has to agree with the daemon.
+			th := deacon.HealthThresholdsFrom(config.LoadOperationalConfig(townRoot).GetDeaconConfig())
 			obs := deacon.ObserveCycle(townRoot, hb, now)
 
 			// The two signals that separate a stopped Deacon from a sleeping or
@@ -749,9 +752,9 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 				AgeSec:     hb.Age().Seconds(),
 				Cycle:      hb.Cycle,
 				LastAction: hb.LastAction,
-				Fresh:      hb.IsFresh(),
-				Stale:      hb.IsStale(),
-				VeryStale:  hb.IsVeryStale(),
+				Fresh:      hb.IsFreshFor(th.Stale),
+				Stale:      hb.IsStaleFor(th.Stale, th.VeryStale),
+				VeryStale:  hb.IsVeryStaleFor(th.VeryStale),
 				Verdict:    string(verdict),
 				Healthy:    verdict.Healthy(),
 				Await:      sig.Await.String(),

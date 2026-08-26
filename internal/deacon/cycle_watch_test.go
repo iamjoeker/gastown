@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/awaitprobe"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -163,7 +164,7 @@ func TestEvaluateHealth_StoppedMidPatrolIsWedged(t *testing.T) {
 	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 	th := DefaultHealthThresholds()
 	hb := &Heartbeat{Timestamp: base, Cycle: 421, LastAction: "cycle 415 closed (abbreviated)"}
-	now := at(base, 6*time.Minute)
+	now := at(base, ageStale)
 
 	// Precondition: the age flags this replaces still read as an ordinary stale
 	// heartbeat, so the wedge verdict is carrying information nothing else does.
@@ -212,14 +213,14 @@ func TestEvaluateHealth(t *testing.T) {
 			// well inside this window.
 			name: "a fresh heartbeat outranks the stopped signals",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 4*time.Minute),
+			now:  at(base, ageFresh),
 			sig:  stopped,
 			want: VerdictFresh,
 		},
 		{
 			name: "aging heartbeat with a live await is stale",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 6*time.Minute),
+			now:  at(base, ageStale),
 			sig:  parked,
 			want: VerdictStale,
 		},
@@ -228,7 +229,7 @@ func TestEvaluateHealth(t *testing.T) {
 			// process. The pane is what tells it apart from a stopped Deacon.
 			name: "a working Deacon with no await is stale, not wedged",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 6*time.Minute),
+			now:  at(base, ageStale),
 			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnActive},
 			want: VerdictStale,
 		},
@@ -237,7 +238,7 @@ func TestEvaluateHealth(t *testing.T) {
 			// table, so a host that cannot be read falls back to age.
 			name: "no process table means no wedge verdict",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 25*time.Minute),
+			now:  at(base, ageVeryStale),
 			sig:  LivenessSignals{Await: awaitprobe.StateUnknown, Turn: tmux.TurnEnded},
 			want: VerdictVeryStale,
 		},
@@ -247,21 +248,21 @@ func TestEvaluateHealth(t *testing.T) {
 			// signal: restart it, do not go looking at its composer.
 			name: "a dead session is very stale, not wedged",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 25*time.Minute),
+			now:  at(base, ageVeryStale),
 			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnUnknown},
 			want: VerdictVeryStale,
 		},
 		{
 			name: "old heartbeat with a live await is very stale",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 25*time.Minute),
+			now:  at(base, ageVeryStale),
 			sig:  parked,
 			want: VerdictVeryStale,
 		},
 		{
 			name: "stopped past the very stale threshold is still wedged",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 25*time.Minute),
+			now:  at(base, ageVeryStale),
 			sig:  stopped,
 			want: VerdictWedged,
 		},
@@ -270,7 +271,7 @@ func TestEvaluateHealth(t *testing.T) {
 			// in the town recovers this one automatically. It must be reported.
 			name: "a stranded composer is wedged",
 			hb:   &Heartbeat{Timestamp: base, Cycle: 421},
-			now:  at(base, 6*time.Minute),
+			now:  at(base, ageStale),
 			sig:  LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnStranded},
 			want: VerdictWedged,
 		},
@@ -297,7 +298,7 @@ func TestEvaluateHealth(t *testing.T) {
 // Deacon called it.
 func TestEvaluateHealth_SleepVerdictIgnoresLastAction(t *testing.T) {
 	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-	now := at(base, 25*time.Minute) // past very stale, where an exact-match rule would condemn
+	now := at(base, ageVeryStale) // past very stale, where an exact-match rule would condemn
 
 	sleeping := []string{
 		"pre-await checkpoint",                      // the formula's spelling
@@ -408,7 +409,7 @@ func TestEvaluateHealth_FieldTraceFromBead(t *testing.T) {
 
 	wedged := LivenessSignals{Await: awaitprobe.StateAbsent, Turn: tmux.TurnStranded}
 
-	// Both Mayor polls land inside the 5m fresh window, so both still read
+	// Both Mayor polls land inside the fresh window, so both still read
 	// fresh. That is the reporting bug gt-bvo filed and it is not fixable by a
 	// verdict: at 3m25s the Deacon is not yet distinguishable from one that is
 	// simply between steps.
@@ -447,9 +448,13 @@ func TestEvaluateHealth_FieldTraceFromBead(t *testing.T) {
 // + EMPTY input box". A working turn has no await process either, so the pane is
 // the only thing separating these from the wedge.
 //
-// The last one matters most: the spinner had been running 9m26s, so a Deacon
-// turn can legitimately outlive the stale threshold. The age gate alone does not
-// save this case — the pane does.
+// The last entry is the one that keeps this test from proving nothing. The four
+// recorded ages all sit inside the fresh window now that the stale threshold
+// covers a whole patrol cycle, so on those four the age gate decides and the
+// pane is never consulted. The relative case restates the same claim where it
+// still bites: a working turn that has outlived the stale threshold — which the
+// gt-cbd measurements show happens, cycles reaching 957s — is saved by the pane
+// and by nothing else.
 func TestEvaluateHealth_KnownFalsePositivesStayUnwedged(t *testing.T) {
 	base := time.Date(2026, 8, 2, 23, 0, 0, 0, time.UTC)
 	th := DefaultHealthThresholds()
@@ -465,6 +470,7 @@ func TestEvaluateHealth_KnownFalsePositivesStayUnwedged(t *testing.T) {
 		{"cycle 425 frozen 3m", 3 * time.Minute},
 		{"cycle 425 frozen 4m9s", 4*time.Minute + 9*time.Second},
 		{"the same turn still crunching at 9m26s", 9*time.Minute + 26*time.Second},
+		{"a turn still crunching past the stale threshold", th.Stale + time.Minute},
 	}
 
 	for _, f := range frozen {
@@ -509,5 +515,76 @@ func TestReadCycleObservation_MissingAndCorrupt(t *testing.T) {
 	}
 	if obs := ReadCycleObservation(townRoot); obs == nil || obs.Cycle != 7 {
 		t.Errorf("ReadCycleObservation() = %+v, want Cycle 7", obs)
+	}
+}
+
+// HealthThresholdsFrom is the only path by which operational.deacon reaches a
+// verdict. Both keys were documented as the escape hatch for a badly calibrated
+// threshold, and nothing read them — the daemon and `gt deacon status` compared
+// against the compiled-in constants, so an operator setting them saw no change
+// and no error (gt-cbd).
+func TestHealthThresholdsFrom(t *testing.T) {
+	t.Run("nil config falls back to the compiled-in defaults", func(t *testing.T) {
+		if got := HealthThresholdsFrom(nil); got != DefaultHealthThresholds() {
+			t.Errorf("HealthThresholdsFrom(nil) = %+v, want %+v", got, DefaultHealthThresholds())
+		}
+	})
+
+	t.Run("an empty config falls back to the compiled-in defaults", func(t *testing.T) {
+		if got := HealthThresholdsFrom(&config.DeaconThresholds{}); got != DefaultHealthThresholds() {
+			t.Errorf("HealthThresholdsFrom(empty) = %+v, want %+v", got, DefaultHealthThresholds())
+		}
+	})
+
+	t.Run("configured values are used", func(t *testing.T) {
+		th := HealthThresholdsFrom(&config.DeaconThresholds{
+			HeartbeatStaleThreshold:     "9m",
+			HeartbeatVeryStaleThreshold: "42m",
+		})
+		if th.Stale != 9*time.Minute {
+			t.Errorf("Stale = %s, want 9m", th.Stale)
+		}
+		if th.VeryStale != 42*time.Minute {
+			t.Errorf("VeryStale = %s, want 42m", th.VeryStale)
+		}
+
+		// The verdict has to move with them, or the wiring is decorative.
+		base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+		hb := &Heartbeat{Timestamp: base, Cycle: 421}
+		if got := EvaluateHealth(hb, at(base, 10*time.Minute), th, parked); got != VerdictStale {
+			t.Errorf("EvaluateHealth() at 10m under a 9m stale threshold = %q, want %q", got, VerdictStale)
+		}
+		if got := EvaluateHealth(hb, at(base, 10*time.Minute), DefaultHealthThresholds(), parked); got != VerdictFresh {
+			t.Errorf("control: the same age under the defaults = %q, want %q — the override is not what moved the verdict",
+				got, VerdictFresh)
+		}
+	})
+}
+
+// The measurements gt-cbd was filed on, kept as an executable record. These are
+// the only numbers that were actually recorded: 30 consecutive closed
+// mol-deacon-patrol wisps, min 224s, mean 604s, max 957s. A threshold below the
+// mean labels a healthy Deacon stale for most of its life, which is what 5m did
+// (29 of 30 cycles, 50.7% of wall-clock).
+//
+// Deliberately asserted against the recorded summary statistics and not against
+// a reconstructed sample: the 30 individual durations were not preserved, and
+// inventing them would make this test agree with whatever it was built to agree
+// with.
+func TestThresholdsClearTheMeasuredCycleDistribution(t *testing.T) {
+	const (
+		measuredMeanCycle = 604 * time.Second
+		measuredMaxCycle  = 957 * time.Second
+	)
+
+	if HeartbeatStaleThreshold <= measuredMeanCycle {
+		t.Errorf("HeartbeatStaleThreshold = %s does not clear the measured mean patrol cycle (%s): "+
+			"a healthy Deacon reads stale on most cycles",
+			HeartbeatStaleThreshold, measuredMeanCycle)
+	}
+	if HeartbeatVeryStaleThreshold <= measuredMaxCycle {
+		t.Errorf("HeartbeatVeryStaleThreshold = %s does not clear the longest measured patrol cycle (%s): "+
+			"the daemon would kill and restart a Deacon on a normal long cycle",
+			HeartbeatVeryStaleThreshold, measuredMaxCycle)
 	}
 }

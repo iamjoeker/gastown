@@ -33,7 +33,21 @@ if the Deacon dies, Witnesses detect it and escalate to the Mayor.
 
 No WITNESS_PING mail is sent. Witnesses observe the Deacon's last_activity
 timestamp instead, and only send an alert to the Mayor if the Deacon appears
-unresponsive (>5 minutes stale). This avoids heartbeat mail spam.
+unresponsive. This avoids heartbeat mail spam.
+
+"Unresponsive" is NOT five minutes. The Deacon stamps its heartbeat at fixed
+points in this cycle and then parks in await-signal for up to `--backoff-max`
+(15m), so the age ramps from zero to the cycle length and resets: it reports
+where in the loop the Deacon is, not whether it is alive. Measured over 30
+consecutive cycles, mean 604s and max 957s, a 5-minute rule fired on 29 of them
+— 50.7% of wall-clock — and three separate agents raised a wedge alarm on the
+same healthy Deacon in one day off exactly that signal (gt-cbd).
+
+Use the daemon's own thresholds, which are the calibrated ones: stale at 15m,
+very-stale at 20m (`operational.deacon.heartbeat_*_threshold`). Age alone still
+carries little information in the stale band — before escalating, check
+`gt deacon status --json` for `verdict: wedged`, which additionally requires no
+turn in flight and no await pending.
 
 ## Verification Sweeps (gt-emm)
 
