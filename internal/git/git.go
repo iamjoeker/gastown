@@ -1913,10 +1913,57 @@ func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 }
 
 // DeleteRemoteBranchIfAt deletes a remote branch only if it still points at expectedHash.
+//
+// The "[deleted]" line and the zero exit status are not proof the ref is gone. A
+// delete was seen to print exactly that while ls-remote returned the old sha
+// immediately afterwards, with the branch's polecat already done and nothing
+// live to re-push it; an identical second delete then took, and the ref was
+// gone. Any cleanup that trusts the push report can therefore leave a live ref
+// behind while reporting success — so verify, and re-issue once. (gt-wkcz)
+//
+// The push error is subordinate to the verification: a second attempt that fails
+// because the ref is already gone has still achieved the caller's goal.
 func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error {
 	ref := "refs/heads/" + branch
-	_, err := g.runWithTimeout(pushTimeout, "push", "--force-with-lease="+ref+":"+expectedHash, remote, ":"+ref)
-	return err
+	lease := "--force-with-lease=" + ref + ":" + expectedHash
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		_, pushErr := g.runWithTimeout(pushTimeout, "push", lease, remote, ":"+ref)
+
+		tip, tipErr := g.remoteBranchDeleteTip(remote, branch)
+		if tipErr == nil && tip == "" {
+			return nil
+		}
+		if pushErr != nil {
+			return pushErr
+		}
+		if tipErr != nil {
+			lastErr = fmt.Errorf("delete of %s/%s reported success but could not be verified: %w", remote, branch, tipErr)
+			continue
+		}
+		lastErr = fmt.Errorf("delete of %s/%s reported success but the branch is still at %s", remote, branch, shortSHA(tip))
+	}
+	return lastErr
+}
+
+// remoteBranchDeleteTip reports the branch tip a delete must have cleared, read
+// from every URL the remote has, and "" when no URL still carries the ref.
+//
+// A split fetch/push origin means the delete writes to one URL while every other
+// agent reads from the other, so a ref cleared from the push URL but still
+// visible to fetchers is still live, and only checking both settles it.
+func (g *Git) remoteBranchDeleteTip(remote, branch string) (string, error) {
+	for _, target := range nonEmptyUnique([]string{g.pushTarget(remote), remote}) {
+		tip, err := g.RemoteBranchTip(target, branch)
+		if err != nil {
+			return "", err
+		}
+		if tip = strings.TrimSpace(tip); tip != "" {
+			return tip, nil
+		}
+	}
+	return "", nil
 }
 
 // ResolveMergedBranchDeleteHead returns the head value a merged-branch delete
