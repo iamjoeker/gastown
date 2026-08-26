@@ -229,6 +229,8 @@ test-makefile:
 	bash -n plugins/gitignore-reconcile/run.sh
 	bash -n plugins/submodule-commit/run.sh
 	bash -n plugins/rebuild-gt/run.sh
+	bash -n plugins/rebuild-gt/run_test.sh
+	bash plugins/rebuild-gt/run_test.sh
 	bash -n plugins/dolt-log-rotate/run.sh
 	bash -n plugins/rig_repos_contract_test.sh
 	bash plugins/rig_repos_contract_test.sh

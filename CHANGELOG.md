@@ -180,6 +180,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gt stale` reads the build branch from the remote, and the rebuild loop can
+  now heal itself** (gt-ympl, gt-side of hq-cak50). Staleness was computed
+  against `$GT_ROOT/gastown/mayor/rig` — a working clone. Its `main` moves only
+  when something pulls and its `origin/main` only when something fetches, and in
+  a Gas Town nothing does either on a schedule. So a merge landed, the compare
+  ref did not move, and the binary was measured against the commit it had been
+  built from: `stale: false`, which is precisely the answer that makes
+  `rebuild-gt` do nothing. Measured live while writing this fix, from two
+  instruments at the same instant — `ls-remote` put `origin/main` at `5b7846e9`;
+  the rig's `main` and the installed binary were both at `bea47f05`, five
+  commits back, and `gt stale` called it fresh. The evening it was filed cost
+  three hand-rebuilds in two hours, the last decaying inside twenty minutes.
+  Every previous fix had been a DATA fix — fast-forward the checkout — which
+  re-decays on the next merge.
+
+  `gt stale` and `gt doctor` now fetch the branch tip from the push remote into
+  a private ref (`--no-write-fetch-head`; `FETCH_HEAD` is one file shared by
+  every worktree on the rig's gitdir) and compare against that. The per-command
+  startup warning stays local and network-free: it can only under-report, so its
+  firing is evidence and its silence is not. `gt stale --offline` asks for the
+  local-only check explicitly, and `compare_ref_refreshed` in `--json` says
+  which answer you got.
+
+  A failed remote read does not fall back to reporting freshness. Staleness is
+  one-sided — a local ref can only lag the remote, never lead it — so "behind
+  the local ref" still proves stale and is reported, while "level with the local
+  ref" proves nothing and is reported as `skipped`.
+
+  `rebuild-gt` had two more ways to do nothing quietly, both fixed. It read
+  `stale` before `skipped`, so a check that could not MEASURE presented as a
+  binary that was FRESH and the `safe_to_rebuild` guard underneath was
+  unreachable in exactly the case it existed for. And it rebuilt the rig
+  checkout without fast-forwarding it: with detection fixed, that compiles the
+  commit the binary already had, so the binary never advances and the plugin
+  reports success on every cycle forever. It now fast-forwards (`--ff-only`,
+  never a merge) before building, and re-runs `gt stale` against the newly
+  installed binary — exercising changed behaviour rather than reading `gt
+  version` or an mtime, both of which agreed with a rebuild that had not
+  happened. A rebuild that leaves the binary stale escalates instead of
+  recording success.
+
 - **Answering by nudge now retires the reply reminder** (gt-w4ba). A reply
   reminder was retired by exactly one event: a mail reply on the same thread.
   Every agent's CLAUDE.md tells it to prefer `gt nudge` for routine replies —

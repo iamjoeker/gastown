@@ -409,7 +409,11 @@ one binary ever disagree, that is a bug.
 
 To check a binary against the source repo, use `gt stale`, which refuses to
 compare when the binary's commit is not present in the gastown repo rather than
-guessing.
+guessing. It reads the build branch's tip from the remote, not from a local
+checkout: a checkout that nothing fast-forwards is a cache with no invalidation,
+and comparing against one made an out-of-date binary report itself fresh
+(gt-ympl). `--offline` skips that read and can then only under-report staleness;
+it reports "skipped" rather than "fresh" when it cannot tell.
 
 When a binary is unstamped, or when you need to confirm a specific fix is live,
 **verify by behaviour**: invoke the changed code path and observe the new

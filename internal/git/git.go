@@ -3580,6 +3580,40 @@ func (g *Git) fetchPushRemoteRefToPrivateRef(remote, refName string) (ref string
 	return dest, remove, nil
 }
 
+// FetchPushRemoteBranchTip returns the current tip of branch on remote's push
+// target, having brought that commit into the local object store first.
+//
+// `git ls-remote` would answer the "what is the tip" half on its own, but the
+// answer would be a bare hash the local repository does not have, so no
+// ancestry, count or diff question could be asked about it. Callers that must
+// compare against the remote — not against a remote-tracking ref that only a
+// fetch updates — need the objects, not just the hash.
+//
+// The commit is held by a ref private to this call, so the caller MUST invoke
+// cleanup once it has finished querying: until then the objects stay reachable
+// even against a concurrent gc. A failure return yields a no-op cleanup.
+func (g *Git) FetchPushRemoteBranchTip(remote, branch string) (commit string, cleanup func(), err error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return "", func() {}, fmt.Errorf("branch is missing a name")
+	}
+	dest, remove, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
+	if err != nil {
+		return "", func() {}, err
+	}
+	hash, err := g.Rev(dest)
+	if err != nil {
+		remove()
+		return "", func() {}, fmt.Errorf("resolving fetched tip of %s/%s: %w", remote, branch, err)
+	}
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		remove()
+		return "", func() {}, fmt.Errorf("fetched tip of %s/%s resolved to nothing", remote, branch)
+	}
+	return hash, remove, nil
+}
+
 // fetchPushRemoteRefExactly brings the listed hash into the object store under a
 // private ref and verifies the remote has not moved underneath the listing.
 // Classifying against a stale remote-tracking ref instead would answer about a
