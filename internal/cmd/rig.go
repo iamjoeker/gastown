@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/deps"
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -1592,26 +1593,7 @@ func runResetStale(bd *beads.Beads, dryRun bool) error {
 // to tmux session name.
 // Returns the session name and whether this is a persistent identity (crew).
 func assigneeToSessionName(assignee string) (sessionName string, isPersistent bool) {
-	parts := strings.Split(assignee, "/")
-
-	switch len(parts) {
-	case 2:
-		// rig/polecatName -> gt-rig-polecatName
-		return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[1]), false
-	case 3:
-		// rig/crew/name -> gt-rig-crew-name
-		if parts[1] == "crew" {
-			return session.CrewSessionName(session.PrefixFor(parts[0]), parts[2]), true
-		}
-		// rig/polecats/name -> gt-rig-name
-		if parts[1] == "polecats" {
-			return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[2]), false
-		}
-		// Other 3-part formats not recognized
-		return "", false
-	default:
-		return "", false
-	}
+	return convoyops.AssigneeSessionName(assignee)
 }
 
 // Helper to check if path exists

@@ -822,9 +822,11 @@ func TestConvoyHandler_WorkStatusRendering(t *testing.T) {
 		wantStatusText string
 	}{
 		{"complete status", "complete", "badge-green", "✓"},
-		{"active status", "active", "badge-green", "Active"},
-		{"stale status", "stale", "badge-yellow", "Stale"},
+		{"working status", "working", "badge-green", "Working"},
+		{"in-queue status", "in-queue", "badge-blue", "In queue"},
+		{"ready status", "ready", "badge-yellow", "Ready"},
 		{"stuck status", "stuck", "badge-red", "Stuck"},
+		{"empty status", "empty", "badge-muted", "Empty"},
 		{"waiting status", "waiting", "badge-muted", "Wait"},
 	}
 
@@ -879,7 +881,7 @@ func TestConvoyHandler_ProgressBarRendering(t *testing.T) {
 				ID:           "hq-cv-progress",
 				Title:        "Progress Test",
 				Status:       "open",
-				WorkStatus:   "active",
+				WorkStatus:   "working",
 				Progress:     "3/4",
 				Completed:    3,
 				Total:        4,
@@ -963,7 +965,7 @@ func TestConvoyHandler_FullDashboard(t *testing.T) {
 				ID:           "hq-cv-full",
 				Title:        "Full Test Convoy",
 				Status:       "open",
-				WorkStatus:   "active",
+				WorkStatus:   "working",
 				Progress:     "2/3",
 				Completed:    2,
 				Total:        3,
@@ -1041,7 +1043,7 @@ func TestE2E_Server_FullDashboard(t *testing.T) {
 				ID:           "hq-cv-e2e",
 				Title:        "E2E Test Convoy",
 				Status:       "open",
-				WorkStatus:   "active",
+				WorkStatus:   "working",
 				Progress:     "2/4",
 				Completed:    2,
 				Total:        4,
@@ -1646,7 +1648,7 @@ func (m *CountingMockFetcher) FetchActivity() ([]ActivityRow, error) {
 func TestConvoyHandler_NonFatalErrors(t *testing.T) {
 	mock := &MockConvoyFetcherWithErrors{
 		Convoys: []ConvoyRow{
-			{ID: "hq-cv-test", Title: "Test", Status: "open", WorkStatus: "active"},
+			{ID: "hq-cv-test", Title: "Test", Status: "open", WorkStatus: "working"},
 		},
 		MergeQueueError: errFetchFailed,
 		WorkersError:    errFetchFailed,

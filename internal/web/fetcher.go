@@ -21,6 +21,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -329,6 +330,10 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 
+	// One classification environment for the whole pass: the scheduled-bead scan
+	// reads every store in town, so it must not run per convoy.
+	env := f.convoyClassifierEnv()
+
 	// Build convoy rows with activity data
 	rows := make([]ConvoyRow, 0, len(convoys))
 	for _, c := range convoys {
@@ -356,10 +361,6 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		for _, t := range tracked {
 			if t.Status == "closed" {
 				row.Completed++
-			} else if t.Assignee != "" {
-				row.InProgress++
-			} else {
-				row.ReadyBeads++
 			}
 			// Track most recent activity from workers
 			if t.LastActivity.After(mostRecentActivity) {
@@ -417,8 +418,19 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 			}
 		}
 
-		// Calculate work status based on progress and activity
-		row.WorkStatus = calculateWorkStatus(row.Completed, row.Total, row.LastActivity.ColorClass)
+		// Classify the convoy from execution state, using the same code
+		// `gt convoy stranded` uses. Activity age is rendered in its own column
+		// and decides nothing (gt-skzk.1).
+		row.WorkStatus, row.Evidence = f.convoyWorkStatus(tracked, env)
+
+		// The work chips come off the same evidence as the badge. Counting an
+		// assignee as "active" is the presence-for-state substitution this bead
+		// is about at bead scale: a polecat that died mid-run leaves its name on
+		// the bead, and a bead that was never routable is not work anyone can
+		// pick up.
+		row.ReadyBeads = row.Evidence[convoyops.DispoReady]
+		row.InProgress = row.Evidence[convoyops.DispoWorking]
+		row.InQueue = row.Evidence[convoyops.DispoInQueue]
 
 		// Get tracked issues for expandable view
 		row.TrackedIssues = make([]TrackedIssue, len(tracked))
@@ -452,30 +464,100 @@ type trackedIssueInfo struct {
 	ID           string
 	Title        string
 	Status       string
+	IssueType    string
 	Assignee     string
+	Blocked      bool
 	LastActivity time.Time
 	UpdatedAt    time.Time // Fallback for activity when no assignee
 }
 
+// webTrackedIssues narrows the panel's rows to the fields that decide a
+// disposition, so the dashboard hands the shared classifier exactly what
+// `gt convoy stranded` hands it.
+func webTrackedIssues(tracked []trackedIssueInfo) []convoyops.TrackedIssue {
+	out := make([]convoyops.TrackedIssue, 0, len(tracked))
+	for _, t := range tracked {
+		out = append(out, convoyops.TrackedIssue{
+			ID:        t.ID,
+			Status:    t.Status,
+			IssueType: t.IssueType,
+			Assignee:  t.Assignee,
+			Blocked:   t.Blocked,
+		})
+	}
+	return out
+}
+
+// convoyClassifierEnv assembles the live lookups the shared convoy classifier
+// needs. It is built once per fetch: the sling-context scan reads every beads
+// store in town, and the merge-queue lookup is consulted only for beads whose
+// session has died, which is where it changes the answer.
+//
+// One deliberate difference from `gt convoy stranded`: when the sling-context
+// scan cannot read every store, the CLI treats every bead as scheduled, because
+// there the answer guards dispatch and over-reporting "scheduled" only costs a
+// missed dispatch. Here the same choice would paint every convoy in town as
+// benignly waiting on the strength of a scan that failed, so the panel uses the
+// partial result and logs what it could not read.
+func (f *LiveConvoyFetcher) convoyClassifierEnv() convoyops.Env {
+	liveSessions := f.liveSessionNames()
+
+	scheduled, err := fetcherScheduledBeads(f.townRoot)
+	if err != nil {
+		log.Printf("dashboard: %v — scheduled beads may render as ready", err)
+	}
+
+	return convoyops.Env{
+		Scheduled:    scheduled,
+		SessionAlive: func(sessionName string) bool { return liveSessions[sessionName] },
+		QueuedMR:     func(beadID string) bool { return fetcherHasQueuedMR(f.townRoot, beadID) },
+	}
+}
+
+// Injection points for the two live lookups (stubbed in tests). Both talk to
+// beads stores directly rather than through runBdCmd.
+var (
+	fetcherScheduledBeads = convoyops.OpenSlingContextWorkBeads
+	fetcherHasQueuedMR    = convoyops.HasQueuedMergeRequest
+)
+
+// convoyWorkStatus decides a convoy's verdict from its tracked beads.
+//
+// Nothing here reads a clock. That is the fix: the previous version took the
+// activity-age COLOR as its only input beyond the completed count, so silence
+// and stalling were the same observation to it (gt-skzk.1).
+func (f *LiveConvoyFetcher) convoyWorkStatus(tracked []trackedIssueInfo, env convoyops.Env) (string, map[string]int) {
+	_, evidence := convoyops.ClassifyAll(f.townRoot, webTrackedIssues(tracked), env)
+	return convoyops.WorkStatus(len(tracked), evidence), evidence
+}
+
+// liveSessionNames returns the set of tmux sessions currently running on the
+// town's socket. One listing answers "is this worker alive?" for every convoy in
+// the pass; asking per assignee would be one tmux exec per tracked bead.
+//
+// An unreadable tmux server yields an empty set, which reads as "no worker is
+// alive". That is the same answer `gt convoy stranded` gives when has-session
+// fails, and it errs toward showing work as needing attention rather than
+// toward a worker that is not there.
+func (f *LiveConvoyFetcher) liveSessionNames() map[string]bool {
+	live := make(map[string]bool)
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}")
+	if err != nil {
+		return live
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			live[name] = true
+		}
+	}
+	return live
+}
+
 // getTrackedIssues fetches tracked issues for a convoy.
 func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInfo, error) {
-	// Query tracked dependencies using bd dep list
-	stdout, err := f.runBdCmd(f.townRoot, "dep", "list", convoyID, "-t", "tracks", "--json")
+	issueIDs, err := f.trackedIssueIDs(convoyID)
 	if err != nil {
-		return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
-	}
-
-	var deps []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &deps); err != nil {
-		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, err)
-	}
-
-	// Collect resolved issue IDs, unwrapping external:prefix:id format
-	issueIDs := make([]string, 0, len(deps))
-	for _, dep := range deps {
-		issueIDs = append(issueIDs, beads.ExtractIssueID(dep.ID))
+		return nil, err
 	}
 
 	// Batch fetch issue details
@@ -495,11 +577,16 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInf
 		if d, ok := details[id]; ok {
 			info.Title = d.Title
 			info.Status = d.Status
+			info.IssueType = d.IssueType
 			info.Assignee = d.Assignee
+			info.Blocked = d.Blocked
 			info.UpdatedAt = d.UpdatedAt
 		} else {
+			// Not observed, not absent: the bead's store was unreadable from
+			// here. The classifier reads this as "unknown" rather than guessing
+			// a status for it.
 			info.Title = "(external)"
-			info.Status = "unknown"
+			info.Status = convoyops.StatusUnknown
 		}
 
 		if w, ok := workers[id]; ok && w.LastActivity != nil {
@@ -512,12 +599,58 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInf
 	return result, nil
 }
 
+// trackedIssueIDs returns the IDs a convoy tracks.
+//
+// It reads the dependencies table directly, because `bd dep list -t tracks`
+// joins against the issues table and so returns NOTHING for a dependency whose
+// target lives in another Dolt database — which is every HQ convoy tracking rig
+// work. Measured 2026-08-25: the join returned [] for all five live convoys
+// while the raw table returned one tracked bead each, so the panel rendered a
+// town of working polecats as five convoys with no work in them (gt-skzk.1).
+//
+// The join is kept as a fallback for stores that are not Dolt-in-server-mode,
+// where there is no server to query.
+func (f *LiveConvoyFetcher) trackedIssueIDs(convoyID string) ([]string, error) {
+	ids, err := fetcherTrackedIssueIDs(f.townRoot, convoyID)
+	if err == nil {
+		return ids, nil
+	}
+
+	stdout, bdErr := f.runBdCmd(f.townRoot, "dep", "list", convoyID, "-t", "tracks", "--json")
+	if bdErr != nil {
+		// Report BOTH: "the dep table was unreachable" and "bd also failed" are
+		// different outages, and a panel that names only the second sends an
+		// operator to the wrong place.
+		return nil, fmt.Errorf("querying tracked issues for %s: dep table: %v; bd dep list: %w", convoyID, err, bdErr)
+	}
+
+	var deps []struct {
+		ID string `json:"id"`
+	}
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &deps); jsonErr != nil {
+		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, jsonErr)
+	}
+
+	// Collect resolved issue IDs, unwrapping external:prefix:id format
+	issueIDs := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		issueIDs = append(issueIDs, beads.ExtractIssueID(dep.ID))
+	}
+	return issueIDs, nil
+}
+
+// fetcherTrackedIssueIDs is the injection point for the dep-table read
+// (stubbed in tests).
+var fetcherTrackedIssueIDs = convoyops.TrackedIssueIDs
+
 // issueDetail holds basic issue info.
 type issueDetail struct {
 	ID        string
 	Title     string
 	Status    string
+	IssueType string
 	Assignee  string
+	Blocked   bool
 	UpdatedAt time.Time
 }
 
@@ -536,23 +669,23 @@ func (f *LiveConvoyFetcher) getIssueDetailsBatch(issueIDs []string) (map[string]
 		return nil, fmt.Errorf("bd show failed (issue_count=%d): %w", len(issueIDs), err)
 	}
 
-	var issues []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		Assignee  string `json:"assignee"`
-		UpdatedAt string `json:"updated_at"`
-	}
+	// Decoded into the shared beads.Issue so blocker state is read the same way
+	// everywhere: blocked_by_count alone is not reliable (bd omits it on some
+	// paths), and HasUnresolvedBlockers falls back to the live dependency edges.
+	var issues []beads.Issue
 	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
 		return nil, fmt.Errorf("bd show returned invalid JSON (issue_count=%d): %w", len(issueIDs), err)
 	}
 
-	for _, issue := range issues {
+	for i := range issues {
+		issue := &issues[i]
 		detail := &issueDetail{
-			ID:       issue.ID,
-			Title:    issue.Title,
-			Status:   issue.Status,
-			Assignee: issue.Assignee,
+			ID:        issue.ID,
+			Title:     issue.Title,
+			Status:    issue.Status,
+			IssueType: issue.Type,
+			Assignee:  issue.Assignee,
+			Blocked:   beads.HasUnresolvedBlockers(issue),
 		}
 		// Parse updated_at timestamp
 		if issue.UpdatedAt != "" {
@@ -703,26 +836,13 @@ func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 	return &mostRecent
 }
 
-// calculateWorkStatus determines the work status based on progress and activity.
-// Returns: "complete", "active", "stale", "stuck", or "waiting"
-func calculateWorkStatus(completed, total int, activityColor string) string {
-	// Check if all work is done
-	if total > 0 && completed == total {
-		return "complete"
-	}
-
-	// Determine status based on activity color
-	switch activityColor {
-	case activity.ColorGreen:
-		return "active"
-	case activity.ColorYellow:
-		return "stale"
-	case activity.ColorRed:
-		return "stuck"
-	default:
-		return "waiting"
-	}
-}
+// calculateWorkStatus is gone: it decided a convoy's verdict from the AGE of
+// the last activity event, so every convoy doing work slower than the ten-minute
+// red threshold turned STUCK and stayed stuck until it completed — measured
+// against 8-minute gate runs and 20-40 minute polecat work items, that is every
+// convoy that does real work. Age answers "was anything logged recently", which
+// is a different question from "is anyone on this". See convoy.WorkStatus for
+// the replacement and gt-skzk.1 for the measurement.
 
 // mergeRequestLabel marks a bead as a merge request. Same label `gt mq list`
 // filters on — the dashboard and CLI must read the same source (gt-4qp).

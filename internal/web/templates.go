@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/activity"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 )
 
 //go:embed templates/*.html
@@ -357,19 +358,33 @@ type MergeQueueRow struct {
 
 // ConvoyRow represents a single convoy in the dashboard.
 type ConvoyRow struct {
-	ID            string
-	Title         string
-	Status        string // "open" or "closed" (raw beads status)
-	WorkStatus    string // Computed: "complete", "active", "stale", "stuck", "waiting"
+	ID     string
+	Title  string
+	Status string // "open" or "closed" (raw beads status)
+	// WorkStatus is the shared convoy verdict — one of convoy.WorkStatus*:
+	// "complete", "working", "in-queue", "ready", "waiting", "stuck", "empty".
+	// It is decided from EXECUTION state (live sessions, queued MRs, blockers),
+	// never from how long ago something was logged (gt-skzk.1).
+	WorkStatus string
+	// Evidence tallies the tracked beads by disposition, so the panel can say
+	// what it observed alongside what it concluded.
+	Evidence      map[string]int
 	Progress      string // e.g., "2/5"
 	Completed     int
 	Total         int
 	ProgressPct   int      // 0-100, computed from Completed/Total
-	ReadyBeads    int      // open beads with no assignee (available to pick up)
-	InProgress    int      // beads currently being worked on
+	ReadyBeads    int      // beads dispatchable right now
+	InProgress    int      // beads whose assignee's session is live
+	InQueue       int      // beads whose work is an open merge request
 	Assignees     []string // unique assignees across tracked issues
 	LastActivity  activity.Info
 	TrackedIssues []TrackedIssue
+}
+
+// EvidenceSummary renders the disposition tally the way `gt convoy stranded`
+// renders it, e.g. "1 working, 2 closed".
+func (r ConvoyRow) EvidenceSummary() string {
+	return convoyops.FormatEvidence(r.Evidence)
 }
 
 // TrackedIssue represents an issue tracked by a convoy.
@@ -439,19 +454,23 @@ func statusClass(status string) string {
 	}
 }
 
-// workStatusClass returns the CSS class for a computed work status.
+// workStatusClass returns the CSS class for a convoy's work status.
 func workStatusClass(workStatus string) string {
 	switch workStatus {
-	case "complete":
+	case convoyops.WorkStatusComplete:
 		return "work-complete"
-	case "active":
-		return "work-active"
-	case "stale":
-		return "work-stale"
-	case "stuck":
+	case convoyops.WorkStatusWorking:
+		return "work-working"
+	case convoyops.WorkStatusInQueue:
+		return "work-in-queue"
+	case convoyops.WorkStatusReady:
+		return "work-ready"
+	case convoyops.WorkStatusStuck:
 		return "work-stuck"
-	case "waiting":
+	case convoyops.WorkStatusWaiting:
 		return "work-waiting"
+	case convoyops.WorkStatusEmpty:
+		return "work-empty"
 	default:
 		return "work-unknown"
 	}

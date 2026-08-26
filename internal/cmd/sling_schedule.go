@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
@@ -405,22 +406,18 @@ func areScheduled(beadIDs []string) map[string]bool {
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
-	contexts, err := listAllSlingContexts(townRoot)
+	//
+	// The scan is shared with the dashboard: "scheduled" has to mean the same
+	// thing to every surface that reports on a bead, or one of them renders a
+	// bead waiting for capacity as one nobody is looking at (gt-skzk.1).
+	// Cleanup owns stale-state closure; idempotency must not use a different
+	// definition of scheduled.
+	scheduledWorkBeads, err := convoyops.OpenSlingContextWorkBeads(townRoot)
 	if err != nil {
 		for _, id := range beadIDs {
 			result[id] = true
 		}
 		return result
-	}
-
-	// Build lookup of work bead IDs from open contexts. Cleanup owns stale-state
-	// closure; idempotency must not use a different definition of scheduled.
-	scheduledWorkBeads := make(map[string]bool)
-	for _, ctx := range contexts {
-		fields := beads.ParseSlingContextFields(ctx.Description)
-		if fields != nil {
-			scheduledWorkBeads[fields.WorkBeadID] = true
-		}
 	}
 
 	// Filter to just the requested IDs
