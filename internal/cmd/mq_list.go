@@ -258,8 +258,21 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Size the identifier columns to the data before rendering anything, so no
+	// id is ever cut (gt-2izk).
+	layoutRows := make([]mqListRow, 0, len(scored))
+	for _, item := range scored {
+		lr := mqListRow{id: item.issue.ID}
+		if item.fields != nil {
+			lr.convoy = item.fields.ConvoyID
+			lr.branch = item.fields.Branch
+			lr.target = item.fields.Target
+		}
+		layoutRows = append(layoutRows, lr)
+	}
+
 	// Create styled table - add GIT/MERGE columns when the flags ask for them
-	table := style.NewTable(buildMQListColumns(mqListVerify, mqListMergeCheck)...)
+	table := style.NewTable(buildMQListColumns(mqListVerify, mqListMergeCheck, mqListWidthsFor(layoutRows))...)
 
 	// Add rows using scored items (already sorted by score)
 	for _, item := range scored {
@@ -302,13 +315,10 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			target = style.Dim.Render("(unset)")
 		}
 
-		// Format convoy column
+		// Format convoy column. A convoy id is an identifier and is rendered in
+		// full — the column was sized to fit the longest one (gt-2izk).
 		convoyDisplay := style.Dim.Render("(none)")
 		if convoyID != "" {
-			// Truncate convoy ID for display
-			if len(convoyID) > 12 {
-				convoyID = convoyID[:12]
-			}
 			convoyDisplay = convoyID
 		}
 
@@ -366,14 +376,11 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		// Calculate age
 		age := formatMRAge(issue.CreatedAt)
 
-		// Truncate ID if needed
-		displayID := issue.ID
-		if len(displayID) > 12 {
-			displayID = displayID[:12]
-		}
-
-		// Build row with conditional GIT/MERGE columns
-		row := []string{displayID, scoreStr, priority, convoyDisplay, branch, target, styledStatus}
+		// The ID is rendered in full, never cut. It is the one field that must
+		// round-trip: a truncated id looks exactly like a whole one, and
+		// querying it returns zero rows — the same answer as "it does not
+		// exist" (gt-2izk).
+		row := []string{issue.ID, scoreStr, priority, convoyDisplay, branch, target, styledStatus}
 		if mqListVerify {
 			row = append(row, gitStatus)
 		}
@@ -384,6 +391,19 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Print(table.Render())
+
+	// Say which columns were cut, at the call site, whenever any were. The
+	// remaining truncating columns do render an ellipsis, but an ellipsis is
+	// only visible to someone reading the row — it is invisible to a grep,
+	// which is how a truncated branch name produced a confident "no prior MR"
+	// and an already-rejected sha was resubmitted (gt-2izk).
+	if cut := mqListTruncatedColumns(layoutRows); len(cut) > 0 {
+		fmt.Printf("\n  %s\n", style.Dim.Render(fmt.Sprintf(
+			"%s truncated to fit, shown with \"...\". ID and CONVOY are always complete.",
+			strings.Join(cut, " and "))))
+		fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf(
+			"Do not grep this table to establish absence — a cut value cannot match. Query it instead: gt mq list %s --json", rigName)))
+	}
 
 	// Show summary of missing/empty branches when --verify is set
 	if mqListVerify {
@@ -456,11 +476,9 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			displayStatus = "blocked"
 		}
 		if blockerID := beads.FirstUnresolvedBlockerID(issue); displayStatus == "blocked" && blockerID != "" {
-			displayID := issue.ID
-			if len(displayID) > 12 {
-				displayID = displayID[:12]
-			}
-			fmt.Printf("  %s %s\n", style.Dim.Render(displayID+":"),
+			// Full id here too — these lines name the MR to act on, and the
+			// blocker id beside it is already rendered whole (gt-2izk).
+			fmt.Printf("  %s %s\n", style.Dim.Render(issue.ID+":"),
 				style.Dim.Render(fmt.Sprintf("waiting on %s", blockerID)))
 		}
 	}
@@ -531,14 +549,86 @@ func outputJSON(data interface{}) error {
 	return enc.Encode(data)
 }
 
-func buildMQListColumns(verify, mergeCheck bool) []style.Column {
+// Fixed widths for the columns whose content may legitimately be abbreviated.
+// Both render an ellipsis when they cut, so a shortened value is visible as
+// shortened. The identifier columns are NOT here: they are sized to their data
+// (see mqListWidths) because a cut identifier is indistinguishable from a whole
+// one and reads as a real absence when queried (gt-2izk).
+const (
+	mqListBranchWidth = 24
+	mqListTargetWidth = 24
+
+	// Floors for the identifier columns, so a short queue keeps the familiar
+	// layout. They grow past this to fit the data; they never cut it.
+	mqListMinIDWidth     = 12
+	mqListMinConvoyWidth = 12
+)
+
+// mqListRow is the variable-length content of one rendered row — the values
+// whose length decides how the table must be laid out.
+type mqListRow struct {
+	id     string
+	convoy string
+	branch string
+	target string
+}
+
+// mqListWidths holds the widths of the identifier columns, sized to the rows
+// being rendered.
+type mqListWidths struct {
+	id     int
+	convoy int
+}
+
+// mqListWidthsFor sizes the ID and CONVOY columns so every value renders whole.
+//
+// The defect this replaces cut both to exactly the column width, which is one
+// character short of the table's own `len > Width` ellipsis rule — so the cut
+// happened and nothing marked it. Across 176 closed MRs that produced 176 ids
+// of identical length, none of them distinguishable from complete, and two
+// agents in one night read a query against a cut id as proof the row was gone.
+func mqListWidthsFor(rows []mqListRow) mqListWidths {
+	w := mqListWidths{id: mqListMinIDWidth, convoy: mqListMinConvoyWidth}
+	for _, r := range rows {
+		if n := len(r.id); n > w.id {
+			w.id = n
+		}
+		if n := len(r.convoy); n > w.convoy {
+			w.convoy = n
+		}
+	}
+	return w
+}
+
+// mqListTruncatedColumns names the columns that actually got cut in this
+// listing, so the table can disclose it rather than presenting a cut value as a
+// whole one. ID and CONVOY can never appear here — mqListWidthsFor sizes them
+// to their data.
+func mqListTruncatedColumns(rows []mqListRow) []string {
+	var cut []string
+	for _, r := range rows {
+		if len(r.branch) > mqListBranchWidth {
+			cut = append(cut, "BRANCH")
+			break
+		}
+	}
+	for _, r := range rows {
+		if len(r.target) > mqListTargetWidth {
+			cut = append(cut, "TARGET")
+			break
+		}
+	}
+	return cut
+}
+
+func buildMQListColumns(verify, mergeCheck bool, w mqListWidths) []style.Column {
 	columns := []style.Column{
-		{Name: "ID", Width: 12},
+		{Name: "ID", Width: w.id},
 		{Name: "SCORE", Width: 7, Align: style.AlignRight},
 		{Name: "PRI", Width: 4},
-		{Name: "CONVOY", Width: 12},
-		{Name: "BRANCH", Width: 24},
-		{Name: "TARGET", Width: 24},
+		{Name: "CONVOY", Width: w.convoy},
+		{Name: "BRANCH", Width: mqListBranchWidth},
+		{Name: "TARGET", Width: mqListTargetWidth},
 		{Name: "STATUS", Width: 10},
 	}
 	if verify {

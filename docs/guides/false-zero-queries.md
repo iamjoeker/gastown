@@ -91,6 +91,43 @@ That is an hq mail wisp *about* the MR, not the MR. It "found" a record from the
 wrong store entirely and nearly refuted a correct report. Anchor to the id
 column (`grep -E "^<id> "`) or query the table directly.
 
+## A silently truncated identifier is a false zero you cannot see
+
+Anchoring to the id column (above) only works if the id in that column is
+whole. `gt mq list` used to cut every id to exactly 12 characters — the same
+number as the column width, and one short of the renderer's own `len > Width`
+ellipsis rule. So the cut happened and **nothing marked it**:
+
+```
+listing showed:      gt-wisp-2hfh     (12 chars, looks like a complete id)
+store actually held: gt-wisp-2hfhc    (13 chars)
+```
+
+The signature was visible in the aggregate and nowhere in a single row: across
+176 rows of `--status closed`, **every id was the same length**. A natural id
+distribution varies. Uniform width across every row means the column is cutting
+or padding, and no row can be told apart from a complete one.
+
+It produced two false findings in one night, in two different columns:
+
+| who | what they read | what they concluded | reality |
+|---|---|---|---|
+| refinery | `gt-wisp-2hfh` off the listing, then `WHERE id = …` → 0 rows | "my close failed" | the id was `gt-wisp-2hfhc` |
+| Mayor | `gt mq list gastown --status closed \| grep wkcz` → 0 | "no prior MR, safe to submit" | `gt-wisp-zhy8` was in the list; the BRANCH column had cut `polecat/chrome/gt-wkcz+…` |
+
+Both applied a reasonable method and got a confident zero. Neither probe could
+have worked. The second case is the sharper one: the BRANCH column *did* render
+an ellipsis, and was honest to a reader — **an ellipsis is invisible to a
+`grep`**. Honest truncation fixes the display, not the pipeline.
+
+`gt mq list` now sizes its ID and CONVOY columns to the data, so identifiers
+always render whole, and it names any column that was cut beneath the table.
+The rule survives the fix, because the fix only covers this one command:
+
+> **Never grep a rendered listing to establish absence.** Query the store, or
+> use `--json`. A rendered table is built for a reader; the characters it drops
+> are exactly the ones that make an identifier unique.
+
 ## What to use
 
 **To audit merge requests, use `gt mq list <rig> --status closed`.** It was the
@@ -120,6 +157,11 @@ leaving "(empty)" to be read as "none exist".
 4. **Two absences are not one.** Absent-because-closed and
    absent-because-nonexistent have different remedies (reopen vs create).
    Collapsing them reports the alarming one.
+5. **Never shorten an identifier silently, and never shorten one at all if you
+   can avoid it.** Size identifier columns to their data. Where a column must
+   cut, it must show that it cut — and even then, point machine readers at
+   `--json`, because an ellipsis is visible to a reader and invisible to a
+   `grep`.
 
 Rule 4 had already bitten `gt doctor`: `AgentBeadsCheck` classified agent beads
 against the open-only wisp listing, so a **closed** agent bead was reported as
