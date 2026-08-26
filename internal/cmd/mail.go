@@ -16,9 +16,9 @@ var (
 	mailType          string
 	mailReplyTo       string
 	mailNotify        bool
-	mailNoNotify      bool // Suppress auto-nudge notification to recipient
-	mailTo            string   // --to flag (alternative to positional arg)
-	mailFrom          string   // --from flag (override sender, for relay/bridge use)
+	mailNoNotify      bool   // Suppress auto-nudge notification to recipient
+	mailTo            string // --to flag (alternative to positional arg)
+	mailFrom          string // --from flag (override sender, for relay/bridge use)
 	mailSendSelf      bool
 	mailCC            []string // CC recipients
 	mailInboxJSON     bool
@@ -32,8 +32,9 @@ var (
 	mailThreadJSON    bool
 	mailReplySubject  string
 	mailReplyMessage  string
-	mailStdin         bool // Read message body from stdin
-	mailAllowEmpty    bool // Permit a subject-only message (gt-gxxm)
+	mailReplyCC       []string // CC recipients on a reply (its own var, not mailCC)
+	mailStdin         bool     // Read message body from stdin
+	mailAllowEmpty    bool     // Permit a subject-only message (gt-gxxm)
 
 	// Search flags
 	mailSearchFrom    string
@@ -329,7 +330,8 @@ The message body can be provided as a positional argument or via -m flag.
 Examples:
   gt mail reply msg-abc123 "Thanks, working on it now"
   gt mail reply msg-abc123 -m "Thanks, working on it now"
-  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"`,
+  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"
+  gt mail reply msg-abc123 --cc gastown/witness -m "Reply body"`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runMailReply,
 }
@@ -526,6 +528,11 @@ func init() {
 	mailReplyCmd.Flags().StringVarP(&mailReplySubject, "subject", "s", "", "Override reply subject (default: Re: <original>)")
 	mailReplyCmd.Flags().StringVarP(&mailReplyMessage, "message", "m", "", "Reply message body")
 	mailReplyCmd.Flags().StringVar(&mailReplyMessage, "body", "", "Reply message body (alias for --message)")
+	// `gt mail send` has had --cc all along; reply was the odd one out, so
+	// reaching for it here printed a flag listing and sent nothing. The operator
+	// who hit that archived the original on the next line, and the reply left no
+	// trace anywhere (gt-1t0v #5, carried to gt-khq8).
+	mailReplyCmd.Flags().StringArrayVar(&mailReplyCC, "cc", nil, "CC recipients (can be used multiple times)")
 
 	// Search flags
 	mailSearchCmd.Flags().StringVar(&mailSearchFrom, "from", "", "Filter by sender address")

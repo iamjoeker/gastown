@@ -506,6 +506,12 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Past argument validation, every remaining failure is operational: the
+	// message would not archive, not the command was called wrong. Cobra prints
+	// usage below the error, and a flag listing under "Error: ..." reads as a
+	// command that never ran (gt-khq8).
+	cmd.SilenceUsage = true
+
 	// Determine which inbox
 	address := detectSender()
 

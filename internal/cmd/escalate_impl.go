@@ -68,6 +68,12 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 
 	// Dry run mode
 	if escalateDryRun {
+		// The same title check the real path makes, made here too. A dry run that
+		// previews a create the real command refuses is worse than no dry run: it
+		// is a confident rehearsal of something that cannot happen.
+		if err := checkEscalationTitleLen(severity, description); err != nil {
+			return err
+		}
 		actions := escalationConfig.GetRouteForSeverity(severity)
 		targets := extractMailTargetsFromActions(actions)
 		fmt.Printf("Would create escalation:\n")

@@ -82,6 +82,14 @@ func runMailThread(cmd *cobra.Command, args []string) error {
 }
 
 func runMailReply(cmd *cobra.Command, args []string) error {
+	// A reply that fails at runtime must not answer with a flag listing. Cobra
+	// prints usage BELOW the error, so the last line an operator (or a `| tail`)
+	// sees is a flag description, and "the reply did not go" reads as "the
+	// command never ran" — which is how this command's failures were retold as
+	// exit 0 (gt-khq8). Set here rather than on the command so genuine flag
+	// misuse, which cobra validates before RunE, still gets usage.
+	cmd.SilenceUsage = true
+
 	msgID := args[0]
 
 	// Get message body from positional arg or flag (positional takes precedence)
@@ -130,6 +138,7 @@ func runMailReply(cmd *cobra.Command, args []string) error {
 	reply := &mail.Message{
 		From:     from,
 		To:       original.From, // Reply to sender
+		CC:       mailReplyCC,
 		Subject:  subject,
 		Body:     messageBody,
 		Type:     mail.TypeReply,
@@ -154,6 +163,9 @@ func runMailReply(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Reply sent to %s\n", style.Bold.Render("✓"), original.From)
 	fmt.Printf("  Subject: %s\n", subject)
+	if len(reply.CC) > 0 {
+		fmt.Printf("  CC: %s\n", strings.Join(reply.CC, ", "))
+	}
 	if original.ThreadID != "" {
 		fmt.Printf("  Thread: %s\n", style.Dim.Render(original.ThreadID))
 	}

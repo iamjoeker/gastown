@@ -657,7 +657,7 @@ func (m *Mailbox) markReadBeads(id string) error {
 }
 
 // closeMessage closes a message bead, resolving the beads directory from the
-// bead ID prefix.
+// bead ID prefix, and confirms the message actually left the mailbox.
 func (m *Mailbox) closeMessage(id string) error {
 	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
@@ -666,9 +666,62 @@ func (m *Mailbox) closeMessage(id string) error {
 		// Cross-rig bead IDs (e.g. ne-*) may live in the home DB when created
 		// via the mail router (which always uses town beads). Fall back to
 		// m.beadsDir before giving up. See ne-bgr.
-		return m.closeInDir(id, m.beadsDir)
+		err = m.closeInDir(id, m.beadsDir)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return m.confirmClosed(id)
+}
+
+// ErrCloseNotApplied reports a close that returned success without taking
+// effect: the bead is still readable in this mailbox with an unclosed status.
+var ErrCloseNotApplied = errors.New("close reported success but the message is still open")
+
+// confirmClosed re-reads a message after its close returned nil and reports a
+// close that did not take.
+//
+// This is a SECOND observation of the effect, made with a different query than
+// the one that claimed it, and that is the whole point. `gt mail archive`
+// printed "✓ Archived 1 of 1 message" and exited 0 for a message that was still
+// in the inbox unread a cycle later with its wisp status=open — because success
+// was read off the return of the close and never off the mailbox (gt-1t0v #4,
+// carried to gt-khq8). Every path that could make that close a no-op — a write
+// routed to a different store than the read, an ownership guard answered
+// leniently, a wisp row untouched by an issues-table update — is invisible from
+// where the caller stands, and they all end here.
+//
+// Fails OPEN on anything that is not a clear "still open": a re-read that errors
+// leaves the close reported as it was. The check exists to catch a silent no-op,
+// and turning an unreadable store into a spurious archive failure would trade
+// one wrong answer for another.
+func (m *Mailbox) confirmClosed(id string) error {
+	msg, err := m.Get(id)
+	if err != nil {
+		// Gone is the outcome we wanted; anything else is unproven, not failed.
+		return nil
+	}
+	if msg == nil || msg.Status == "" {
+		// No status to judge — older read paths leave it empty (see Message.Status).
+		return nil
+	}
+	if isClosedStatus(msg.Status) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s is still %q in %s", ErrCloseNotApplied, id, msg.Status, m.identity)
+}
+
+// isClosedStatus reports whether a bead status means the message has left the
+// inbox. The inbox lists "open" and "hooked" (see queryWispMessages and
+// listFromDir), so those two are the states a close must have moved away from;
+// anything else is treated as gone rather than as a failure, so a status this
+// code has not seen before cannot manufacture an archive error.
+func isClosedStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "open", "hooked":
+		return false
+	}
+	return true
 }
 
 // closeInDir closes a message in a specific beads directory.
