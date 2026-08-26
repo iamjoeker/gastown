@@ -128,6 +128,17 @@ func witnessActionFor(verdict string) string {
 		// logged-out agent; only a human at a browser clears it. Restart-first is
 		// correct for ordinary stalls and wrong for exactly this one (gt-acb1).
 		return "escalate"
+	case polecat.WorkstateVerdictSuspectStall:
+		// Escalate, not restart, and not leave-alone.
+		//
+		// Leave-alone is what this case USED to get — a wedged agent renders the
+		// busy marker, so it read as WORKING — and that is the whole defect
+		// (gt-y39t). Restart is wrong in the other direction: the evidence is
+		// two pane samples a minute apart, which is enough to say nothing is
+		// moving and not enough to say the agent is dead, and restarting throws
+		// away its context to find out. A person can settle it by looking at
+		// the pane.
+		return "escalate"
 	case "PENDING_MR":
 		return "leave-alone"
 	case "UNVERIFIED":

@@ -236,7 +236,12 @@ func TestWitnessActionFor(t *testing.T) {
 		// No restart path supplies credentials, so restarting a logged-out agent
 		// produces another logged-out agent and destroys its context on the way;
 		// only a human at a browser clears it (gt-acb1).
-		"NEEDS_LOGIN":    "escalate",
+		"NEEDS_LOGIN": "escalate",
+		// Not leave-alone, which is what this case got while it was reported as
+		// WORKING, and not restart either: two pane samples a minute apart show
+		// nothing moving, which is not the same as showing the agent is dead,
+		// and a restart discards its context to find out (gt-y39t).
+		"SUSPECT_STALL":  "escalate",
 		"":               "restart",
 		"SOME_NEW_STATE": "restart",
 	}

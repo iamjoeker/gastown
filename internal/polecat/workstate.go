@@ -1,6 +1,10 @@
 package polecat
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 const (
 	WorkstateVerdictWorking       = "WORKING"
@@ -46,6 +50,30 @@ const (
 	// another logged-out session. That is exactly the loop gt-acb1 documents.
 	WorkstateVerdictNeedsLogin = "NEEDS_LOGIN"
 
+	// WorkstateVerdictSuspectStall is the answer for a polecat whose pane shows
+	// a turn in flight that is consuming no tokens, with nothing visible that
+	// would explain the wait.
+	//
+	// It exists because it is the one state a working/parked binary can NEVER
+	// surface. A wedged agent still renders the busy marker, so SessionBusy
+	// reads it as generating and prescribes leave-alone; its bead still says
+	// working; its session is alive. Every input says healthy while the agent
+	// executes nothing. The token counter is the only surface that moves, and
+	// only across a window long enough to resolve it (tmux.MinLivenessWindow).
+	//
+	// It is deliberately NARROWER than "tokens are static". Tokens-static means
+	// not thinking, which is the normal and healthy shape of an agent inside a
+	// `sleep` or a long test run — the majority of blocking waits. What makes
+	// this one a fault is that the pane shows no command in flight to be waiting
+	// on. Escalating on tokens-static alone is the false alarm the detector was
+	// asked to avoid, not the defect it was asked to catch (gt-y39t).
+	//
+	// It routes to escalate rather than restart: whether the agent is genuinely
+	// wedged or merely between tool calls in a way the pane did not render is
+	// not something this evidence settles, and restart destroys the agent's
+	// context. A human or the Mayor looking at the pane settles it in seconds.
+	WorkstateVerdictSuspectStall = "SUSPECT_STALL"
+
 	// WorkstateVerdictUnverified is the answer for a caller that never gathered
 	// the git and merge-queue facts (ReuseFactsMeasured false). It is not a
 	// claim that anything is wrong — it is the refusal to make a claim at all.
@@ -76,6 +104,17 @@ const (
 	// one HAS read the pane; unlike it, the state it names does not clear on its
 	// own.
 	WorkstateReasonSessionLoggedOut = "session-logged-out"
+
+	// WorkstateReasonSessionSuspectStall means the pane was sampled TWICE, at
+	// least tmux.MinLivenessWindow apart, and the agent's clock climbed while
+	// its token counter did not — with no command in flight to explain the wait.
+	//
+	// It is the only reason string here that rests on a measurement over time
+	// rather than on a single reading, which is why it names the window in the
+	// blocker it produces. A reader who cannot see the window cannot tell this
+	// apart from a snap judgement, and a snap judgement on this signal is wrong
+	// most of the time (gt-y39t).
+	WorkstateReasonSessionSuspectStall = "session-suspect-stall"
 )
 
 // Reuse-status strings — the vocabulary `gt polecat list` prints as
@@ -127,9 +166,26 @@ func DispositionUnmeasured(d WorkstateDisposition) bool {
 // WorkstateInput contains the lifecycle, git, and merge-queue facts needed to
 // classify a polecat consistently across list, recovery, witness, and capacity.
 type WorkstateInput struct {
-	State                          State
-	SessionBusy                    bool
-	SessionLoggedOut               bool
+	State            State
+	SessionBusy      bool
+	SessionLoggedOut bool
+
+	// SessionSuspectStall is the two-sample pane measurement described at
+	// WorkstateVerdictSuspectStall: the agent's clock climbed while its token
+	// counter did not, and no command was in flight.
+	//
+	// It is a separate field from SessionBusy rather than a refinement of it
+	// because a caller that did not sample twice must leave it false and get
+	// exactly the old behaviour. Only tmux.LivenessReading.SuspectStall should
+	// set it; that predicate is already false for a single-sample read, so a
+	// cheap caller cannot accidentally arm this.
+	SessionSuspectStall bool
+
+	// SessionStallWindow is how far apart the two samples behind
+	// SessionSuspectStall were taken. Reported in the blocker so the claim can
+	// be read as the measurement it is (gt-y39t).
+	SessionStallWindow time.Duration
+
 	HookBead                       string
 	CleanupStatus                  CleanupStatus
 	IgnoreCleanupStatus            bool
@@ -287,6 +343,43 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	// meaningful, so report WORKING — the same disposition StateWorking gets
 	// below — and let the caller re-check once the pane goes quiet. An unknown
 	// or unreadable session leaves this false and behavior is unchanged.
+	// Checked BEFORE SessionBusy, which is the whole reason it can fire at all.
+	//
+	// A wedged agent renders the busy marker exactly like a generating one — the
+	// marker says a turn is open, not that anything is happening inside it — so
+	// SessionBusy is TRUE for every case this catches. Ordering this second
+	// would make it unreachable, and the resulting verdict (WORKING /
+	// leave-alone) is precisely the one that let a stuck agent sit unnoticed.
+	//
+	// The two checks are not in tension despite looking like it. SessionBusy
+	// answers "is a turn open" from one snapshot; this answers "is anything
+	// moving inside it" from two, a minute or more apart. The second question
+	// strictly refines the first, so where they disagree the refinement is the
+	// one carrying more evidence — and it is the only one of the two that could
+	// have been armed by a caller that paid for the measurement.
+	// The !SessionLoggedOut guard is here rather than expressed as ordering
+	// because the auth wall must beat this one while still LOSING to
+	// SessionBusy, and no single ordering of three arms gives both.
+	//
+	// The two cannot co-occur in one reading — a logged-out pane has no turn
+	// open, so it classifies as logged-out and never as blocking-wait. They can
+	// co-occur across two, because check-recovery reads the auth wall and the
+	// token delta from different captures taken a minute or more apart, which is
+	// exactly long enough for a session to hit its auth wall in between. When
+	// they disagree the auth wall wins: it names a remedy (a human at a browser)
+	// while this verdict only says to go look, and "go look" at a pane that
+	// already says "Please run /login" wastes the one reading that was clear.
+	if in.SessionSuspectStall && !in.SessionLoggedOut {
+		return WorkstateDisposition{
+			Verdict:              WorkstateVerdictSuspectStall,
+			Reason:               WorkstateReasonSessionSuspectStall,
+			CountsTowardCapacity: true,
+			Blockers: []string{fmt.Sprintf(
+				"session_state=blocking-wait (turn open, token counter static across %s, no command in flight)",
+				in.SessionStallWindow)},
+		}
+	}
+
 	if in.SessionBusy {
 		return WorkstateDisposition{
 			Verdict:              WorkstateVerdictWorking,

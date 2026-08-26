@@ -3083,6 +3083,34 @@ func (m *Manager) SessionLoggedOut(name string) bool {
 	return m.tmux.IsLoggedOut(sessionName)
 }
 
+// SessionLiveness reports what the polecat's pane says the agent is actually
+// doing: working, blocking-wait, logged-out, or parked (gt-y39t).
+//
+// It is the successor to SessionBusy and SessionLoggedOut rather than a third
+// peer — both of those answer a yes/no question about the same status region,
+// and between them they have two states where the pane has four. A polecat
+// inside `sleep 300` and a wedged one are both "busy" to SessionBusy, because
+// both render the busy marker; only the token counter separates them.
+//
+// window is how long to wait between the two samples this needs. Pass zero for
+// the cheap read: logged-out and parked are decided from one sample, and a turn
+// in flight is reported as such rather than guessed at. Pass at least
+// tmux.MinLivenessWindow to separate working from blocking-wait — and note that
+// this then BLOCKS for that long.
+//
+// Same positive-evidence contract as SessionBusy: no tmux, no session, or an
+// unreadable pane all produce LivenessUnknown, which callers must not act on.
+func (m *Manager) SessionLiveness(name string, window time.Duration) tmux.LivenessReading {
+	if m.tmux == nil {
+		return tmux.LivenessReading{}
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	if running, err := m.tmux.HasSession(sessionName); err != nil || !running {
+		return tmux.LivenessReading{}
+	}
+	return m.tmux.Liveness(sessionName, window)
+}
+
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	if m.tmux == nil {
 		return false, false

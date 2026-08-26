@@ -167,6 +167,7 @@ var (
 	polecatNukeOverrideRestartFirst      bool
 	polecatCheckRecoveryJSON             bool
 	polecatCheckRecoveryReconcileCleanup bool
+	polecatCheckRecoveryLivenessWindow   time.Duration
 	polecatPoolInitDryRun                bool
 	polecatPoolInitSize                  int
 )
@@ -267,6 +268,21 @@ Reports whether any work is at risk. It does NOT authorize destroying the poleca
   - NEEDS_LOGIN: the pane was read and shows an auth wall. Nothing is at risk, and
     no restart can clear this one either — restarting produces another logged-out
     session. A human must run /login in the session (gt-acb1)
+  - SUSPECT_STALL: the pane was sampled twice and the agent's turn clock climbed
+    while its token counter did not, with no command in flight. Only reachable
+    with --liveness-window (gt-y39t)
+
+The 'liveness' field reports what the pane says the agent is DOING, which is not
+the same question as whether work is at risk: working, blocking-wait, logged-out,
+parked, or turn-in-flight when only one sample was taken. Without
+--liveness-window one sample is taken, which settles logged-out and parked for
+free; separating working from blocking-wait needs a token delta, so it needs two
+samples at least 60s apart and this command BLOCKS for that long when asked.
+
+60s is a floor, not a suggestion. Three captures of a live agent twenty seconds
+apart read its token counter as 40.8k, 41.4k, 41.4k while it was demonstrably
+generating the whole time — the counter is rendered rounded to a hundred tokens,
+so a short window reports a healthy agent as blocked.
 
 Every predicate except WORKING/session-busy and NEEDS_LOGIN is read from the agent
 bead and from git, both of which 'gt done' writes BEFORE it pushes, submits the
@@ -309,7 +325,8 @@ over work provably in main (gt-uapr).
 Examples:
   gt polecat check-recovery greenplace/Toast
   gt polecat check-recovery greenplace/Toast --json
-  gt polecat check-recovery greenplace/Toast --reconcile-cleanup`,
+  gt polecat check-recovery greenplace/Toast --reconcile-cleanup
+  gt polecat check-recovery greenplace/Toast --liveness-window 90s`,
 	Args: cobra.ExactArgs(1),
 	RunE: runPolecatCheckRecovery,
 }
@@ -433,6 +450,8 @@ func init() {
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale completion state (cleanup_status, push_failed) on the agent bead when live recovery predicates prove no work is at risk")
+	polecatCheckRecoveryCmd.Flags().DurationVar(&polecatCheckRecoveryLivenessWindow, "liveness-window", 0,
+		"Sample the pane twice this far apart to separate a working agent from one blocked consuming no tokens. BLOCKS for the duration; minimum 60s (shorter windows report healthy agents as blocked). Zero takes one sample, which still settles logged-out and parked")
 
 	// Stale flags
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
@@ -1173,26 +1192,39 @@ type RecoveryStatus struct {
 	// because the two polecat surfaces disagreed and neither output said what it
 	// had decided from, so a reader could not tell which one to believe
 	// (gt-mkpm).
-	State                polecat.State         `json:"state,omitempty"`
-	CleanupStatus        polecat.CleanupStatus `json:"cleanup_status"`
-	NeedsRecovery        bool                  `json:"needs_recovery"`
-	Verdict              string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, or NEEDS_LOGIN
-	WitnessAction        string                `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
-	Reason               string                `json:"reason,omitempty"`
-	Reusable             bool                  `json:"reusable"`
-	SafeToNuke           bool                  `json:"safe_to_nuke"`
-	NeedsMQSubmit        bool                  `json:"needs_mq_submit"`
-	NeedsLogin           bool                  `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
-	CountsTowardCapacity bool                  `json:"counts_toward_capacity"`
-	ReuseStatus          string                `json:"reuse_status,omitempty"`
-	Branch               string                `json:"branch,omitempty"`
-	Issue                string                `json:"issue,omitempty"`
-	MQStatus             string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
-	ActiveMR             string                `json:"active_mr,omitempty"`
-	Blockers             []string              `json:"blockers,omitempty"`
-	Diagnostics          []string              `json:"diagnostics,omitempty"`
-	RecoveryActions      []string              `json:"recovery_actions,omitempty"`
-	Reconciled           bool                  `json:"reconciled,omitempty"`
+	State         polecat.State         `json:"state,omitempty"`
+	CleanupStatus polecat.CleanupStatus `json:"cleanup_status"`
+	NeedsRecovery bool                  `json:"needs_recovery"`
+	Verdict       string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, NEEDS_LOGIN, or SUSPECT_STALL
+	WitnessAction string                `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
+	Reason        string                `json:"reason,omitempty"`
+	Reusable      bool                  `json:"reusable"`
+	SafeToNuke    bool                  `json:"safe_to_nuke"`
+	NeedsMQSubmit bool                  `json:"needs_mq_submit"`
+	NeedsLogin    bool                  `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
+
+	// Liveness is what the pane says the agent is DOING — working,
+	// blocking-wait, logged-out, parked, or turn-in-flight — as opposed to what
+	// the verdict says about its work. Reported alongside the verdict rather
+	// than folded into it because they answer different questions and used to
+	// be conflated: hooked-ness was read as liveness, so an agent that could
+	// not execute a turn reported WORKING (gt-y39t).
+	Liveness string `json:"liveness,omitempty"`
+
+	// LivenessWindow names how far apart the two samples behind Liveness were.
+	// Empty when only one sample was taken, which is the tell that
+	// working-vs-blocking-wait was never asked.
+	LivenessWindow       string   `json:"liveness_window,omitempty"`
+	CountsTowardCapacity bool     `json:"counts_toward_capacity"`
+	ReuseStatus          string   `json:"reuse_status,omitempty"`
+	Branch               string   `json:"branch,omitempty"`
+	Issue                string   `json:"issue,omitempty"`
+	MQStatus             string   `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
+	ActiveMR             string   `json:"active_mr,omitempty"`
+	Blockers             []string `json:"blockers,omitempty"`
+	Diagnostics          []string `json:"diagnostics,omitempty"`
+	RecoveryActions      []string `json:"recovery_actions,omitempty"`
+	Reconciled           bool     `json:"reconciled,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1246,6 +1278,41 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// is a measured one (gt-49dp).
 		ReuseFactsMeasured: true,
 	}
+
+	// The third pane read, and the only one that costs anything. The two above
+	// are single snapshots; this one samples twice across --liveness-window to
+	// see whether the token counter moves, which is the only surface that
+	// separates a generating agent from one wedged inside an open turn. Both
+	// render the busy marker, so SessionBusy above says "working" for either.
+	//
+	// With no window this still runs and still reports — logged-out and parked
+	// need no delta — but SuspectStall is false by construction, so the verdict
+	// machinery is untouched for callers that did not pay for the measurement
+	// (gt-y39t).
+	//
+	// A too-short window is refused OUT LOUD rather than silently degraded to a
+	// single sample. Someone who typed --liveness-window asked a specific
+	// question, and answering a different one without saying so is how "the
+	// check ran and found nothing" becomes indistinguishable from "the check
+	// never ran" — the reading that turns a working detector into a false
+	// all-clear.
+	if polecatCheckRecoveryLivenessWindow > 0 && polecatCheckRecoveryLivenessWindow < tmux.MinLivenessWindow {
+		fmt.Fprintf(os.Stderr,
+			"note: --liveness-window %s is below the %s minimum; taking one sample instead.\n"+
+				"      A shorter window reports healthy agents as blocked — the token counter is\n"+
+				"      displayed rounded to a hundred tokens, and a live agent was measured static\n"+
+				"      across a 20s window while it was generating throughout.\n",
+			polecatCheckRecoveryLivenessWindow, tmux.MinLivenessWindow)
+	}
+	liveness := mgr.SessionLiveness(polecatName, polecatCheckRecoveryLivenessWindow)
+	if liveness.State != tmux.LivenessUnknown {
+		status.Liveness = liveness.State.String()
+	}
+	if liveness.Sampled {
+		status.LivenessWindow = liveness.Window.String()
+	}
+	input.SessionSuspectStall = liveness.SuspectStall()
+	input.SessionStallWindow = liveness.Window
 	// Set only where an open MR for this polecat was actually looked up and read
 	// back open. It promotes a detected "stalled" to "handed-off" below, so it
 	// must never be set from a fail-closed "could not rule one out".
@@ -1452,6 +1519,19 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if status.ActiveMR != "" {
 		fmt.Printf("  Active MR:       %s\n", status.ActiveMR)
 	}
+	if status.Liveness != "" {
+		// Printed next to the verdict, not inside it. The verdict answers "is
+		// work at risk"; this answers "is the agent doing anything", and the
+		// whole of gt-y39t is that those two were one field. A reader who sees
+		// WORKING here also sees whether the pane agrees.
+		liveline := status.Liveness
+		if status.LivenessWindow != "" {
+			liveline += fmt.Sprintf(" (token counter sampled %s apart)", status.LivenessWindow)
+		} else {
+			liveline += " (one sample; --liveness-window separates working from blocking-wait)"
+		}
+		fmt.Printf("  Liveness:        %s\n", liveline)
+	}
 	if len(status.Diagnostics) > 0 {
 		fmt.Printf("  Diagnostics:     %s\n", strings.Join(status.Diagnostics, "; "))
 	}
@@ -1483,6 +1563,29 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Printf("  %s\n", style.Dim.Render("This verdict used to read WORKING, because a logged-out agent keeps its"))
 		fmt.Printf("  %s\n", style.Dim.Render("hooked bead and its lifecycle state — hooked-ness read as liveness (gt-acb1)"))
+	case polecat.WorkstateVerdictSuspectStall:
+		fmt.Printf("  Verdict:         %s\n", style.Error.Render("SUSPECT_STALL"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
+		fmt.Println()
+		for _, blocker := range status.Blockers {
+			fmt.Printf("    - %s\n", blocker)
+		}
+		fmt.Println()
+		fmt.Printf("  %s The pane was sampled twice. The agent's turn clock climbed and its\n", style.Warning.Render("⚠"))
+		fmt.Println("  token counter did not, and nothing on screen was running that it could")
+		fmt.Println("  be waiting on. A turn is open and nothing is moving inside it.")
+		fmt.Println()
+		fmt.Println("  Look before acting — this is evidence of not-thinking, not proof of death:")
+		fmt.Printf("    gt peek %s/%s\n", rigName, polecatName)
+		fmt.Println()
+		fmt.Println("  Do NOT restart on this alone. An agent legitimately inside a long sleep or")
+		fmt.Println("  a slow test produces the same token signature; what separates it is the")
+		fmt.Println("  command in flight, and this verdict fires only when none was visible.")
+		fmt.Println("  A restart would destroy the agent's context to answer a question a human")
+		fmt.Println("  answers by looking at the pane.")
+		fmt.Println()
+		fmt.Printf("  %s\n", style.Dim.Render("This case used to read WORKING: a wedged agent renders the busy marker"))
+		fmt.Printf("  %s\n", style.Dim.Render("exactly like a generating one, so the binary detector could never see it (gt-y39t)"))
 	case "NEEDS_MQ_SUBMIT":
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
 		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
