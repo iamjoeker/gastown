@@ -366,6 +366,88 @@ func TestSourceCloseRejectsLocalMergeStrategy(t *testing.T) {
 	}
 }
 
+// gt-j9uv: the refinery closes a bead after merging it, so a polecat that comes
+// back to a landed branch has nothing to close. Entering the close block anyway
+// is what trapped it — on a fork-backed rig the no-MR path refuses a zero-commit
+// branch outright, and there was no other exit.
+func TestSourceCloseSkipsAlreadyClosedIssueWithoutFailing(t *testing.T) {
+	issue := &beads.Issue{
+		ID:     "gt-work",
+		Type:   "bug",
+		Status: string(beads.StatusClosed),
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || fatal {
+		t.Fatalf("closed source close gate = %q, %v; want non-fatal skip", reason, fatal)
+	}
+	for _, want := range []string{"gt-work", "already closed"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("reason = %q, want it to name %q", reason, want)
+		}
+	}
+}
+
+// The already-closed skip has to land ahead of the gates that are fatal for real
+// work, or the trap survives behind whichever of them fires first. Review-only
+// with no evidence is fatal on an open bead; on a closed one there is nothing
+// left for the evidence to authorise.
+func TestSourceCloseSkipsAlreadyClosedReviewOnlyIssue(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-work",
+		Type:        "task",
+		Status:      string(beads.StatusClosed),
+		Description: "review_only: true\n",
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || fatal {
+		t.Fatalf("closed review-only close gate = %q, %v; want non-fatal skip", reason, fatal)
+	}
+	if !strings.Contains(reason, "already closed") {
+		t.Fatalf("reason = %q, want already-closed reason", reason)
+	}
+}
+
+// Sources that are not work at all stay fatal whatever their status: a wisp or
+// an MR bead on the hook is a dispatch fault, and closing it was never the point.
+func TestSourceCloseStillRejectsClosedNonConcreteIssue(t *testing.T) {
+	issue := &beads.Issue{
+		ID:     "gt-mr",
+		Status: string(beads.StatusClosed),
+		Labels: []string{"gt:merge-request"},
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || !fatal {
+		t.Fatalf("closed non-concrete close gate = %q, %v; want fatal rejection", reason, fatal)
+	}
+	if !strings.Contains(reason, "not concrete") {
+		t.Fatalf("reason = %q, want non-concrete reason", reason)
+	}
+}
+
+// The witness alarm and the "remains open" line both describe work left behind.
+// An already-closed bead leaves none, so it must not fire either — a skip that
+// mails DONE_CLOSE_SKIPPED for it spends a permanent Dolt commit on a claim that
+// is false on both counts.
+func TestAlreadyClosedSourceSuppressesCloseSkippedAlarm(t *testing.T) {
+	closed := &beads.Issue{ID: "gt-work", Type: "bug", Status: string(beads.StatusClosed)}
+	if !doneSourceIssueAlreadyClosed(nil, closed.ID, closed) {
+		t.Fatal("closed source not recognised as already closed; the witness gets a false alarm")
+	}
+
+	for _, issue := range []*beads.Issue{
+		{ID: "gt-work", Type: "bug", Status: string(beads.StatusOpen)},
+		{ID: "gt-work", Type: "bug", Status: string(beads.IssueStatusHooked)},
+		{ID: "gt-work", Type: "bug"},
+	} {
+		if doneSourceIssueAlreadyClosed(nil, issue.ID, issue) {
+			t.Fatalf("status %q reported as already closed; a real skipped close would go unreported", issue.Status)
+		}
+	}
+}
+
 func TestDirectMergeRejectsUnsafeSourceBeforePush(t *testing.T) {
 	freshEvidenceReviewOnly := &beads.Issue{
 		ID:          "gt-review",

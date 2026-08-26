@@ -509,6 +509,14 @@ func doneSourceCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue *be
 	if err := validateConcreteSourceIssue(issueID, issue); err != nil {
 		return err.Error(), true
 	}
+	// An already-closed bead has nothing left to close, and entering the close
+	// block regardless is what trapped the polecat: on a fork-backed rig the
+	// no-MR path refuses a zero-commit branch outright, so a bead the refinery
+	// had already merged and closed left no exit at all (gt-j9uv). Skipping is
+	// the whole remedy, same as the protected-label skip above.
+	if issue != nil && strings.EqualFold(strings.TrimSpace(issue.Status), string(beads.StatusClosed)) {
+		return fmt.Sprintf("issue %s is already closed — nothing to close", issueID), false
+	}
 	if attachment := beads.ParseAttachmentFields(issue); attachment != nil && strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local") {
 		return fmt.Sprintf("issue %s has merge_strategy=local — skipping close", issueID), false
 	}
@@ -519,6 +527,21 @@ func doneSourceCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue *be
 		return fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked), false
 	}
 	return "", false
+}
+
+// doneSourceIssueAlreadyClosed reports whether a skipped close was skipped
+// because there was nothing left to close.
+//
+// Every other skip reason leaves real work behind for a human, which is what
+// the "remains open for witness/mayor review" line and the DONE_CLOSE_SKIPPED
+// mail announce. For an already-closed bead both statements are false, and the
+// mail costs a permanent Dolt commit to make them (gt-j9uv).
+func doneSourceIssueAlreadyClosed(bd *beads.Beads, issueID string, issue *beads.Issue) bool {
+	issue, _, _ = loadDoneSourceIssue(bd, issueID, issue)
+	if issue == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(issue.Status), string(beads.StatusClosed))
 }
 
 func doneReviewOnlyCloseSkipReason(bd *beads.Beads, issueID string, issue *beads.Issue) (string, bool) {
@@ -1204,8 +1227,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				skipClose := false
 				if skipReason, fatal := doneSourceCloseSkipReason(bd, issueID, sourceIssueForNoMerge); skipReason != "" {
 					style.PrintWarning("%s", skipReason)
-					fmt.Printf("  The bead will remain open for witness/mayor review.\n")
-					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+					if fatal || !doneSourceIssueAlreadyClosed(bd, issueID, sourceIssueForNoMerge) {
+						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+					}
 					if fatal {
 						return fmt.Errorf("cannot complete review-only/no-MR work: %s", skipReason)
 					}
@@ -1465,7 +1490,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, ledgerNoteErr.Error())
 				} else if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, sourceIssueForNoMerge); skipReason != "" {
 					style.PrintWarning("%s", skipReason)
-					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+					if fatal || !doneSourceIssueAlreadyClosed(directBd, issueID, sourceIssueForNoMerge) {
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+					}
 					if fatal {
 						return fmt.Errorf("cannot complete direct-merge work: %s", skipReason)
 					}
@@ -1573,7 +1600,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, ledgerNoteErr.Error())
 			} else if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, sourceIssueForNoMerge); skipReason != "" {
 				style.PrintWarning("%s", skipReason)
-				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+				if fatal || !doneSourceIssueAlreadyClosed(directBd, issueID, sourceIssueForNoMerge) {
+					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+				}
 				if fatal {
 					return fmt.Errorf("cannot complete direct-merge work: %s", skipReason)
 				}
