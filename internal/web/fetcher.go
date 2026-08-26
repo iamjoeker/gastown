@@ -1743,12 +1743,17 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 	// measured count, and the ten it could not see are the ten nobody is
 	// coming for. An unbounded query cannot be truncated, so there is nothing
 	// to mark; the count is a true count (gt-skzk.2).
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", "--json", "--limit=0")
-	if err != nil {
-		return nil, fmt.Errorf("listing escalations: %w", err)
-	}
-
-	var issues []struct {
+	//
+	// The pinned half is asked for separately for the same reason `--limit=0`
+	// is passed: bd's default `--status=open` is silently `--no-pinned`, and it
+	// has no include-pinned flag. Measured on hq 2026-08-26 the single default
+	// query returned 1 of the 4 open escalations, the other 3 being pinned —
+	// two of them HIGH. Truncation at least has a cause a reader could guess;
+	// this one drops precisely the rows an operator pinned to keep in view, and
+	// the panel renders the town calmest at its worst moment (gt-z5h7, and the
+	// same shape as gt-edty and gt-qee3). Unioned by ID rather than switched
+	// between, so it stays correct if bd's default ever changes.
+	type escalationIssue struct {
 		ID          string   `json:"id"`
 		Title       string   `json:"title"`
 		CreatedAt   string   `json:"created_at"`
@@ -1756,8 +1761,26 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 		Labels      []string `json:"labels"`
 		Description string   `json:"description"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		return nil, fmt.Errorf("parsing escalations: %w", err)
+
+	var issues []escalationIssue
+	seen := make(map[string]bool)
+	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
+		stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", pinnedFilter, "--json", "--limit=0")
+		if err != nil {
+			return nil, fmt.Errorf("listing escalations (%s): %w", pinnedFilter, err)
+		}
+
+		var half []escalationIssue
+		if err := json.Unmarshal(stdout.Bytes(), &half); err != nil {
+			return nil, fmt.Errorf("parsing escalations (%s): %w", pinnedFilter, err)
+		}
+		for _, issue := range half {
+			if seen[issue.ID] {
+				continue
+			}
+			seen[issue.ID] = true
+			issues = append(issues, issue)
+		}
 	}
 
 	var rows []EscalationRow
