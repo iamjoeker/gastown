@@ -3619,6 +3619,17 @@ func (g *Git) preservationOfRefAgainstRef(head, ref string) (BranchPreservationS
 	if err != nil {
 		return status, err
 	}
+	// A blank listing is not a clean bill of health, and callers that delete on
+	// Preserved must never read it as one. `git cherry` prints one line per
+	// commit on head, so no lines means the range held nothing — which is
+	// exactly the case the ancestor check above already settles. Reaching here
+	// with empty output means the two readings disagree, and an undetermined
+	// measurement must fall to KEEP rather than to the destructive side. This is
+	// the shape that read an empty query as "every table is missing" (hq-emgkr);
+	// on a delete path the same default is unrecoverable rather than alarming.
+	if strings.TrimSpace(out) == "" {
+		return status, fmt.Errorf("git cherry %s %s listed no commits while %s is not an ancestor of %s: containment undetermined", ref, head, head, ref)
+	}
 	status.UnpreservedPatchCount = CountCherryUnmergedCommits(out)
 	status.Preserved = status.UnpreservedPatchCount == 0
 	if status.Preserved {
@@ -4169,7 +4180,7 @@ func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error
 // PrunedBranch represents a local branch that was pruned (or would be pruned in dry-run).
 type PrunedBranch struct {
 	Name   string // Branch name (e.g., "polecat/rictus-mkb0vq9f")
-	Reason string // Why it was pruned: "merged", "no-remote", "no-remote-merged"
+	Reason string // Why it was pruned: "merged", "rebase-landed", "no-remote", "no-remote-merged"
 }
 
 // SkippedBranch represents a local branch that matched the staleness predicate
@@ -4180,7 +4191,7 @@ type PrunedBranch struct {
 // none", and the two must not be reported the same way.
 type SkippedBranch struct {
 	Name   string // Branch name
-	Reason string // Why it was a candidate: "merged", "no-remote", "no-remote-merged"
+	Reason string // Why it was a candidate: "merged", "rebase-landed", "no-remote", "no-remote-merged"
 	Detail string // Why it survived (worktree checkout, git branch -d refusal, ...)
 }
 
@@ -4211,7 +4222,9 @@ func (r *PruneReport) Candidates() int {
 // tracking ref but the local branch persists indefinitely.
 //
 // Safety: never deletes the current branch or the default branch (main/master).
-// Uses git branch -d (not -D), so only fully-merged branches are deleted.
+// Uses git branch -d (not -D) except for branches proven patch-identical to the
+// target, where -d's ancestry check is the very thing being answered a better
+// way; see PruneStaleBranchesReport.
 func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, error) {
 	report, err := g.PruneStaleBranchesReport(pattern, dryRun)
 	if err != nil {
@@ -4230,6 +4243,13 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 //     promise a deletion the action cannot perform.
 //   - A git branch -d failure at delete time, reported with git's own message
 //     rather than dropped.
+//
+// Staleness is ancestry OR proven patch identity. A branch the refinery rebased
+// before landing is contained in the target without being an ancestor of it, so
+// an ancestry-only predicate leaves it behind on every future pass; a predicate
+// that took every non-ancestor would destroy genuinely unlanded work instead.
+// Patch identity is the third answer, and it only ever counts when it is
+// proven — an unreadable or contradictory comparison keeps the branch (gt-wbvx).
 func (g *Git) PruneStaleBranchesReport(pattern string, dryRun bool) (*PruneReport, error) {
 	if pattern == "" {
 		pattern = "polecat/*"
@@ -4271,7 +4291,8 @@ func (g *Git) PruneStaleBranchesReport(pattern string, dryRun bool) (*PruneRepor
 		}
 
 		// Check if the branch is merged to the default branch
-		merged, err := g.IsAncestor(branch, "origin/"+defaultBranch)
+		target := "origin/" + defaultBranch
+		merged, err := g.IsAncestor(branch, target)
 		if err != nil {
 			// If we can't determine merge status, only prune if remote is gone
 			if hasRemote {
@@ -4281,15 +4302,36 @@ func (g *Git) PruneStaleBranchesReport(pattern string, dryRun bool) (*PruneRepor
 			continue
 		}
 
+		// Ancestry proves containment one way only. The refinery rebases before
+		// landing, so the landed commits are patch-identical to the branch tip
+		// without descending from it, and ancestry-only hygiene can never
+		// collect those branches — measured on gastown at 17 of 41, with every
+		// rebase-merge adding one more (gt-wbvx).
+		//
+		// Both naive predicates are wrong: delete only ancestors and the 17 stay
+		// forever; delete every non-ancestor and 6 branches holding real
+		// unlanded work are destroyed. So the second question is patch identity,
+		// and it must be PROVEN — preservationOfRefAgainstRef errors rather than
+		// answering when it cannot read, and an error here falls through to KEEP.
+		rebaseLanded := false
+		if !merged {
+			if status, presErr := g.preservationOfRefAgainstRef(branch, target); presErr == nil && status.Preserved {
+				rebaseLanded = true
+			}
+		}
+
 		var reason string
-		if merged && !hasRemote {
+		switch {
+		case merged && !hasRemote:
 			reason = "no-remote-merged"
-		} else if merged {
+		case merged:
 			reason = "merged"
-		} else if !hasRemote {
+		case rebaseLanded:
+			reason = "rebase-landed"
+		case !hasRemote:
 			reason = "no-remote"
-		} else {
-			continue // Branch has remote and is not merged — keep it
+		default:
+			continue // Branch has remote and is not landed — keep it
 		}
 
 		// A checked-out branch is refused by git branch -d in every mode, so it
@@ -4306,7 +4348,13 @@ func (g *Git) PruneStaleBranchesReport(pattern string, dryRun bool) (*PruneRepor
 		if !dryRun {
 			// Use -d (not -D) for safety — only deletes fully merged branches.
 			// For "no-remote" branches that aren't merged, -d will fail safely.
-			if err := g.DeleteBranch(branch, false); err != nil {
+			//
+			// "rebase-landed" is the one case that must force, because git's own
+			// -d check is the ancestry check this predicate just went past. The
+			// force is earned, not assumed: it is reachable only when patch
+			// identity was proven above, and every unproven or unreadable answer
+			// left rebaseLanded false and never gets here.
+			if err := g.DeleteBranch(branch, reason == "rebase-landed"); err != nil {
 				report.Skipped = append(report.Skipped, SkippedBranch{
 					Name:   branch,
 					Reason: reason,

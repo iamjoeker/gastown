@@ -168,6 +168,70 @@ gh_can_act() {
   return 1
 }
 
+# --- Is the branch's work already in the target? (gt-wbvx) --------------------
+#
+# This step used to ask ancestry and nothing else. Ancestry proves containment
+# ONE WAY ONLY: the refinery rebases before landing, so a landed branch's
+# commits are patch-identical to what is on main without descending from it, and
+# an ancestry-only predicate can never collect those branches. Measured on
+# gastown: 41 polecat branches on the remote, 18 ancestors, 17 rebase-landed and
+# invisible to this check, 6 genuinely unlanded. Every rebase-merge adds one
+# more, and the residue had to be cleared by hand.
+#
+# Both naive predicates are wrong, and this is worth stating so nobody reaches
+# for either:
+#
+#   delete only ancestors      -> leaves 17 stale branches behind (the old bug)
+#   delete every non-ancestor  -> destroys 6 branches holding real unlanded work
+#
+# So the second question is patch identity, and the third answer is "I could not
+# tell". Step 3 below is the part that is easy to get wrong under time pressure:
+# an empty or unreadable `git cherry` must fall through to KEEP, not to DELETE.
+# Defaulting a failed measurement to the destructive branch is the same defect
+# class as reading an empty query result as "every table is missing" (hq-emgkr);
+# on a delete path it is unrecoverable rather than merely alarming.
+#
+# Returns 0 to delete, 1 to keep, and sets LANDED_EVIDENCE to the proof that
+# carried it so the receipt says which one did.
+LANDED_EVIDENCE=""
+branch_is_landed() {
+  local repo="$1" ref="$2" target="$3" cherry
+  LANDED_EVIDENCE=""
+
+  # 1. Contained by sha. The cheapest and strongest answer.
+  if git -C "$repo" merge-base --is-ancestor "$ref" "$target" 2>/dev/null; then
+    LANDED_EVIDENCE="ancestor"
+    return 0
+  fi
+
+  # 2. Contained by content. `git cherry <target> <ref>` prints one line per
+  #    commit on the ref: '-' when the same patch is already in the target,
+  #    '+' when it is not. Minus is the RELIABLE direction — patch-id equality
+  #    is positive evidence of redundancy — which is why the test is for the
+  #    absence of '+' rather than for the presence of '-'.
+  if ! cherry=$(git -C "$repo" cherry "$target" "$ref" 2>&1); then
+    cherry=$(printf '%s' "$cherry" | tr '\n' ' ' | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')
+    log "    KEEPING $ref: git cherry could not compare it against $target ($cherry)"
+    return 1
+  fi
+
+  # 3. An empty listing is not a clean bill of health. `git cherry` prints one
+  #    line per commit, so no lines means the range held nothing — which the
+  #    ancestor check above would already have settled. Reaching here with no
+  #    output means the two readings disagree, and a contradiction on a delete
+  #    path resolves to KEEP.
+  if [ -z "$(printf '%s' "$cherry" | tr -d '[:space:]')" ]; then
+    log "    KEEPING $ref: git cherry listed no commits while it is not an ancestor of $target — undetermined"
+    return 1
+  fi
+
+  if printf '%s\n' "$cherry" | grep -q '^+'; then
+    return 1
+  fi
+  LANDED_EVIDENCE="patch-identical, rebase-landed"
+  return 0
+}
+
 # --- Which remotes can vouch for a branch? (gt-x6ji) --------------------------
 #
 # The orphan sweep force-deletes anything "the remote" does not hold, so what
@@ -430,7 +494,7 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
       if ! echo "$RBRANCH" | grep -qE "^($REMOTE_PATTERNS)"; then
         continue
       fi
-      if git -C "$REPO_PATH" merge-base --is-ancestor "origin/$RBRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+      if branch_is_landed "$REPO_PATH" "origin/$RBRANCH" "origin/$DEFAULT_BRANCH"; then
         # Ask once, on the first branch that actually needs deleting, whether we
         # can act on GitHub at all. Without this the loop below issued N doomed
         # API calls, swallowed N errors, and counted zero — a result identical to
@@ -440,7 +504,7 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
           REMOTE_BLOCKED=1
           break
         fi
-        log "    Deleting remote: origin/$RBRANCH"
+        log "    Deleting remote: origin/$RBRANCH ($LANDED_EVIDENCE)"
         # Same rule as delete_branch above: a refusal must not abort the run, but
         # it is captured, logged and counted rather than sent to /dev/null.
         if REMOTE_ERR=$(gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>&1 >/dev/null); then

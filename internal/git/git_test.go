@@ -1331,6 +1331,106 @@ func makeStaleMergedBranch(t *testing.T, g *Git, localDir, mainBranch, branch, f
 	}
 }
 
+// The refinery rebases before landing, so a landed branch's commits are
+// patch-identical to what is on the target without descending from it. An
+// ancestry-only hygiene predicate can never collect those branches, and they
+// accumulate forever — measured on gastown at 17 of 41 polecat branches, with
+// every rebase-merge adding one more (gt-wbvx).
+//
+// The two naive predicates are both wrong: delete only ancestors and the 17
+// stay; delete every non-ancestor and genuinely unlanded work is destroyed.
+// TestPruneStaleBranches_SkipsUnmerged is the other half of this pair and must
+// keep passing — this test alone is satisfied by the destructive predicate.
+func TestPruneStaleBranchesReport_CollectsRebaseLandedBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const branch = "polecat/rebase-landed"
+
+	makeRebaseLandedBranch(t, g, localDir, mainBranch, branch, "landed.txt")
+
+	report, err := g.PruneStaleBranchesReport("polecat/*", false)
+	if err != nil {
+		t.Fatalf("PruneStaleBranchesReport: %v", err)
+	}
+	if len(report.Pruned) != 1 || report.Pruned[0].Name != branch {
+		t.Fatalf("pruned = %+v skipped = %+v, want %s collected", report.Pruned, report.Skipped, branch)
+	}
+	if report.Pruned[0].Reason != "rebase-landed" {
+		t.Errorf("pruned reason = %q, want rebase-landed", report.Pruned[0].Reason)
+	}
+
+	branches, err := g.ListBranches("polecat/*")
+	if err != nil {
+		t.Fatalf("ListBranches: %v", err)
+	}
+	if len(branches) != 0 {
+		t.Fatalf("branch survived the prune: %v", branches)
+	}
+}
+
+// makeRebaseLandedBranch pushes a polecat branch, then lands its patch on main
+// under a different sha the way the refinery's rebase does. The branch stays on
+// the remote, contained by content and not by ancestry. Returns the branch tip.
+//
+// The remote half of the same question is already covered by
+// TestPushRemoteRefTargetStatusPreservesRebasedRemoteBranch, which is why this
+// fixture only feeds the local predicate.
+func makeRebaseLandedBranch(t *testing.T, g *Git, localDir, mainBranch, branch, file string) string {
+	t.Helper()
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, file), []byte(file+"\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add(file); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("work that will land rebased"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	tip, err := g.Rev(branch)
+	if err != nil {
+		t.Fatalf("Rev: %v", err)
+	}
+	tip = strings.TrimSpace(tip)
+	runGit(t, localDir, "push", "origin", branch)
+
+	// Main moves on first, then the work is replayed on top: same patch, new
+	// sha, no ancestry. This is the majority path under load, not an exception.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "before-"+file), []byte("someone else landed first\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("before-" + file); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("someone else landed first"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "cherry-pick", tip)
+	runGit(t, localDir, "push", "origin", mainBranch)
+	if err := g.FetchPrune("origin"); err != nil {
+		t.Fatalf("FetchPrune: %v", err)
+	}
+
+	// The fixture is only a fixture if ancestry genuinely fails on it: if the
+	// branch were an ancestor, an ancestry-only predicate would pass too.
+	ancestor, err := g.IsAncestor(branch, "origin/"+mainBranch)
+	if err != nil {
+		t.Fatalf("IsAncestor: %v", err)
+	}
+	if ancestor {
+		t.Fatalf("fixture is not a rebase landing: %s is an ancestor of origin/%s", branch, mainBranch)
+	}
+	return tip
+}
+
 // A branch checked out in a worktree can never be deleted by git branch -d.
 // The preview must say so, and the real run must not report it as "found none"
 // (gt-p12r: --dry-run promised 11 deletions, the real run deleted nothing and

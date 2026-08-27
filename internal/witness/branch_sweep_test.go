@@ -754,11 +754,18 @@ func TestSweepMarksLandedNonAncestorsAsHygieneUnreachable(t *testing.T) {
 		wantUnreachable bool
 	}{
 		{"ancestor", false},
+		// Patch identity is the second proof git-hygiene acts on: `git cherry`
+		// with no '+' line is exactly what its predicate tests, so a
+		// rebase-landed branch now routes to hygiene rather than to nobody
+		// (gt-wbvx).
+		{"cherry", false},
+		// An empty merge is NOT patch identity. The target has the content;
+		// that does not make each commit patch-identical to one on the target,
+		// so hygiene leaves these alone and the sweep must still name them.
 		{"merge_tree_noop", true},
-		{"cherry", true},
 		// An evidence string this build does not recognise cannot be assumed to
-		// be ancestry. Naming the branch costs a line; assuming hygiene has it
-		// is how the row goes uncollected forever.
+		// be one hygiene acts on. Naming the branch costs a line; assuming
+		// hygiene has it is how the row goes uncollected forever.
 		{"some_future_proof", true},
 		{"", true},
 	}
@@ -848,7 +855,7 @@ func TestHygieneUnreachableCountIsSeparateFromAttention(t *testing.T) {
 		status: map[string]git.BranchPreservationStatus{
 			"polecat/a/gt-check+aaa": {Preserved: false, UnpreservedPatchCount: 3},
 			"polecat/b/gt-anc+bbb":   {Preserved: true, Evidence: "ancestor"},
-			"polecat/c/gt-wz3y+ccc":  {Preserved: true, Evidence: "cherry"},
+			"polecat/c/gt-wz3y+ccc":  {Preserved: true, Evidence: "merge_tree_noop"},
 		},
 	}
 	bd := &fakeSweepBeads{issues: map[string]*beads.Issue{
@@ -865,7 +872,7 @@ func TestHygieneUnreachableCountIsSeparateFromAttention(t *testing.T) {
 		t.Fatalf("AttentionCount = %d, want 1 (the check row only)", got)
 	}
 	if got := result.HygieneUnreachableCount(); got != 1 {
-		t.Fatalf("HygieneUnreachableCount = %d, want 1 (the cherry row only)", got)
+		t.Fatalf("HygieneUnreachableCount = %d, want 1 (the empty-merge row only)", got)
 	}
 	if got := result.CountByClass()[BranchSweepLanded]; got != 2 {
 		t.Fatalf("landed = %d, want 2 — both halves are still landed", got)
@@ -909,8 +916,10 @@ func TestSweepSettlesMarkedBranchesAndStopsReportingThem(t *testing.T) {
 			remoteRef("polecat/refinery/gt-aqk+ddd", "sha-aqk"),
 		},
 		status: map[string]git.BranchPreservationStatus{
-			"polecat/dust/gt-k3v+aaa":     {Preserved: false, UnpreservedPatchCount: 2},
-			"polecat/refinery/gt-aqk+ddd": {Preserved: true, Evidence: "cherry"},
+			"polecat/dust/gt-k3v+aaa": {Preserved: false, UnpreservedPatchCount: 2},
+			// An empty merge: landed, and outside the two proofs hygiene acts
+			// on, so this row is on the --deletable list until a marker settles it.
+			"polecat/refinery/gt-aqk+ddd": {Preserved: true, Evidence: "merge_tree_noop"},
 		},
 	}
 	bd := &fakeSweepBeads{issues: map[string]*beads.Issue{

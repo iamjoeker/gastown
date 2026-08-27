@@ -1507,8 +1507,13 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) bool {
 		leaseHead := expectedHead
 		remoteDeleteSafe := true
 		if isPolecat {
-			if e.git.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: expectedHead}) {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", mr.Branch)
+			// The protection is one decision with two reasons, and the reasons
+			// have to reach the log separately: "found an open PR" is settled,
+			// "could not look" leaves the branch unclassified on the remote and
+			// is the operator's cue to go and check (gt-wbvx).
+			protection := e.git.CheckOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: expectedHead})
+			if protection.Protected() {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: %s\n", mr.Branch, protection.Reason())
 			} else if resolvedHead, err := e.git.ResolveMergedBranchDeleteHead("origin", mr.Branch, strings.TrimSpace(mr.Target), expectedHead); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
 				remoteDeleteSafe = false

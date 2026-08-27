@@ -35,14 +35,16 @@ func (m *fakeMQPostMergeManager) PostMergeMR(mr *refinery.MergeRequest) (*refine
 }
 
 type fakeMQPostMergeGit struct {
-	verifyErr   error
-	verifyProof git.MergeProof
-	openPR      bool
-	deleteErr   error
-	remoteTip   string
-	localHead   string
-	tipErr      error
-	resolveErr  error
+	verifyErr    error
+	verifyProof  git.MergeProof
+	openPR       bool
+	openPRNumber int
+	prLookupErr  error
+	deleteErr    error
+	remoteTip    string
+	localHead    string
+	tipErr       error
+	resolveErr   error
 
 	verifiedCommits []string
 	resolvedTargets []string
@@ -62,8 +64,14 @@ func (g *fakeMQPostMergeGit) VerifyCommitLandedOnPushTarget(_, _, commit string)
 	return g.verifyProof, nil
 }
 
-func (g *fakeMQPostMergeGit) HasOpenPullRequest(git.PullRequestRef) bool {
-	return g.openPR
+func (g *fakeMQPostMergeGit) CheckOpenPullRequest(git.PullRequestRef) git.PullRequestProtection {
+	if g.prLookupErr != nil {
+		return git.PullRequestProtection{LookupFailed: true, Err: g.prLookupErr}
+	}
+	if g.openPR {
+		return git.PullRequestProtection{Open: true, PR: &git.PullRequestInfo{Number: g.openPRNumber, State: "OPEN"}}
+	}
+	return git.PullRequestProtection{}
 }
 
 // ResolveMergedBranchDeleteHead mirrors the real resolver's contract: the
@@ -338,6 +346,79 @@ func TestReportMQPostMerge_PreCleanupFailureClaimsNoOutstandingBranch(t *testing
 	}
 	if strings.Contains(err.Error(), "outstanding") || strings.Contains(out.String(), "Outstanding") {
 		t.Fatalf("pre-cleanup failure reported branch as outstanding: err=%v out=%s", err, out.String())
+	}
+}
+
+// A PR lookup that never completed must not be reported as a PR that was found.
+// The two share a decision — skip the delete — and nothing else. An operator
+// told "open PR exists" leaves the branch alone believing a PR is holding it;
+// the truth was an HTTP 401 and nothing about the branch was measured. The old
+// line also rendered a hardcoded bead reference, "(gas-fk4)", exactly where a
+// reader expects a PR number (gt-wbvx).
+func TestRunVerifiedMQPostMerge_FailedPRLookupIsNotReportedAsAnOpenPR(t *testing.T) {
+	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
+	rigGit := &fakeMQPostMergeGit{
+		prLookupErr: errors.New("gh pr list head polecat/test/gt-proof failed: HTTP 401: Requires authentication"),
+		localHead:   mgr.mr.CommitSHA,
+	}
+
+	result, proof, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	if err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if cleanup.OpenPR {
+		t.Fatalf("cleanup.OpenPR = true for a lookup that never completed: %+v", cleanup)
+	}
+	if !cleanup.PRLookupFailed {
+		t.Fatalf("cleanup.PRLookupFailed = false, cleanup=%+v", cleanup)
+	}
+	// Fail-closed is the behaviour that was always correct and must not change.
+	if len(rigGit.deletedBranches) != 0 {
+		t.Fatalf("remote branch deleted after an unreadable PR lookup: %v", rigGit.deletedBranches)
+	}
+
+	var out strings.Builder
+	if err := reportMQPostMerge(&out, result, proof, cleanup, nil); err != nil {
+		t.Fatalf("reportMQPostMerge: %v", err)
+	}
+	text := out.String()
+	for _, want := range []string{"PR lookup FAILED", "401", "nothing was verified"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("report output missing %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"open PR exists", "gas-fk4"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("report output still claims %q:\n%s", unwanted, text)
+		}
+	}
+}
+
+// The control for the test above, and the reason it is not simply asserting the
+// absence of a string: a genuinely open PR must still be reported as one, and
+// now names the PR the lookup actually found instead of a bead reference.
+func TestRunVerifiedMQPostMerge_OpenPRIsNamedByNumber(t *testing.T) {
+	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
+	rigGit := &fakeMQPostMergeGit{openPR: true, openPRNumber: 7331, localHead: mgr.mr.CommitSHA}
+
+	result, proof, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	if err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if !cleanup.OpenPR || cleanup.PRLookupFailed {
+		t.Fatalf("unexpected cleanup for a found open PR: %+v", cleanup)
+	}
+
+	var out strings.Builder
+	if err := reportMQPostMerge(&out, result, proof, cleanup, nil); err != nil {
+		t.Fatalf("reportMQPostMerge: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "open PR #7331") {
+		t.Errorf("report output does not name the open PR:\n%s", text)
+	}
+	if strings.Contains(text, "gas-fk4") {
+		t.Errorf("report output still renders a bead reference where a PR number belongs:\n%s", text)
 	}
 }
 

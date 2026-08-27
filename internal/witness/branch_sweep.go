@@ -52,16 +52,18 @@ import (
 // THIRD, added by gt-l65a: "landed" is two different situations wearing one
 // name, and the difference decides who — if anyone — can act on the branch.
 //
-// The git-hygiene plugin deletes a remote branch when
-// `git merge-base --is-ancestor origin/<branch> origin/main` succeeds. Ancestry
-// is the ONLY containment proof it acts on. This sweep proves containment three
-// ways: ancestry, an empty merge, and patch identity. So a branch that was
-// rebased before landing — its patch in the target, its commit never in the
-// target's history — is landed, is not an ancestor, and is therefore reachable
-// by nothing: hygiene will not delete it because it is not an ancestor, and the
-// short list will not raise it because it is not a check. It is reported as
-// landed on every future sweep, forever, by a tool whose value depends on its
-// output being short.
+// The git-hygiene plugin deletes a remote branch when its work is provably in
+// the target. It originally asked ancestry and nothing else, and this sweep
+// proves containment three ways — ancestry, an empty merge, and patch identity
+// — so a branch rebased before landing was landed, was not an ancestor, and was
+// therefore reachable by nothing: hygiene would not delete it, and the short
+// list would not raise it because it is not a check. It was reported as landed
+// on every future sweep, forever, by a tool whose value depends on its output
+// being short. Measured on gastown at 17 of 41 branches (gt-wbvx).
+//
+// Hygiene now acts on patch identity too, so that population routes somewhere.
+// What remains unreachable is containment proved ONLY by an empty merge, and
+// the distinction below is still what decides who can act on a landed row.
 //
 // And it is the SAFEST deletion candidate in the whole listing, which is the
 // part worth sitting with, because the classes imply the opposite priority:
@@ -115,11 +117,21 @@ import (
 // The session state is recorded on the finding either way, so an "active"
 // verdict carries the evidence it rests on rather than asserting it.
 
-// branchHygieneEvidence is the one containment proof the git-hygiene plugin
-// acts on (plugins/git-hygiene/run.sh, "Delete merged remote branches"). Keep
-// this in step with that check: containment proved any other way is invisible
-// to hygiene, and this constant is what says so.
-const branchHygieneEvidence = "ancestor"
+// branchHygieneEvidence lists the containment proofs the git-hygiene plugin
+// acts on (plugins/git-hygiene/run.sh, branch_is_landed). Keep this in step
+// with that predicate: containment proved any other way is invisible to
+// hygiene, and this set is what says so.
+//
+// "merge_tree_noop" is deliberately absent. An empty merge means the target
+// already has the branch's CONTENT; it does not mean each of the branch's
+// commits is patch-identical to one on the target, which is the question
+// `git cherry` asks and the plugin acts on. A branch whose changes were landed
+// and then partly reverted can merge to nothing while still showing '+' lines,
+// and hygiene will — correctly — leave it alone (gt-wbvx).
+var branchHygieneEvidence = map[string]bool{
+	"ancestor": true,
+	"cherry":   true,
+}
 
 // Session-presence strings as they appear on a finding and in JSON.
 //
@@ -142,9 +154,9 @@ type BranchSweepClass string
 const (
 	// BranchSweepLanded means the branch's content is in the target, by
 	// ancestry, by an empty merge, or by patch identity. No decision is
-	// needed — but "no decision" is not "nothing to do": only the ancestry
-	// case is collected by branch hygiene, so check HygieneUnreachable before
-	// reading a landed row as finished.
+	// needed — but "no decision" is not "nothing to do": not every proof is
+	// one branch hygiene acts on, so check HygieneUnreachable before reading
+	// a landed row as finished.
 	BranchSweepLanded BranchSweepClass = "landed"
 
 	// BranchSweepQueued means an open merge request is holding this branch.
@@ -252,10 +264,10 @@ type BranchSweepFinding struct {
 	ContainedIn string `json:"contained_in,omitempty"`
 
 	// HygieneUnreachable marks landed content that branch hygiene will never
-	// delete: the branch is contained in the target, but not by ancestry, and
-	// ancestry is the only proof hygiene acts on. Nothing else routes it either
-	// — it is not on the short list, because it is not a check — so it is a
-	// permanent row in a listing whose worth is its shortness (gt-l65a).
+	// delete: the branch is contained in the target, but by neither of the two
+	// proofs hygiene acts on (see branchHygieneEvidence). Nothing else routes
+	// it either — it is not on the short list, because it is not a check — so
+	// it is a permanent row in a listing whose worth is its shortness (gt-l65a).
 	//
 	// It is deliberately NOT omitempty. A false here means "landed, and hygiene
 	// has it", which is a measurement; an absent key would read the same as a
@@ -675,15 +687,15 @@ func classifyBranch(
 			finding.ContainedIn = targets[0]
 		}
 		// How containment was proved decides who can act on the branch, so it
-		// is recorded as a routing fact and not only as a label. Anything that
-		// is not ancestry — an empty merge, patch identity, or an evidence
-		// string this build does not recognise — is out of hygiene's reach; the
-		// safe direction for an unrecognised value is to name the branch rather
+		// is recorded as a routing fact and not only as a label. Anything
+		// outside the set hygiene acts on — an empty merge, or an evidence
+		// string this build does not recognise — is out of its reach; the safe
+		// direction for an unrecognised value is to name the branch rather
 		// than assume something else will collect it.
-		finding.HygieneUnreachable = strings.TrimSpace(status.Evidence) != branchHygieneEvidence
+		finding.HygieneUnreachable = !branchHygieneEvidence[strings.TrimSpace(status.Evidence)]
 		finding.Note = "content is in " + finding.ContainedIn + " (" + evidenceLabel(status.Evidence) + ")"
 		if finding.HygieneUnreachable {
-			finding.Note += "; NOT an ancestor of " + finding.ContainedIn + " — branch hygiene cannot delete it"
+			finding.Note += "; contained in " + finding.ContainedIn + " by neither ancestry nor patch identity — branch hygiene cannot delete it"
 		}
 		if mr != nil && mr.Open() {
 			finding.Note += "; open MR " + mr.ID + " is still queued for content that already landed"

@@ -71,13 +71,23 @@ commits read as needing no decision for 23 hours (gt-6i5d). Every active row now
 carries the session state it rests on, and a sweep that could not ask says so.
 
 A landed branch is two situations under one name, and --deletable separates
-them. Branch hygiene deletes a remote branch only when it is an ANCESTOR of the
-target; this sweep also proves containment by an empty merge and by patch
-identity. A branch rebased before landing is contained but is not an ancestor,
-so hygiene will not collect it and the short list will not raise it — it is
-reported as landed on every future sweep, forever. Those rows carry the
-strongest evidence of redundancy in the listing (patch-id EQUALITY, the
-reliable direction) and are marked landed* in the table.
+them. The post-merge cleanup that deletes a branch runs ONCE, at the moment its
+own MR merges, and never comes back: a branch it skipped — an unreadable PR
+lookup, a delete that failed, cleanup disabled — is left on the remote with
+nothing scheduled to revisit it. A branch rebased before landing is contained
+but is not an ancestor, so the short list will not raise it either; it is
+reported as landed on every future sweep until something clears it. Those rows
+carry the strongest evidence of redundancy in the listing (patch-id EQUALITY,
+the reliable direction) and are marked landed* in the table.
+
+The sweeper that CAN clear them is:
+
+  gt polecat prune <rig> --remote --dry-run   # preview
+  gt polecat prune <rig> --remote             # collect
+
+It keys on the same three-step containment this sweep uses rather than on
+ancestry alone. It is not run on a schedule, which is why the backlog
+accumulates.
 
 The sweep RE-DERIVES every verdict on every run, and that is what 'mark' is
 for. A branch settled once — superseded, its substance landed by different
@@ -775,7 +785,7 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 	}
 
 	writeBranchSweepSupersededNotice(w, result)
-	writeBranchSweepHygieneNotice(w, result, showAll)
+	writeBranchSweepHygieneNotice(w, rigName, result, showAll)
 	return nil
 }
 
@@ -804,7 +814,7 @@ func writeBranchSweepSupersededNotice(w io.Writer, result *witness.BranchSweepRe
 // under --all, folded into a dim "landed" that reads as finished. A reader who
 // never passes --all never learns they exist, and they accumulate in a listing
 // whose worth is its shortness (gt-l65a).
-func writeBranchSweepHygieneNotice(w io.Writer, result *witness.BranchSweepResult, showAll bool) {
+func writeBranchSweepHygieneNotice(w io.Writer, rigName string, result *witness.BranchSweepResult, showAll bool) {
 	unreachable := result.HygieneUnreachableCount()
 	if unreachable == 0 {
 		return
@@ -815,10 +825,11 @@ func writeBranchSweepHygieneNotice(w io.Writer, result *witness.BranchSweepResul
 		fmt.Fprintln(w, "  Marked landed* in the table above.")
 	}
 	fmt.Fprintf(w, "  Their content is provably in the target — patch-id EQUALITY, the reliable\n")
-	fmt.Fprintf(w, "  direction, and the strongest evidence of redundancy this sweep produces. But\n")
-	fmt.Fprintf(w, "  branch hygiene deletes by ancestry alone, so nothing will ever collect them and\n")
-	fmt.Fprintf(w, "  every future sweep reports them again.\n")
+	fmt.Fprintf(w, "  direction, and the strongest evidence of redundancy this sweep produces. The\n")
+	fmt.Fprintf(w, "  post-merge delete that should have collected each one has already run and gone,\n")
+	fmt.Fprintf(w, "  so they will be reported again on every future sweep until something clears them.\n")
 	fmt.Fprintf(w, "    gt patrol branches --deletable   # the list, with the commands to verify and delete\n")
+	fmt.Fprintf(w, "    gt polecat prune %s --remote --dry-run   # the sweeper, which does key on patch identity\n", rigName)
 }
 
 // writeBranchSweepTable renders the shared row format. landed* marks a landed
@@ -892,10 +903,11 @@ func writePatrolBranchesDeletable(w io.Writer, rigName string, result *witness.B
 	}
 
 	fmt.Fprintf(w, "%s  %s\n", style.Bold.Render("Summary:"), branchSweepSummary(result))
-	fmt.Fprintf(w, "%s %d of %d landed branch(es) are NOT ancestors of %s, so branch hygiene\n",
+	fmt.Fprintf(w, "%s %d of %d landed branch(es) are NOT ancestors of %s, so their\n",
 		style.Warning.Render("⚠"), len(rows), counts[witness.BranchSweepLanded], result.Target)
-	fmt.Fprintf(w, "  will never delete them. Their content is in the target by patch identity, which\n")
-	fmt.Fprintf(w, "  is positive evidence of redundancy — stronger than anything on the CHECK list.\n")
+	fmt.Fprintf(w, "  post-merge delete is gone and nothing is scheduled to revisit them. Their content\n")
+	fmt.Fprintf(w, "  is in the target by patch identity, which is positive evidence of redundancy —\n")
+	fmt.Fprintf(w, "  stronger than anything on the CHECK list.\n")
 	fmt.Fprintf(w, "\n  Verify each one, then delete it:\n")
 	for _, f := range rows {
 		base := strings.TrimSpace(f.ContainedIn)

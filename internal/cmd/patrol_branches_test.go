@@ -45,9 +45,9 @@ func sweepFixture() *witness.BranchSweepResult {
 				Branch: "polecat/refinery/gt-aqk+ddd", CommitSHA: "sha4",
 				IssueID: "gt-aqk", IssueStatus: "closed",
 				SessionPresence: "unknown",
-				Class:           witness.BranchSweepLanded, Evidence: "cherry",
+				Class:           witness.BranchSweepLanded, Evidence: "merge_tree_noop",
 				ContainedIn: "origin/main", HygieneUnreachable: true,
-				Note: "content is in origin/main (same patches, squashed or cherry-picked); NOT an ancestor of origin/main — branch hygiene cannot delete it",
+				Note: "content is in origin/main (merges to nothing); contained in origin/main by neither ancestry nor patch identity — branch hygiene cannot delete it",
 			},
 		},
 	}
@@ -487,8 +487,14 @@ func TestPatrolBranchesHumanRaisesHygieneUnreachableInTheDefaultView(t *testing.
 	}
 	// The routing claim is the finding. Saying only "landed" is what left these
 	// rows in every future sweep.
-	if !strings.Contains(out, "branch hygiene deletes by ancestry") {
+	if !strings.Contains(out, "post-merge delete that should have collected each one has already run") {
 		t.Errorf("default view does not say why nothing collects them:\n%s", out)
+	}
+	// And it must name the sweeper that can. "Nothing will ever collect them"
+	// was false — gt polecat prune --remote keys on patch identity — and the
+	// claim sent an operator to delete 35 branches by hand (gt-wbvx).
+	if !strings.Contains(out, "gt polecat prune gastown --remote") {
+		t.Errorf("default view does not name the sweeper that can collect them:\n%s", out)
 	}
 }
 
@@ -741,7 +747,7 @@ func supersededSweepFixture() *witness.BranchSweepResult {
 			Branch: "polecat/settled/gt-egq9+fff", CommitSHA: "sha6",
 			IssueID: "gt-egq9", IssueStatus: "closed",
 			Class: witness.BranchSweepSuperseded, UnderlyingClass: witness.BranchSweepLanded,
-			Evidence: "cherry", ContainedIn: "origin/main", HygieneUnreachable: true,
+			Evidence: "merge_tree_noop", ContainedIn: "origin/main", HygieneUnreachable: true,
 			Superseded: &git.SupersededMark{
 				Branch: "polecat/settled/gt-egq9+fff", Commit: "sha6",
 				Reason: "keep the branch: only surviving copy as originally authored", MarkedBy: "mayor",

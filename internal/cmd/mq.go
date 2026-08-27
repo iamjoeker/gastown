@@ -262,7 +262,7 @@ type mqPostMergeManager interface {
 type mqPostMergeGit interface {
 	VerifyCommitLandedOnPushTarget(remote, branch, commit string) (git.MergeProof, error)
 	ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead string) (string, error)
-	HasOpenPullRequest(ref git.PullRequestRef) bool
+	CheckOpenPullRequest(ref git.PullRequestRef) git.PullRequestProtection
 	Rev(ref string) (string, error)
 	DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error
 	DeleteBranch(branch string, force bool) error
@@ -272,12 +272,21 @@ type mqPostMergeBranchCleanup struct {
 	// Attempted records that the branch-cleanup step ran at all, which is what
 	// separates a cleanup failure (MR and issue already closed, branch left
 	// behind) from a failure before either was touched.
-	Attempted     bool
-	Branch        string
-	NoBranch      bool
-	Skipped       bool
-	Disabled      bool
-	OpenPR        bool
+	Attempted bool
+	Branch    string
+	NoBranch  bool
+	Skipped   bool
+	Disabled  bool
+	// OpenPR means a completed PR lookup found an open PR. PRLookupFailed means
+	// the lookup could not run, so nothing about the branch was determined.
+	// Both skip the delete; only one of them is a fact about the branch, and
+	// printing them as the same line told operators a PR was open when the
+	// lookup had 401'd (gt-wbvx).
+	OpenPR         bool
+	PRLookupFailed bool
+	// PRReason is the rendered protection, carrying the PR number when one was
+	// found and the lookup error when there was none.
+	PRReason      string
 	AlreadyGone   bool
 	RemoteDeleted bool
 	LocalDeleted  bool
@@ -811,7 +820,12 @@ func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, proof git.
 	case branchCleanup.Disabled:
 		fmt.Fprintf(w, "  %s Branch delete disabled by config\n", style.Dim.Render("○"))
 	case branchCleanup.OpenPR:
-		fmt.Fprintf(w, "  %s Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", style.Dim.Render("○"), branch)
+		fmt.Fprintf(w, "  %s Skipping remote branch delete for %s: %s\n", style.Dim.Render("○"), branch, branchCleanup.PRReason)
+	case branchCleanup.PRLookupFailed:
+		// Warning, not a dim skip: an open PR is a settled state that needs
+		// nothing from anyone, while a failed lookup means this branch is
+		// unclassified and will stay on the remote until someone looks.
+		fmt.Fprintf(w, "  %s Skipping remote branch delete for %s: %s\n", style.Warning.Render("⚠"), branch, branchCleanup.PRReason)
 	case branchCleanup.AlreadyGone:
 		fmt.Fprintf(w, "  %s Remote branch already absent: %s\n", style.Dim.Render("○"), branch)
 	case branchCleanup.RemoteDeleted && branchCleanup.RefreshedHead != "":
@@ -933,8 +947,11 @@ func cleanupMQPostMergeBranch(rigPath string, rigGit mqPostMergeGit, mr *refiner
 	// Deleting a branch with an open PR causes GitHub to auto-close the PR as
 	// "closed" (not "merged"), destroying the PR audit trail. (gas-fk4)
 	leaseHead := expectedHead
-	if rigGit.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: cleanup.Branch, HeadSHA: expectedHead}) {
-		cleanup.OpenPR = true
+	protection := rigGit.CheckOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: cleanup.Branch, HeadSHA: expectedHead})
+	if protection.Protected() {
+		cleanup.OpenPR = protection.Open
+		cleanup.PRLookupFailed = protection.LookupFailed
+		cleanup.PRReason = protection.Reason()
 	} else {
 		// Lease against the branch's head as it stands now, not the sha recorded
 		// at submission: a branch refreshed to resolve a conflict has moved on,
