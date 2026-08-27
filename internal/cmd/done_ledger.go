@@ -75,6 +75,67 @@ func noMRCloseRefusal(c noMRCloseContext) string {
 	return ""
 }
 
+// zeroCommitSubmitContext describes a `gt done` that reached the no-MR path
+// because the branch is zero commits ahead of base.
+type zeroCommitSubmitContext struct {
+	// BaseRef is the ref the branch was measured against — upstream/main on a
+	// fork-backed rig, origin/main otherwise. Named in the refusal so the
+	// reader can check the measurement rather than trust it.
+	BaseRef string
+	// IsPolecat is true when running as a polecat (GT_POLECAT set). Only
+	// polecats are refused here: crew and the mayor complete without commits
+	// routinely.
+	IsPolecat bool
+	// ReportOnly is true for --cleanup-status=clean — an audit or review whose
+	// findings are the deliverable.
+	ReportOnly bool
+	// IsNonCodeTask is true when the bead carries no_merge or review_only.
+	IsNonCodeTask bool
+	// BranchPushedWithWork is true when the pushed feature branch carries real
+	// commits even though base has since advanced past them (GH#wd7).
+	BranchPushedWithWork bool
+	// WorkLandedOnTarget is true when a sibling already landed this bead's work
+	// on the target (gt-7k3q).
+	WorkLandedOnTarget bool
+	// SourceIssueClosed is true when the source bead is already closed. The
+	// bead is the ledger entry this completion would write, and it is written:
+	// whoever closed it recorded a reason. There is nothing left to submit and
+	// nothing left to close, so refusing strands a session over an outcome that
+	// has already been accounted for (gt-gubw).
+	SourceIssueClosed bool
+}
+
+// zeroCommitSubmitRefusal returns the reason a polecat must not complete with an
+// empty branch, or "" when completing is legitimate.
+//
+// The rule protects against the sleepwalking polecat: one that worked its
+// checklist without writing any code and would otherwise report success. Every
+// exemption below is a case where something other than this branch accounts for
+// the work — a pushed branch base has moved past, a sibling's landed commit, a
+// task that produces no code by design, or a bead someone has already closed.
+//
+// The already-closed exemption is the weakest of the four and deliberately so.
+// A polecat can reach it by closing its own bead, which is exactly what
+// CLAUDE.md tells one to do when its assignment turns out to need no change.
+// That is not a silent bypass: closing a bead writes a reason and an author to
+// the ledger, which is a louder record than the refusal it replaces, and a
+// sleepwalker that leaves its bead HOOKED — the overwhelmingly common shape —
+// is still refused here.
+func zeroCommitSubmitRefusal(c zeroCommitSubmitContext) string {
+	if !c.IsPolecat || c.ReportOnly || c.IsNonCodeTask {
+		return ""
+	}
+	if c.BranchPushedWithWork || c.WorkLandedOnTarget || c.SourceIssueClosed {
+		return ""
+	}
+	base := strings.TrimSpace(c.BaseRef)
+	if base == "" {
+		base = "the base branch"
+	}
+	return fmt.Sprintf("cannot complete: no commits on branch ahead of %s\n"+
+		"Polecats must have at least 1 commit to submit.", base)
+}
+
 // ledgerProofRejection returns the reason a commit must not be recorded on a
 // bead as proof of work, or "" when recording it is safe.
 //

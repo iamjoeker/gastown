@@ -460,3 +460,100 @@ func TestClosingAgentIdentities(t *testing.T) {
 		}
 	}
 }
+
+// gt-gubw: the no-MR close block learned to skip an already-closed bead
+// (gt-j9uv), but this guard runs earlier in the same zero-commit branch and
+// refused first. A polecat whose bead had been closed underneath it — by the
+// refinery after merging the work elsewhere, or by the polecat itself under the
+// no-changes rule CLAUDE.md prescribes — had no COMPLETED exit at all.
+func TestZeroCommitSubmitRefusal_ClosedSourceBeadIsNotRefused(t *testing.T) {
+	ctx := zeroCommitSubmitContext{
+		BaseRef:   "upstream/main",
+		IsPolecat: true,
+	}
+	if refusal := zeroCommitSubmitRefusal(ctx); refusal == "" {
+		t.Fatal("control: a polecat with an open bead and an empty branch must still be refused")
+	}
+
+	ctx.SourceIssueClosed = true
+	if refusal := zeroCommitSubmitRefusal(ctx); refusal != "" {
+		t.Fatalf("closed source bead still refused: %s", refusal)
+	}
+}
+
+func TestZeroCommitSubmitRefusal(t *testing.T) {
+	tests := []struct {
+		name    string
+		ctx     zeroCommitSubmitContext
+		refused bool
+	}{
+		{
+			name:    "polecat with an empty unpushed branch is refused",
+			ctx:     zeroCommitSubmitContext{IsPolecat: true},
+			refused: true,
+		},
+		{
+			name:    "crew and mayor complete without commits routinely",
+			ctx:     zeroCommitSubmitContext{},
+			refused: false,
+		},
+		{
+			name:    "report-only work has no commits by design",
+			ctx:     zeroCommitSubmitContext{IsPolecat: true, ReportOnly: true},
+			refused: false,
+		},
+		{
+			name:    "no_merge/review_only work has no commits by design",
+			ctx:     zeroCommitSubmitContext{IsPolecat: true, IsNonCodeTask: true},
+			refused: false,
+		},
+		{
+			name:    "work on the pushed branch counts even once base moves past it",
+			ctx:     zeroCommitSubmitContext{IsPolecat: true, BranchPushedWithWork: true},
+			refused: false,
+		},
+		{
+			name:    "a sibling's landed commit accounts for the work",
+			ctx:     zeroCommitSubmitContext{IsPolecat: true, WorkLandedOnTarget: true},
+			refused: false,
+		},
+		{
+			name:    "an already-closed bead has already been accounted for",
+			ctx:     zeroCommitSubmitContext{IsPolecat: true, SourceIssueClosed: true},
+			refused: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refusal := zeroCommitSubmitRefusal(tt.ctx)
+			if tt.refused && refusal == "" {
+				t.Error("expected refusal, got none")
+			}
+			if !tt.refused && refusal != "" {
+				t.Errorf("expected completion to be allowed, got refusal: %s", refusal)
+			}
+		})
+	}
+}
+
+// The refusal names the ref it measured against, so a reader can re-run the
+// comparison instead of taking "no commits" on faith. On a fork-backed rig that
+// ref is upstream/main, and reading it as origin/main is the mistake the name
+// exists to prevent.
+func TestZeroCommitSubmitRefusalNamesTheBaseRef(t *testing.T) {
+	refusal := zeroCommitSubmitRefusal(zeroCommitSubmitContext{
+		BaseRef:   "upstream/main",
+		IsPolecat: true,
+	})
+	if !strings.Contains(refusal, "upstream/main") {
+		t.Fatalf("refusal should name the base ref, got: %s", refusal)
+	}
+
+	// A caller that could not resolve a base ref still gets a readable refusal
+	// rather than one that trails off mid-sentence.
+	bare := zeroCommitSubmitRefusal(zeroCommitSubmitContext{IsPolecat: true})
+	if !strings.Contains(bare, "the base branch") {
+		t.Fatalf("empty base ref should fall back to a readable phrase, got: %s", bare)
+	}
+}

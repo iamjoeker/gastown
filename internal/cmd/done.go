@@ -1212,13 +1212,31 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				fmt.Printf("  %s\n", superseded.Commit.Subject)
 			}
 
-			if os.Getenv("GT_POLECAT") != "" && doneCleanupStatus != "clean" && !isNoMergeTask {
-				if !branchPushedWithWork && !superseded.Landed {
-					return fmt.Errorf("cannot complete: no commits on branch ahead of %s\n"+
-						"Polecats must have at least 1 commit to submit.\n"+
-						"%s",
-						baseRef, supersededRefusalHint(superseded))
-				}
+			// gt-gubw: the close block below already lets a polecat past an
+			// already-closed bead (gt-j9uv), but this guard runs first and
+			// refuses before that skip is ever reached. Fixing the later gate
+			// left the trap intact for every polecat whose branch was also
+			// unpushed — including the one CLAUDE.md prescribes by name, which
+			// closes its bead with a no-changes reason and then calls gt done.
+			sourceAlreadyClosed := issueID != "" && doneSourceIssueAlreadyClosed(sourceBD, issueID, sourceIssueForNoMerge)
+			if refusal := zeroCommitSubmitRefusal(zeroCommitSubmitContext{
+				BaseRef:              baseRef,
+				IsPolecat:            os.Getenv("GT_POLECAT") != "",
+				ReportOnly:           doneCleanupStatus == "clean",
+				IsNonCodeTask:        isNoMergeTask,
+				BranchPushedWithWork: branchPushedWithWork,
+				WorkLandedOnTarget:   superseded.Landed,
+				SourceIssueClosed:    sourceAlreadyClosed,
+			}); refusal != "" {
+				return fmt.Errorf("%s\n%s", refusal, supersededRefusalHint(superseded))
+			}
+			if sourceAlreadyClosed && !branchPushedWithWork && !superseded.Landed {
+				// Say which of the three exits was taken. Otherwise this reads
+				// as the ordinary already-merged completion below, and the one
+				// fact that authorised it — someone else closed the bead — is
+				// nowhere in the record.
+				fmt.Printf("%s %s was already closed, so there is nothing left to submit or close\n",
+					style.Bold.Render("→"), issueID)
 			}
 
 			// Non-polecat (crew/mayor), polecat with --cleanup-status=clean
