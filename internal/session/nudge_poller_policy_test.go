@@ -19,7 +19,41 @@ import (
 // fail instead of certifying the tree clean. The value is deliberately below the
 // count at the time of writing (8): this is a control against seeing NOTHING,
 // not a census that has to be edited whenever a spawn path is added or removed.
+//
+// It is the weaker of the two controls and is no longer alone — a count cannot
+// say WHICH creator went missing, and this one clears with two of the eight
+// already lost. knownSpawnPaths below covers that gap by name.
 const minSessionCreators = 6
+
+// knownSpawnPaths is the other half of the control, and the stronger half.
+//
+// The floor above only asks "did the walk see SOMETHING". It cannot say what,
+// and it sits below the count of files known to hold a spawn path, so a walk
+// whose heuristic quietly stopped recognising two of them still clears it and
+// then reports the two it lost as clean. That is the failure the floor exists
+// to prevent, arriving two below where the floor bites.
+//
+// These files are named instead. Each must contribute at least one discovered
+// session creator, and the failure says which ones went missing — a count
+// never can, and a refactor that drops one spawn path while adding another
+// keeps any count unchanged.
+//
+// The list is a positive control, not a census: the walk stays authoritative
+// for anything NEW, which is the thing a fixed list can never catch. So it is
+// correct to delete an entry here when a spawn path genuinely goes away, and
+// wrong to delete one to make a red test green.
+//
+// Paths are slash-separated and relative to the repo root.
+var knownSpawnPaths = []string{
+	"internal/cmd/deacon.go",
+	"internal/crew/manager.go",
+	"internal/daemon/lifecycle.go",
+	"internal/deacon/manager.go",
+	"internal/polecat/session_manager.go",
+	"internal/refinery/manager.go",
+	"internal/session/lifecycle.go",
+	"internal/witness/manager.go",
+}
 
 // TestSpawnPathsStartANudgePoller is the structural half of the gt-xmq6 fix.
 //
@@ -61,6 +95,7 @@ func TestSpawnPathsStartANudgePoller(t *testing.T) {
 
 	var violations []string
 	var creators []string
+	seen := map[string]bool{}
 	err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -81,6 +116,13 @@ func TestSpawnPathsStartANudgePoller(t *testing.T) {
 			return nil
 		}
 		found, missing := spawnsMissingNudgePoller(t, repoRoot, path)
+		if len(found) > 0 {
+			rel, relErr := filepath.Rel(repoRoot, path)
+			if relErr != nil {
+				rel = path
+			}
+			seen[filepath.ToSlash(rel)] = true
+		}
 		creators = append(creators, found...)
 		violations = append(violations, missing...)
 		return nil
@@ -95,6 +137,21 @@ func TestSpawnPathsStartANudgePoller(t *testing.T) {
 			"here so a blind walk fails instead. Either the walk broke or the spawn paths moved; do not "+
 			"lower the floor to make this pass",
 			len(creators), repoRoot, creators, minSessionCreators)
+	}
+
+	var blind []string
+	for _, known := range knownSpawnPaths {
+		if !seen[known] {
+			blind = append(blind, known)
+		}
+	}
+	if len(blind) > 0 {
+		t.Fatalf("the walk no longer finds a session creator in %d file(s) known to hold one, so a clean "+
+			"verdict from it means nothing — it can pass the floor of %d while silently having stopped "+
+			"looking at these. Fix the walk (a renamed session creator? a moved package? a new skip rule?) "+
+			"or, if a spawn path genuinely went away, remove it from knownSpawnPaths — but do not remove "+
+			"an entry to make this pass:\n  %s",
+			len(blind), minSessionCreators, strings.Join(blind, "\n  "))
 	}
 
 	if len(violations) > 0 {
