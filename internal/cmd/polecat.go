@@ -315,12 +315,24 @@ and a stronger one: restarting a logged-out agent does not merely fail to fix it
 it produces another logged-out agent and destroys the context on the way.
 
 --reconcile-cleanup additionally REPAIRS stale completion state on the agent bead
-when this command's own measurement contradicts it: a dirty cleanup_status, and a
-push_failed left true by a rebase whose content is already on the remote. Neither
-is written unless the verdict is SAFE_TO_NUKE and the git checks actually ran, and
-each confirms its write by re-reading the bead. Without it, push_failed had no
-clearing path any role could run and kept a polecat reading idle-recovery-needed
-over work provably in main (gt-uapr).
+when this command's own measurement contradicts it: a dirty or MISSING
+cleanup_status, and a push_failed left true by a rebase whose content is already
+on the remote. Neither is written unless the git checks actually ran and every
+OTHER predicate proves safe, and each confirms its write by re-reading the bead.
+Without it, push_failed had no clearing path any role could run and kept a polecat
+reading idle-recovery-needed over work provably in main (gt-uapr).
+
+The cleanup_status half asks its SAFE_TO_NUKE precondition of the bead it would
+PRODUCE rather than the one it found. Asking it of the bead as found closed the
+recovery loop into a circle — a stale cleanup_status is itself a NEEDS_RECOVERY
+blocker, so on exactly the polecats this flag exists to repair the precondition
+could never hold, the write never ran, and nuke was the only verb left that
+changed anything (gt-hm0v, hq-f183o).
+
+It reports what it did to every field it was asked about, on every road, and
+EXITS NON-ZERO when a repair it was asked for did not happen. Silence plus exit 0
+is the one outcome it must never produce: it reads as "the safe path did not
+apply here", which is the reasoning that reaches for the destructive one.
 
 Examples:
   gt polecat check-recovery greenplace/Toast
@@ -449,7 +461,7 @@ func init() {
 
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
-	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale completion state (cleanup_status, push_failed) on the agent bead when live recovery predicates prove no work is at risk")
+	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale completion state (cleanup_status, push_failed) on the agent bead when live recovery predicates prove no work is at risk; reports what it did to each field and exits non-zero if a repair was refused")
 	polecatCheckRecoveryCmd.Flags().DurationVar(&polecatCheckRecoveryLivenessWindow, "liveness-window", 0,
 		"Sample the pane twice this far apart to separate a working agent from one blocked consuming no tokens. BLOCKS for the duration; minimum 60s (shorter windows report healthy agents as blocked). Zero takes one sample, which still settles logged-out and parked")
 
@@ -1241,6 +1253,17 @@ type RecoveryStatus struct {
 	Diagnostics          []string `json:"diagnostics,omitempty"`
 	RecoveryActions      []string `json:"recovery_actions,omitempty"`
 	Reconciled           bool     `json:"reconciled,omitempty"`
+
+	// Reconcile is what --reconcile-cleanup did to each field it was asked
+	// about: populated with one entry per field whenever the flag is passed,
+	// and absent otherwise.
+	//
+	// Both reconcilers append unconditionally, so this is never empty when the
+	// flag was passed — which is what makes its absence mean "the flag was not
+	// passed" and nothing else. Until gt-hm0v three different situations
+	// produced identical output: the flag never passed, the flag passed and
+	// repaired nothing, and the flag passed, declined, and told nobody.
+	Reconcile []ReconcileOutcome `json:"reconcile,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1248,6 +1271,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// From here on every error this command returns is a measurement result,
+	// not a usage mistake — including the non-zero exit a refused
+	// --reconcile-cleanup now carries. Cobra prints usage BELOW the error, so
+	// without this the last line an operator reads is a flag description rather
+	// than the predicate that stopped the repair.
+	cmd.SilenceUsage = true
 
 	mgr, r, err := getPolecatManager(rigName)
 	if err != nil {
@@ -1519,7 +1548,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// by turning the verdict into NEEDS_RECOVERY, so a failure in either one
 		// stops the other rather than compounding.
 		reconcilePushFailedIfRefuted(&status, bd, agentBeadID, input, fields)
-		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
+		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields, input)
 	}
 
 	// "The bead still says push_failed and my own measurement says otherwise."
@@ -1556,7 +1585,10 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if polecatCheckRecoveryJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(status)
+		if err := enc.Encode(status); err != nil {
+			return err
+		}
+		return reconcileExitError(status.Reconcile)
 	}
 
 	// Human-readable output
@@ -1569,7 +1601,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// direct measurement it can contradict. Side by side, "handed-off" over
 	// "absent" is legible as the conflict it is (gt-9f67).
 	fmt.Printf("  Session:         %s\n", recoverySessionPresenceLabel(status.SessionPresence))
-	fmt.Printf("  Cleanup Status:  %s\n", status.CleanupStatus)
+	// Rendered through cleanupStatusLabel, so a missing field reads as
+	// "<missing>" rather than as a blank after the colon. Blank reads as a
+	// formatting artifact — and this exact field being absent is the blocker
+	// that stranded three polecats while the line that was supposed to report
+	// it showed nothing at all (gt-hm0v).
+	fmt.Printf("  Cleanup Status:  %s\n", cleanupStatusLabel(status.CleanupStatus))
 	if status.Branch != "" {
 		fmt.Printf("  Branch:          %s\n", status.Branch)
 	}
@@ -1595,6 +1632,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if len(status.Diagnostics) > 0 {
 		fmt.Printf("  Diagnostics:     %s\n", strings.Join(status.Diagnostics, "; "))
 	}
+	printReconcileOutcomes(os.Stdout, polecatCheckRecoveryReconcileCleanup, status.Reconcile)
 	fmt.Println()
 
 	switch status.Verdict {
@@ -1751,7 +1789,52 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s\n", style.Dim.Render("(restart-first policy, gt-dsgp)"))
 	}
 
-	return nil
+	return reconcileExitError(status.Reconcile)
+}
+
+// printReconcileOutcomes renders what --reconcile-cleanup did, and renders
+// something on every road the flag was passed on.
+//
+// The heading is printed even when nothing was repaired. That is the point:
+// the flag's defect was that a run which repaired nothing looked exactly like a
+// run that was never asked to, and the remaining output — an ordinary refusal
+// report — read as "the safe path did not apply here", which is the reasoning
+// that sends the next operator to the destructive one (gt-hm0v).
+func printReconcileOutcomes(w io.Writer, requested bool, outcomes []ReconcileOutcome) {
+	if !requested {
+		return
+	}
+	fmt.Fprintln(w, "  Reconcile:")
+	if len(outcomes) == 0 {
+		// Unreachable while both reconcilers report unconditionally, and
+		// written out anyway: the failure this replaces WAS a silent road that
+		// nobody knew existed, and a heading with nothing under it is at least
+		// visible.
+		fmt.Fprintln(w, "    - (no field was evaluated — please report this output; it is a reporting bug)")
+		return
+	}
+	for _, o := range outcomes {
+		fmt.Fprintf(w, "    - %s: %s (was %s) — %s\n", o.Field, o.Action, o.Previous, o.Detail)
+	}
+}
+
+// reconcileExitError turns a repair that did not happen into a non-zero exit.
+//
+// A caller cannot tell "refused" from "done" by reading prose, and the
+// diagnostic and the status code disagreeing is what made this silent: exit 0,
+// empty stderr, and stdout that looked like an ordinary report. The status code
+// is what callers read, so the status code has to carry the answer (gt-hm0v).
+func reconcileExitError(outcomes []ReconcileOutcome) error {
+	if !reconcileOutcomesActionable(outcomes) {
+		return nil
+	}
+	var unmet []string
+	for _, o := range outcomes {
+		if o.Action == reconcileActionRefused || o.Action == reconcileActionFailed {
+			unmet = append(unmet, fmt.Sprintf("%s %s: %s", o.Field, o.Action, o.Detail))
+		}
+	}
+	return fmt.Errorf("--reconcile-cleanup made no change: %s", strings.Join(unmet, "; "))
 }
 
 // recoverySessionPresenceLabel renders the liveness measurement for a human,
@@ -2015,8 +2098,81 @@ func hookBeadAssigneeForDiagnostic(beadAssignee string) string {
 	return beadAssignee
 }
 
+// cleanupStatusUpdater is the write half of the cleanup_status reconcile, plus
+// the reader it confirms itself with. The read-back is not optional: this
+// reconcile exists because a field nothing clears kept polecats out of the
+// pool, and a write that reported success without landing would put them right
+// back there with a diagnostic saying otherwise (gt-hm0v).
 type cleanupStatusUpdater interface {
 	UpdateAgentCleanupStatus(id string, cleanupStatus string) error
+	GetAgentBead(id string) (*beads.Issue, *beads.AgentFields, error)
+}
+
+// Actions a single field reconcile can end in. Every road out of a reconcile
+// lands on exactly one of these — including the roads that used to `return`
+// with nothing written and nothing said (gt-hm0v).
+const (
+	// reconcileActionWritten: the field was rewritten and the write was
+	// confirmed by re-reading the bead.
+	reconcileActionWritten = "written"
+	// reconcileActionNoChange: there was nothing to repair. Not a refusal, and
+	// not a failure — the requested end state already holds.
+	reconcileActionNoChange = "no_change"
+	// reconcileActionRefused: a predicate stopped the write. Detail names it.
+	reconcileActionRefused = "refused"
+	// reconcileActionFailed: the write was attempted and did not land.
+	reconcileActionFailed = "failed"
+)
+
+// ReconcileOutcome is what --reconcile-cleanup DID to one field, reported
+// whether or not anything changed.
+//
+// It exists because the flag's failure mode was silence. Asked to repair a
+// stale cleanup_status, it evaluated a predicate, returned false, wrote
+// nothing, said nothing, and exited 0 — so the caller could not tell "repaired"
+// from "declined" from "never looked", and the output that remained read as an
+// ordinary refusal report rather than as a report that the requested action was
+// skipped. Exit code, stderr and stdout all agreed on success while the field
+// stayed exactly as it was (gt-hm0v).
+//
+// So: one outcome per field per run, always appended, always printed, and
+// `refused`/`failed` carry the exit status with them.
+type ReconcileOutcome struct {
+	Field    string `json:"field"`              // cleanup_status, push_failed
+	Action   string `json:"action"`             // written, no_change, refused, failed
+	Previous string `json:"previous,omitempty"` // the value found before the run
+	Detail   string `json:"detail"`             // why — never empty, on any road
+}
+
+// reconcileOutcomesActionable reports whether any reconcile this run was asked
+// to perform did not happen. It is what turns the exit status non-zero, so a
+// caller can tell "refused" from "done" without parsing prose.
+func reconcileOutcomesActionable(outcomes []ReconcileOutcome) bool {
+	for _, o := range outcomes {
+		if o.Action == reconcileActionRefused || o.Action == reconcileActionFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupStatusLabel renders a cleanup_status for a human, including the empty
+// case. Never blank: a blank value here is the one this bug was made of, and
+// "cleanup_status: " with nothing after it reads as a formatting artifact
+// rather than as the missing field it is.
+func cleanupStatusLabel(status polecat.CleanupStatus) string {
+	if status == "" {
+		return "<missing>"
+	}
+	return string(status)
+}
+
+// blockerSummary renders a disposition's blockers for a one-line refusal.
+func blockerSummary(blockers []string) string {
+	if len(blockers) == 0 {
+		return "no blocker was recorded"
+	}
+	return "still blocked by: " + strings.Join(blockers, "; ")
 }
 
 // pushFailedUpdater is the write half of the push_failed reconcile. It is its own
@@ -2053,7 +2209,9 @@ type pushFailedUpdater interface {
 // recovery. An unmeasured or failed git check leaves PushFailedRefuted false and
 // nothing is written.
 func reconcilePushFailedIfRefuted(status *RecoveryStatus, updater pushFailedUpdater, agentBeadID string, input polecat.WorkstateInput, fields *beads.AgentFields) {
-	if !pushFailedReconcileCandidate(status, input, fields) {
+	out, ok := pushFailedReconcilePlan(status, input, fields)
+	if !ok {
+		status.Reconcile = append(status.Reconcile, out)
 		return
 	}
 	if updater == nil {
@@ -2084,6 +2242,12 @@ func reconcilePushFailedIfRefuted(status *RecoveryStatus, updater pushFailedUpda
 	// polecat that no longer exists.
 	fields.PushFailed = false
 	status.Reconciled = true
+	status.Reconcile = append(status.Reconcile, ReconcileOutcome{
+		Field:    "push_failed",
+		Action:   reconcileActionWritten,
+		Previous: "true",
+		Detail:   "cleared and confirmed by re-reading the agent bead; direct git state is safe (clean tree, no stash, 0 unpreserved patches)",
+	})
 	status.Diagnostics = append(status.Diagnostics,
 		"reconciled_push_failed=false previous=true direct_git_state=safe (clean tree, no stash, 0 unpreserved patches)")
 }
@@ -2092,67 +2256,211 @@ func pushFailedReconcileFailed(status *RecoveryStatus, detail string) {
 	status.NeedsRecovery = true
 	status.Verdict = "NEEDS_RECOVERY"
 	status.Blockers = append(status.Blockers, fmt.Sprintf("push_failed_reconcile_failed: %s", detail))
+	status.Reconcile = append(status.Reconcile, ReconcileOutcome{
+		Field:    "push_failed",
+		Action:   reconcileActionFailed,
+		Previous: "true",
+		Detail:   detail,
+	})
 }
 
-func pushFailedReconcileCandidate(status *RecoveryStatus, input polecat.WorkstateInput, fields *beads.AgentFields) bool {
+// pushFailedReconcilePlan is pushFailedReconcileCandidate plus the sentence it
+// never said. Same predicates, same order, same answers — the difference is
+// that a false now arrives attached to the reason for it, so a run that
+// declined to clear push_failed is distinguishable from a run that cleared it
+// (gt-hm0v).
+func pushFailedReconcilePlan(status *RecoveryStatus, input polecat.WorkstateInput, fields *beads.AgentFields) (ReconcileOutcome, bool) {
+	out := ReconcileOutcome{Field: "push_failed", Action: reconcileActionRefused, Previous: "true"}
 	if status == nil || fields == nil {
-		return false
+		out.Previous = "<unread>"
+		out.Detail = "no agent bead was loaded, so push_failed was never read"
+		return out, false
 	}
 	if !fields.PushFailed {
-		return false
+		out.Action = reconcileActionNoChange
+		out.Previous = "false"
+		out.Detail = "not set; nothing to reconcile"
+		return out, false
 	}
-	// Refuted by measurement, never by silence — the same bar DecideWorkstate
-	// applies before it stops letting the flag block (gt-3bzt).
 	if !input.PushFailedRefuted {
-		return false
+		// Refused, not no_change: the flag IS set, this run was asked to clear
+		// it, and it is still there. Reporting that as "nothing to do" is what
+		// let a stranded polecat read as a healthy one.
+		out.Detail = "this run's git measurement did not refute it (a failed push may still have lost work); " +
+			"clearing it requires a measured worktree that is clean, unstashed and fully pushed"
+		return out, false
 	}
-	// The verdict is the summary of everything else this command looked at. A
-	// polecat that still has a hook, a dirty tree, or work outside the merge
-	// queue needs recovery whatever push_failed says, and clearing the field
-	// there would shrink its blocker list without changing its situation.
-	return status.Verdict == "SAFE_TO_NUKE"
+	if status.Verdict != "SAFE_TO_NUKE" {
+		out.Detail = fmt.Sprintf("verdict=%s — %s", status.Verdict, blockerSummary(status.Blockers))
+		return out, false
+	}
+	out.Action = ""
+	out.Detail = ""
+	return out, true
 }
 
-func reconcileCleanupStatusIfSafe(status *RecoveryStatus, updater cleanupStatusUpdater, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields) {
-	previous, ok := cleanupStatusReconcileCandidate(status, p, fields)
+// pushFailedReconcileCandidate answers "is push_failed still set and still
+// contradicted by this run's own measurement" — the condition the SAFE_TO_NUKE
+// output arm names the repair command for.
+//
+// It delegates to pushFailedReconcilePlan so the two can never drift: the
+// predicates are refuted-by-measurement, never by silence (the same bar
+// DecideWorkstate applies before it stops letting the flag block, gt-3bzt), and
+// a verdict of SAFE_TO_NUKE, because a polecat that still has a hook, a dirty
+// tree, or work outside the merge queue needs recovery whatever push_failed
+// says, and clearing the field there would shrink its blocker list without
+// changing its situation.
+func pushFailedReconcileCandidate(status *RecoveryStatus, input polecat.WorkstateInput, fields *beads.AgentFields) bool {
+	_, ok := pushFailedReconcilePlan(status, input, fields)
+	return ok
+}
+
+func reconcileCleanupStatusIfSafe(status *RecoveryStatus, updater cleanupStatusUpdater, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields, input polecat.WorkstateInput) {
+	previous, out, ok := cleanupStatusReconcilePlan(status, p, fields, input)
 	if !ok {
+		status.Reconcile = append(status.Reconcile, out)
 		return
 	}
 	if updater == nil {
-		status.NeedsRecovery = true
-		status.Verdict = "NEEDS_RECOVERY"
-		status.Blockers = append(status.Blockers, "cleanup_reconcile_failed: updater unavailable")
+		status.Reconcile = append(status.Reconcile, cleanupReconcileFailed(status, previous, "updater unavailable"))
 		return
 	}
 	if err := updater.UpdateAgentCleanupStatus(agentBeadID, string(polecat.CleanupClean)); err != nil {
-		status.NeedsRecovery = true
-		status.Verdict = "NEEDS_RECOVERY"
-		status.Blockers = append(status.Blockers, fmt.Sprintf("cleanup_reconcile_failed: %v", err))
+		status.Reconcile = append(status.Reconcile, cleanupReconcileFailed(status, previous, err.Error()))
 		return
 	}
+	// Read back, on the same reasoning the push_failed reconcile does it: the
+	// write path is a bd subprocess against Dolt and a nil error is not evidence
+	// the row changed. The bead this fix came from says explicitly not to trust
+	// this command's own rendered output over the stored field — so this command
+	// now goes and reads the stored field itself.
+	_, after, err := updater.GetAgentBead(agentBeadID)
+	if err != nil {
+		status.Reconcile = append(status.Reconcile, cleanupReconcileFailed(status, previous,
+			fmt.Sprintf("write reported success but the bead could not be re-read: %v", err)))
+		return
+	}
+	if after == nil || polecat.CleanupStatus(after.CleanupStatus) != polecat.CleanupClean {
+		stored := polecat.CleanupStatus("")
+		if after != nil {
+			stored = polecat.CleanupStatus(after.CleanupStatus)
+		}
+		status.Reconcile = append(status.Reconcile, cleanupReconcileFailed(status, previous,
+			"write reported success but the stored cleanup_status still reads "+cleanupStatusLabel(stored)))
+		return
+	}
+
+	// Keep the caller's in-memory view in step with the store it just changed,
+	// then re-derive the verdict from it. Reporting the pre-repair verdict after
+	// a successful repair is how a caller ends up reading NEEDS_RECOVERY over a
+	// polecat this very run made safe — and the witness's slot-open check reads
+	// exactly that field.
+	fields.CleanupStatus = string(polecat.CleanupClean)
 	status.CleanupStatus = polecat.CleanupClean
 	status.Reconciled = true
-	status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("reconciled_cleanup_status=clean previous=%s", previous))
+	repaired := input
+	repaired.CleanupStatus = polecat.CleanupClean
+	applyWorkstateDispositionToRecoveryStatus(status, polecat.DecideWorkstate(repaired))
+
+	out.Action = reconcileActionWritten
+	out.Detail = "rewritten to clean and confirmed by re-reading the agent bead"
+	status.Reconcile = append(status.Reconcile, out)
+	status.Diagnostics = append(status.Diagnostics,
+		fmt.Sprintf("reconciled_cleanup_status=clean previous=%s", cleanupStatusLabel(previous)))
 }
 
-func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat, fields *beads.AgentFields) (polecat.CleanupStatus, bool) {
+// cleanupReconcileFailed records a reconcile that was attempted and did not
+// land, and fails the verdict closed.
+func cleanupReconcileFailed(status *RecoveryStatus, previous polecat.CleanupStatus, detail string) ReconcileOutcome {
+	status.NeedsRecovery = true
+	status.Verdict = "NEEDS_RECOVERY"
+	status.Blockers = append(status.Blockers, fmt.Sprintf("cleanup_reconcile_failed: %s", detail))
+	return ReconcileOutcome{
+		Field:    "cleanup_status",
+		Action:   reconcileActionFailed,
+		Previous: cleanupStatusLabel(previous),
+		Detail:   detail,
+	}
+}
+
+// cleanupStatusReconcilePlan decides whether --reconcile-cleanup may rewrite
+// cleanup_status, and — the half that was missing — names why whenever it may
+// not. Every road returns an outcome a caller can read.
+//
+// The verdict precondition is asked of the bead this flag would PRODUCE, not of
+// the one it found, and that is the whole fix. Demanding SAFE_TO_NUKE of the
+// bead as found closed the recovery loop into a circle: a stale or missing
+// cleanup_status is itself a NEEDS_RECOVERY blocker, so on exactly the polecats
+// this flag exists to repair the precondition could never hold, the write never
+// ran, and the only verb left that changed anything was nuke — which destroys a
+// worktree, a branch and an agent bead to clear a field that was never written
+// (gt-hm0v, hq-f183o).
+//
+// Re-deciding with the field clean is strictly stronger evidence than the
+// blocker list, because it runs the merge-queue tail that a NEEDS_RECOVERY
+// return never reaches. SAFE_TO_NUKE out of it means every OTHER predicate this
+// command measured — hook, git, active MR, merge queue, session — proved safe,
+// which is precisely what the flag documents as its bar.
+func cleanupStatusReconcilePlan(status *RecoveryStatus, p *polecat.Polecat, fields *beads.AgentFields, input polecat.WorkstateInput) (polecat.CleanupStatus, ReconcileOutcome, bool) {
+	out := ReconcileOutcome{Field: "cleanup_status", Action: reconcileActionRefused}
 	if status == nil || p == nil || fields == nil {
-		return "", false
+		out.Previous = cleanupStatusLabel("")
+		out.Detail = "no agent bead or no polecat record was loaded, so nothing about this polecat was measured"
+		return "", out, false
 	}
+
 	previous := polecat.CleanupStatus(fields.CleanupStatus)
-	if previous == "" || previous == polecat.CleanupClean {
-		return previous, false
+	out.Previous = cleanupStatusLabel(previous)
+
+	// A missing field is NOT excluded here. It used to be, and it was the exact
+	// value every polecat this bug stranded carried: the one blocker standing
+	// between them and the pool was `cleanup_status=<missing>`, and the flag
+	// that exists to clear it skipped it by name (gt-hm0v).
+	if previous == polecat.CleanupClean {
+		out.Action = reconcileActionNoChange
+		out.Detail = "already clean; nothing to reconcile"
+		return previous, out, false
 	}
-	if p.State != polecat.StateIdle || beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
-		return previous, false
+	if reconcileOutcomesActionable(status.Reconcile) {
+		out.Detail = "an earlier field reconcile on this run did not land; not compounding it"
+		return previous, out, false
 	}
-	if status.NeedsRecovery || status.Verdict != "SAFE_TO_NUKE" {
-		return previous, false
+	if p.State != polecat.StateIdle {
+		out.Detail = "polecat_state=" + string(p.State) + " (reconcile requires an idle polecat)"
+		return previous, out, false
 	}
-	if status.Branch != "" && status.MQStatus != "submitted" && status.MQStatus != "not_required" {
-		return previous, false
+	if beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
+		out.Detail = "agent_state=" + orUnknownRecoveryField(fields.AgentState) + " (reconcile requires agent_state=idle)"
+		return previous, out, false
 	}
-	return previous, true
+
+	repaired := input
+	repaired.CleanupStatus = polecat.CleanupClean
+	disposition := polecat.DecideWorkstate(repaired)
+	if disposition.Verdict != "SAFE_TO_NUKE" {
+		out.Detail = fmt.Sprintf("a clean cleanup_status would still leave verdict=%s — %s",
+			disposition.Verdict, blockerSummary(disposition.Blockers))
+		return previous, out, false
+	}
+	// Not a whitelist of acceptable mq_status values. The merge-queue tail just
+	// ran inside DecideWorkstate and came out SAFE_TO_NUKE, and that IS the
+	// discharge — a second, narrower list of statuses beside it is only a way
+	// for the two to disagree. The old one read status.MQStatus, which the
+	// pre-repair NEEDS_RECOVERY return leaves EMPTY because it never reaches
+	// that tail, so it refused every polecat that had a branch.
+	//
+	// What is worth asserting on its own is that anybody looked at all: a
+	// surface too cheap to run the queue check returns the same zeros as a
+	// branch with nothing left to submit (gt-49dp).
+	if status.Branch != "" && !repaired.MQCheckRequired {
+		out.Detail = "branch " + status.Branch + " exists and no merge-queue check was run for it, " +
+			"so whether it still holds unsubmitted work is unknown"
+		return previous, out, false
+	}
+
+	out.Action = ""
+	out.Detail = ""
+	return previous, out, true
 }
 
 // pausedAgentState returns the agent bead's agent_state when it names a

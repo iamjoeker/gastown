@@ -791,8 +791,17 @@ func nudgeRefinery(townRoot, rigName string) error {
 	return t.NudgeSession(sessionName, "New MR available - check merge queue for pending work")
 }
 
+// slotOpenRecoveryCheck runs the measuring surface for a slot that just opened.
+//
+// It keeps stdout on a non-zero exit on purpose. --reconcile-cleanup exits
+// non-zero when a repair it was asked for did not happen (gt-hm0v), and that is
+// a routine outcome here — the witness runs this seconds after every polecat
+// exits, on polecats whose push_failed is genuinely unrefuted. The JSON verdict
+// and its blockers are still on stdout and are what this handler reports;
+// throwing them away would replace an actionable blocker list with "exit status
+// 1" on the exact road the exit status was added to make legible.
 var slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
-	return util.ExecWithOutput(workDir, "gt", "polecat", "check-recovery", rigName+"/"+polecatName, "--json", "--reconcile-cleanup")
+	return util.ExecCaptureStdout(workDir, "gt", "polecat", "check-recovery", rigName+"/"+polecatName, "--json", "--reconcile-cleanup")
 }
 
 type slotOpenSchedulerStatus struct {
@@ -894,7 +903,11 @@ func runGTForSlotOpen(townRoot string, args ...string) (string, error) {
 
 func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, string) {
 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)
-	if err != nil {
+	// A non-zero exit with a verdict still on stdout is a graded answer, not a
+	// missing one — see slotOpenRecoveryCheck. Fall through to the parse and let
+	// the verdict decide; only an exit that produced no JSON at all is a failure
+	// this handler cannot see past.
+	if err != nil && strings.TrimSpace(output) == "" {
 		return false, fmt.Sprintf("check-recovery failed: %v", err)
 	}
 

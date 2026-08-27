@@ -38,6 +38,33 @@ func ExecWithOutput(workDir, cmd string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// ExecCaptureStdout is ExecWithOutput except that it returns stdout whether or
+// not the command succeeded.
+//
+// ExecWithOutput drops stdout on a non-zero exit, which is right when the exit
+// status means "there is no answer" and wrong when the command reports its
+// answer on stdout AND uses the exit status to grade it. `gt polecat
+// check-recovery --json --reconcile-cleanup` is the second kind: it exits
+// non-zero when a repair it was asked for did not happen, with the verdict and
+// its blockers still on stdout (gt-hm0v). Callers that parse that output need
+// it; the error is returned alongside so nobody loses the failure either.
+func ExecCaptureStdout(workDir, cmd string, args ...string) (string, error) {
+	c := exec.Command(cmd, args...) //nolint:gosec // G204: callers validate args
+	c.Dir = workDir
+	SetDetachedProcessGroup(c) // suppress console window flash on Windows
+
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+
+	err := c.Run()
+	out := strings.TrimSpace(stdout.String())
+	if err != nil {
+		return out, subprocessError(err, stderr.String())
+	}
+	return out, nil
+}
+
 // ExecRun runs a command in the specified directory.
 // If the command fails, stderr content is included in the error message.
 func ExecRun(workDir, cmd string, args ...string) error {
