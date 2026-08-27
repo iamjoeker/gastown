@@ -316,11 +316,13 @@ it produces another logged-out agent and destroys the context on the way.
 
 --reconcile-cleanup additionally REPAIRS stale completion state on the agent bead
 when this command's own measurement contradicts it: a dirty or MISSING
-cleanup_status, and a push_failed left true by a rebase whose content is already
-on the remote. Neither is written unless the git checks actually ran and every
-OTHER predicate proves safe, and each confirms its write by re-reading the bead.
-Without it, push_failed had no clearing path any role could run and kept a polecat
-reading idle-recovery-needed over work provably in main (gt-uapr).
+cleanup_status, a push_failed left true by a rebase whose content is already on
+the remote, and an agent_state that still claims work in progress over a session
+that "tmux has-session" proves is gone. None is written unless the git checks
+ran and every OTHER predicate proves safe, and each confirms its write by
+re-reading the bead. Without it, push_failed had no clearing path any role could
+run and kept a polecat reading idle-recovery-needed over work provably in main
+(gt-uapr).
 
 The cleanup_status half asks its SAFE_TO_NUKE precondition of the bead it would
 PRODUCE rather than the one it found. Asking it of the bead as found closed the
@@ -328,6 +330,14 @@ recovery loop into a circle — a stale cleanup_status is itself a NEEDS_RECOVER
 blocker, so on exactly the polecats this flag exists to repair the precondition
 could never hold, the write never ran, and nuke was the only verb left that
 changed anything (gt-hm0v, hq-f183o).
+
+The agent_state half exists because that circle then reproduced one level up: the
+cleanup repair is gated on agent_state=idle, and agent_state=working is written
+only by starting work and cleared only by finishing it, so a polecat that died in
+between had no path out and "gt polecat clear-state" declines it by design — a
+pause is deliberate, a stale working is not. It shares the cleanup half's
+precondition and adds one of its own: the session must be MEASURED absent, never
+merely unknown, so a live polecat can never reach the write (gt-xj5d).
 
 It reports what it did to every field it was asked about, on every road, and
 EXITS NON-ZERO when a repair it was asked for did not happen. Silence plus exit 0
@@ -461,7 +471,7 @@ func init() {
 
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
-	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale completion state (cleanup_status, push_failed) on the agent bead when live recovery predicates prove no work is at risk; reports what it did to each field and exits non-zero if a repair was refused")
+	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale completion state (cleanup_status, push_failed, agent_state) on the agent bead when live recovery predicates prove no work is at risk; reports what it did to each field and exits non-zero if a repair was refused")
 	polecatCheckRecoveryCmd.Flags().DurationVar(&polecatCheckRecoveryLivenessWindow, "liveness-window", 0,
 		"Sample the pane twice this far apart to separate a working agent from one blocked consuming no tokens. BLOCKS for the duration; minimum 60s (shorter windows report healthy agents as blocked). Zero takes one sample, which still settles logged-out and parked")
 
@@ -1221,15 +1231,28 @@ type RecoveryStatus struct {
 	// four of them did not. Whether it is present, absent, or unknown, the answer
 	// now travels with the verdict that was reached in spite of it.
 	SessionPresence polecat.SessionPresence `json:"session_presence,omitempty"`
-	CleanupStatus   polecat.CleanupStatus   `json:"cleanup_status"`
-	NeedsRecovery   bool                    `json:"needs_recovery"`
-	Verdict         string                  `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, NEEDS_LOGIN, or SUSPECT_STALL
-	WitnessAction   string                  `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
-	Reason          string                  `json:"reason,omitempty"`
-	Reusable        bool                    `json:"reusable"`
-	SafeToNuke      bool                    `json:"safe_to_nuke"`
-	NeedsMQSubmit   bool                    `json:"needs_mq_submit"`
-	NeedsLogin      bool                    `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
+	// AgentState is the agent bead's agent_state as this run last saw it —
+	// after any repair, so it reports the stored value rather than the one found.
+	//
+	// It is reported for the reason cleanup_status is: it is a GATE. A stale
+	// agent_state=working refuses the cleanup repair, counts against capacity on
+	// the inventory surface, and was on neither output. Three polecats sat behind
+	// it and the only way to see the field at all was to pass
+	// --reconcile-cleanup and read the refusal it produced (gt-xj5d).
+	//
+	// Not omitempty, on the same reasoning: a bead with no agent_state at all is
+	// a fact worth seeing, and a key that vanishes when the value is missing
+	// makes the missing case indistinguishable from a caller that never read it.
+	AgentState    string                `json:"agent_state"`
+	CleanupStatus polecat.CleanupStatus `json:"cleanup_status"`
+	NeedsRecovery bool                  `json:"needs_recovery"`
+	Verdict       string                `json:"verdict"`        // SAFE_TO_NUKE, PENDING_MR, NEEDS_RECOVERY, NEEDS_MQ_SUBMIT, NEEDS_LOGIN, or SUSPECT_STALL
+	WitnessAction string                `json:"witness_action"` // restart, escalate, or leave-alone — never nuke (gt-dsgp)
+	Reason        string                `json:"reason,omitempty"`
+	Reusable      bool                  `json:"reusable"`
+	SafeToNuke    bool                  `json:"safe_to_nuke"`
+	NeedsMQSubmit bool                  `json:"needs_mq_submit"`
+	NeedsLogin    bool                  `json:"needs_login,omitempty"` // pane shows an auth wall; only a human /login clears it (gt-acb1)
 
 	// Liveness is what the pane says the agent is DOING — working,
 	// blocking-wait, logged-out, parked, or turn-in-flight — as opposed to what
@@ -1548,7 +1571,18 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// by turning the verdict into NEEDS_RECOVERY, so a failure in either one
 		// stops the other rather than compounding.
 		reconcilePushFailedIfRefuted(&status, bd, agentBeadID, input, fields)
+		// And this one before the cleanup reconcile because agent_state=idle is
+		// the gate the cleanup reconcile checks by name — a stale claim of work
+		// in progress refused it on three polecats at once, and nothing anywhere
+		// could write the field (gt-xj5d).
+		reconcileAgentStateIfStale(&status, bd, agentBeadID, p, fields, input)
 		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields, input)
+	}
+
+	// Read after the reconcile block, so the reported value is the one now
+	// stored rather than the one this run found and repaired.
+	if fields != nil {
+		status.AgentState = strings.TrimSpace(fields.AgentState)
 	}
 
 	// "The bead still says push_failed and my own measurement says otherwise."
@@ -1601,6 +1635,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// direct measurement it can contradict. Side by side, "handed-off" over
 	// "absent" is legible as the conflict it is (gt-9f67).
 	fmt.Printf("  Session:         %s\n", recoverySessionPresenceLabel(status.SessionPresence))
+	// Printed next to Session for the same reason Session is printed next to
+	// State: this is the bead's claim about what the agent is doing, and that is
+	// the direct measurement which can contradict it. Side by side,
+	// "working" over "absent" is legible as the stale field it is — and it was
+	// on no surface at all while it stranded three polecats (gt-xj5d).
+	fmt.Printf("  Agent State:     %s\n", orUnknownRecoveryField(status.AgentState))
 	// Rendered through cleanupStatusLabel, so a missing field reads as
 	// "<missing>" rather than as a blank after the colon. Blank reads as a
 	// formatting artifact — and this exact field being absent is the blocker
@@ -1852,6 +1892,17 @@ func recoverySessionPresenceLabel(l polecat.SessionPresence) string {
 	default:
 		return "unknown (tmux has-session did not run or could not answer)"
 	}
+}
+
+// recoveryPolecatAddress renders the <rig>/<polecat> a refusal should tell the
+// reader to run its remedy against, and falls back to the placeholder rather
+// than to a bare "/" when the status carries no identity. A command line with an
+// empty address in it is one a reader will paste and be confused by.
+func recoveryPolecatAddress(status *RecoveryStatus) string {
+	if status == nil || status.Rig == "" || status.Polecat == "" {
+		return "<rig>/<polecat>"
+	}
+	return status.Rig + "/" + status.Polecat
 }
 
 func orUnknownRecoveryField(s string) string {
@@ -2315,6 +2366,208 @@ func pushFailedReconcileCandidate(status *RecoveryStatus, input polecat.Workstat
 	return ok
 }
 
+// agentStateUpdater is the write half of the agent_state reconcile. It is its
+// own interface rather than a reuse of pushFailedUpdater so the two stay
+// independently fakeable, and it demands the reader as well as the writer
+// because this reconcile confirms its own write.
+type agentStateUpdater interface {
+	UpdateAgentDescriptionFields(id string, updates beads.AgentFieldUpdates) error
+	GetAgentBead(id string) (*beads.Issue, *beads.AgentFields, error)
+}
+
+// reconcileAgentStateIfStale writes agent_state=idle when the agent bead claims
+// the agent is doing something and this run MEASURED that there is no session
+// for it to be doing anything in.
+//
+// gt-hm0v gave --reconcile-cleanup a working repair for cleanup_status, and the
+// trap reproduced one level up: that repair is gated on agent_state=idle, and
+// agent_state=working is written only by starting work and cleared only by
+// finishing it. A polecat that dies in between has no path out. Measured
+// identically on beads/capable, gastown/chrome and gastown/deathclaw — the same
+// refusal on all three, and the field named in it was one no verb could write
+// (gt-xj5d).
+//
+// `gt polecat clear-state` is the obvious candidate and declines by design. Its
+// scope is the PAUSED states (stuck, awaiting-gate, paused, escalated), which
+// are deliberate and must be lifted deliberately. working is not deliberate; it
+// is simply stale. And clearing it safely needs the git and merge-queue
+// measurement that clear-state deliberately does not make — which is why the
+// repair lives here, on the command that measures, and runs where the witness
+// already reaches it: the SLOT_OPEN handler runs `gt polecat check-recovery
+// --json --reconcile-cleanup` seconds after a polecat exits.
+//
+// A LIVE polecat can never reach the write. The state is only stale if there is
+// no session, so this demands SessionPresence == SessionAbsent — the tri-state,
+// where absent means the check RAN and found nothing. Unknown refuses: a
+// surface that did not look, or looked and could not tell, must not have its
+// silence read as proof the agent is gone (gt-9f67). Everything else that could
+// make the claim true — a hook still held, a dirty tree, unpushed commits, an
+// open MR, work outside the queue — is refused by the shared safety bar, which
+// is the same one the cleanup repair passes.
+//
+// Ordered BEFORE the cleanup reconcile because it is what unblocks it. If it
+// refuses, the cleanup reconcile refuses too ("not compounding it") and the
+// reason is on the line above.
+func reconcileAgentStateIfStale(status *RecoveryStatus, updater agentStateUpdater, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields, input polecat.WorkstateInput) {
+	previous, out, ok := agentStateReconcilePlan(status, p, fields, input)
+	if !ok {
+		status.Reconcile = append(status.Reconcile, out)
+		return
+	}
+	if updater == nil {
+		status.Reconcile = append(status.Reconcile, agentStateReconcileFailed(status, previous, "updater unavailable"))
+		return
+	}
+	idle := string(beads.AgentStateIdle)
+	if err := updater.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{AgentState: &idle}); err != nil {
+		status.Reconcile = append(status.Reconcile, agentStateReconcileFailed(status, previous, err.Error()))
+		return
+	}
+	// Read back, on the same reasoning the other two reconciles do it: the write
+	// path is a bd subprocess against Dolt and a nil error is not evidence the
+	// row changed. The bead this fix came from asks specifically that the STORED
+	// agent_state be confirmed changed rather than the command's rendered output
+	// believed — so this command goes and reads the stored field itself.
+	_, after, err := updater.GetAgentBead(agentBeadID)
+	if err != nil {
+		status.Reconcile = append(status.Reconcile, agentStateReconcileFailed(status, previous,
+			fmt.Sprintf("write reported success but the bead could not be re-read: %v", err)))
+		return
+	}
+	if after == nil || strings.TrimSpace(after.AgentState) != idle {
+		stored := "<unparsable>"
+		if after != nil {
+			stored = orUnknownRecoveryField(after.AgentState)
+		}
+		status.Reconcile = append(status.Reconcile, agentStateReconcileFailed(status, previous,
+			"write reported success but the stored agent_state still reads "+stored))
+		return
+	}
+
+	// Keep the caller's in-memory view in step with the store it just changed.
+	// The cleanup reconcile below reads this very field as its gate, so a stale
+	// copy here would refuse the repair this write exists to enable.
+	fields.AgentState = idle
+	status.AgentState = idle
+	status.Reconciled = true
+
+	out.Action = reconcileActionWritten
+	out.Detail = "rewritten to idle and confirmed by re-reading the agent bead; session_presence=absent, " +
+		"so the claim of work in progress had no session to be true in"
+	status.Reconcile = append(status.Reconcile, out)
+	status.Diagnostics = append(status.Diagnostics,
+		fmt.Sprintf("reconciled_agent_state=idle previous=%s session_presence=absent", previous))
+	// Durable record of what the state was, the same one `gt polecat
+	// clear-state` writes. The bead now says "idle" and carries no memory of the
+	// claim it used to make, so without this the fact that a polecat sat at
+	// working with no session — and when, and what lifted it — is gone.
+	recordAgentStateCleared(status.Rig, status.Polecat, previous,
+		"(gt polecat check-recovery --reconcile-cleanup: session_presence=absent)")
+}
+
+// agentStateReconcileFailed records an agent_state repair that was attempted and
+// did not land, and fails the verdict closed.
+func agentStateReconcileFailed(status *RecoveryStatus, previous, detail string) ReconcileOutcome {
+	status.NeedsRecovery = true
+	status.Verdict = "NEEDS_RECOVERY"
+	status.Blockers = append(status.Blockers, fmt.Sprintf("agent_state_reconcile_failed: %s", detail))
+	return ReconcileOutcome{
+		Field:    "agent_state",
+		Action:   reconcileActionFailed,
+		Previous: orUnknownRecoveryField(previous),
+		Detail:   detail,
+	}
+}
+
+// agentStateReconcilePlan decides whether --reconcile-cleanup may rewrite
+// agent_state, and names why whenever it may not. Every road returns an outcome
+// a caller can read.
+//
+// The predicates are ordered so that the most specific true sentence is the one
+// reported: "this is a deliberate pause, and clear-state is its verb" beats
+// "this is not a stale activity claim", which beats "the session might still be
+// there".
+func agentStateReconcilePlan(status *RecoveryStatus, p *polecat.Polecat, fields *beads.AgentFields, input polecat.WorkstateInput) (string, ReconcileOutcome, bool) {
+	out := ReconcileOutcome{Field: "agent_state", Action: reconcileActionRefused}
+	if status == nil || p == nil || fields == nil {
+		out.Previous = "<unread>"
+		out.Detail = "no agent bead or no polecat record was loaded, so agent_state was never read"
+		return "", out, false
+	}
+
+	previous := strings.TrimSpace(fields.AgentState)
+	state := beads.AgentState(previous)
+	out.Previous = orUnknownRecoveryField(previous)
+
+	if state == beads.AgentStateIdle {
+		out.Action = reconcileActionNoChange
+		out.Detail = "already idle; nothing to reconcile"
+		return previous, out, false
+	}
+	// The two out-of-scope roads below are no_change, NOT refused, and the
+	// difference is the exit status. `refused` is what turns the exit non-zero,
+	// and it must mean "this flag was asked to repair a stale field and a
+	// predicate stopped it" — never "the field was never this flag's business".
+	//
+	// Measured before the distinction was drawn: almost every polecat in the town
+	// rests at agent_state=done, and the witness runs this flag on every slot
+	// that opens. Reporting `refused` there made a healthy run exit 1, which is
+	// the reading that makes a MEANINGFUL non-zero unreadable — the same defect
+	// as the silent exit 0, pointed the other way.
+
+	// A pause is somebody's decision, not a stale field, and it has its own verb.
+	// Rewriting it here would discard a pause that was set on purpose — the
+	// failure `gt polecat clear-state` was built to avoid rather than cause
+	// (gt-fbgq).
+	if state.IsPaused() {
+		out.Action = reconcileActionNoChange
+		out.Detail = fmt.Sprintf("agent_state=%s is a deliberate pause, not stale completion state, so it is out of scope here; "+
+			"lifting it is a decision, and its verb is `gt polecat clear-state %s`",
+			previous, recoveryPolecatAddress(status))
+		return previous, out, false
+	}
+	// IsActive, not a hand-written list of one: every state that CLAIMS the agent
+	// is doing something (working, running, spawning, patrolling) is stale under
+	// a measured-absent session by the same argument, and a list here would go
+	// out of step with the one that defines the claim. done and nuked are not
+	// claims of activity — they are legitimate resting states — and rewriting
+	// them would be a lifecycle transition rather than a repair.
+	if !state.IsActive() {
+		out.Action = reconcileActionNoChange
+		out.Detail = fmt.Sprintf("agent_state=%s does not claim work in progress, so there is nothing stale to repair; "+
+			"this reconcile only rewrites a claim of activity that a measured-absent session contradicts",
+			orUnknownRecoveryField(previous))
+		return previous, out, false
+	}
+	// THE discriminator between a stale claim and a true one. Only SessionAbsent
+	// decides: it means `tmux has-session` RAN and found no session. Unknown is
+	// what a caller gets when it never looked or when tmux itself failed, and
+	// reading either as "the agent is gone" would clear the state of a polecat
+	// that is working right now.
+	if input.SessionPresence != polecat.SessionAbsent {
+		out.Detail = fmt.Sprintf("session_presence=%s — clearing a claim of work in progress requires a MEASURED absent session "+
+			"(`tmux has-session` ran and found none); an unknown session is not evidence the agent is gone",
+			orUnknownRecoveryField(string(input.SessionPresence)))
+		return previous, out, false
+	}
+	if p.State != polecat.StateIdle {
+		out.Detail = "polecat_state=" + string(p.State) + " (reconcile requires an idle polecat)"
+		return previous, out, false
+	}
+	if reconcileOutcomesActionable(status.Reconcile) {
+		out.Detail = "an earlier field reconcile on this run did not land; not compounding it"
+		return previous, out, false
+	}
+	if blocker := staleFieldReconcileBlocker(status, input); blocker != "" {
+		out.Detail = blocker
+		return previous, out, false
+	}
+
+	out.Action = ""
+	out.Detail = ""
+	return previous, out, true
+}
+
 func reconcileCleanupStatusIfSafe(status *RecoveryStatus, updater cleanupStatusUpdater, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields, input polecat.WorkstateInput) {
 	previous, out, ok := cleanupStatusReconcilePlan(status, p, fields, input)
 	if !ok {
@@ -2434,13 +2687,44 @@ func cleanupStatusReconcilePlan(status *RecoveryStatus, p *polecat.Polecat, fiel
 		return previous, out, false
 	}
 
+	if blocker := staleFieldReconcileBlocker(status, input); blocker != "" {
+		out.Detail = blocker
+		return previous, out, false
+	}
+
+	out.Action = ""
+	out.Detail = ""
+	return previous, out, true
+}
+
+// staleFieldReconcileBlocker is the safety bar every stale-field repair on this
+// command shares: nothing is at risk once the stale fields this run would
+// rewrite are treated as rewritten. It returns the reason when that does not
+// hold, and "" when it does.
+//
+// It is one function rather than a copy per field because the two reconciles
+// are a CHAIN — cleanup_status is gated on agent_state=idle, so agent_state is
+// repaired first and only in order to let the cleanup repair run. Two copies of
+// this bar could disagree, and a disagreement here means agent_state gets
+// rewritten on a polecat the cleanup repair then refuses: a field changed for a
+// repair that never happened.
+//
+// The verdict precondition is asked of the bead the repairs would PRODUCE, not
+// of the one they found. That is gt-hm0v's whole lesson: a stale cleanup_status
+// is itself a NEEDS_RECOVERY blocker, so demanding SAFE_TO_NUKE of the bead as
+// found closed the loop into a circle on exactly the polecats the flag exists to
+// repair.
+//
+// Re-deciding with the field clean is strictly stronger evidence than the
+// blocker list, because it runs the merge-queue tail that a NEEDS_RECOVERY
+// return never reaches. SAFE_TO_NUKE out of it means every OTHER predicate this
+// command measured — hook, git, active MR, merge queue, session — proved safe.
+func staleFieldReconcileBlocker(status *RecoveryStatus, input polecat.WorkstateInput) string {
 	repaired := input
 	repaired.CleanupStatus = polecat.CleanupClean
-	disposition := polecat.DecideWorkstate(repaired)
-	if disposition.Verdict != "SAFE_TO_NUKE" {
-		out.Detail = fmt.Sprintf("a clean cleanup_status would still leave verdict=%s — %s",
+	if disposition := polecat.DecideWorkstate(repaired); disposition.Verdict != "SAFE_TO_NUKE" {
+		return fmt.Sprintf("a clean cleanup_status would still leave verdict=%s — %s",
 			disposition.Verdict, blockerSummary(disposition.Blockers))
-		return previous, out, false
 	}
 	// Not a whitelist of acceptable mq_status values. The merge-queue tail just
 	// ran inside DecideWorkstate and came out SAFE_TO_NUKE, and that IS the
@@ -2453,14 +2737,10 @@ func cleanupStatusReconcilePlan(status *RecoveryStatus, p *polecat.Polecat, fiel
 	// surface too cheap to run the queue check returns the same zeros as a
 	// branch with nothing left to submit (gt-49dp).
 	if status.Branch != "" && !repaired.MQCheckRequired {
-		out.Detail = "branch " + status.Branch + " exists and no merge-queue check was run for it, " +
+		return "branch " + status.Branch + " exists and no merge-queue check was run for it, " +
 			"so whether it still holds unsubmitted work is unknown"
-		return previous, out, false
 	}
-
-	out.Action = ""
-	out.Detail = ""
-	return previous, out, true
+	return ""
 }
 
 // pausedAgentState returns the agent bead's agent_state when it names a

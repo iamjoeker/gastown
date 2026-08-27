@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -58,6 +59,13 @@ If it refuses, the blockers it prints are the work to deal with. Escalate:
 
 --force bypasses the safety check. It is for a human or the Mayor with a
 reason, not a way for a witness to route around the refusal.
+
+NOT IN SCOPE — a stale agent_state=working:
+That is a claim of work in progress, not a pause, and this command reports it
+as nothing to clear. Deciding the claim is stale means measuring the session,
+the tree, and the merge queue, which this command deliberately does not do.
+The command that measures repairs it:
+  gt polecat check-recovery <rig>/<polecat> --reconcile-cleanup
 
 Examples:
   gt polecat clear-state greenplace/Toast
@@ -130,9 +138,7 @@ func runPolecatClearState(cmd *cobra.Command, args []string) error {
 		// against whatever check-recovery named, and a second run — or a run
 		// against a polecat that was never paused — is a no-op, not an error.
 		result.Reason = "not-paused"
-		return reportClearState(result, fmt.Sprintf(
-			"agent_state=%s is not a paused state — nothing to clear.",
-			displayAgentState(fields.AgentState)))
+		return reportClearState(result, notPausedMessage(rigName, polecatName, fields.AgentState))
 	}
 
 	// The same measured classifier the reuse gate and check-recovery use, so this
@@ -192,7 +198,11 @@ A human or the Mayor can pass --force to clear it anyway`,
 	// Durable record of what the state was. The bead now says "idle" and carries
 	// no memory of the pause, so without this the fact that somebody was parked
 	// at stuck — and when, and by whose hand it was lifted — is gone.
-	recordAgentStateCleared(rigName, polecatName, prior, result.Forced)
+	note := ""
+	if result.Forced {
+		note = "(--force: other blockers were present)"
+	}
+	recordAgentStateCleared(rigName, polecatName, prior, note)
 
 	return reportClearState(result, fmt.Sprintf(
 		"Cleared agent_state on %s/%s: %s → %s. Worktree, branch, and session untouched.",
@@ -228,6 +238,35 @@ func formatClearStateBlockers(blockers []string) string {
 	return out
 }
 
+// notPausedMessage says what this command did not do, and — when the state is a
+// claim of work in progress rather than a pause — where the verb for it lives.
+//
+// "agent_state=working is not a paused state — nothing to clear" is true, and at
+// exit 0 it reads as "nothing is wrong here". It is the sentence three stranded
+// polecats produced while agent_state=working was the one gate between them and
+// a repair, and the reader's next move was to conclude no verb existed at all
+// (gt-xj5d).
+//
+// The pointer is to check-recovery rather than to a flag on this command,
+// because a stale working is not this command's to clear. Deciding that a claim
+// of work in progress is stale means measuring the session, the tree, and the
+// merge queue, and this command deliberately measures none of them — it writes
+// one field and touches nothing else, which is what makes it safe to hand to a
+// witness. So name the command that measures instead of implying there is
+// nothing to name.
+func notPausedMessage(rigName, polecatName, agentState string) string {
+	msg := fmt.Sprintf("agent_state=%s is not a paused state — nothing to clear.",
+		displayAgentState(agentState))
+	if !beads.AgentState(strings.TrimSpace(agentState)).IsActive() {
+		return msg
+	}
+	return msg + fmt.Sprintf(`
+  It claims work in progress, which is not a pause and is not cleared by lifting
+  one. If the session is gone the claim is stale, and repairing it needs the git
+  and merge-queue measurement this command does not make:
+    gt polecat check-recovery %s/%s --reconcile-cleanup`, rigName, polecatName)
+}
+
 // displayAgentState renders an empty agent_state as something a reader can tell
 // apart from a state that is genuinely named "".
 func displayAgentState(state string) string {
@@ -240,14 +279,20 @@ func displayAgentState(state string) string {
 // recordAgentStateCleared writes the audit line. Best-effort: a missing town log
 // must never turn a completed state change into a failure, and the caller has
 // already confirmed the write landed.
-func recordAgentStateCleared(rigName, polecatName, prior string, forced bool) {
+//
+// note says which hand lifted it and under what. Two commands write this field
+// now — clear-state on a deliberate pause, and `check-recovery
+// --reconcile-cleanup` on a stale claim of work in progress — and the bead
+// retains no memory of either, so an audit line that cannot say which one acted
+// is a record of a change with no author (gt-xj5d).
+func recordAgentStateCleared(rigName, polecatName, prior, note string) {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return
 	}
 	context := fmt.Sprintf("cleared agent_state=%s to idle", prior)
-	if forced {
-		context += " (--force: other blockers were present)"
+	if note != "" {
+		context += " " + note
 	}
 	agent := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
 	_ = townlog.NewLogger(townRoot).Log(townlog.EventAgentStateCleared, agent, context)
