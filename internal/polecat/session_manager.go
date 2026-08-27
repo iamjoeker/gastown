@@ -648,6 +648,15 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
 	_ = session.TrackSessionPID(townRoot, sessionID, m.tmux)
 
+	// Start the background nudge-queue poller. A polecat parked at its prompt
+	// takes no further turn, so its UserPromptSubmit hook never fires and a
+	// nudge queued for it — by mail notification, by gt hook, by gt sling —
+	// would sit in the queue indefinitely with every producer reporting success
+	// (gt-xmq6). Non-fatal: the session is already up.
+	if err := session.EnsureNudgePoller(townRoot, sessionID); err != nil {
+		style.PrintWarning("%v", err)
+	}
+
 	// Touch initial heartbeat so liveness detection works from the start (gt-qjtq).
 	// Subsequent touches happen on every gt command via persistentPreRun.
 	TouchSessionHeartbeat(townRoot, sessionID)

@@ -426,6 +426,15 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 		return fmt.Errorf("creating session: %w", err)
 	}
 
+	// Start the background nudge-queue poller for the restarted session. The
+	// poller belonging to the previous session exited with it, so a restart
+	// leaves even a role whose own spawn path starts one — witness, refinery,
+	// crew, deacon — with nothing draining its queue. Same shape as gt-gllf,
+	// where the restart silently undid the account fix (gt-xmq6). Non-fatal.
+	if err := session.EnsureNudgePoller(d.config.TownRoot, sessionName); err != nil {
+		d.logger.Printf("warning: %v", err)
+	}
+
 	// Set environment variables in tmux session table (for debugging/monitoring tools).
 	d.setSessionEnvironment(sessionName, roleConfig, parsed)
 

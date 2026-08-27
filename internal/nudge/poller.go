@@ -62,6 +62,10 @@ func StartPoller(townRoot, session string) (int, error) {
 		return pid, nil // already running
 	}
 
+	if handled, err := guardTestStartPoller(townRoot, session); handled {
+		return 0, err
+	}
+
 	// Find the gt binary.
 	gtBin, err := os.Executable()
 	if err != nil {
