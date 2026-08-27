@@ -731,7 +731,10 @@ non-emptiness: `PRESENT` means the branch exists and carries commits over its
 target, `EMPTY` means it carries none, `MISSING` means no ref resolves. A
 `PRESENT` branch can still be unmergeable — the good state used to be spelled
 `OK`, and read as clearance it sent two branches to the refinery that conflicted
-in 17 and 12 files, their merge base 700 commits back (gt-0w2l).
+in 17 and 12 files, their merge base 700 commits back (gt-0w2l). A divergence
+that large is usually the duplicated lineage `main` carries, not real work; see
+[Lineage in this repo](guides/lineage-and-patch-id.md) before acting on a commit
+count.
 
 To ask whether a branch merges, use `gt mq list <rig> --merge-check`. It
 rehearses each merge with `git merge-tree --write-tree` against the same refs

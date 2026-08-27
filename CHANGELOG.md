@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`main`'s duplicated lineage is written down instead of rediscovered**
+  (gt-9ff4). `main` contains commits that are content-duplicates of other
+  commits in `main` under different SHAs — 350 of them arrived in a single
+  otherwise-legitimate merge on 2026-08-23, brought in by the gt-lj2n defect
+  that rebased MR-bound branches onto `upstream/main` on fork-backed rigs. That
+  defect is fixed (`5512b73f`), but the copies in trunk are permanent short of
+  rewriting a shared branch, and every agent who reasons about lineage here
+  meets them: chrome's four phantom conflicts (gt-82cw) and the two branches
+  that reached the refinery with a merge base 700 commits back (gt-0w2l) were
+  both this property, read as real divergence.
+
+  New guide at `docs/guides/lineage-and-patch-id.md`, with the measurement
+  reproducible rather than asserted — on `origin/main` at `5e84c5b44`, 7268
+  non-merge commits, 208 patch-ids occurring more than once across 449 commits,
+  241 of them redundant copies, stated as an upper bound because patch-id
+  equality proves same content and never same provenance.
+
+  The guide's substance is the four probes that lie here, all verified against
+  the repo rather than reasoned about. `git patch-id` emits **no line at all**
+  for a merge commit and for an empty one — 35 of main's non-merge commits plus
+  every merge — so a loop reading its output positionally shifts by one and
+  attributes the next commit's patch-id to this one; key on the SHA in
+  patch-id's own second column and treat an absent line as UNKNOWN. `git cherry`
+  drops a commit entirely when it is already an ancestor of upstream, so empty
+  output is ambiguous between "contained", "range empty" and "nothing to say",
+  and it can never surface duplicates living inside upstream. Patch-id
+  *inequality* stays what it always was — a prompt to read the diff, not a
+  verdict — because a change replayed onto a different base legitimately hashes
+  differently. And the fingerprint is recorded: a rebase cannot replay a merge,
+  so it flattens it, leaving an **empty commit whose subject begins `Merge … into
+  main`** beside a re-sha'd copy of the change. `main` carries one such
+  quadruple at `8a8a625c`/`a3bc0a3d`/`8127893d`/`fffcacac`.
+
+  Whether to clean the pairs up is deliberately not acted on — it needs history
+  rewriting on a shared branch, the mayor, and a human. The bead is labelled
+  `gt:record` so the record stops being dispatched as implementable work
+  (gt-f8td).
+
 - **`gt patrol branches` can be told a branch is settled, and remembers** (gt-8xcg).
   The sweep re-derived every verdict on every run because a correct answer had
   nowhere to live. Measured on gastown: 39 branches scanned, and 22 of them — 6
