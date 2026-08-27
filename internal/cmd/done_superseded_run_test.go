@@ -164,3 +164,34 @@ func TestRunDoneRecordsTheLandingCommitOnSupersededClose(t *testing.T) {
 		t.Errorf("close still uses the generic no-code-changes reason, which names no evidence:\n%s", log)
 	}
 }
+
+// gt-gubw, at the level the pure guard cannot reach: that runDone actually
+// consults the bead's status before refusing.
+//
+// This is TestRunDoneRefusesForkBackedCloseWhenNothingLanded with one variable
+// changed — the source bead is closed rather than open — and it is the control
+// for this one. Same fork-backed rig, same empty unpushed branch, same absence
+// of any landing commit naming the bead; that test must keep refusing, or the
+// exemption here is a blanket pass rather than a status check.
+//
+// The state is what a polecat assigned to fix ANOTHER agent's branch ends up
+// in: the work lands over there under a commit naming the branch owner's bead,
+// the refinery closes this one, and this branch is empty by design.
+func TestRunDoneExitsWhenTheSourceBeadIsAlreadyClosed(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupSupersededGitRepo(t, workDir, false, true)
+	logPath := installSubmitSourceBDRecorderWithStatus(t, currentBeadsDir, ownerBeadsDir, "closed")
+	resetDoneFlagsForTest(t)
+	primeSupersededDoneEnv(t, workDir, routedSourceTestTownRoot(workDir))
+
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone on an already-closed bead: %v\nthe bead is closed, so there is no completion to record and nothing left to refuse", err)
+	}
+
+	// Exempting the guard must not turn into closing the bead a second time,
+	// which would overwrite the refinery's proof of work with a generic reason.
+	if log := readSubmitSourceBDLog(t, logPath); strings.Contains(log, "close bd-source") {
+		t.Errorf("an already-closed bead must not be closed again:\n%s", log)
+	}
+}
