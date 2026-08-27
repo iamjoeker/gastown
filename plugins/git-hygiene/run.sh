@@ -111,6 +111,63 @@ delete_branch() {
   return 1
 }
 
+# --- Can we actually act on GitHub? (gt-zp1q) ---------------------------------
+#
+# `gh auth status` was measured on this host EXITING 0 while printing
+#
+#     X Failed to log in to github.com account iamjoeker (default)
+#     - The token in default is invalid.
+#
+# so an auth predicate shaped like `if gh auth status; then` reads
+# "authenticated" throughout an outage, and one that also redirects stderr
+# (`gh auth status 2>/dev/null`) throws away the only signal there was. That is
+# how an expired token survived 17 consecutive merges with the remote sweep
+# below deleting nothing and recording success every time.
+#
+# The predicate here is therefore a real authenticated API call — the capability
+# this step actually needs — rather than a status report about one. `gh api user`
+# returns 401 and exits nonzero on an invalid token, and it cannot drift from
+# what the deletes require because it is the same credential on the same path.
+#
+# Two properties are deliberate:
+#
+#   - Exit status is not trusted alone. A `gh` that exits 0 while printing no
+#     login is not proof of anything; the login has to come back.
+#   - stderr is captured and reported, never discarded. "It produced nothing"
+#     and "it never ran" are indistinguishable from the caller's side otherwise.
+#
+# Memoized and called lazily, so a town whose remotes are not GitHub — or a run
+# with no branch to delete — never pays for a network round trip and never
+# reports an auth problem it did not have.
+GH_AUTH_STATE=unknown # unknown | ok | missing | denied
+GH_AUTH_ERR=""
+
+gh_can_act() {
+  case "$GH_AUTH_STATE" in
+    ok) return 0 ;;
+    missing | denied) return 1 ;;
+  esac
+
+  if ! command -v gh >/dev/null 2>&1; then
+    GH_AUTH_STATE=missing
+    GH_AUTH_ERR="gh CLI is not installed"
+    return 1
+  fi
+
+  local out
+  if out=$(gh api user --jq .login 2>&1) && [ -n "$out" ]; then
+    GH_AUTH_STATE=ok
+    log "  gh authenticated as $out"
+    return 0
+  fi
+
+  GH_AUTH_STATE=denied
+  # Collapse to one line: this lands in a plugin receipt, not a terminal.
+  GH_AUTH_ERR=$(printf '%s' "$out" | tr '\n' ' ' | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')
+  [ -n "$GH_AUTH_ERR" ] || GH_AUTH_ERR="gh api user exited 0 without returning a login"
+  return 1
+}
+
 # --- Which remotes can vouch for a branch? (gt-x6ji) --------------------------
 #
 # The orphan sweep force-deletes anything "the remote" does not hold, so what
@@ -224,7 +281,9 @@ TOTAL_GC=0
 TOTAL_BACKUPS_WRITTEN=0
 TOTAL_BACKUPS_EXPIRED=0
 TOTAL_SKIPPED_REPOS=0
+TOTAL_REMOTE_BLOCKED=0
 DELETE_FAILURES=0
+REMOTE_DELETE_FAILURES=0
 
 while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   [ -z "$REPO_PATH" ] && continue
@@ -349,6 +408,7 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
   # Step 4: Delete merged remote branches on GitHub
   log "  Deleting merged remote branches..."
   REMOTE_DELETED=0
+  REMOTE_BLOCKED=0
 
   # A clone with no origin is normal; it must not abort the run.
   GH_REPO=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null \
@@ -371,12 +431,33 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
         continue
       fi
       if git -C "$REPO_PATH" merge-base --is-ancestor "origin/$RBRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        # Ask once, on the first branch that actually needs deleting, whether we
+        # can act on GitHub at all. Without this the loop below issued N doomed
+        # API calls, swallowed N errors, and counted zero — a result identical to
+        # "there was nothing to delete" (gt-zp1q).
+        if ! gh_can_act; then
+          log "    SKIPPING remote deletes for $GH_REPO: $GH_AUTH_ERR"
+          REMOTE_BLOCKED=1
+          break
+        fi
         log "    Deleting remote: origin/$RBRANCH"
-        gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>/dev/null && REMOTE_DELETED=$((REMOTE_DELETED + 1)) || true
+        # Same rule as delete_branch above: a refusal must not abort the run, but
+        # it is captured, logged and counted rather than sent to /dev/null.
+        if REMOTE_ERR=$(gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>&1 >/dev/null); then
+          REMOTE_DELETED=$((REMOTE_DELETED + 1))
+        else
+          REMOTE_ERR=$(printf '%s' "$REMOTE_ERR" | tr '\n' ' ' | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')
+          [ -n "$REMOTE_ERR" ] || REMOTE_ERR="gh api DELETE failed with no message"
+          log "    FAILED to delete remote origin/$RBRANCH: $REMOTE_ERR"
+          REMOTE_DELETE_FAILURES=$((REMOTE_DELETE_FAILURES + 1))
+        fi
       fi
     done <<< "$REMOTE_BRANCHES"
   fi
   TOTAL_REMOTE=$((TOTAL_REMOTE + REMOTE_DELETED))
+  if [ "$REMOTE_BLOCKED" -gt 0 ]; then
+    TOTAL_REMOTE_BLOCKED=$((TOTAL_REMOTE_BLOCKED + 1))
+  fi
 
   # Step 5: Clear stale stashes
   #
@@ -422,6 +503,15 @@ fi
 if [ "$DELETE_FAILURES" -gt 0 ]; then
   SUMMARY="$SUMMARY, $DELETE_FAILURES delete failure(s)"
 fi
+if [ "$REMOTE_DELETE_FAILURES" -gt 0 ]; then
+  SUMMARY="$SUMMARY, $REMOTE_DELETE_FAILURES remote delete failure(s)"
+fi
+# "Could not act on GitHub" belongs in the receipt every single run. A summary
+# that reads the same whether the remote sweep ran or was impossible is what
+# made an expired token invisible across 17 merges (gt-zp1q).
+if [ "$TOTAL_REMOTE_BLOCKED" -gt 0 ]; then
+  SUMMARY="$SUMMARY, remote sweep BLOCKED on $TOTAL_REMOTE_BLOCKED repo(s): $GH_AUTH_ERR"
+fi
 
 log ""
 log "=== Git Hygiene Summary ==="
@@ -434,7 +524,15 @@ fi
 # a deletion step silently refused every branch is exactly how this plugin's
 # sibling in the recycle formula stayed inert and unnoticed.
 RESULT=success
-if [ "$DELETE_FAILURES" -gt 0 ]; then
+if [ "$DELETE_FAILURES" -gt 0 ] || [ "$REMOTE_DELETE_FAILURES" -gt 0 ]; then
+  RESULT=failure
+fi
+# A rejected credential is an operator condition that recurs silently and gets
+# worse: it is the failure this plugin is least able to notice on its own, so it
+# fails the receipt and trips notify_on_failure. `gh` simply not being installed
+# is static and visible in the summary above — worth saying, not worth paging
+# about every 12h.
+if [ "$GH_AUTH_STATE" = denied ]; then
   RESULT=failure
 fi
 

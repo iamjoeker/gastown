@@ -125,10 +125,34 @@ exit 0
 SH
   chmod +x "$bin_dir/bd"
 
+  # Scriptable `gh` stub (gt-zp1q). The default is "the credential is rejected",
+  # because that is the state the plugins have to survive and the one that was
+  # never exercised. A test opts into a working credential by writing
+  # $TEST_STATE/gh_login; an EMPTY gh_login is the "exits 0 having proved
+  # nothing" case, which must read as unauthenticated. gh_delete_fails makes the
+  # DELETE call fail while auth succeeds.
   cat > "$bin_dir/gh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TEST_STATE/gh.log"
-exit 1
+
+if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
+  if [ -f "$TEST_STATE/gh_login" ]; then
+    cat "$TEST_STATE/gh_login"
+    exit 0
+  fi
+  printf 'gh: Bad credentials (HTTP 401)\n' >&2
+  exit 1
+fi
+
+if [ ! -f "$TEST_STATE/gh_login" ]; then
+  printf 'gh: Bad credentials (HTTP 401)\n' >&2
+  exit 1
+fi
+if [ -f "$TEST_STATE/gh_delete_fails" ]; then
+  printf 'gh: Must have admin rights to Repository. (HTTP 403)\n' >&2
+  exit 1
+fi
+exit 0
 SH
   chmod +x "$bin_dir/gh"
 }
@@ -511,6 +535,108 @@ assert_branch "$REPO" "polecat/unknown/al-4+ddd" yes \
   "git-hygiene: deletes nothing when a remote could not be consulted"
 assert_contains "$ENV_ROOT/state/record.log" "repo(s) skipped" \
   "git-hygiene: the skip reaches the receipt, not just the log"
+
+# --- Tests 11-14: auth failure must be detectable (gt-zp1q) ------------------
+#
+# `gh auth status` exits 0 while reporting an invalid token, so a predicate
+# built on its exit code reads "authenticated" throughout an outage. The remote
+# sweep then issued a doomed DELETE per branch, swallowed each error with
+# 2>/dev/null, and counted zero — indistinguishable from an empty work list. An
+# expired token survived 17 consecutive merges that way, with a success receipt
+# every time.
+#
+# Both directions are tested here on purpose. A check that has only ever run
+# against a working credential is exactly what shipped, so the rejected-token
+# case is the one that carries the regression; the accepted-token case is its
+# control, proving these assertions can distinguish the two at all rather than
+# failing for some unrelated reason.
+
+# make_mergeable_remote_branch pushes a polecat branch, merges it into main, and
+# pushes that — so origin/<branch> is an ancestor of origin/main and the remote
+# sweep has exactly one candidate to act on.
+make_mergeable_remote_branch() {
+  local repo="$1" branch="$2"
+  commit_on "$repo" "$branch" "${branch//\//_}.txt"
+  git -C "$repo" push -q origin "$branch"
+  git -C "$repo" merge -q --ff-only "$branch"
+  git -C "$repo" push -q origin main
+  git -C "$repo" fetch -q origin
+}
+
+# Test 11: a rejected credential blocks the sweep, says so, and fails the receipt.
+make_hygiene_env
+make_mergeable_remote_branch "$REPO" "polecat/landed/al-5+eee"
+
+OUT="$ENV_ROOT/out.txt"
+STATUS=$(run_plugin "$ENV_ROOT" git-hygiene "$OUT")
+assert_exit "$STATUS" 0 "git-hygiene: completes the run when gh cannot authenticate"
+assert_contains "$ENV_ROOT/state/gh.log" "api user" \
+  "git-hygiene: probes auth with a real API call, not gh auth status"
+assert_not_contains "$ENV_ROOT/state/gh.log" "auth status" \
+  "git-hygiene: never uses gh auth status as the predicate"
+assert_contains "$OUT" "SKIPPING remote deletes" \
+  "git-hygiene: says the remote sweep did not run"
+assert_not_contains "$ENV_ROOT/state/gh.log" "-X DELETE" \
+  "git-hygiene: issues no doomed DELETE calls once auth is known bad"
+assert_contains "$ENV_ROOT/state/record.log" "remote sweep BLOCKED" \
+  "git-hygiene: the block reaches the receipt, not just the log"
+assert_contains "$ENV_ROOT/state/record.log" "--result failure" \
+  "git-hygiene: a rejected credential is a failure, not a quiet success"
+
+# Test 12: the control — a working credential lets the sweep through.
+make_hygiene_env
+printf 'iamjoeker\n' > "$ENV_ROOT/state/gh_login"
+make_mergeable_remote_branch "$REPO" "polecat/landed/al-6+fff"
+
+OUT="$ENV_ROOT/out.txt"
+STATUS=$(run_plugin "$ENV_ROOT" git-hygiene "$OUT")
+assert_exit "$STATUS" 0 "git-hygiene: exits 0 with a working credential"
+assert_contains "$OUT" "gh authenticated as iamjoeker" \
+  "git-hygiene: reports who it authenticated as"
+assert_contains "$ENV_ROOT/state/gh.log" "-X DELETE" \
+  "git-hygiene: actually deletes the merged remote branch"
+assert_not_contains "$OUT" "SKIPPING remote deletes" \
+  "git-hygiene: does not skip the sweep when auth is good"
+assert_not_contains "$ENV_ROOT/state/record.log" "BLOCKED" \
+  "git-hygiene: no block reported when there was none"
+assert_contains "$ENV_ROOT/state/record.log" "--result success" \
+  "git-hygiene: a clean run still records success"
+
+# Test 13: exit 0 is not proof. A gh that returns no login has demonstrated
+# nothing, and accepting it would rebuild the defect from the other side.
+make_hygiene_env
+: > "$ENV_ROOT/state/gh_login"
+make_mergeable_remote_branch "$REPO" "polecat/landed/al-7+ggg"
+
+OUT="$ENV_ROOT/out.txt"
+STATUS=$(run_plugin "$ENV_ROOT" git-hygiene "$OUT")
+assert_exit "$STATUS" 0 "git-hygiene: completes when gh exits 0 with no login"
+assert_contains "$OUT" "SKIPPING remote deletes" \
+  "git-hygiene: exit 0 without a login does not count as authenticated"
+assert_not_contains "$ENV_ROOT/state/gh.log" "-X DELETE" \
+  "git-hygiene: no deletes attempted on an unproven credential"
+assert_contains "$ENV_ROOT/state/record.log" "--result failure" \
+  "git-hygiene: an unproven credential fails the receipt"
+
+# Test 14: a remote delete that fails is counted and reported, not swallowed.
+# This is the second half of the original defect: even with good auth, the old
+# `2>/dev/null && count++` made a refusal look like nothing to do.
+make_hygiene_env
+printf 'iamjoeker\n' > "$ENV_ROOT/state/gh_login"
+: > "$ENV_ROOT/state/gh_delete_fails"
+make_mergeable_remote_branch "$REPO" "polecat/landed/al-8+hhh"
+
+OUT="$ENV_ROOT/out.txt"
+STATUS=$(run_plugin "$ENV_ROOT" git-hygiene "$OUT")
+assert_exit "$STATUS" 0 "git-hygiene: a refused remote delete does not abort the run"
+assert_contains "$OUT" "FAILED to delete remote" \
+  "git-hygiene: names the remote branch it could not delete"
+assert_contains "$OUT" "HTTP 403" \
+  "git-hygiene: surfaces gh's stderr instead of discarding it"
+assert_contains "$ENV_ROOT/state/record.log" "remote delete failure(s)" \
+  "git-hygiene: the remote delete failure reaches the receipt"
+assert_contains "$ENV_ROOT/state/record.log" "--result failure" \
+  "git-hygiene: a refused remote delete is a failure, not a success"
 
 # --- Summary -----------------------------------------------------------------
 

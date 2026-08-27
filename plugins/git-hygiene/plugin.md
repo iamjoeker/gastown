@@ -23,7 +23,51 @@ Automated cleanup of stale git branches, stashes, and loose objects across all
 rig repos. Covers local branches (merged and orphaned), remote branches on
 GitHub, stale stashes, and garbage collection.
 
-Requires: `gh` CLI installed and authenticated (`gh auth status`).
+Requires: `gh` CLI installed and authenticated (`gh api user` — **not**
+`gh auth status`, see below).
+
+## Auth failure has to be detectable (gt-zp1q)
+
+`gh auth status` was measured on this host **exiting 0** while reporting that
+the token was invalid:
+
+```
+$ gh auth status
+github.com
+  X Failed to log in to github.com account iamjoeker (default)
+  - The token in default is invalid.
+$ echo $?
+0
+```
+
+So any caller shaped like `if gh auth status; then …` proceeds as though
+authenticated, and one that also redirects stderr loses the diagnostic too. Step
+2d below then issued a doomed `gh api … -X DELETE` per branch, swallowed every
+error with `2>/dev/null`, and counted zero — a result byte-identical to "there
+was nothing to delete". An expired token survived **17 consecutive merges**
+that way, with a success receipt each time.
+
+Three changes make it detectable, and each covers what the others do not:
+
+1. **The predicate is a real authenticated API call.** `gh api user --jq .login`
+   exercises the capability the deletes need rather than a status report about
+   it, and exits nonzero on an invalid token. Exit 0 alone is not accepted — the
+   login has to come back — because "exits 0 having done nothing" is the failure
+   shape under repair. It is asked once per run, lazily, on the first branch
+   that actually needs deleting, so a non-GitHub town never pays for it and
+   never reports an auth problem it does not have.
+2. **Remote deletes are auditable.** `gh api … -X DELETE 2>/dev/null && count++`
+   is gone; stderr is captured, logged, and counted into the receipt, exactly as
+   the local deletes already were.
+3. **"Could not act on GitHub" is always in the summary,** and a *rejected*
+   credential makes the receipt a `failure`. That is the condition this plugin is
+   least able to notice on its own and the one that recurs silently. `gh` simply
+   not being installed is static and stays a success — reported, not paged.
+
+Verifying a fix here needs **both** directions, and the second is the one that
+matters: point `GH_TOKEN` at a garbage value in a scoped subshell and confirm
+the predicate goes false. A check that has only ever run against a working token
+is precisely what shipped.
 
 ## The recovery window (gt-x6ji)
 
@@ -283,9 +327,23 @@ while IFS=$'\t' read -r RIG_NAME REPO_PATH; do
       fi
       # Check if merged into default branch
       if git -C "$REPO_PATH" merge-base --is-ancestor "origin/$RBRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        # Ask once, here, whether we can act on GitHub at all — see "Auth
+        # failure has to be detectable". Without it this loop made N doomed API
+        # calls and reported the same zero as an empty work list.
+        if ! gh_can_act; then
+          echo "    SKIPPING remote deletes for $GH_REPO: $GH_AUTH_ERR"
+          REMOTE_BLOCKED=1
+          break
+        fi
         echo "    Deleting remote: origin/$RBRANCH"
-        # Use gh api because git push --delete may be blocked by pre-push hooks
-        gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>/dev/null && REMOTE_DELETED=$((REMOTE_DELETED + 1))
+        # Use gh api because git push --delete may be blocked by pre-push hooks.
+        # stderr is captured and counted, never sent to /dev/null.
+        if REMOTE_ERR=$(gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>&1 >/dev/null); then
+          REMOTE_DELETED=$((REMOTE_DELETED + 1))
+        else
+          echo "    FAILED to delete remote origin/$RBRANCH: $REMOTE_ERR"
+          REMOTE_DELETE_FAILURES=$((REMOTE_DELETE_FAILURES + 1))
+        fi
       fi
     done <<< "$REMOTE_BRANCHES"
   else
@@ -330,6 +388,8 @@ SUMMARY="$RIG_COUNT rig(s): $TOTAL_LOCAL_MERGED merged branch(es), $TOTAL_LOCAL_
 SUMMARY="$SUMMARY, $TOTAL_BACKUPS_WRITTEN backup(s) written, $TOTAL_BACKUPS_EXPIRED expired"
 [ "$TOTAL_SKIPPED_REPOS" -gt 0 ] && SUMMARY="$SUMMARY, $TOTAL_SKIPPED_REPOS repo(s) skipped (unreadable push remote)"
 [ "$DELETE_FAILURES" -gt 0 ] && SUMMARY="$SUMMARY, $DELETE_FAILURES delete failure(s)"
+[ "$REMOTE_DELETE_FAILURES" -gt 0 ] && SUMMARY="$SUMMARY, $REMOTE_DELETE_FAILURES remote delete failure(s)"
+[ "$TOTAL_REMOTE_BLOCKED" -gt 0 ] && SUMMARY="$SUMMARY, remote sweep BLOCKED on $TOTAL_REMOTE_BLOCKED repo(s): $GH_AUTH_ERR"
 echo ""
 echo "=== Git Hygiene Summary ==="
 echo "$SUMMARY"
@@ -343,6 +403,10 @@ follows the delete counters:
 ```bash
 RESULT=success
 [ "$DELETE_FAILURES" -gt 0 ] && RESULT=failure
+[ "$REMOTE_DELETE_FAILURES" -gt 0 ] && RESULT=failure
+# A rejected credential recurs silently and gets worse; gh being absent is
+# static and already visible in the summary.
+[ "$GH_AUTH_STATE" = denied ] && RESULT=failure
 
 gt plugin record-run --plugin git-hygiene --result "$RESULT" \
   --title "git-hygiene: $SUMMARY" --description "$SUMMARY" >/dev/null 2>&1 || true

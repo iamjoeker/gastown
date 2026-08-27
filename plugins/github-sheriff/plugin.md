@@ -28,19 +28,36 @@ Categorizes each PR as:
 - **Easy win**: CI passing, small (<200 LOC changed), no merge conflicts
 - **Needs review**: CI failing, large, or has conflicts
 
-Requires: `gh` CLI installed and authenticated (`gh auth status`).
+Requires: `gh` CLI installed and authenticated (`gh api user`).
 
 ## Detection
 
-Verify `gh` is available and authenticated:
+Verify `gh` is available and authenticated.
+
+**Do not use `gh auth status` as the predicate (gt-zp1q).** It was measured on
+this host *exiting 0* while printing `The token in default is invalid.`, so
+`gh auth status; if [ $? -ne 0 ]` reads "authenticated" for the entire duration
+of an outage — and the `2>/dev/null` this block used to carry threw away the one
+place the failure was stated. An expired token survived 17 consecutive merges
+that way.
+
+Ask for the capability instead of for a status report about it. `gh api user`
+uses the same credential on the same path as every call below, returns 401 and
+exits nonzero on an invalid token, and cannot drift from what this plugin needs:
 
 ```bash
-gh auth status 2>/dev/null
-if [ $? -ne 0 ]; then
-  echo "SKIP: gh CLI not authenticated"
+# stderr is captured, not discarded: "produced nothing" and "never ran" are
+# indistinguishable otherwise, and the second is the more common one.
+if ! GH_LOGIN=$(gh api user --jq .login 2>&1) || [ -z "$GH_LOGIN" ]; then
+  echo "SKIP: gh CLI cannot authenticate to GitHub: $GH_LOGIN"
   exit 0
 fi
+echo "gh authenticated as $GH_LOGIN"
 ```
+
+The `-z` arm matters as much as the exit status: a `gh` that exits 0 while
+returning no login has not demonstrated anything, and treating exit 0 alone as
+proof is the defect being fixed.
 
 Detect the repo from the rig's git remote. Fall back to explicit config if
 detection fails:
