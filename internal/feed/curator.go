@@ -527,6 +527,12 @@ func (c *Curator) generateSummary(event *events.Event) string {
 		}
 		return "Session terminated"
 
+	case events.TypePoolReuseRefused, events.TypePoolReuseSkipped:
+		// Without this arm the line rendered as the bare type name, and the
+		// bare type name said "refused" on events that recorded a successful
+		// reuse (gt-ibtb).
+		return events.PoolReuseSummary(event.Type, event.Payload)
+
 	case events.TypeMassDeath:
 		count, _ := event.Payload["count"].(float64) // JSON numbers are float64
 		possibleCause, _ := event.Payload["possible_cause"].(string)

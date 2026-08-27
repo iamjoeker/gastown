@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/polecat"
 )
 
@@ -59,5 +61,114 @@ func TestPoolReuseRejectionsNamesEveryRefusal(t *testing.T) {
 	// refusal every time a rig had no polecats at all.
 	if got := poolReuseRejections(nil); len(got) != 0 {
 		t.Fatalf("empty pool = %v, want no rejections", got)
+	}
+}
+
+// TestPoolReuseEventTypeFollowsTheSettledOutcome covers gt-ibtb.
+//
+// The emit used to run BEFORE the check that distinguishes success from
+// refusal, so TypePoolReuseRefused fired whenever any candidate was passed
+// over — which, because the gate short-circuits on the first reusable polecat,
+// is the normal shape of a SUCCESS. All 21 events on record were successes and
+// a genuine total refusal had never been emitted.
+func TestPoolReuseEventTypeFollowsTheSettledOutcome(t *testing.T) {
+	// Reuse succeeded: the candidates before it were passed over, not refused.
+	reused := events.PoolReuseOutcome{ReusedPolecat: "chrome", GateAccepted: true}
+	if got := poolReuseEventType(reused); got != events.TypePoolReuseSkipped {
+		t.Fatalf("type = %q on a successful reuse, want %q", got, events.TypePoolReuseSkipped)
+	}
+
+	// Nothing reused: this is the case the old name always claimed and never
+	// once described.
+	if got := poolReuseEventType(events.PoolReuseOutcome{}); got != events.TypePoolReuseRefused {
+		t.Fatalf("type = %q with no reuse, want %q", got, events.TypePoolReuseRefused)
+	}
+
+	// The gate cleared a candidate and reuse then failed on it. Accepting is
+	// not reusing, and the type must follow the reuse — this is the shape that
+	// would reintroduce the bug one step further along the path.
+	gateOnly := events.PoolReuseOutcome{GateAccepted: true}
+	if got := poolReuseEventType(gateOnly); got != events.TypePoolReuseRefused {
+		t.Fatalf("type = %q when the gate accepted but reuse failed, want %q", got, events.TypePoolReuseRefused)
+	}
+}
+
+// TestPoolReuseGateOutcomeMarksThePrefix pins the other half: the candidate
+// list stops at the polecat the gate accepted, so it is a prefix whenever one
+// was accepted — whether or not reuse then succeeded.
+func TestPoolReuseGateOutcomeMarksThePrefix(t *testing.T) {
+	candidates := []polecat.PoolReuseCandidate{
+		{Name: "brahmin", State: polecat.StateDone, StateEligible: true, Reason: "push-failed"},
+		{Name: "chrome", State: polecat.StateIdle, StateEligible: true, Reusable: true, Reason: "reusable"},
+	}
+
+	accepted := poolReuseGateOutcome("gastown", &polecat.Polecat{Name: "chrome"}, candidates, nil)
+	if !accepted.GateAccepted {
+		t.Fatal("GateAccepted = false when the gate short-circuited on chrome")
+	}
+	if accepted.Considered != 2 {
+		t.Fatalf("Considered = %d, want 2", accepted.Considered)
+	}
+	// The accepted candidate is not a rejection.
+	if len(accepted.Rejections) != 1 || !strings.Contains(accepted.Rejections[0], "brahmin") {
+		t.Fatalf("Rejections = %v, want just brahmin", accepted.Rejections)
+	}
+	// The gate's verdict alone must never claim a reuse: the attempt has not
+	// run yet at this point.
+	if accepted.ReusedPolecat != "" {
+		t.Fatalf("ReusedPolecat = %q before the reuse was attempted", accepted.ReusedPolecat)
+	}
+
+	exhausted := poolReuseGateOutcome("gastown", nil, candidates[:1], nil)
+	if exhausted.GateAccepted {
+		t.Fatal("GateAccepted = true when nothing was accepted")
+	}
+
+	// The lookup error the caller used to discard unexamined (gt-49dp).
+	failed := poolReuseGateOutcome("gastown", nil, nil, errors.New("listing polecats: boom"))
+	if !strings.Contains(failed.LookupError, "boom") {
+		t.Fatalf("LookupError = %q, want the lookup failure", failed.LookupError)
+	}
+}
+
+// TestAuditPoolReuseSummaryIsNotTheBareTypeName is the `gt audit` half of the
+// same guarantee the feed curator carries. Both surfaces fell through to their
+// default arm and printed the type name, and the type name was the lie.
+func TestAuditPoolReuseSummaryIsNotTheBareTypeName(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		eventType string
+		payload   map[string]interface{}
+		want      string
+	}{
+		{
+			name:      "reuse",
+			eventType: events.TypePoolReuseSkipped,
+			payload: events.PoolReuseOutcomePayload(events.PoolReuseOutcome{
+				Rig: "gastown", Considered: 2,
+				Rejections:    []string{"brahmin=push-failed state=done"},
+				ReusedPolecat: "chrome", GateAccepted: true,
+			}),
+			want: "chrome",
+		},
+		{
+			name:      "refusal",
+			eventType: events.TypePoolReuseRefused,
+			payload: events.PoolReuseOutcomePayload(events.PoolReuseOutcome{
+				Rig: "gastown", Considered: 1,
+				Rejections: []string{"brahmin=git-dirty state=idle"},
+			}),
+			want: "REFUSED",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatFeedSummary(events.Event{Type: tc.eventType, Actor: "gt", Payload: tc.payload})
+			if got == tc.eventType {
+				t.Fatalf("summary fell through to the default arm: %q", got)
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("summary %q must contain %q", got, tc.want)
+			}
+		})
 	}
 }

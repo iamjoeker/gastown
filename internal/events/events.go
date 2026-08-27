@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -47,10 +48,24 @@ const (
 	TypeHalt    = "halt"
 
 	// TypePoolReuseRefused records that `gt sling` considered the idle polecat
-	// pool and reused nothing, with the per-candidate reasons. The success path
+	// pool and reused NOTHING, with the per-candidate reasons. The success path
 	// has always logged TypeSpawn; the refusal logged nothing at all, so the
 	// cost of a fresh worktree was measurable while its cause was not (gt-49dp).
+	//
+	// This type used to fire on success too — whenever ANY candidate had been
+	// passed over, including the runs that went on to reuse the very next one.
+	// Every one of the 21 events on record was a success; a genuine total
+	// refusal had never been emitted, and two witnesses plus a deacon each read
+	// the name at face value and jointly scoped a P1 on it (gt-ibtb, gt-uapr).
+	// The passed-over case is TypePoolReuseSkipped now, and both carry the
+	// outcome in the payload so the name is not the only thing to go on.
 	TypePoolReuseRefused = "pool_reuse_refused"
+
+	// TypePoolReuseSkipped records that `gt sling` passed over one or more idle
+	// polecats and then REUSED a later one. It is a success: a fresh worktree
+	// was not allocated and the pool did not grow. Split out of
+	// TypePoolReuseRefused, which named the opposite outcome (gt-ibtb).
+	TypePoolReuseSkipped = "pool_reuse_skipped"
 
 	// Session events (for seance discovery)
 	TypeSessionStart = "session_start"
@@ -213,20 +228,157 @@ func SpawnPayload(rig, polecat string) map[string]interface{} {
 	}
 }
 
-// PoolReuseRefusedPayload creates a payload for pool reuse refusal events.
-// rejections are "<polecat>=<reason>" pairs, one per candidate the reuse gate
-// turned down; lookupErr is the FindIdlePolecat error, if any, which the caller
-// used to discard unexamined.
-func PoolReuseRefusedPayload(rig string, considered int, rejections []string, lookupErr string) map[string]interface{} {
-	p := map[string]interface{}{
-		"rig":        rig,
-		"considered": considered,
-		"rejected":   rejections,
+// Candidate-list dispositions carried by pool reuse events. The reuse gate
+// short-circuits on the first reusable polecat, so a list that ends in a reuse
+// is a PREFIX of the roster and not a survey of it: nine rejections there means
+// the tenth was accepted, not that ten were turned down.
+const (
+	CandidateListPrefix   = "prefix"
+	CandidateListComplete = "complete"
+)
+
+// PoolReuseOutcome is what one pass of the idle-polecat reuse gate decided.
+// It is a struct rather than a parameter list because its two booleans are
+// independent and easy to swap: the gate can accept a candidate that reuse then
+// fails on, which is a refusal reported over a prefix.
+type PoolReuseOutcome struct {
+	Rig string
+	// Considered is how many polecats the gate evaluated, which is NOT the
+	// roster size — see GateAccepted.
+	Considered int
+	// Rejections are "<polecat>=<reason> state=<state>" triples, one per
+	// candidate turned down.
+	Rejections []string
+	// LookupError is the FindIdlePolecat error, if any, which the caller used
+	// to discard unexamined (gt-49dp).
+	LookupError string
+	// ReusedPolecat is the polecat actually reused, empty when reuse did not
+	// happen. This is the field that decides "reused".
+	ReusedPolecat string
+	// GateAccepted reports that the gate short-circuited on a candidate, so the
+	// candidate list is a PREFIX of the roster. It is not the same as a reuse:
+	// ReuseIdlePolecat can still fail on the accepted candidate, and the
+	// candidates after it were never evaluated either way.
+	GateAccepted bool
+}
+
+// PoolReuseOutcomePayload creates a payload for pool reuse events —
+// TypePoolReuseSkipped when a polecat was reused, TypePoolReuseRefused when
+// none was.
+//
+// "reused" is written unconditionally, never omitempty: an absent field would
+// be indistinguishable from a recorded false, which is the exact ambiguity this
+// payload exists to end. A reader of the feed alone must be able to say whether
+// a polecat was reused and which one (gt-ibtb).
+func PoolReuseOutcomePayload(o PoolReuseOutcome) map[string]interface{} {
+	candidateList := CandidateListComplete
+	if o.GateAccepted {
+		candidateList = CandidateListPrefix
 	}
-	if lookupErr != "" {
-		p["lookup_error"] = lookupErr
+	p := map[string]interface{}{
+		"rig":            o.Rig,
+		"considered":     o.Considered,
+		"rejected":       o.Rejections,
+		"reused":         o.ReusedPolecat != "",
+		"candidate_list": candidateList,
+	}
+	if o.ReusedPolecat != "" {
+		p["reused_polecat"] = o.ReusedPolecat
+	}
+	if o.LookupError != "" {
+		p["lookup_error"] = o.LookupError
 	}
 	return p
+}
+
+// PoolReuseSummary renders a pool reuse event as one self-explaining line,
+// from the payload alone and with no source access.
+//
+// It lives here, not in the two renderers, because there are two: the feed
+// curator and `gt audit`. Both used to fall through to their default arm and
+// print the bare type name, so "pool_reuse_refused" WAS the whole rendered
+// line — and that line was a lie on every event ever emitted (gt-ibtb). One
+// implementation is what keeps the two surfaces from drifting apart again.
+//
+// Events emitted before the outcome was recorded carry no "reused" key. Those
+// are reported as outcome-not-recorded rather than guessed at: inferring reuse
+// from considered == len(rejected)+1 is exactly the short-circuit contract a
+// reader of the feed should not have to know.
+func PoolReuseSummary(eventType string, payload map[string]interface{}) string {
+	rig, _ := payload["rig"].(string)
+	if rig == "" {
+		rig = "?"
+	}
+	considered := payloadInt(payload, "considered")
+	rejected := payloadStrings(payload, "rejected")
+	lookupErr, _ := payload["lookup_error"].(string)
+	reused, outcomeRecorded := payload["reused"].(bool)
+	// Fall back to the type when the payload predates the flag but the type
+	// itself is the post-split one, which can only mean a reuse.
+	if !outcomeRecorded && eventType == TypePoolReuseSkipped {
+		reused, outcomeRecorded = true, true
+	}
+	reusedName, _ := payload["reused_polecat"].(string)
+
+	var b strings.Builder
+	switch {
+	case !outcomeRecorded:
+		fmt.Fprintf(&b, "%s: pool reuse outcome NOT RECORDED by this event (%d considered, %d passed over)", rig, considered, len(rejected))
+	case reused:
+		name := reusedName
+		if name == "" {
+			name = "an idle polecat"
+		}
+		fmt.Fprintf(&b, "%s: REUSED %s after passing over %d of %d candidates; no fresh worktree", rig, name, len(rejected), considered)
+	default:
+		fmt.Fprintf(&b, "%s: REFUSED — no idle polecat reused (%d considered); allocating a fresh worktree", rig, considered)
+	}
+	// The compounding half of gt-ibtb: nine rejections over a prefix is not a
+	// survey that turned down nine polecats. Say so on the line, so the reader
+	// does not need the short-circuit contract to size the number.
+	if payload["candidate_list"] == CandidateListPrefix {
+		b.WriteString("; candidate list is a PREFIX — the gate stopped at the one it accepted and never evaluated the rest")
+	}
+	if len(rejected) > 0 {
+		fmt.Fprintf(&b, "; passed over: %s", strings.Join(rejected, "; "))
+	}
+	if lookupErr != "" {
+		fmt.Fprintf(&b, "; lookup error: %s", lookupErr)
+	}
+	return b.String()
+}
+
+// payloadInt reads a numeric payload field, tolerating both the native int a
+// same-process caller passes and the float64 encoding/json hands back after a
+// round trip through the feed file.
+func payloadInt(payload map[string]interface{}, key string) int {
+	switch v := payload[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// payloadStrings reads a string-slice payload field, tolerating both the native
+// []string and the []interface{} a JSON round trip produces.
+func payloadStrings(payload map[string]interface{}, key string) []string {
+	switch v := payload[key].(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // BootPayload creates a payload for rig boot events.

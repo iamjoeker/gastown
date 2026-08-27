@@ -924,8 +924,10 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			// Same shape, no declaration. The bead is closed, so nothing will
 			// submit this branch either — but the closure did not say the work was
 			// unwanted, so this still blocks exactly as hard as mq-not-submitted.
-			// Only the words change, and they change because they are what
-			// pool_reuse_refused records: refused as "mq-not-submitted" this slot
+			// Only the words change, and they change because they are what the
+			// pool reuse events record in their rejection lines
+			// (pool_reuse_skipped when a later candidate was reused,
+			// pool_reuse_refused when none was): refused as "mq-not-submitted" this slot
 			// reads like a polecat that merely has not got round to submitting yet,
 			// and a reader has no way to see that the same refusal will repeat on
 			// every dispatch until a human intervenes (gt-xm6w).

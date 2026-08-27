@@ -382,6 +382,36 @@ func TestCurator_GeneratesSummary(t *testing.T) {
 	}
 }
 
+// TestCurator_PoolReuseSummaryIsNotTheBareTypeName covers gt-ibtb at the
+// surface where the misreading started.
+//
+// Pool reuse events had no arm in generateSummary, so they fell through to the
+// default and rendered as "gt: pool_reuse_refused" — the type name WAS the
+// whole line. It named the wrong outcome on every event ever emitted, and three
+// observers arrived through this line rather than through the bead.
+func TestCurator_PoolReuseSummaryIsNotTheBareTypeName(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "feed-test-*")
+	defer os.RemoveAll(tmpDir)
+	curator := NewCurator(tmpDir)
+
+	event := &events.Event{
+		Type:  events.TypePoolReuseSkipped,
+		Actor: "gt",
+		Payload: events.PoolReuseOutcomePayload(events.PoolReuseOutcome{
+			Rig: "gastown", Considered: 2,
+			Rejections:    []string{"brahmin=push-failed state=done"},
+			ReusedPolecat: "chrome", GateAccepted: true,
+		}),
+	}
+	summary := curator.generateSummary(event)
+	if summary == fmt.Sprintf("%s: %s", event.Actor, event.Type) {
+		t.Fatalf("summary fell through to the default arm: %q", summary)
+	}
+	if !strings.Contains(summary, "chrome") || !strings.Contains(summary, "REUSED") {
+		t.Fatalf("summary %q must name the reuse and the polecat reused", summary)
+	}
+}
+
 // --- Truncation and size limit tests ---
 
 func TestCurator_TruncatesAtMaxSize(t *testing.T) {
