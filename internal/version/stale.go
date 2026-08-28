@@ -197,22 +197,42 @@ func CheckStaleBinaryWithOptions(repoDir string, opts StaleOptions) *StaleBinary
 	// feature work and produces a false "N commits behind" warning advising a
 	// rebuild from the feature branch (GH#4034). Staleness is only meaningful
 	// relative to a *build branch*.
+	// Whatever ref is chosen must CONTAIN the binary's commit. Staleness is
+	// "the build ref moved past the binary"; comparing against a ref the binary
+	// is already past measures nothing, and the two surfaces that print the
+	// result both render it as a plain disagreement the reader cannot resolve:
+	// the startup banner said "gt binary is stale (built from fcffa2c2, main at
+	// 5e84c5b4)" while `gt stale` said "1 commits behind origin/main
+	// (ba5302e9)" in the same minute — and 5e84c5b4 is an ANCESTOR of
+	// fcffa2c2, so on the banner's own numbers the binary was AHEAD (gt-inde).
+	//
+	// resolveBuildBranchRef has always required this; the on-a-build-branch
+	// shortcut below did not, and $GT_ROOT/gastown/mayor/rig sits on `main`
+	// with a local `main` that only moves when something pulls — exactly the
+	// ref most likely to lag the binary.
+	var headCommit string
 	var compareCommit string
 	var compareRef buildBranchRef
 	if info.OnMainBranch {
-		// Already on a build branch — its HEAD is the build branch.
-		compareCommit, err = resolveGitCommit(repoDir, "HEAD")
+		// Already on a build branch — its HEAD is the build branch, provided
+		// the branch has not fallen behind the binary.
+		headCommit, err = resolveGitCommit(repoDir, "HEAD")
 		if err != nil {
 			info.Error = fmt.Errorf("cannot resolve build branch HEAD: %w", err)
 			return info
 		}
-		compareRef = buildBranchRef{display: branch, commit: compareCommit, branch: branch}
-	} else {
-		// Resolve a real build-branch ref instead of the feature HEAD.
+		if isAncestor(repoDir, binaryCommit, headCommit) {
+			compareCommit = headCommit
+			compareRef = buildBranchRef{display: branch, commit: headCommit, branch: branch}
+		}
+	}
+	if compareCommit == "" {
+		// Resolve a real build-branch ref instead of the feature HEAD, or
+		// instead of a build branch that does not contain the binary.
 		ref, ok := resolveBuildBranchRef(repoDir, binaryCommit)
 		if !ok {
 			info.Skipped = true
-			info.SkipReason = "source worktree not on a build branch and no build-branch ref found to compare against"
+			info.SkipReason = noComparableRefReason(branch, headCommit, info.BinaryCommit)
 			return info
 		}
 		compareRef = ref
@@ -242,6 +262,16 @@ func CheckStaleBinaryWithOptions(repoDir string, opts StaleOptions) *StaleBinary
 			info.RefreshError = err.Error()
 		case remoteCommit == "":
 			info.RefreshError = fmt.Sprintf("%s/%s resolved to no commit", remote, compareRef.branch)
+		case !isAncestor(repoDir, binaryCommit, remoteCommit):
+			// Same containment rule the ref selection above applies, enforced a
+			// second time because the refresh can swap in a commit nobody
+			// checked. A tip that does not contain the binary cannot say how
+			// far the binary is behind; adopting it would print a "build ref"
+			// that is an ANCESTOR of the build commit (gt-inde). Keeping the
+			// local ref instead is safe: it does contain the binary, and an
+			// unrefreshed "fresh" is downgraded to Skipped below.
+			info.RefreshError = fmt.Sprintf("%s/%s is at %s, which does not contain the binary's commit %s",
+				remote, compareRef.branch, ShortCommit(remoteCommit), ShortCommit(info.BinaryCommit))
 		default:
 			info.Refreshed = true
 			compareCommit = remoteCommit
@@ -301,6 +331,22 @@ func markUnprovenFreshness(info *StaleBinaryInfo, opts StaleOptions) {
 	info.Skipped = true
 	info.SkipReason = fmt.Sprintf("could not read %s from the remote, and a local ref that nothing updates cannot prove the binary is fresh: %s",
 		info.CompareRef, info.RefreshError)
+}
+
+// noComparableRefReason explains why no build-branch ref could be compared
+// against, distinguishing the two ways it happens. headCommit is empty when the
+// worktree is not on a build branch at all.
+//
+// The distinction matters because the second case is the one that used to
+// produce a wrong answer rather than no answer: the branch was there, it just
+// did not contain the binary, and saying "no build-branch ref found" would
+// leave a reader looking at a checked-out `main` wondering which ref gt meant.
+func noComparableRefReason(branch, headCommit, binaryCommit string) string {
+	if headCommit == "" {
+		return "source worktree not on a build branch and no build-branch ref found to compare against"
+	}
+	return fmt.Sprintf("build branch %s is at %s, which does not contain the binary's commit %s, and no other build-branch ref does either; cannot measure staleness",
+		branch, ShortCommit(headCommit), ShortCommit(binaryCommit))
 }
 
 // resolveBuildBranchRef finds a build-branch ref to compare the binary against

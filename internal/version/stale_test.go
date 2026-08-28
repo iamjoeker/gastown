@@ -263,6 +263,106 @@ func TestCheckStaleBinary_OnMainBehind(t *testing.T) {
 	}
 }
 
+// TestCheckStaleBinary_OnBuildBranchBehindTheBinary is the gt-inde regression.
+//
+// $GT_ROOT/gastown/mayor/rig sits on `main`, and its local `main` only moves
+// when something pulls — so it routinely LAGS the commit the binary was built
+// from. The on-a-build-branch shortcut compared against that HEAD without
+// asking whether it contained the binary, and the startup banner printed
+// "gt binary is stale (built from fcffa2c2, main at 5e84c5b4)" while `gt stale`
+// printed "1 commits behind origin/main (ba5302e9)" in the same minute. The
+// banner's SHA was an ANCESTOR of the build commit, so a reader working from
+// the banner alone would conclude the binary was AHEAD of main and dismiss a
+// warning that was correct for a reason the banner did not state.
+//
+// The fix is that the compare ref must CONTAIN the binary's commit —
+// resolveBuildBranchRef has always required it; this path did not.
+func TestCheckStaleBinary_OnBuildBranchBehindTheBinary(t *testing.T) {
+	dir := newGitRepo(t)
+	ancestor := gitCommit(t, dir, "a.go", "1") // what local main is parked on
+	binary := gitCommit(t, dir, "b.go", "2")   // what the binary was built from
+	landed := gitCommit(t, dir, "c.go", "3")   // where the build branch really is
+	gitRun(t, dir, "branch", "-M", "main")
+	gitRun(t, dir, "update-ref", "refs/remotes/origin/main", landed)
+	gitRun(t, dir, "reset", "--hard", ancestor)
+	setBinaryCommit(t, binary)
+
+	info := CheckStaleBinary(dir)
+	if info.Error != nil {
+		t.Fatalf("unexpected error: %v", info.Error)
+	}
+	if info.Skipped {
+		t.Fatalf("expected not skipped (origin/main contains the binary), got skip: %s", info.SkipReason)
+	}
+	if !info.OnMainBranch {
+		t.Errorf("OnMainBranch should be true: the worktree is on main")
+	}
+	if info.RepoCommit == ancestor {
+		t.Fatalf("compared against %s, which the binary is already past — the gt-inde defect", ShortCommit(ancestor))
+	}
+	if isAncestor(dir, info.RepoCommit, info.BinaryCommit) {
+		t.Fatalf("RepoCommit %s is an ancestor of the binary commit %s; the compare ref must contain the binary",
+			ShortCommit(info.RepoCommit), ShortCommit(info.BinaryCommit))
+	}
+	if info.CompareRef != "origin/main" {
+		t.Errorf("CompareRef = %q, want origin/main (local main lags the binary)", info.CompareRef)
+	}
+	if info.RepoCommit != landed {
+		t.Errorf("RepoCommit = %q, want %q", info.RepoCommit, landed)
+	}
+	if !info.IsStale {
+		t.Errorf("binary is genuinely one commit behind origin/main; must be stale")
+	}
+	if info.CommitsBehind != 1 {
+		t.Errorf("CommitsBehind = %d, want 1", info.CommitsBehind)
+	}
+	if !info.IsForward {
+		t.Errorf("IsForward should be true: origin/main descends from the binary commit")
+	}
+
+	// The banner is the surface that carried the wrong SHA, so pin its text.
+	msg := info.Describe("gt binary")
+	if !strings.Contains(msg, ShortCommit(landed)) {
+		t.Errorf("banner %q must name the build-branch tip %s", msg, ShortCommit(landed))
+	}
+	if strings.Contains(msg, ShortCommit(ancestor)) {
+		t.Errorf("banner %q must not name %s, an ancestor of the build commit", msg, ShortCommit(ancestor))
+	}
+}
+
+// TestCheckStaleBinary_OnBuildBranchBehindBinaryNoOtherRefSkips: same shape as
+// the gt-inde regression but with no other build-branch ref to fall back to.
+// "Cannot measure" is the honest answer; reporting stale against a ref the
+// binary is past is not.
+func TestCheckStaleBinary_OnBuildBranchBehindBinaryNoOtherRefSkips(t *testing.T) {
+	dir := newGitRepo(t)
+	ancestor := gitCommit(t, dir, "a.go", "1")
+	binary := gitCommit(t, dir, "b.go", "2")
+	gitRun(t, dir, "branch", "-M", "main")
+	// Keep the binary's commit reachable (a non-build-branch ref, so it is not
+	// a compare candidate) while main is parked behind it.
+	gitRun(t, dir, "update-ref", "refs/heads/keep/binary", binary)
+	gitRun(t, dir, "reset", "--hard", ancestor)
+	setBinaryCommit(t, binary)
+
+	info := CheckStaleBinary(dir)
+	if info.Error != nil {
+		t.Fatalf("unexpected error: %v", info.Error)
+	}
+	if info.IsStale {
+		t.Fatalf("binary is ahead of main; must not report stale")
+	}
+	if !info.Skipped {
+		t.Fatalf("expected Skipped when no build-branch ref contains the binary")
+	}
+	if !strings.Contains(info.SkipReason, "does not contain the binary's commit") {
+		t.Errorf("SkipReason = %q, want it to say main does not contain the binary's commit", info.SkipReason)
+	}
+	if !strings.Contains(info.SkipReason, ShortCommit(ancestor)) {
+		t.Errorf("SkipReason = %q, want it to name where main actually is (%s)", info.SkipReason, ShortCommit(ancestor))
+	}
+}
+
 // TestCheckStaleBinary_NoBuildBranchSkips: feature branch, no main/master/
 // carry/remote — the check must skip rather than diff against feature HEAD.
 func TestCheckStaleBinary_NoBuildBranchSkips(t *testing.T) {

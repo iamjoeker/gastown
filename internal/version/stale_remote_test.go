@@ -163,6 +163,43 @@ func TestCheckStaleBinary_UnreachableRemoteStillReportsStale(t *testing.T) {
 	}
 }
 
+// TestCheckStaleBinary_RemoteTipBehindBinaryIsNotStale closes the second route
+// to the gt-inde defect. Fixing the ref SELECTION is not enough: the refresh
+// swaps in a commit nobody checked, so a remote tip that does not contain the
+// binary would be adopted and printed as the "build ref" — an ancestor of the
+// build commit, the same wrong pair on the other surface.
+//
+// Here the binary is built from a local commit that was never pushed, so
+// origin/main is behind it. The binary is AHEAD, not stale, and the check must
+// say it could not measure rather than name a SHA the binary is past.
+func TestCheckStaleBinary_RemoteTipBehindBinaryIsNotStale(t *testing.T) {
+	_, clone := newClonedRepo(t)
+	remoteTip := gitRun(t, clone, "rev-parse", "HEAD")
+	binary := gitCommit(t, clone, "b.go", "2")
+	setBinaryCommit(t, binary)
+
+	info := CheckStaleBinaryWithOptions(clone, StaleOptions{RefreshRemote: true})
+	if info.Error != nil {
+		t.Fatalf("unexpected error: %v", info.Error)
+	}
+	if info.IsStale {
+		t.Fatalf("binary is ahead of origin/main; must not report stale (RepoCommit=%s)", ShortCommit(info.RepoCommit))
+	}
+	if info.RepoCommit == remoteTip {
+		t.Errorf("adopted the remote tip %s, which does not contain the binary %s",
+			ShortCommit(remoteTip), ShortCommit(binary))
+	}
+	if info.Refreshed {
+		t.Errorf("Refreshed must be false when the remote tip could not be used")
+	}
+	if !strings.Contains(info.RefreshError, "does not contain the binary's commit") {
+		t.Errorf("RefreshError = %q, want it to say the remote tip does not contain the binary", info.RefreshError)
+	}
+	if !info.Skipped {
+		t.Fatalf("an unrefreshed 'fresh' must be reported as Skipped")
+	}
+}
+
 // TestCheckStaleBinary_RefreshFromFeatureBranch: the rig is not always parked
 // on main. From a feature branch the compare ref is resolved from the
 // candidate list, and the refresh must re-read THAT branch from ITS remote
