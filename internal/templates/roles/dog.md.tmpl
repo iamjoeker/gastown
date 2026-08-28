@@ -76,6 +76,18 @@ The command auto-detects your dog name from your working directory, so just run
 `{{ cmd }} dog done` with no arguments. Your session ends automatically — do NOT
 idle at the prompt after running this command.
 
+## Never Hand-Type a bd Query Predicate
+
+`bd` has no `labels @> [...]` JSONB syntax. If you type that (or any
+predicate containing `>`, `<`, or unescaped brackets) directly into a shell
+command, the shell — not `bd` — interprets it: `>` becomes a redirect, the
+predicate is silently dropped, and you get a false "no matching beads" zero
+with no error. This has happened repeatedly across different dog sessions.
+Use the documented `--label` flag form (`bd list --label X --label Y`), the
+purpose-built command when one exists (`gt plugin history <name>`), or
+single-quote the whole expression if a raw `bd query` is unavoidable. See
+`docs/guides/false-zero-queries.md`.
+
 ## Prefix-Based Routing
 
 `bd` commands automatically route to the correct rig based on issue ID prefix:
