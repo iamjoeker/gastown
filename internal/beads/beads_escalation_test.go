@@ -840,6 +840,30 @@ func TestCloseEscalation_ClosesDeliveredCopies(t *testing.T) {
 	}
 }
 
+// Both the record and its delivered copy are force-closed (pin guard, or
+// closing another agent's bead). Without a marker, that bypass is
+// indistinguishable from an ordinary close after the fact (gt-cks0, mirrors
+// hq-smicg).
+func TestCloseEscalation_StampsForceCloseLabel(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	if _, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved: dolt restarted"); err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+
+	for _, id := range []string{"hq-wisp-r1", "hq-c1"} {
+		if !stub.hasWrite("update "+id, "--add-label="+ForceCloseLabel) {
+			t.Errorf("%s was not stamped with %q; bd writes:\n%s", id, ForceCloseLabel, strings.Join(stub.writes(), "\n"))
+		}
+	}
+}
+
 // A copy's description is the mail body. Rewriting it with the structured
 // escalation format would destroy the delivered message.
 func TestCloseEscalation_DoesNotRewriteCopyDescriptions(t *testing.T) {

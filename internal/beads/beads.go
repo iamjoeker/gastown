@@ -2307,6 +2307,24 @@ type closeOptions struct {
 	force      bool
 }
 
+// ForceCloseLabel marks an issue as closed via --force, bypassing gate
+// satisfaction or pinned-bead protection. Without it, a forced close is
+// byte-for-byte indistinguishable from a clean one, so the bypass can never
+// be audited after the fact (gt-cks0, mirrors hq-smicg).
+const ForceCloseLabel = "force-closed"
+
+// markForceClosed stamps ids with ForceCloseLabel after a forced close has
+// already succeeded. It is best-effort: the close itself is the operation
+// that matters, so a labeling failure is reported but does not undo or fail
+// the close.
+func (b *Beads) markForceClosed(ids ...string) {
+	for _, id := range ids {
+		if err := b.Update(id, UpdateOptions{AddLabels: []string{ForceCloseLabel}}); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: force-closed %s but failed to stamp %q label: %v\n", id, ForceCloseLabel, err)
+		}
+	}
+}
+
 // Close closes one or more issues.
 // If a runtime session ID is set in the environment, it is passed to bd close
 // for work attribution tracking (see decision 009-session-events-architecture.md).
@@ -2363,7 +2381,13 @@ func (b *Beads) closeInCurrentDB(opts closeOptions, ids ...string) error {
 	// ForceCloseWithReason (e.g., gt done nuking polecat wisps) are already
 	// accepting that deps may remain dangling, so this is intentional.
 	if b.store != nil {
-		return b.storeClose(opts.reason, runtime.SessionIDFromEnv(), ids...)
+		if err := b.storeClose(opts.reason, runtime.SessionIDFromEnv(), ids...); err != nil {
+			return err
+		}
+		if opts.force {
+			b.markForceClosed(ids...)
+		}
+		return nil
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -2379,8 +2403,13 @@ func (b *Beads) closeInCurrentDB(opts closeOptions, ids ...string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	_, err := b.run(args...)
-	return err
+	if _, err := b.run(args...); err != nil {
+		return err
+	}
+	if opts.force {
+		b.markForceClosed(ids...)
+	}
+	return nil
 }
 
 // Release moves an in_progress issue back to open status.

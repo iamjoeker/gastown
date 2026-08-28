@@ -885,6 +885,35 @@ func TestStoreForceCloseWithReason(t *testing.T) {
 	if !store.closed["test-1"] {
 		t.Fatal("expected issue to be force-closed")
 	}
+
+	found := false
+	for _, l := range store.labels["test-1"] {
+		if l == ForceCloseLabel {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected %q label to be stamped on forced close, got labels %v", ForceCloseLabel, store.labels["test-1"])
+	}
+}
+
+// TestStoreCloseWithReason_DoesNotStampForceCloseLabel guards against a plain
+// (non-forced) close being mistaken for a forced one, which would defeat the
+// marker's purpose (gt-cks0).
+func TestStoreCloseWithReason_DoesNotStampForceCloseLabel(t *testing.T) {
+	store := newMockStorage()
+	b := newTestBeads(store)
+
+	store.CreateIssue(context.Background(), &beadsdk.Issue{Title: "clean-close-me"}, "test")
+
+	if err := b.CloseWithReason("done", "test-1"); err != nil {
+		t.Fatalf("CloseWithReason: %v", err)
+	}
+	for _, l := range store.labels["test-1"] {
+		if l == ForceCloseLabel {
+			t.Fatalf("plain close must not carry the %q label", ForceCloseLabel)
+		}
+	}
 }
 
 func TestStoreReleaseWithReason(t *testing.T) {

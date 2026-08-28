@@ -622,6 +622,7 @@ func (b *Beads) closeEscalationRecord(issue *Issue, closedBy, reason string) (bo
 	if _, err := target.run("close", issue.ID, "--force", "--reason="+reason); err != nil {
 		return false, scrubForceAdvice(err)
 	}
+	target.markForceClosed(issue.ID)
 	return true, nil
 }
 
@@ -637,8 +638,11 @@ func (b *Beads) closeEscalationCopy(issue *Issue, reason string) error {
 	if err := target.Update(issue.ID, UpdateOptions{AddLabels: []string{"resolved"}}); err != nil {
 		return err
 	}
-	_, err := target.run("close", issue.ID, "--force", "--reason="+reason)
-	return scrubForceAdvice(err)
+	if _, err := target.run("close", issue.ID, "--force", "--reason="+reason); err != nil {
+		return scrubForceAdvice(err)
+	}
+	target.markForceClosed(issue.ID)
+	return nil
 }
 
 // forceAdvice matches bd's "(use --force to override)" remedy, which it appends
