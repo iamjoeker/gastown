@@ -1761,7 +1761,20 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			fmt.Printf("    reason=%s state=%s — please report this output; it is a reporting bug.\n",
 				orUnknownRecoveryField(status.Reason), orUnknownRecoveryField(string(status.State)))
 		}
-		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
+		fmt.Println()
+		// There is no distinct 'recover' verb — "Escalate to Mayor for recovery"
+		// used to name one that doesn't exist. The only cleanup-adjacent command
+		// is `gt polecat nuke`, and it requires a human or Mayor identity
+		// (restart-first policy, gt-dsgp); nothing here runs it automatically
+		// (gt-d2r1, mirrors hq-f183o).
+		if len(status.RecoveryActions) > 0 {
+			fmt.Println("  Run the recovery action(s) above, then rerun check-recovery. If none")
+			fmt.Println("  apply, escalate to Mayor: this state needs manual resolution, not an")
+			fmt.Println("  automated recovery command.")
+		} else {
+			fmt.Println("  Escalate to Mayor: this state needs manual resolution — there is no")
+			fmt.Println("  automated recovery command to run first.")
+		}
 	case polecat.WorkstateVerdictNeedsStateClear:
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_STATE_CLEAR"))
 		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
