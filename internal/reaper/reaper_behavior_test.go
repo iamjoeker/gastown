@@ -163,6 +163,61 @@ func TestAutoCloseExemptionMatrix(t *testing.T) {
 	}
 }
 
+// TestAutoCloseAckedMailBehaviour is the acceptance test for gt-ljun.
+//
+// `gt mail check --inject` writes `delivery:acked` on every unread message
+// purely to record delivery, without reading or closing it. AutoClose's
+// blanket gt:message exemption (AutoCloseExemptLabels) then keeps that bead
+// open forever, inflating every ready-work count derived from status=open.
+// AutoCloseAckedMail must close the acked-and-stale one while leaving a
+// same-age mail bead that was never acked (still awaiting a reader) alone —
+// that one really is "unread mail" in the sense the original exemption meant.
+func TestAutoCloseAckedMailBehaviour(t *testing.T) {
+	f := newFixture(t, "autoclose_acked_mail")
+	stale := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	fresh := time.Now().UTC().Add(-1 * time.Hour)
+
+	f.insertIssues(t,
+		issueRow{id: "hq-acked-stale", priority: 2, updatedAt: stale, labels: []string{"gt:message", "delivery:acked"}},
+		issueRow{id: "hq-unacked-stale", priority: 2, updatedAt: stale, labels: []string{"gt:message"}},
+		issueRow{id: "hq-acked-fresh", priority: 2, updatedAt: fresh, labels: []string{"gt:message", "delivery:acked"}},
+	)
+
+	// The blanket sweep must still leave every gt:message bead alone —
+	// AutoCloseAckedMail is a separate, narrower pass, not a replacement.
+	autoCloseResult, err := AutoClose(f.db, f.dbName, staleAge, false)
+	if err != nil {
+		t.Fatalf("AutoClose: %v", err)
+	}
+	if autoCloseResult.Closed != 0 {
+		t.Errorf("AutoClose.Closed = %d, want 0 — it must not touch gt:message beads itself", autoCloseResult.Closed)
+	}
+
+	result, err := AutoCloseAckedMail(f.db, f.dbName, staleAge, false)
+	if err != nil {
+		t.Fatalf("AutoCloseAckedMail: %v", err)
+	}
+
+	if got := f.issueStatus(t, "hq-acked-stale"); got != "closed" {
+		t.Errorf("hq-acked-stale status = %q, want closed — acked-and-stale mail must close", got)
+	}
+	if got := f.issueStatus(t, "hq-unacked-stale"); got != "open" {
+		t.Errorf("hq-unacked-stale status = %q, want open — never-acked mail is still unread and must stay open", got)
+	}
+	if got := f.issueStatus(t, "hq-acked-fresh"); got != "open" {
+		t.Errorf("hq-acked-fresh status = %q, want open — not stale yet", got)
+	}
+	if got := closedEntryIDs(result); !reflect.DeepEqual(got, []string{"hq-acked-stale"}) {
+		t.Errorf("ClosedEntries = %v, want [hq-acked-stale]", got)
+	}
+	if result.Closed != 1 {
+		t.Errorf("Closed = %d, want 1", result.Closed)
+	}
+	if commits := f.doltCommitMessages(); len(commits) != 1 {
+		t.Errorf("DOLT_COMMIT calls = %v, want exactly one", commits)
+	}
+}
+
 // TestPurgeClosedWispsBehaviour covers the reaper's only unrecoverable
 // operation: purge DELETEs rows. The controls are a recently-closed wisp and a
 // stale OPEN wisp, both of which must survive — an over-broad DELETE takes them
