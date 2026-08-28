@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -141,6 +142,47 @@ func TestPollerAlive_LiveProcess(t *testing.T) {
 	if pid != myPid {
 		t.Errorf("pollerAlive() pid = %d, want %d", pid, myPid)
 	}
+}
+
+// A zombie still answers signal(0) — it holds its PID until its parent calls
+// wait(2) — so a liveness check based on that alone treats a defunct poller
+// as running forever and never restarts it (hq-hidp). This spawns a real
+// child, lets it exit, and deliberately withholds Wait() to produce a real
+// zombie, then verifies pollerProcessAlive reports it as NOT alive.
+func TestPollerAlive_ZombieProcessIsNotAlive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("zombie processes are a POSIX concept")
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("relies on /proc or a ps with -o state=; only verified on Linux CI")
+	}
+
+	cmd := exec.Command("true")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting child: %v", err)
+	}
+	pid := cmd.Process.Pid
+
+	// Deliberately do NOT call cmd.Wait() — that is what turns the exited
+	// child into a zombie instead of reaping it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		state, ok := procStatState(pid)
+		if ok && state == "Z" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child pid %d never became a zombie (last state %q, ok=%v)", pid, state, ok)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if pollerProcessAlive(pid) {
+		t.Errorf("pollerProcessAlive(%d) = true for a zombie process, want false", pid)
+	}
+
+	// Clean up: reap it now that the assertion is done.
+	_ = cmd.Wait()
 }
 
 func TestBuildPollerCommand_UsesDetachedProcessGroup(t *testing.T) {

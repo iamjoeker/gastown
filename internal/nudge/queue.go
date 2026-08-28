@@ -115,6 +115,89 @@ func queueDir(townRoot, session string) string {
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe)
 }
 
+// discardLogPath returns the path of the durable discard log for a session.
+// It lives outside queueDir so it is never mistaken for a pending nudge by
+// Pending/Drain/removeMatching (all of which only look at "*.json" entries
+// directly inside queueDir) and never counted toward MaxQueueDepth.
+func discardLogPath(townRoot, session string) string {
+	safe := strings.ReplaceAll(session, "/", "_")
+	return filepath.Join(townRoot, constants.DirRuntime, "nudge_discarded", safe+".jsonl")
+}
+
+// DiscardedNudge is one line of the discard log: a nudge that was removed
+// without ever being delivered, and why.
+type DiscardedNudge struct {
+	QueuedNudge
+	Reason      string    `json:"reason"`
+	DiscardedAt time.Time `json:"discarded_at"`
+}
+
+// recordDiscard appends a durable record of a nudge that was destroyed
+// without delivery, and prints a warning.
+//
+// Before this, an expired nudge was simply os.Remove'd: Drain (gt-1g2q)
+// silently ate 87 of 95 queued nudges past their TTL, and nothing else ever
+// looked at the queue to notice. A durable log turns "vanished, no trace" into
+// something a human or a future patrol can actually find and count. The
+// stderr warning is best-effort — the poller process discards its own stderr
+// (buildPollerCommand), so the log file is the signal of record; stderr helps
+// only in contexts (like `gt mail check`) where it isn't thrown away.
+func recordDiscard(townRoot, session string, n QueuedNudge, reason string) {
+	rec := DiscardedNudge{QueuedNudge: n, Reason: reason, DiscardedAt: time.Now()}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	path := discardLogPath(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to record discarded nudge (mkdir): %v\n", err)
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to record discarded nudge: %v\n", err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to write discarded nudge record: %v\n", err)
+	}
+	fmt.Fprintf(os.Stderr, "Warning: discarding %s nudge for %s from %s (queued %s ago): %.80s\n",
+		reason, session, n.Sender, humanAge(time.Since(n.Timestamp)), n.Message)
+}
+
+// DiscardedSince returns nudges destroyed without delivery for a session
+// since the given time (zero value returns the whole log). This is the
+// read side of recordDiscard — the durable trace a TTL-discard or a purge
+// leaves behind, for callers (patrols, `gt nudge` status output, tests) that
+// need to know a queue's silence does not mean nothing was lost.
+func DiscardedSince(townRoot, session string, since time.Time) ([]DiscardedNudge, error) {
+	path := discardLogPath(townRoot, session)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading discard log: %w", err)
+	}
+	var out []DiscardedNudge
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec DiscardedNudge
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec.DiscardedAt.Before(since) {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
 // randomSuffix returns a short random hex string to disambiguate filenames
 // when multiple processes enqueue within the same nanosecond.
 func randomSuffix() string {
@@ -309,7 +392,11 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 		}
 
 		// Skip expired nudges — stale messages create noise, not value.
+		// The nudge itself is still recorded to the discard log before removal
+		// so this destruction leaves a trace (gt-1g2q): silently deleting it
+		// outright is what let 87 of 95 queued nudges vanish unnoticed.
 		if !n.ExpiresAt.IsZero() && now.After(n.ExpiresAt) {
+			recordDiscard(townRoot, session, n, "ttl-expired-drain")
 			if rmErr := os.Remove(claimPath); rmErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to remove expired nudge %s: %v\n", entry.Name(), rmErr)
 			}
@@ -379,7 +466,7 @@ func RemoveKindByThread(townRoot, session, kind, threadID string) (int, error) {
 	}
 	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
 		return n.Kind == kind && n.ThreadID == threadID
-	})
+	}, nil)
 }
 
 // RemoveReplyReminders deletes queued reply-reminder nudges for a session whose
@@ -397,7 +484,7 @@ func RemoveReplyReminders(townRoot, session string, owedTo func(replyTo string) 
 	}
 	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
 		return n.Kind == KindReplyReminder && n.ReplyTo != "" && owedTo(n.ReplyTo)
-	})
+	}, nil)
 }
 
 // PurgeExpired removes queued nudges whose TTL has already elapsed, returning
@@ -406,10 +493,15 @@ func RemoveReplyReminders(townRoot, session string, owedTo func(replyTo string) 
 //
 // Drain already discards expired entries as it reads them, but Drain only runs
 // when someone is there to receive; a queue nobody is draining keeps its dead
-// entries indefinitely and they count against the depth cap.
+// entries indefinitely and they count against the depth cap. Each removal here
+// is recorded to the discard log (see recordDiscard) — this is the path that
+// silently ate most of a real backlog (gt-1g2q) precisely because no one was
+// draining to see it happen.
 func PurgeExpired(townRoot, session string) (int, error) {
 	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
 		return !n.ExpiresAt.IsZero() && time.Now().After(n.ExpiresAt)
+	}, func(n QueuedNudge) {
+		recordDiscard(townRoot, session, n, "ttl-expired-purge")
 	})
 }
 
@@ -432,12 +524,18 @@ func RemoveByMessage(townRoot, session, messageID, threadID string) (int, error)
 			return true
 		}
 		return n.MessageID == "" && threadID != "" && n.ThreadID == threadID
-	})
+	}, nil)
 }
 
 // removeMatching deletes queued .json entries for which match returns true.
 // Claimed files are skipped: a concurrent drainer owns those.
-func removeMatching(townRoot, session string, match func(QueuedNudge) bool) (int, error) {
+//
+// onRemove, if non-nil, is called with each nudge just before it is deleted.
+// Callers that remove a nudge because it is spent (delivered, superseded,
+// answered) pass nil — that removal is the intended lifecycle. PurgeExpired
+// passes recordDiscard, because there the removal IS the failure the nudge
+// was supposed to prevent: a message nobody drained in time.
+func removeMatching(townRoot, session string, match func(QueuedNudge) bool, onRemove func(QueuedNudge)) (int, error) {
 	dir := queueDir(townRoot, session)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -475,6 +573,9 @@ func removeMatching(townRoot, session string, match func(QueuedNudge) bool) (int
 				continue
 			}
 			return removed, fmt.Errorf("removing queued nudge %s: %w", entry.Name(), err)
+		}
+		if onRemove != nil {
+			onRemove(n)
 		}
 		removed++
 	}
