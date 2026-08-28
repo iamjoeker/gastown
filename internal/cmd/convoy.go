@@ -2516,6 +2516,14 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 		deps = append(deps, dep)
 	}
 
+	// A tracked bead moved to another rig after being enqueued keeps its
+	// original id, so the prefix-routed read above finds only the closed
+	// source copy — the live row sits in the rig it moved to. Left as-is,
+	// closeConvoyIfComplete reads that "closed" as the work being done and
+	// auto-closes the convoy while the real row is still open and
+	// undispatched (gt-ju7k, same class as gt-ygb7's scheduler-side fix).
+	adoptMovedTrackedDeps(townBeads, deps)
+
 	// Collect non-closed issue IDs for worker lookup
 	openIssueIDs := make([]string, 0, len(deps))
 	for _, dep := range deps {
