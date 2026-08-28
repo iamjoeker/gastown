@@ -152,6 +152,20 @@ case "${1:-}" in
       printf ']\n'
       exit 0
     fi
+    if [ "${2:-}" = "check-recovery" ]; then
+      target="${3:-}"
+      name="${target##*/}"
+      printf '%s\n' "$target" >> "$TEST_STATE/check_recovery_calls.log"
+      if [ -f "$TEST_STATE/check_recovery_fail/$name" ]; then
+        exit 1
+      fi
+      needs_recovery=false
+      if [ -f "$TEST_STATE/needs_recovery/$name" ]; then
+        needs_recovery=true
+      fi
+      printf '{"needs_recovery":%s}\n' "$needs_recovery"
+      exit 0
+    fi
     ;;
   mq)
     if [ "${2:-}" = "list" ]; then
@@ -335,7 +349,7 @@ setup_case() {
   export GT_STUCK_AGENT_DOG_STATE_DIR="$TEST_TMP/dogstate"
   local bin_dir="$TEST_TMP/bin"
 
-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$bin_dir"
+  mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/needs_recovery" "$TEST_STATE/check_recovery_fail" "$bin_dir"
   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
   : > "$TEST_STATE/mail.log"
@@ -439,6 +453,37 @@ test_healthy_runtime() {
   assert_file_empty "$TEST_STATE/mail.log" "$runtime healthy: no restart mail"
   assert_file_empty "$TEST_STATE/escalate.log" "$runtime healthy: no escalation"
   assert_file_contains "$TEST_STATE/health_calls.log" "gt-$runtime --max-inactivity 0s" "$runtime healthy: used central health"
+}
+
+# --- check-recovery cross-check (gt-zt4o, mirrors hq-h6c2i) ------------------
+# The measured hq-h6c2i population showed a zombie counted healthy and a
+# NEEDS_RECOVERY polecat dropped entirely, both via the session-health arms.
+# These two cover the same shape of defect reached through a healthy session:
+# check-recovery's own verdict, not the session probe, is authoritative for
+# NEEDS_RECOVERY.
+
+test_healthy_session_but_needs_recovery_is_not_counted_healthy() {
+  setup_case
+  add_polecat wedged healthy
+  touch "$TEST_STATE/needs_recovery/wedged"
+  run_script
+
+  assert_file_contains "$TEST_STATE/check_recovery_calls.log" "gastown/wedged" "needs-recovery mismatch: check-recovery consulted"
+  assert_file_contains "$TEST_STATE/output.log" "NEEDS_RECOVERY: gt-wedged session healthy but check-recovery verdict says needs_recovery=true" "needs-recovery mismatch: named"
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 0 uncounted, 0 terminal, 0 post-submission, 0 pending, 1 needs_recovery" "needs-recovery mismatch: split out of healthy"
+  assert_file_empty "$TEST_STATE/mail.log" "needs-recovery mismatch: no restart mail (reporting only)"
+  assert_file_not_contains "$TEST_STATE/output.log" "WARN:" "needs-recovery mismatch: denominator still balances"
+}
+
+test_check_recovery_unavailable_trusts_session_health() {
+  setup_case
+  add_polecat chrome healthy
+  touch "$TEST_STATE/check_recovery_fail/chrome"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "NOTICE: check-recovery unavailable for gastown/chrome; trusting session health" "check-recovery unavailable: degradation announced"
+  assert_file_contains "$TEST_STATE/output.log" "1 healthy" "check-recovery unavailable: still counted healthy"
+  assert_file_not_contains "$TEST_STATE/output.log" "NEEDS_RECOVERY: gt-chrome" "check-recovery unavailable: not falsely flagged"
 }
 
 test_agent_hung_observe_only() {
@@ -1174,6 +1219,8 @@ test_healthy_runtime opencode
 test_healthy_runtime bun
 test_healthy_runtime node
 test_healthy_runtime claude
+test_healthy_session_but_needs_recovery_is_not_counted_healthy
+test_check_recovery_unavailable_trusts_session_health
 test_agent_hung_observe_only
 test_session_dead_without_hook_is_uncounted
 test_summary_denominator_covers_every_polecat

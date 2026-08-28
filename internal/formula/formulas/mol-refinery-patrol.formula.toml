@@ -108,7 +108,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 16
+version = 17
 
 [vars]
 [vars.wisp_type]
@@ -230,11 +230,21 @@ in merge-push step to send MERGED notification, close the MR bead, and archive t
 Mark as read. The work will be processed in queue-scan/process-branch.
 **Do NOT archive yet** - archive after merge/reject decision in merge-push step.
 
-**PATROL: Wake up**:
-Witness detected MRs waiting but refinery idle. Acknowledge and archive:
+**PATROL: Wake up** (or ANY other nudge/message received while parked):
+Witness detected MRs waiting but refinery idle — or you were nudged with
+free-form text (`gt nudge` delivers text straight into your pane; it is not
+one of the structured events `await-event` watches for, so vague wording is
+common). Either way this is a WAKE SIGNAL, not something to answer
+conversationally. Replying with only an acknowledgment like "Ready to
+process incoming MRs" and returning to idle leaves the queue untouched —
+observed twice in one night from a generic nudge (gt-sbog). Regardless of
+the exact wording:
 ```bash
-gt mail archive <message-id>
+gt mail archive <message-id>   # mail only; a nudge has nothing to archive
 ```
+then immediately continue to queue-scan and run `gt mq list <rig>` before
+saying anything back. Only report queue-empty status AFTER you've checked —
+never in place of checking.
 
 **HELP / Blocked**:
 Assess and respond. If you can't help, escalate to Mayor.
