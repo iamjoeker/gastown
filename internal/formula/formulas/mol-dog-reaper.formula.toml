@@ -242,12 +242,20 @@ Generate summary and signal completion.
 **Anomalies**: (list any anomalies found)
 ```
 
-**2. If anomalies were found, escalate:**
+**2. Give the report a durable sink — write it to a file and close the reaper's**
+**own wisp with it, so the counts (especially Wisps purged, the only record of**
+**bulk deletion) survive past the pane:**
 ```bash
-gt escalate "Reaper anomalies detected" -s MEDIUM -m "<anomaly details>"
+bd close <reaper-wisp-id> --reason-file <path-to-report-file>
 ```
 
-**Exit criteria:** Report generated, anomalies escalated if any."""
+**3. If anomalies were found, escalate (note: `-r`/`--reason`, not `-m`):**
+```bash
+gt escalate "Reaper anomalies detected" -s MEDIUM -r "<anomaly details>"
+```
+
+**Exit criteria:** Report generated and durably recorded via `bd close --reason-file`,
+anomalies escalated if any."""
 
 [vars]
 [vars.max_age]
