@@ -229,7 +229,7 @@ func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
 			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean, ReuseFactsMeasured: true},
 			wantReusable: true,
 			wantSafe:     true,
-			wantCapacity: polecatCapacitySnapshot{ReusableIdle: 1},
+			wantCapacity: polecatCapacitySnapshot{VerifiedReusableIdle: 1},
 		},
 		{
 			// The same polecat as above, seen by the bead-only inventory
@@ -252,7 +252,7 @@ func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
 			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupStash, IgnoreCleanupStatus: true, ReuseFactsMeasured: true},
 			wantReusable: true,
 			wantSafe:     true,
-			wantCapacity: polecatCapacitySnapshot{ReusableIdle: 1},
+			wantCapacity: polecatCapacitySnapshot{VerifiedReusableIdle: 1},
 		},
 		{
 			name:         "live branch stash remains recovery blocked",
@@ -303,7 +303,7 @@ func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
 			}
 			snapshot := polecatCapacitySnapshot{}
 			applyWorkstateDispositionToCapacitySnapshot(&snapshot, tt.in.State, disposition)
-			if snapshot.Working != tt.wantCapacity.Working || snapshot.RecoveryBlocked != tt.wantCapacity.RecoveryBlocked || snapshot.ReusableIdle != tt.wantCapacity.ReusableIdle || snapshot.UnverifiedIdle != tt.wantCapacity.UnverifiedIdle || snapshot.PendingMR != tt.wantCapacity.PendingMR {
+			if snapshot.Working != tt.wantCapacity.Working || snapshot.RecoveryBlocked != tt.wantCapacity.RecoveryBlocked || snapshot.VerifiedReusableIdle != tt.wantCapacity.VerifiedReusableIdle || snapshot.UnverifiedIdle != tt.wantCapacity.UnverifiedIdle || snapshot.PendingMR != tt.wantCapacity.PendingMR {
 				t.Fatalf("capacity projection = %+v, want %+v", snapshot, tt.wantCapacity)
 			}
 		})

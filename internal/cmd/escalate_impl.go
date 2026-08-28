@@ -68,6 +68,12 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 
 	// Dry run mode
 	if escalateDryRun {
+		// The same title check the real path makes, made here too. A dry run that
+		// previews a create the real command refuses is worse than no dry run: it
+		// is a confident rehearsal of something that cannot happen.
+		if err := checkEscalationTitleLen(severity, description); err != nil {
+			return err
+		}
 		actions := escalationConfig.GetRouteForSeverity(severity)
 		targets := extractMailTargetsFromActions(actions)
 		fmt.Printf("Would create escalation:\n")
@@ -97,156 +103,58 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Create escalation bead
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	// Create and route the escalation. The record + routing lives in
+	// raiseEscalation so gt done can raise one too (gt-lj2n) without
+	// reimplementing the durable-twin rules.
 	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
-	if fingerprintLabel != "" {
-		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
-		if err != nil {
-			return fmt.Errorf("checking escalation fingerprint: %w", err)
-		}
-		if len(matches) > 0 {
-			existing := matches[0]
-			if escalateJSON {
-				result := map[string]interface{}{
-					"id":          existing.ID,
-					"status":      "duplicate_suppressed",
-					"fingerprint": fingerprintLabel,
-				}
-				out, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
-				fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
-			}
-			return nil
-		}
-	}
-	fields := &beads.EscalationFields{
+	outcome, err := raiseEscalation(escalationRequest{
+		TownRoot:    townRoot,
+		AgentID:     agentID,
+		Description: description,
 		Severity:    severity,
 		Reason:      escalateReason,
 		Source:      escalateSource,
-		EscalatedBy: agentID,
-		EscalatedAt: time.Now().Format(time.RFC3339),
 		RelatedBead: escalateRelatedBead,
 		Fingerprint: fingerprintLabel,
-	}
-
-	issue, err := bd.CreateEscalationBead(description, fields)
+		Config:      escalationConfig,
+	})
 	if err != nil {
-		return fmt.Errorf("creating escalation bead: %w", err)
+		return err
 	}
 
-	// Get routing actions for this severity
-	actions := escalationConfig.GetRouteForSeverity(severity)
-	targets := extractMailTargetsFromActions(actions)
-
-	// Send mail to each target (actions with "mail:" prefix)
-	router := mail.NewRouter(townRoot)
-	defer router.WaitPendingNotifications()
-	// Statuses start EMPTY. A status is appended only once its channel has been
-	// attempted, and its success flags are set only from a real result. Seeding
-	// this slice with a hardcoded {Channel: "bead", Created: true} was the whole
-	// of the "bead" action's implementation (gt-3i4e): a claim that could never
-	// report failure, printed on every escalation at every severity.
-	var statuses []deliveryStatus
-	for _, target := range targets {
-		status := deliveryStatus{Target: target, Channel: "mail", Severity: severity, NotificationRoute: "mail+nudge"}
-		msg := &mail.Message{
-			From:     agentID,
-			To:       target,
-			Subject:  fmt.Sprintf("[%s] %s", strings.ToUpper(severity), description),
-			Body:     formatEscalationMailBody(issue.ID, severity, escalateReason, agentID, escalateRelatedBead),
-			Type:     mail.TypeEscalation,
-			ThreadID: issue.ID,
-		}
-
-		// Set priority based on severity
-		switch severity {
-		case config.SeverityCritical:
-			msg.Priority = mail.PriorityUrgent
-		case config.SeverityHigh:
-			msg.Priority = mail.PriorityHigh
-		case config.SeverityMedium:
-			msg.Priority = mail.PriorityNormal
-		default:
-			msg.Priority = mail.PriorityLow
-		}
-
-		if err := router.Send(msg); err != nil {
-			status.Error = err.Error()
-			statuses = append(statuses, status)
-			style.PrintWarning("failed to send to %s: %v", target, err)
-			continue
-		}
-		status.Persisted = true
-		status.RuntimeNotified = true
-
-		mailBeads := beads.New(beads.ResolveBeadsDir(townRoot))
-		mailIssue, err := mailBeads.FindLatestIssueByTitleAndAssignee(msg.Subject, mail.AddressToIdentity(target))
-		if err != nil {
-			status.Warning = fmt.Sprintf("annotation lookup failed: %v", err)
-			statuses = append(statuses, status)
-			style.PrintWarning("failed to annotate escalation mail for %s: %v", target, err)
-			continue
-		}
-		status.BeadID = mailIssue.ID
-
-		addLabels := []string{
-			fmt.Sprintf("severity:%s", severity),
-			fmt.Sprintf("escalation:%s", issue.ID),
-		}
-		if err := mailBeads.Update(mailIssue.ID, beads.UpdateOptions{AddLabels: addLabels}); err != nil {
-			status.Warning = fmt.Sprintf("annotation update failed: %v", err)
-			style.PrintWarning("failed to annotate escalation mail labels for %s: %v", target, err)
+	if outcome.Duplicate {
+		if escalateJSON {
+			result := map[string]interface{}{
+				"id":          outcome.RecordID,
+				"status":      "duplicate_suppressed",
+				"fingerprint": fingerprintLabel,
+			}
+			out, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(out))
 		} else {
-			status.Annotated = true
+			fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), outcome.RecordID)
+			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		statuses = append(statuses, status)
+		return nil
 	}
-
-	// Execute the "bead" routing action. It runs after the mail loop on purpose:
-	// a successfully annotated mail copy already IS the durable delivery bead, so
-	// this only creates one when nothing else has (see deliverEscalationBead).
-	beadStatus := deliverEscalationBead(bd, actions, statuses, issue.ID, severity,
-		fmt.Sprintf("[%s] %s", strings.ToUpper(severity), description),
-		formatEscalationDeliveryBody(issue.ID, description, fields))
-	if beadStatus != nil {
-		// Prepend: "bead" is listed first in every configured route, and the
-		// durable record reads before the notifications about it.
-		statuses = append([]deliveryStatus{*beadStatus}, statuses...)
-	}
-
-	// Process external notification actions (email:, sms:, slack, log)
-	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
-
-	// Log to activity feed
-	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
-	payload["severity"] = severity
-	payload["actions"] = strings.Join(actions, ",")
-	if escalateSource != "" {
-		payload["source"] = escalateSource
-	}
-	_ = events.LogFeed(events.TypeEscalationSent, agentID, payload)
 
 	// Output
-	delivered := escalationWasDelivered(statuses)
 	if escalateJSON {
 		hasFailure := false
-		for _, status := range statuses {
+		for _, status := range outcome.Statuses {
 			if status.Error != "" {
 				hasFailure = true
 				break
 			}
 		}
 		result := map[string]interface{}{
-			"id":        issue.ID,
+			"id":        outcome.RecordID,
 			"severity":  severity,
-			"actions":   actions,
-			"targets":   targets,
-			"delivery":  statuses,
-			"status":    escalationDeliveryStatus(delivered, hasFailure),
-			"delivered": delivered,
+			"actions":   outcome.Actions,
+			"targets":   outcome.Targets,
+			"delivery":  outcome.Statuses,
+			"status":    escalationDeliveryStatus(outcome.Delivered, hasFailure),
+			"delivered": outcome.Delivered,
 		}
 		if escalateSource != "" {
 			result["source"] = escalateSource
@@ -258,7 +166,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		fmt.Println(string(out))
 	} else {
 		emoji := severityEmoji(severity)
-		fmt.Printf("%s Escalation created: %s\n", emoji, issue.ID)
+		fmt.Printf("%s Escalation created: %s\n", emoji, outcome.RecordID)
 		fmt.Printf("  Severity: %s\n", severity)
 		if escalateSource != "" {
 			fmt.Printf("  Source: %s\n", escalateSource)
@@ -266,34 +174,28 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if fingerprintLabel != "" {
 			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		if beadStatus != nil && beadStatus.BeadID != "" {
+		if outcome.DurableBeadID != "" {
 			// The record itself is an ephemeral wisp; this is the bead that
 			// outlives it and that `gt escalate list` renders.
-			fmt.Printf("  Recorded as: %s\n", beadStatus.BeadID)
+			fmt.Printf("  Recorded as: %s\n", outcome.DurableBeadID)
 		}
-		if len(targets) > 0 {
-			fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
+		if len(outcome.Targets) > 0 {
+			fmt.Printf("  Routed to: %s\n", strings.Join(outcome.Targets, ", "))
 		} else {
 			// An empty "Routed to:" is how this bug hid for so long — it reads
 			// as a rendering glitch rather than as "nobody was told".
-			fmt.Printf("  Routed to: no mail targets (%s route: %s)\n", severity, strings.Join(actions, ", "))
+			fmt.Printf("  Routed to: no mail targets (%s route: %s)\n", severity, strings.Join(outcome.Actions, ", "))
 		}
-		for _, status := range statuses {
+		for _, status := range outcome.Statuses {
 			if status.Error != "" {
 				fmt.Printf("  Delivery issue [%s:%s]: %s\n", status.Channel, status.Target, status.Error)
 			}
 		}
 	}
 
-	// A routing no-op must never print a success banner and exit 0. The record
-	// exists, but it is an ephemeral wisp with nothing durable referencing it, so
-	// it will be garbage-collected unread — which is exactly how the dn-qpk
-	// disposition was lost for 16 days (gt-3i4e).
-	if !delivered {
-		return fmt.Errorf("escalation %s was recorded but NOT delivered: the %q route (%s) produced no delivery, "+
-			"and the record is an ephemeral wisp that will be garbage-collected with no trace. "+
-			"Fix the route in %s, or re-file at a higher severity",
-			issue.ID, severity, strings.Join(actions, ", "), config.EscalationConfigPath(townRoot))
+	// A routing no-op must never print a success banner and exit 0.
+	if !outcome.Delivered {
+		return undeliveredEscalationError(townRoot, outcome.RecordID, severity, outcome.Actions)
 	}
 
 	return nil
@@ -431,6 +333,11 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 
 	var issues []*beads.Issue
+	// Open escalation beads this list hides because their record is closed. They
+	// are still open beads, so they still count wherever beads are counted, and
+	// saying nothing about them is what made this list disagree with those counts
+	// in silence (gt-f0b3).
+	var stranded []*beads.Issue
 	if escalateListAll {
 		// List all (open and closed)
 		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
@@ -441,7 +348,7 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("parsing escalations: %w", err)
 		}
 	} else {
-		issues, err = bd.ListEscalations()
+		issues, stranded, err = bd.ListEscalationsWithStranded()
 		if err != nil {
 			return fmt.Errorf("listing escalations: %w", err)
 		}
@@ -470,8 +377,20 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	issues = live
 
 	if escalateListJSON {
+		// A nil slice marshals to `null`, and `null` is not a measured zero — it
+		// is what a parser sees when the query died, when the filter dropped
+		// everything, and when there genuinely are no open escalations, with no
+		// way to tell the three apart. Errors already return early above, so the
+		// only honest empty answer here is an empty array (gt-qee3).
+		if issues == nil {
+			issues = []*beads.Issue{}
+		}
 		out, _ := json.MarshalIndent(issues, "", "  ")
 		fmt.Println(string(out))
+		// The JSON shape stays a plain array of the open escalations, so the
+		// hidden set goes to stderr rather than changing what parsers see —
+		// the same channel the phantom warning above already uses.
+		printStrandedEscalations(os.Stderr, stranded)
 		return nil
 	}
 
@@ -482,6 +401,10 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Println("No escalations found")
 		}
+		// "No escalations found" is the most consequential line this command
+		// prints, and it must not be the whole story while open escalation beads
+		// exist.
+		printStrandedEscalations(os.Stdout, stranded)
 		return nil
 	}
 
@@ -490,6 +413,16 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		fields := beads.ParseEscalationFields(issue.Description)
 		emoji := severityEmoji(fields.Severity)
 
+		// The rendered status is a PROJECTION, not issues.status. Every row this
+		// list prints is status='open' by construction — the query filters on it
+		// — so an "[acked]" row disagrees with the table by design, and anyone
+		// reconciling the two finds a mismatch that is not a data problem
+		// (gt-qee3). Ack state lives in the bare "acked" label, written by
+		// `gt escalate ack`. Note the near-miss: mail delivery writes
+		// "delivery:acked" + "delivery-acked-by:<agent>" when a recipient's inbox
+		// receives the copy, and that is NOT an acknowledgement of the
+		// escalation — it must not be read here, or every delivered escalation
+		// would render as handled the moment it was sent.
 		status := issue.Status
 		if beads.HasLabel(issue, "acked") {
 			status = "acked"
@@ -504,7 +437,39 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 	}
 
+	printStrandedEscalations(os.Stdout, stranded)
+
 	return nil
+}
+
+// printStrandedEscalations reports the open escalation beads this list hid.
+//
+// An escalation is two beads: an ephemeral record wisp and a durable delivered
+// copy. When the record is closed and the copy is not, the copy is almost
+// certainly resolved residue and showing it as a live HIGH is the bug gt-4xl
+// fixed — but "almost certainly" is the whole point. Anything can close the
+// record without touching the copy: `bd close` run by hand, or any
+// `gt escalate close` from before gt-4xl. So the difference is reported rather
+// than swallowed, with the ID and the command that reconciles it. The count is
+// exactly the gap between this list and `bd list --label=gt:escalation
+// --status=open`, which is what nothing explained before (gt-f0b3).
+func printStrandedEscalations(w io.Writer, stranded []*beads.Issue) {
+	if len(stranded) == 0 {
+		return
+	}
+
+	noun := "escalation beads are"
+	if len(stranded) == 1 {
+		noun = "escalation bead is"
+	}
+	fmt.Fprintf(w, "%d open %s hidden from this list: the escalation record is closed but the delivered copy was never closed with it,\n", len(stranded), noun)
+	fmt.Fprintf(w, "so this list reads %d lower than any count of open gt:escalation beads. A closed record is not proof the escalation was handled.\n", len(stranded))
+	for _, issue := range stranded {
+		fmt.Fprintf(w, "  %s [%s] %s\n", issue.ID, issue.Status, issue.Title)
+		fmt.Fprintf(w, "     record %s is closed | reconcile: gt escalate close %s --reason \"...\"\n",
+			beads.EscalationRecordID(issue), issue.ID)
+	}
+	fmt.Fprintf(w, "  Full history, including these: gt escalate list --all\n")
 }
 
 func runEscalateAck(cmd *cobra.Command, args []string) error {
@@ -539,6 +504,15 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 func runEscalateClose(cmd *cobra.Command, args []string) error {
 	escalationID := args[0]
 
+	// Cobra only honours SilenceUsage from the executed command and the ROOT, so
+	// the flag on `escalate` never reached its subcommands: a close that failed
+	// printed the error and then dumped the usage block over it. That is how
+	// three failed closes read as quiet successes — the operator's `| tail -1`
+	// showed the last line of the usage block, not the error (gt-u3mo).
+	// Setting it here rather than on the command keeps usage on arg/flag misuse,
+	// which cobra validates before RunE.
+	cmd.SilenceUsage = true
+
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -564,20 +538,56 @@ func runEscalateClose(cmd *cobra.Command, args []string) error {
 	// Log to activity feed
 	_ = events.LogFeed(events.TypeEscalationClosed, closedBy, map[string]interface{}{
 		"escalation_id": result.RecordID,
+		"requested_id":  result.RequestedID,
 		"closed_by":     closedBy,
 		"reason":        escalateCloseReason,
+		"record_closed": result.RecordClosed,
 		"copies_closed": strings.Join(result.CopyIDs, ","),
 	})
 
-	fmt.Printf("%s Escalation closed: %s\n", style.Bold.Render("✓"), result.RecordID)
-	fmt.Printf("  Reason: %s\n", escalateCloseReason)
+	printEscalateCloseReport(os.Stdout, result, escalateCloseReason)
+	return nil
+}
+
+// printEscalateCloseReport renders what a close actually did.
+//
+// Every line here is derived from a bead this close WROTE TO, never from an ID
+// it merely resolved. The old report was the latter: it printed
+// "✓ Escalation closed: <result.RecordID>" unconditionally, so a close that
+// wrote to nothing still produced a checkmark, and the ID on it was not even
+// the one the operator typed (gt-w0z8).
+func printEscalateCloseReport(w io.Writer, result *beads.EscalationCloseResult, reason string) {
+	// A close that closed nothing must not print a checkmark. The whole stranded
+	// population has a closed record by definition, so a success line derived
+	// from "we resolved an ID" was true of every no-op this command could
+	// produce — the operator had no signal to distinguish them.
+	if !result.Changed() {
+		fmt.Fprintf(w, "Nothing to close: %s is already closed.\n", result.RequestedID)
+		if result.RecordID != result.RequestedID {
+			fmt.Fprintf(w, "  Escalation record %s is closed too, and no open delivered copy is linked to it.\n", result.RecordID)
+		}
+		return
+	}
+
+	// The ID on the success line is the one the operator PASSED. Printing the
+	// resolved record ID instead is how a close that touched nothing they named
+	// read as a success: the tell was there — ✓ Escalation closed: hq-wisp-51nirc
+	// after typing hq-9mxa7 — but only to someone who noticed the ID had changed.
+	fmt.Fprintf(w, "%s Escalation closed: %s\n", style.Bold.Render("✓"), result.RequestedID)
+	fmt.Fprintf(w, "  Reason: %s\n", reason)
+	if result.RecordID != result.RequestedID {
+		if result.RecordClosed {
+			fmt.Fprintf(w, "  Escalation record: %s (closed)\n", result.RecordID)
+		} else {
+			fmt.Fprintf(w, "  Escalation record: %s (was already closed)\n", result.RecordID)
+		}
+	}
 	// The delivered copies are what the queue renders, so say plainly that they
 	// went with it — a close that only touched the record used to report success
 	// while leaving the escalation live in the Mayor's queue (gt-4xl).
 	if len(result.CopyIDs) > 0 {
-		fmt.Printf("  Cleared from queue: %s\n", strings.Join(result.CopyIDs, ", "))
+		fmt.Fprintf(w, "  Cleared from queue: %s\n", strings.Join(result.CopyIDs, ", "))
 	}
-	return nil
 }
 
 func runEscalateStale(cmd *cobra.Command, args []string) error {

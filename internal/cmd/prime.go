@@ -1394,27 +1394,64 @@ func setTmuxWorkContext(workRig, workBead, workMol string) {
 	setOrUnset("GT_WORK_MOL", workMol)
 }
 
+// pendingEscalation is one row of the Mayor's startup escalation banner.
+type pendingEscalation struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Priority    int    `json:"priority"`
+	Description string `json:"description"`
+	Created     string `json:"created"`
+}
+
 // checkPendingEscalations queries for open escalation beads and displays them prominently.
 // This is called on Mayor startup to surface issues needing human attention.
 func checkPendingEscalations(ctx RoleContext) {
-	// Query for open escalations using bd list with tag filter
-	stdout, _, err := runPrimeExternalCommand(ctx.WorkDir, "bd", "list", "--status=open", "--tag=escalation", "--json")
-	if err != nil {
-		// Silently skip - escalation check is best-effort
-		return
+	// `--label=gt:escalation` is the label an escalation actually carries —
+	// CreateEscalationBead and the mail router both write it, and every other
+	// escalation query in the tree reads it. This asked for `--tag=escalation`,
+	// a flag bd does not have, so bd exited 1 with "Error: unknown flag: --tag"
+	// on stderr and no stdout, and the best-effort skip below turned that into
+	// silence. Measured 2026-08-26 against hq: exit 1, zero bytes of stdout, on
+	// a store holding four open escalations. This banner has never fired for
+	// anyone, and nothing distinguished that from a quiet town.
+	//
+	// The pinned half is asked for separately because `bd list --status=open`
+	// is silently `--no-pinned` and offers no include-pinned flag, and pinning
+	// is what an operator does to an escalation to keep it in view. On that same
+	// store the default half returned 1 of the 4 (gt-z5h7, gt-qee3).
+	var escalations []pendingEscalation
+	seen := make(map[string]bool)
+	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
+		stdout, stderr, err := runPrimeExternalCommand(ctx.WorkDir, "bd",
+			"list", "--status=open", "--label=gt:escalation", pinnedFilter, "--json")
+		if err != nil {
+			// Not silent, and not best-effort. This is the startup alarm
+			// channel: a query that could not run must never render as a town
+			// with nothing to report, which is precisely how it stayed dead.
+			// bd's own message is the useful one, and it was what got discarded.
+			detail := strings.TrimSpace(stderr.String())
+			if detail == "" {
+				detail = err.Error()
+			}
+			fmt.Printf("⚠️  escalation check failed, so this is NOT an all-clear: %s\n", detail)
+			return
+		}
+
+		var half []pendingEscalation
+		if err := json.Unmarshal(stdout.Bytes(), &half); err != nil {
+			fmt.Printf("⚠️  escalation check could not parse bd output, so this is NOT an all-clear: %v\n", err)
+			return
+		}
+		for _, e := range half {
+			if seen[e.ID] {
+				continue
+			}
+			seen[e.ID] = true
+			escalations = append(escalations, e)
+		}
 	}
 
-	// Parse JSON output
-	var escalations []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Priority    int    `json:"priority"`
-		Description string `json:"description"`
-		Created     string `json:"created"`
-	}
-
-	if err := json.Unmarshal(stdout.Bytes(), &escalations); err != nil || len(escalations) == 0 {
-		// No escalations or parse error
+	if len(escalations) == 0 {
 		return
 	}
 

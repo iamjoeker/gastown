@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -113,6 +114,13 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	instructions := fmt.Sprintf("I am Dog %s.%s IMPORTANT: If your hook is empty and you have no mail, WAIT — the dispatcher is still setting up your assignment. Do NOT search for work, scan directories, or take autonomous action. Check hook (`"+cli.Name()+" hook`) and mail (`"+cli.Name()+" mail inbox`). If neither has work, wait 10 seconds and re-check. Execute only assigned work. When done, run `"+cli.Name()+" dog done` — this clears your work and auto-terminates the session.", dogName, workInfo)
 
 	// Use unified session lifecycle.
+	//
+	// Dogs are spawned by the deacon/daemon, which usually has no
+	// CLAUDE_CONFIG_DIR of its own, so this must be resolved from accounts.json
+	// rather than inherited (gt-gllf). Without it every dog comes up on the
+	// default account and goes silently logged out when that account's session
+	// expires — and a dog's only output is a file on disk, so nothing downstream
+	// notices the miss.
 	theme := tmux.DogTheme()
 	_, err = session.StartSession(m.tmux, session.SessionConfig{
 		SessionID: sessionID,
@@ -125,15 +133,16 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 			Sender:    "deacon",
 			Topic:     "assigned",
 		},
-		Instructions:   instructions,
-		AgentOverride:  opts.AgentOverride,
-		Theme:          &theme,
-		WaitForAgent:   true,
-		WaitFatal:      true,
-		AcceptBypass:   true,
-		ReadyDelay:     true,
-		VerifySurvived: true,
-		TrackPID:       true,
+		Instructions:     instructions,
+		AgentOverride:    opts.AgentOverride,
+		RuntimeConfigDir: config.ResolveTownRuntimeConfigDir(m.townRoot),
+		Theme:            &theme,
+		WaitForAgent:     true,
+		WaitFatal:        true,
+		AcceptBypass:     true,
+		ReadyDelay:       true,
+		VerifySurvived:   true,
+		TrackPID:         true,
 	})
 	if err != nil {
 		return err

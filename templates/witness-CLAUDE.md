@@ -61,13 +61,61 @@ Read the `witness_action` field for what *you* may do:
 
 | Verdict | Meaning | `witness_action` |
 |---------|---------|------------------|
-| SAFE_TO_NUKE | No work at risk | `restart` — `gt session restart {{RIG}}/<name>` |
+| SAFE_TO_NUKE, `state: idle` or `done` | No work at risk, and already reusable | `leave-alone` — do nothing |
+| SAFE_TO_NUKE, `state: handed-off` | No work at risk, slot not yet reusable | `restart` — `gt session restart {{RIG}}/<name>` |
+| NEEDS_STATE_CLEAR | No work at risk, but `agent_state` is a deliberate pause | `clear-state` — `gt polecat clear-state {{RIG}}/<name>` |
 | NEEDS_MQ_SUBMIT | Pushed but never submitted to MQ | `escalate` |
 | NEEDS_RECOVERY | Unpushed/uncommitted work exists | `escalate` |
 | PENDING_MR | MR in flight; refinery needs the branch | `leave-alone` |
 
 The verdict name `SAFE_TO_NUKE` is legacy vocabulary describing git state, not
-an instruction to you. Treat it as `restart`.
+an instruction to you. Read `witness_action`, not the verdict — the same verdict
+prescribes two different things depending on the state beside it.
+
+### SAFE_TO_NUKE on a done or idle polecat — there is no slot to reclaim
+
+`gt sling` re-reads a polecat's lifecycle state on every dispatch, and it already
+accepts both `idle` and `done`. A polecat in either state is a reuse candidate
+**right now**, so restarting it cannot make it more available: `gt session
+restart` stops one tmux session and starts another and writes no lifecycle state
+at all.
+
+The restart is not merely inert here — it costs you the slot it claims to
+reclaim. The fresh session primes, finds an empty hook, and runs `gt done`, and
+a fork-mode polecat whose bead is already closed parks at `agent_state=stuck` on
+that path (gt-j9uv, gt-gubw). Measured 2026-08-23: the witness followed the old
+`restart` prescription on ghoul and synth, both parked, and both had to be
+cleared by hand. Two healthy done polecats spent for nothing.
+
+So `witness_action` is `leave-alone` and it means it. This agrees with the
+Restart-First Policy above, which has always said "Done polecat (bead closed) →
+leave alone (sandbox preserved)" — this surface used to be the only thing
+contradicting it (gt-t6k2).
+
+`handed-off` is the one SAFE_TO_NUKE state where restart still applies: the
+reuse gate does **not** accept it, so that really is a slot nothing else will
+reclaim.
+
+### NEEDS_STATE_CLEAR — restart will not fix this one
+
+`gt done` writes `agent_state=stuck` for escalated and deferred exits. It means
+"paused on purpose", and it is durable: **no restart path writes `agent_state`
+at all**, so `gt session restart` leaves a paused polecat paused. Restarting it
+is not wrong, it is inert.
+
+```bash
+gt polecat clear-state {{RIG}}/<name>
+```
+
+You may run this. It writes one field on the agent bead — the worktree, branch,
+session, and hook are untouched — and it refuses unless the pause is the only
+thing standing, so it cannot talk you past work at risk. If it refuses, the
+blockers it prints are the real problem: escalate.
+
+This verdict exists because `check-recovery` never read `agent_state` and so
+answered `SAFE_TO_NUKE` / `restart` for polecats `gt polecat list` was
+simultaneously calling `NEEDS_RECOVERY` on `agent_state=stuck` — a remedy that
+provably could not move the state, and a slot nothing could reclaim (gt-fbgq).
 
 ### UNVERIFIED — only from `gt polecat list`
 
@@ -115,6 +163,14 @@ Before restarting ANY polecat session:
 
 **If witness_action is `escalate`:** Escalate to Mayor and stop. Do not nuke.
 
+**If witness_action is `clear-state`:** Run `gt polecat clear-state {{RIG}}/<name>`,
+then re-run check-recovery. Do not restart first — restart writes no `agent_state`
+and the verdict will come back unchanged.
+
+**If witness_action is `leave-alone`:** Stop here. On a `done` or `idle` polecat
+this is not a soft "not yet" — the slot is already reusable and restarting it
+risks parking the polecat at `agent_state=stuck` for no gain (gt-t6k2).
+
 **If git state dirty but polecat still alive:**
 1. Nudge the worker to clean up
 2. Wait 5 minutes for response
@@ -150,6 +206,7 @@ ONLY mail Mayor for:
 # Polecat management
 gt polecat list {{RIG}}
 gt polecat check-recovery {{RIG}}/<name>
+gt polecat clear-state {{RIG}}/<name>   # Lift a paused agent_state (restart cannot)
 gt polecat git-state {{RIG}}/<name>
 gt polecat nuke {{RIG}}/<name>         # Blocks on unpushed work
 gt polecat nuke --force {{RIG}}/<name> # Force nuke (LOSES WORK)

@@ -189,7 +189,7 @@ func checkStopSlungWork(townRoot string) string {
 
 	// Fallback: query for any hooked beads assigned to this agent.
 	// This catches cases where the agent bead doesn't exist yet.
-	hookedBeads, err := b.List(beads.ListOptions{
+	hookedBeads, err := b.ListAcrossAgentAddressForms(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: identity,
 		Priority: -1,

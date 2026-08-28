@@ -124,6 +124,87 @@ exit 1
 	}
 }
 
+// TestCheckOpenPullRequestSeparatesFoundFromCouldNotLook is the regression for
+// the bool that carried two meanings. An auth failure and an open PR both
+// protect the branch, and the old single bool made them indistinguishable —
+// which is how a 401 got reported to operators as "open PR exists" (gt-wbvx).
+func TestCheckOpenPullRequestSeparatesFoundFromCouldNotLook(t *testing.T) {
+	installFakeGH(t, `#!/bin/sh
+printf 'HTTP 401: Requires authentication\n' >&2
+exit 1
+`)
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+	addGitHubRemotes(t, g)
+
+	protection := g.CheckOpenPullRequest(PullRequestRef{Branch: "polecat/dust/gt-wbvx"})
+	if !protection.Protected() {
+		t.Fatalf("Protected() = false on a failed lookup: %+v", protection)
+	}
+	if protection.Open {
+		t.Fatalf("Open = true on a lookup that never completed: %+v", protection)
+	}
+	if !protection.LookupFailed || protection.Err == nil {
+		t.Fatalf("LookupFailed/Err not set on a failed lookup: %+v", protection)
+	}
+	reason := protection.Reason()
+	if !strings.Contains(reason, "FAILED") || !strings.Contains(reason, "401") {
+		t.Fatalf("Reason() = %q, want the failure and its cause", reason)
+	}
+	if strings.Contains(reason, "open PR") {
+		t.Fatalf("Reason() = %q claims an open PR that was never found", reason)
+	}
+	// The fail-closed decision the old bool stood for is unchanged.
+	if !g.HasOpenPullRequest(PullRequestRef{Branch: "polecat/dust/gt-wbvx"}) {
+		t.Fatal("HasOpenPullRequest = false on a failed lookup; the branch lost its protection")
+	}
+}
+
+// The control for the test above: the same call, against a working gh, must
+// still report a real open PR as one — and name it.
+func TestCheckOpenPullRequestReportsTheFoundPR(t *testing.T) {
+	installFakeGH(t, `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s\n' '[{"number":7331,"url":"https://github.com/upstream/repo/pull/7331","state":"OPEN","mergedAt":"","headRefName":"polecat/dust/gt-wbvx","headRefOid":"aa11","headRepository":{"nameWithOwner":"fork/repo"},"headRepositoryOwner":{"login":"fork"},"baseRepository":{"nameWithOwner":"upstream/repo"}}]'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+`)
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+	addGitHubRemotes(t, g)
+
+	protection := g.CheckOpenPullRequest(PullRequestRef{Branch: "polecat/dust/gt-wbvx"})
+	if !protection.Open || protection.LookupFailed {
+		t.Fatalf("unexpected protection: %+v", protection)
+	}
+	if reason := protection.Reason(); !strings.Contains(reason, "#7331") {
+		t.Fatalf("Reason() = %q, want the PR number the lookup actually found", reason)
+	}
+}
+
+// A completed lookup that found no PR protects nothing — otherwise every branch
+// would be permanently undeletable and the split above would be pointless.
+func TestCheckOpenPullRequestNotFoundLeavesBranchDeletable(t *testing.T) {
+	installFakeGH(t, `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[]\n'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+`)
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+	addGitHubRemotes(t, g)
+
+	protection := g.CheckOpenPullRequest(PullRequestRef{Branch: "polecat/dust/gt-wbvx"})
+	if protection.Protected() || protection.Reason() != "" {
+		t.Fatalf("a completed not-found lookup protected the branch: %+v (%q)", protection, protection.Reason())
+	}
+}
+
 func TestFindPRNumberRequiresOpenPR(t *testing.T) {
 	installFakeGH(t, `#!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "99" ]; then

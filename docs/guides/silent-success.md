@@ -193,6 +193,42 @@ var parentCmd = &cobra.Command{
 Prefer this shape wherever the class can be pinned by a test: a convention
 catches what a reviewer remembers to look for, a test catches the rest.
 
+Rule 2 — *a best-effort path MUST return an error* — is enforced the same way by
+`TestDeliveryReportersReturnTheirFailure` in
+`internal/cmd/success_reporting_policy_test.go`. It walks the delivery packages
+and fails on any function named for delivery (`send`, `notify`, `nudge`,
+`escalate`, `dispatch`, …) that swallows a failure into a log and returns
+nothing, held against a baseline that can only shrink.
+
+Rule 2 is enforceable where the others are not, and the reason is worth stating:
+**the defect is visible in the signature.** The three worst instances found for
+gt-9tpw were all invisible at the call site —
+
+- gt-32gf `watchAndDeliver` logged the tmux failure and returned nothing, so
+  `runNudge` printed `✓ Nudged` one line below the error, exit 0.
+- gt-lae6 `nudgeWitness` returns nothing, so `gt done`'s durable checkpoint
+  hardcodes `"ok"` — written *before* the attempt it describes.
+- gt-9tpw `Daemon.escalate` returned nothing, so a destructive reaper fallback
+  reported itself escalated when the escalation had failed.
+
+— and in each the caller was blameless: it had nothing to test. A rule about
+print statements cannot see any of them, because the print is correct code
+sitting downstream of a function that lied by omission.
+
+### An alarm that shares a failure mode with the fault
+
+`Daemon.escalate` is the worked example of a trap specific to this class. The
+reaper escalates when Dog dispatch fails; both the dispatch and the escalation
+run `gt`, so the single most likely cause — a broken `gt` binary, which is what
+happened on 2026-08-24 — takes out the alarm along with the safe path.
+
+Escalating and assuming it landed would be this very defect committed inside its
+own fix. So `escalateE` returns whether the escalation was delivered, and the
+caller says plainly in the daemon log when a destructive path ran unreported.
+
+**When you add a report, ask what it shares with the thing it reports on.** A
+channel that fails whenever its subject fails is not a channel.
+
 ## See also
 
 - [Verification Sweeps](verification-sweeps.md) — the same failure shape in

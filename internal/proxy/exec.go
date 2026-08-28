@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/util"
 	"golang.org/x/time/rate"
 )
 
@@ -107,15 +108,32 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		execCtx, cancel = context.WithTimeout(execCtx, s.execTimeout)
 		defer cancel()
 	}
-	out, errOut, exitCode := runCommand(execCtx, argv, identity, envOverride)
+	out, errOut, info := runCommand(execCtx, argv, identity, envOverride)
+	exitCode := info.Code
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
-	if exitCode == 0 {
+	switch {
+	case exitCode == 0:
 		s.log.Info("exec", "identity", identity, "cmd", cmd0,
 			"sub", subForLog(req.Argv), "exit", exitCode)
-	} else {
+	case info.OOMSuspected():
+		// The victim of a SIGKILL cannot log its own death, so this line is
+		// the only record that the command was killed rather than failed.
+		s.log.Error("exec killed", "identity", identity, "cmd", cmd0,
+			"sub", subForLog(req.Argv), "exit", exitCode,
+			"signal", info.Signal.String(), "oom_suspected", true,
+			"detail", info.Describe())
+	default:
 		s.log.Warn("exec failed", "identity", identity, "cmd", cmd0,
-			"sub", subForLog(req.Argv), "exit", exitCode)
+			"sub", subForLog(req.Argv), "exit", exitCode,
+			"signaled", info.Signaled)
+	}
+
+	// A killed subprocess writes nothing to stderr, so without this the caller
+	// receives an empty stderr and a bare exit code and has no way to tell an
+	// OOM kill from a silent failure.
+	if info.Signaled {
+		errOut = appendDiagnostic(errOut, "gt: "+info.Describe())
 	}
 
 	// The handler always returns HTTP 200 even when the subprocess exits
@@ -210,7 +228,24 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 	return v.(*rate.Limiter)
 }
 
-func runCommand(ctx context.Context, argv []string, identity string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
+// appendDiagnostic adds a gt-authored line to subprocess stderr without
+// swallowing whatever the subprocess itself managed to write first.
+func appendDiagnostic(stderr, line string) string {
+	if stderr == "" {
+		return line + "\n"
+	}
+	if !strings.HasSuffix(stderr, "\n") {
+		stderr += "\n"
+	}
+	return stderr + line + "\n"
+}
+
+// runCommand runs argv and classifies how it ended.
+//
+// The returned ExitInfo carries a shell-convention exit code: a subprocess
+// killed by SIGKILL reports 137, not Go's -1. Callers that only need the
+// number can read info.Code.
+func runCommand(ctx context.Context, argv []string, identity string, envOverride ...[]string) (stdout, stderr string, info util.ExitInfo) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
@@ -227,15 +262,14 @@ func runCommand(ctx context.Context, argv []string, identity string, envOverride
 		env = append(env, "GT_PROXY_IDENTITY="+identity)
 	}
 	cmd.Env = env
-	err := cmd.Run()
-	if err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			exitCode = exit.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	// ctx.Err() distinguishes our own deadline kill — CommandContext SIGKILLs
+	// on expiry — from a SIGKILL imposed from outside, such as the OOM killer.
+	info = util.ClassifyExitError(cmd.Run(), ctx.Err())
+	if !info.Started {
+		// exec itself failed; the wire protocol has always reported 1 here.
+		info.Code = 1
 	}
-	return outBuf.String(), errBuf.String(), exitCode
+	return outBuf.String(), errBuf.String(), info
 }
 
 func (s *Server) rewriteBDCreateRepo(argv []string) ([]string, []string) {

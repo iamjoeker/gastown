@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -27,18 +28,48 @@ type StaleBinaryInfo struct {
 	RepoCommit    string // Commit of the ref the binary was compared against (CompareRef)
 	CompareRef    string // The ref staleness was computed against (e.g. "main", "origin/main")
 	CommitsBehind int    // Number of commits binary is behind (0 if unknown)
+	Refreshed     bool   // True if RepoCommit was read from the remote during this check
+	RefreshError  string // Why the remote read did not happen or did not succeed
 	Skipped       bool   // True if staleness could not be determined safely
 	SkipReason    string // Human-readable reason the check was skipped
 	Error         error  // Any error encountered during check
 }
 
+// StaleOptions tunes how the compare ref is resolved.
+type StaleOptions struct {
+	// RefreshRemote asks the check to read the build branch's tip from the
+	// remote rather than trusting a local ref. It costs one bounded fetch, so
+	// callers on a hot path (the per-command startup warning) leave it off and
+	// accept that they can only ever under-report staleness.
+	RefreshRemote bool
+
+	// Remote overrides the remote to read from. Empty means "whatever the
+	// build branch tracks", falling back to origin.
+	Remote string
+}
+
+// defaultRemote is the remote a build branch is read from when it tracks
+// nothing.
+const defaultRemote = "origin"
+
 type buildBranchRef struct {
 	ref     string
 	display string
 	commit  string
+	remote  string // remote to re-read this branch from ("" = whatever it tracks)
+	branch  string // branch name as it exists on that remote
 }
 
 // resolveCommitHash gets the commit hash from build info or the Commit variable.
+//
+// vcs.revision is NOT trustworthy on its own: Go stamps it from whichever git
+// repository encloses the build directory, which inside a Gas Town tree is
+// often the town repo rather than gastown. CheckStaleBinary is safe against
+// that only because it verifies the hash resolves in the source repo before
+// comparing anything (see the resolveGitCommit call below, which turns a
+// foreign sha into Skipped rather than a wrong verdict). Do not remove that
+// check, and do not surface this value to users as the binary's build commit —
+// see internal/cmd.resolveCommitHash for the provenance distinction. (gt-5mvj)
 func resolveCommitHash() string {
 	if Commit != "" {
 		return Commit
@@ -97,10 +128,37 @@ func commitsMatch(a, b string) bool {
 }
 
 // CheckStaleBinary compares the binary's embedded commit with a build-branch
-// ref. It returns staleness info including whether the binary needs rebuilding.
-// This check is designed to be fast and non-blocking - errors are captured but
-// don't interrupt normal operation.
+// ref resolved entirely from the local repository. It never touches the
+// network, which also means it can only ever UNDER-report staleness: see
+// CheckStaleBinaryWithOptions.
 func CheckStaleBinary(repoDir string) *StaleBinaryInfo {
+	return CheckStaleBinaryWithOptions(repoDir, StaleOptions{})
+}
+
+// CheckStaleBinaryWithOptions compares the binary's embedded commit with a
+// build-branch ref. It returns staleness info including whether the binary
+// needs rebuilding. This check is designed to be fast and non-blocking -
+// errors are captured but don't interrupt normal operation.
+//
+// # Why opts.RefreshRemote exists
+//
+// Every ref this check can reach locally is a CACHE WITH NO INVALIDATION.
+// GetRepoRoot resolves to $GT_ROOT/gastown/mayor/rig, a working clone; its
+// `main` only moves when something pulls, and its `refs/remotes/origin/main`
+// only moves when something fetches. In a Gas Town nothing does either on a
+// schedule. So when a commit lands on the real main, the compare ref does not
+// move, the binary is measured against the commit it was already built from,
+// and a binary that IS out of date reports stale:false — which is the one
+// answer that makes the rebuild loop do nothing. Measured on gastown: twice in
+// one evening, the second time within twenty minutes of a hand-rebuild
+// (gt-ympl / hq-cak50).
+//
+// RefreshRemote reads the branch tip from the remote instead, for one bounded
+// fetch. When that read fails the check does NOT quietly fall back to
+// reporting freshness: a local ref can only lag the remote, so "behind the
+// local ref" still proves stale, while "level with the local ref" proves
+// nothing and is reported as Skipped.
+func CheckStaleBinaryWithOptions(repoDir string, opts StaleOptions) *StaleBinaryInfo {
 	info := &StaleBinaryInfo{}
 
 	// Get binary commit
@@ -139,25 +197,86 @@ func CheckStaleBinary(repoDir string) *StaleBinaryInfo {
 	// feature work and produces a false "N commits behind" warning advising a
 	// rebuild from the feature branch (GH#4034). Staleness is only meaningful
 	// relative to a *build branch*.
+	// Whatever ref is chosen must CONTAIN the binary's commit. Staleness is
+	// "the build ref moved past the binary"; comparing against a ref the binary
+	// is already past measures nothing, and the two surfaces that print the
+	// result both render it as a plain disagreement the reader cannot resolve:
+	// the startup banner said "gt binary is stale (built from fcffa2c2, main at
+	// 5e84c5b4)" while `gt stale` said "1 commits behind origin/main
+	// (ba5302e9)" in the same minute — and 5e84c5b4 is an ANCESTOR of
+	// fcffa2c2, so on the banner's own numbers the binary was AHEAD (gt-inde).
+	//
+	// resolveBuildBranchRef has always required this; the on-a-build-branch
+	// shortcut below did not, and $GT_ROOT/gastown/mayor/rig sits on `main`
+	// with a local `main` that only moves when something pulls — exactly the
+	// ref most likely to lag the binary.
+	var headCommit string
 	var compareCommit string
+	var compareRef buildBranchRef
 	if info.OnMainBranch {
-		// Already on a build branch — its HEAD is the build branch.
-		info.CompareRef = branch
-		compareCommit, err = resolveGitCommit(repoDir, "HEAD")
+		// Already on a build branch — its HEAD is the build branch, provided
+		// the branch has not fallen behind the binary.
+		headCommit, err = resolveGitCommit(repoDir, "HEAD")
 		if err != nil {
 			info.Error = fmt.Errorf("cannot resolve build branch HEAD: %w", err)
 			return info
 		}
-	} else {
-		// Resolve a real build-branch ref instead of the feature HEAD.
+		if isAncestor(repoDir, binaryCommit, headCommit) {
+			compareCommit = headCommit
+			compareRef = buildBranchRef{display: branch, commit: headCommit, branch: branch}
+		}
+	}
+	if compareCommit == "" {
+		// Resolve a real build-branch ref instead of the feature HEAD, or
+		// instead of a build branch that does not contain the binary.
 		ref, ok := resolveBuildBranchRef(repoDir, binaryCommit)
 		if !ok {
 			info.Skipped = true
-			info.SkipReason = "source worktree not on a build branch and no build-branch ref found to compare against"
+			info.SkipReason = noComparableRefReason(branch, headCommit, info.BinaryCommit)
 			return info
 		}
-		info.CompareRef = ref.display
+		compareRef = ref
 		compareCommit = ref.commit
+	}
+	info.CompareRef = compareRef.display
+
+	// Replace the local (never-invalidated) compare commit with the remote's,
+	// when the caller is willing to pay for the round trip.
+	if opts.RefreshRemote {
+		remote := opts.Remote
+		if remote == "" {
+			remote = compareRef.remote
+		}
+		if remote == "" {
+			remote = branchRemote(repoDir, compareRef.branch)
+		}
+		remoteCommit, cleanup, err := fetchBranchTip(repoDir, remote, compareRef.branch)
+		if cleanup != nil {
+			// Held until every ancestry/count/diff question below has been
+			// asked: the private ref is what keeps the fetched objects
+			// reachable.
+			defer cleanup()
+		}
+		switch {
+		case err != nil:
+			info.RefreshError = err.Error()
+		case remoteCommit == "":
+			info.RefreshError = fmt.Sprintf("%s/%s resolved to no commit", remote, compareRef.branch)
+		case !isAncestor(repoDir, binaryCommit, remoteCommit):
+			// Same containment rule the ref selection above applies, enforced a
+			// second time because the refresh can swap in a commit nobody
+			// checked. A tip that does not contain the binary cannot say how
+			// far the binary is behind; adopting it would print a "build ref"
+			// that is an ANCESTOR of the build commit (gt-inde). Keeping the
+			// local ref instead is safe: it does contain the binary, and an
+			// unrefreshed "fresh" is downgraded to Skipped below.
+			info.RefreshError = fmt.Sprintf("%s/%s is at %s, which does not contain the binary's commit %s",
+				remote, compareRef.branch, ShortCommit(remoteCommit), ShortCommit(info.BinaryCommit))
+		default:
+			info.Refreshed = true
+			compareCommit = remoteCommit
+			info.CompareRef = remote + "/" + compareRef.branch
+		}
 	}
 	info.RepoCommit = compareCommit
 
@@ -169,6 +288,7 @@ func CheckStaleBinary(repoDir string) *StaleBinaryInfo {
 		// binary and should not trigger a stale warning. (GH#2596)
 		if onlyBeadsChanges(repoDir, binaryCommit, compareCommit) {
 			// Build ref advanced but only via beads-only commits — not stale
+			markUnprovenFreshness(info, opts)
 			return info
 		}
 
@@ -191,7 +311,42 @@ func CheckStaleBinary(repoDir string) *StaleBinaryInfo {
 		}
 	}
 
+	markUnprovenFreshness(info, opts)
 	return info
+}
+
+// markUnprovenFreshness downgrades an unverified "fresh" verdict to Skipped.
+//
+// Staleness detection is one-sided. A local ref can only LAG the remote, never
+// lead it, so a binary measured as behind that ref is behind the remote too —
+// the positive verdict survives a failed refresh. The negative one does not:
+// "level with a ref that nothing updates" is not evidence of anything, and it
+// is precisely the shape that let a stale binary read as fresh for two hours
+// (gt-ympl). A caller that asked for the remote and did not get it is told the
+// check could not measure, rather than being handed the wrong answer.
+func markUnprovenFreshness(info *StaleBinaryInfo, opts StaleOptions) {
+	if !opts.RefreshRemote || info.Refreshed || info.IsStale {
+		return
+	}
+	info.Skipped = true
+	info.SkipReason = fmt.Sprintf("could not read %s from the remote, and a local ref that nothing updates cannot prove the binary is fresh: %s",
+		info.CompareRef, info.RefreshError)
+}
+
+// noComparableRefReason explains why no build-branch ref could be compared
+// against, distinguishing the two ways it happens. headCommit is empty when the
+// worktree is not on a build branch at all.
+//
+// The distinction matters because the second case is the one that used to
+// produce a wrong answer rather than no answer: the branch was there, it just
+// did not contain the binary, and saying "no build-branch ref found" would
+// leave a reader looking at a checked-out `main` wondering which ref gt meant.
+func noComparableRefReason(branch, headCommit, binaryCommit string) string {
+	if headCommit == "" {
+		return "source worktree not on a build branch and no build-branch ref found to compare against"
+	}
+	return fmt.Sprintf("build branch %s is at %s, which does not contain the binary's commit %s, and no other build-branch ref does either; cannot measure staleness",
+		branch, ShortCommit(headCommit), ShortCommit(binaryCommit))
 }
 
 // resolveBuildBranchRef finds a build-branch ref to compare the binary against
@@ -247,14 +402,47 @@ func buildBranchCandidates(repoDir string) []buildBranchRef {
 		}
 	}
 	candidates = append(candidates,
-		buildBranchRef{ref: "refs/remotes/upstream/main", display: "upstream/main"},
-		buildBranchRef{ref: "refs/remotes/upstream/master", display: "upstream/master"},
-		buildBranchRef{ref: "refs/remotes/origin/main", display: "origin/main"},
-		buildBranchRef{ref: "refs/remotes/origin/master", display: "origin/master"},
-		buildBranchRef{ref: "refs/heads/main", display: "main"},
-		buildBranchRef{ref: "refs/heads/master", display: "master"},
+		buildBranchRef{ref: "refs/remotes/upstream/main", display: "upstream/main", remote: "upstream", branch: "main"},
+		buildBranchRef{ref: "refs/remotes/upstream/master", display: "upstream/master", remote: "upstream", branch: "master"},
+		buildBranchRef{ref: "refs/remotes/origin/main", display: "origin/main", remote: "origin", branch: "main"},
+		buildBranchRef{ref: "refs/remotes/origin/master", display: "origin/master", remote: "origin", branch: "master"},
+		buildBranchRef{ref: "refs/heads/main", display: "main", branch: "main"},
+		buildBranchRef{ref: "refs/heads/master", display: "master", branch: "master"},
 	)
 	return candidates
+}
+
+// branchRemote returns the remote a local branch tracks, defaulting to origin.
+//
+// Not merely a convenience: gastown clones carry an `upstream` that is ~99
+// commits behind the fork they actually build from, so guessing the wrong
+// remote here would reintroduce the same wrong-reference bug this refresh
+// exists to close.
+func branchRemote(repoDir, branch string) string {
+	if branch == "" {
+		return defaultRemote
+	}
+	cmd := exec.Command("git", "config", "--get", "branch."+branch+".remote")
+	cmd.Dir = repoDir
+	util.SetDetachedProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return defaultRemote
+	}
+	if remote := strings.TrimSpace(string(out)); remote != "" {
+		return remote
+	}
+	return defaultRemote
+}
+
+// fetchBranchTip reads branch's tip from remote and brings the commit into the
+// local object store so the ancestry and count queries below can answer about
+// it. The caller must invoke the returned cleanup.
+func fetchBranchTip(repoDir, remote, branch string) (commit string, cleanup func(), err error) {
+	if branch == "" {
+		return "", nil, fmt.Errorf("no branch name to read from %s", remote)
+	}
+	return git.NewGit(repoDir).FetchPushRemoteBranchTip(remote, branch)
 }
 
 func resolveGitCommit(repoDir, rev string) (string, error) {
@@ -293,7 +481,18 @@ func singleBranchRef(repoDir, pattern string) (buildBranchRef, bool) {
 	}
 	display := strings.TrimPrefix(refs[0], "refs/heads/")
 	display = strings.TrimPrefix(display, "refs/remotes/")
-	return buildBranchRef{ref: refs[0], display: display}, true
+
+	// Split the display back into (remote, branch) so the ref can be re-read
+	// from the remote. A local ref has no remote in its name; a remote-tracking
+	// one carries it as the first segment, and the rest is the branch as the
+	// remote knows it (carry/operational, not origin/carry/operational).
+	var remote, branch string
+	if strings.HasPrefix(refs[0], "refs/remotes/") {
+		remote, branch, _ = strings.Cut(display, "/")
+	} else {
+		branch = display
+	}
+	return buildBranchRef{ref: refs[0], display: display, remote: remote, branch: branch}, true
 }
 
 // GetRepoRoot returns the git repository root for the gt source code.

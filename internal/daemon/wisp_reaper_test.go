@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -241,4 +243,208 @@ func TestDoltServerHostUsesConfiguredTownHost(t *testing.T) {
 	if got := d.doltServerHost(); got != "127.0.0.2" {
 		t.Fatalf("doltServerHost() = %q, want configured host", got)
 	}
+}
+
+// fakeGTAndBD writes stub gt and bd binaries and returns their paths plus the
+// file that records every bd invocation.
+//
+// The gt stub records its arguments too (gtCallLog, alongside bdLog in the same
+// directory), because the reaper's dispatch-failure branch now has to be
+// checked for what it TELLS somebody, not only for what it pours.
+func fakeGTAndBD(t *testing.T, gtExit int) (gtPath, bdPath, bdLog string) {
+	t.Helper()
+	dir := t.TempDir()
+	bdLog = filepath.Join(dir, "bd-calls.log")
+	gtLog := filepath.Join(dir, "gt-calls.log")
+
+	gtPath = filepath.Join(dir, "gt")
+	gtScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %q\nexit %d\n", gtLog, gtExit)
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	bdPath = filepath.Join(dir, "bd")
+	bdScript := `#!/bin/sh
+printf '%s\n' "$*" >> "` + bdLog + `"
+case "$1" in
+  mol) printf 'Spawned wisp: hq-wisp-reap01 - mol-dog-reaper\n' ;;
+  show) printf '{"hq-wisp-reap01":[],"schema_version":1}\n' ;;
+  *) : ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	return gtPath, bdPath, bdLog
+}
+
+// reaperTestDaemon points the daemon at stub binaries and a dead Dolt port, so
+// the inline fallback fails fast on connect instead of reaching a real server.
+//
+// It returns the bd call log, the gt call log and the buffer the daemon logger
+// writes to. The gt log and the buffer exist so a test can assert what the
+// dispatch-failure branch REPORTS; before gt-9tpw that branch was one INFO line
+// and there was nothing to assert.
+//
+// Pointing d.gtPath at the stub is what keeps `gt escalate` inside the test. It
+// only works because escalate no longer hard-codes a bare "gt" resolved from
+// PATH — with that, this test would have raised a real HIGH escalation against
+// whatever town the test host is sitting in, every run.
+func reaperTestDaemon(t *testing.T, gtExit int) (*Daemon, string, string, *bytes.Buffer) {
+	t.Helper()
+	gtPath, bdPath, bdLog := fakeGTAndBD(t, gtExit)
+	gtLog := filepath.Join(filepath.Dir(bdLog), "gt-calls.log")
+	logBuf := &bytes.Buffer{}
+	d := &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		gtPath: gtPath,
+		bdPath: bdPath,
+		logger: log.New(logBuf, "", 0),
+		patrolConfig: &DaemonPatrolConfig{
+			Patrols: &PatrolsConfig{WispReaper: &WispReaperConfig{
+				Enabled: true,
+				// A database that cannot be reached: the fallback must not touch a
+				// live server just to prove it poured a molecule.
+				Databases: []string{"testonly_unreachable"},
+			}},
+		},
+		doltServer: &DoltServerManager{config: &DoltServerConfig{Host: "127.0.0.1", Port: 1}},
+	}
+	return d, bdLog, gtLog, logBuf
+}
+
+func readBDCalls(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read bd call log: %v", err)
+	}
+	return string(data)
+}
+
+// TestReapWispsDoesNotPourWhenDispatchSucceeds is the gt-bnpw duplicate-pour
+// regression.
+//
+// dispatchReaperDog slings the FORMULA NAME, so `gt sling` pours the molecule
+// the Dog actually runs. A molecule poured here as well is a second, redundant
+// one — and reapWisps closed it while the Dog was still working on its own.
+// Measured on hq 2026-08-24: every cycle emitted two mol-dog-reaper roots 2-3
+// seconds apart, one assigned to deacon/dogs/alpha and one unassigned carrying
+// six step children.
+func TestReapWispsDoesNotPourWhenDispatchSucceeds(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks")
+	}
+	d, bdLog, _, _ := reaperTestDaemon(t, 0)
+
+	d.reapWisps()
+
+	if calls := readBDCalls(t, bdLog); strings.Contains(calls, "mol wisp") {
+		t.Fatalf("a successful sling must not also pour a molecule here, got bd calls:\n%s", calls)
+	}
+}
+
+// TestReapWispsPoursOnInlineFallback: the molecule is not merely deleted. When
+// the sling fails, nothing else records the run and reapWispsInline closes each
+// step as it goes, so there it is the only trace of the work.
+func TestReapWispsPoursOnInlineFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks")
+	}
+	d, bdLog, _, _ := reaperTestDaemon(t, 1) // gt sling fails
+
+	d.reapWisps()
+
+	calls := readBDCalls(t, bdLog)
+	if !strings.Contains(calls, "mol wisp "+constants.MolDogReaper) {
+		t.Fatalf("inline fallback must pour the observability molecule, got bd calls:\n%s", calls)
+	}
+}
+
+// TestReapWispsEscalatesWhenDispatchFailureDivertsToDestructivePath is the
+// gt-9tpw failure-path regression, instance 6.
+//
+// The behaviour under test is NOT "the fallback runs" — that already worked and
+// is what TestReapWispsPoursOnInlineFallback covers. It is that taking the
+// fallback is REPORTED. A dispatch failure diverts execution onto a path that
+// deletes unversioned rows; on 2026-08-24 that happened on every cycle because
+// an unrelated binary was broken, 229 wisps were purged, and the only trace was
+// an INFO line indistinguishable in level from the routine success line one
+// branch over.
+//
+// Written against the unfixed reapWisps first, where it fails: the gt call log
+// holds the `sling` invocation and nothing else, because no escalation was ever
+// attempted.
+func TestReapWispsEscalatesWhenDispatchFailureDivertsToDestructivePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks")
+	}
+	d, _, gtLog, _ := reaperTestDaemon(t, 1) // gt sling fails
+
+	d.reapWisps()
+
+	calls := readGTCalls(t, gtLog)
+
+	// Control: the stub records invocations at all, and the branch under test
+	// was really entered. Without this an empty log would read as "no escalation"
+	// whether the escalation was missing or the stub never ran.
+	if !strings.Contains(calls, "sling") {
+		t.Fatalf("fixture never reached dispatch — no `gt sling` in the call log, so this test proves nothing:\n%s", calls)
+	}
+
+	if !strings.Contains(calls, "escalate") {
+		t.Fatalf("a dispatch failure diverted reaping onto the destructive inline path without escalating.\ngt calls were:\n%s", calls)
+	}
+	// The escalation has to name what is about to happen, not just that something
+	// failed. "Dog dispatch failed" alone reads as a scheduling hiccup.
+	if !strings.Contains(calls, "DELETES") {
+		t.Errorf("escalation does not say the fallback deletes rows; a reader cannot tell this is destructive.\ngt calls were:\n%s", calls)
+	}
+}
+
+// TestReapWispsReportsWhenItsOwnEscalationCouldNotBeSent covers the case the fix
+// above cannot solve, only disclose.
+//
+// The escalation runs `gt`. The branch that raises it was entered because a `gt`
+// invocation failed. So the most likely single cause — a broken gt binary, which
+// is exactly what happened on 2026-08-24 — takes out the alarm along with the
+// safe path. Escalating and assuming it landed would be this bead's defect
+// committed inside its own fix, so the daemon log must say the destructive
+// fallback ran unreported.
+//
+// The stub exits non-zero for EVERY subcommand, which is that scenario.
+func TestReapWispsReportsWhenItsOwnEscalationCouldNotBeSent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks")
+	}
+	d, _, gtLog, logBuf := reaperTestDaemon(t, 1) // every gt subcommand fails
+
+	d.reapWisps()
+
+	// Control: the escalation was attempted and did fail. If it had succeeded,
+	// the assertion below would be checking for a line that correctly is absent.
+	if calls := readGTCalls(t, gtLog); !strings.Contains(calls, "escalate") {
+		t.Fatalf("escalation was never attempted, so this test is not exercising a failed one:\n%s", calls)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "UNREPORTED DESTRUCTIVE FALLBACK") {
+		t.Fatalf("escalation failed and the daemon log does not say the destructive fallback went unreported.\ndaemon log:\n%s", logs)
+	}
+}
+
+func readGTCalls(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read gt call log: %v", err)
+	}
+	return string(data)
 }

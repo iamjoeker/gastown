@@ -310,9 +310,14 @@ func waitForServer(db *sql.DB) error {
 // reaper never relies on cascade behaviour — it deletes auxiliary rows itself,
 // and that explicit cleanup is what these tests verify.
 var beadsFixtureDDL = []string{
+	// description is where a hook bead records the molecule attached to it, as an
+	// "attached_molecule: <id>" line. That line is the dispatch record the
+	// stranded-molecule probe reads, so a fixture without this column cannot tell
+	// a probe that consults it from one whose query errors and reports zero.
 	`CREATE TABLE issues (
 		id varchar(255) NOT NULL PRIMARY KEY,
 		title varchar(500) NOT NULL DEFAULT '',
+		description text NOT NULL DEFAULT '',
 		status varchar(32) NOT NULL DEFAULT 'open',
 		priority int NOT NULL DEFAULT 2,
 		issue_type varchar(32) NOT NULL DEFAULT 'task',
@@ -389,10 +394,22 @@ var beadsFixtureDDL = []string{
 		issue_id varchar(255) NOT NULL,
 		text text NOT NULL
 	)`,
+	// Carries every column of the production wisp_events DDL
+	// (internal/doltserver wispAuxTableDDLs). A narrowed copy would have made
+	// the archive's SELECT fail on the columns it now reads, and the reaper
+	// answers a failed archive query by leaving rows protected — so the fixture
+	// would have reported "nothing released" for a query production runs fine.
+	// Defaults are looser than production so the aux-row builders can insert a
+	// bare (issue_id, event_type) row.
 	`CREATE TABLE wisp_events (
 		id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		issue_id varchar(255) NOT NULL,
-		event_type varchar(32) NOT NULL DEFAULT ''
+		event_type varchar(32) NOT NULL DEFAULT '',
+		actor varchar(255) NOT NULL DEFAULT '',
+		old_value text,
+		new_value text,
+		comment text,
+		created_at datetime
 	)`,
 	`CREATE TABLE wisp_dependencies (
 		id varchar(64) NOT NULL PRIMARY KEY,
@@ -415,6 +432,9 @@ type issueRow struct {
 	updatedAt time.Time
 	closedAt  *time.Time
 	labels    []string
+	// description carries the hook-bead fields, including the
+	// "attached_molecule: <id>" line that records a molecule's dispatch.
+	description string
 }
 
 func (f *fixture) insertIssues(t *testing.T, rows ...issueRow) {
@@ -430,8 +450,8 @@ func (f *fixture) insertIssues(t *testing.T, rows ...issueRow) {
 			r.title = r.id
 		}
 		if _, err := f.db.Exec(
-			"INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			r.id, r.title, r.status, r.priority, r.issueType, r.updatedAt, r.updatedAt, r.closedAt); err != nil {
+			"INSERT INTO issues (id, title, description, status, priority, issue_type, created_at, updated_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			r.id, r.title, r.description, r.status, r.priority, r.issueType, r.updatedAt, r.updatedAt, r.closedAt); err != nil {
 			t.Fatalf("insert issue %s: %v", r.id, err)
 		}
 		for _, label := range r.labels {
@@ -541,6 +561,19 @@ func (f *fixture) insertWispComment(t *testing.T, wispID, text string) {
 	t.Helper()
 	if _, err := f.db.Exec("INSERT INTO wisp_comments (issue_id, text) VALUES (?, ?)", wispID, text); err != nil {
 		t.Fatalf("insert comment for %s: %v", wispID, err)
+	}
+}
+
+// insertWispEvent records one state transition on a wisp. For a merge-request
+// wisp these are the only place the transitions exist — the row keeps the final
+// status and nothing else — so archive tests place a known sequence and look
+// for it again.
+func (f *fixture) insertWispEvent(t *testing.T, wispID, eventType, actor, oldValue, newValue string, createdAt time.Time) {
+	t.Helper()
+	if _, err := f.db.Exec(
+		"INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		wispID, eventType, actor, nullString(oldValue), nullString(newValue), createdAt); err != nil {
+		t.Fatalf("insert wisp event %s/%s: %v", wispID, eventType, err)
 	}
 }
 

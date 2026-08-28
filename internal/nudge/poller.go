@@ -62,6 +62,10 @@ func StartPoller(townRoot, session string) (int, error) {
 		return pid, nil // already running
 	}
 
+	if handled, err := guardTestStartPoller(townRoot, session); handled {
+		return 0, err
+	}
+
 	// Find the gt binary.
 	gtBin, err := os.Executable()
 	if err != nil {
@@ -83,8 +87,12 @@ func StartPoller(townRoot, session string) (int, error) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write poller PID file: %v\n", err)
 	}
 
-	// Release the process so it runs independently.
-	_ = cmd.Process.Release()
+	// Reap in the background so the poller cannot linger as a zombie. Release
+	// was here before and does not do this job: it drops Go's handle on the
+	// process without collecting its wait status, so the corpse stays in the
+	// process table until the spawner — a crew manager, i.e. the daemon —
+	// exits. The PID above stays valid; ReapDetached takes only the wait.
+	util.ReapDetached(cmd)
 
 	return pid, nil
 }
@@ -136,6 +144,18 @@ func StopPoller(townRoot, session string) error {
 
 	_ = os.Remove(pidPath)
 	return nil
+}
+
+// PollerAlive reports whether a background nudge-poller is running for session,
+// and its PID if so.
+//
+// It is exported because a poller is one of only two things that can take a
+// queued nudge back OUT of the queue — the other being the agent's own
+// turn-boundary hook, which an agent sitting parked at its prompt will not
+// reach. A caller that is about to claim a queued nudge was delivered has to be
+// able to ask whether anything will drain it (gt-1t0v).
+func PollerAlive(townRoot, session string) (int, bool) {
+	return pollerAlive(townRoot, session)
 }
 
 // pollerAlive checks if a poller is running for the given session.

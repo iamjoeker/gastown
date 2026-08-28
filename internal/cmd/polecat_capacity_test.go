@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -293,14 +294,14 @@ func TestCapacitySnapshotJSONOmitsUnmeasuredFieldsWhenAdmissionDisabled(t *testi
 	// Deliberately non-zero counters that a real max<=0 snapshot could never
 	// have produced — if any of them marshal, the guard is not doing its job.
 	data, err := json.Marshal(polecatCapacitySnapshot{
-		Max:             -1,
-		ActiveSessions:  3,
-		Working:         7,
-		RecoveryBlocked: 8,
-		ReusableIdle:    9,
-		PendingMR:       10,
-		Reservations:    11,
-		Free:            12,
+		Max:                  -1,
+		ActiveSessions:       3,
+		Working:              7,
+		RecoveryBlocked:      8,
+		VerifiedReusableIdle: 9,
+		PendingMR:            10,
+		Reservations:         11,
+		Free:                 12,
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -310,7 +311,7 @@ func TestCapacitySnapshotJSONOmitsUnmeasuredFieldsWhenAdmissionDisabled(t *testi
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"working", "recovery_blocked", "reusable_idle", "pending_mr", "reservations", "free"} {
+	for _, key := range []string{"working", "recovery_blocked", "verified_reusable_idle", "pending_mr", "reservations", "free"} {
 		if _, ok := got[key]; ok {
 			t.Fatalf("capacity JSON %s carries unmeasured field %q", data, key)
 		}
@@ -329,14 +330,14 @@ func TestCapacitySnapshotJSONOmitsUnmeasuredFieldsWhenAdmissionDisabled(t *testi
 
 func TestCapacitySnapshotJSONReportsMeasuredFieldsWhenAdmissionEnabled(t *testing.T) {
 	data, err := json.Marshal(polecatCapacitySnapshot{
-		Max:             4,
-		ActiveSessions:  3,
-		Working:         1,
-		RecoveryBlocked: 2,
-		ReusableIdle:    5,
-		PendingMR:       6,
-		Reservations:    1,
-		Free:            0,
+		Max:                  4,
+		ActiveSessions:       3,
+		Working:              1,
+		RecoveryBlocked:      2,
+		VerifiedReusableIdle: 5,
+		PendingMR:            6,
+		Reservations:         1,
+		Free:                 0,
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -347,7 +348,7 @@ func TestCapacitySnapshotJSONReportsMeasuredFieldsWhenAdmissionEnabled(t *testin
 		t.Fatalf("unmarshal: %v", err)
 	}
 	want := map[string]float64{
-		"max": 4, "working": 1, "recovery_blocked": 2, "reusable_idle": 5,
+		"max": 4, "working": 1, "recovery_blocked": 2, "verified_reusable_idle": 5,
 		"pending_mr": 6, "reservations": 1, "free": 0, "active_sessions": 3,
 	}
 	for key, value := range want {
@@ -430,7 +431,7 @@ func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			snapshot := polecatCapacitySnapshot{}
 			applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", "synth", tt.fields, tt.activeWork, nil, nil)
-			if snapshot.Working != tt.want.Working || snapshot.RecoveryBlocked != tt.want.RecoveryBlocked || snapshot.ReusableIdle != tt.want.ReusableIdle || snapshot.UnverifiedIdle != tt.want.UnverifiedIdle || snapshot.PendingMR != tt.want.PendingMR || snapshot.capacityUsed != tt.want.capacityUsed {
+			if snapshot.Working != tt.want.Working || snapshot.RecoveryBlocked != tt.want.RecoveryBlocked || snapshot.VerifiedReusableIdle != tt.want.VerifiedReusableIdle || snapshot.UnverifiedIdle != tt.want.UnverifiedIdle || snapshot.PendingMR != tt.want.PendingMR || snapshot.capacityUsed != tt.want.capacityUsed {
 				t.Fatalf("snapshot = %+v, want %+v", snapshot, tt.want)
 			}
 		})
@@ -463,16 +464,16 @@ func TestPrintDryRunPlanUsesCapacitySnapshot(t *testing.T) {
 			Skipped:    2,
 			Reason:     "capacity",
 		}, polecatCapacitySnapshot{
-			Max:             2,
-			Working:         1,
-			RecoveryBlocked: 1,
-			Reservations:    0,
-			ReusableIdle:    3,
-			PendingMR:       2,
-			Free:            0,
+			Max:                  2,
+			Working:              1,
+			RecoveryBlocked:      1,
+			Reservations:         0,
+			VerifiedReusableIdle: 3,
+			PendingMR:            2,
+			Free:                 0,
 		}, 5)
 	})
-	for _, want := range []string{"0 free of 2", "working: 1", "recovery_blocked: 1", "reusable_idle: 3", "pending_mr: 2"} {
+	for _, want := range []string{"0 free of 2", "working: 1", "recovery_blocked: 1", "verified_reusable_idle: 3", "pending_mr: 2"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dry-run output %q missing %q", out, want)
 		}
@@ -624,5 +625,169 @@ func TestStandaloneFormulaExistingPolecatNoopDoesNotRequireCapacity(t *testing.T
 
 	if err := runSlingFormula(context.Background(), []string{"test-formula", "gastown/polecats/toast"}); err != nil {
 		t.Fatalf("runSlingFormula: %v", err)
+	}
+}
+
+// The bead-only inventory constructor runs no git, so essentially every idle
+// polecat lands in unverified_idle and verified_reusable_idle sits near zero
+// whatever the pool's real depth. A reader who takes that zero for scarcity
+// concludes the town is full when it is empty — which is what happened, and
+// what put nuking stuck polecats on the table (gt-rjhr).
+//
+// The population here is the measured one from the bead: 21 idle-but-unchecked
+// polecats, zero verified. Every surface that prints the breakdown must say so.
+func polecatCapacityUnverifiedPopulation(t *testing.T, unverified int) polecatCapacitySnapshot {
+	t.Helper()
+	snapshot := polecatCapacitySnapshot{Max: 25}
+	for i := 0; i < unverified; i++ {
+		applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", polecatCapacityTestNames[i], &beads.AgentFields{
+			AgentState:    string(beads.AgentStateIdle),
+			CleanupStatus: "clean",
+		}, nil, nil, nil)
+	}
+	snapshot.Free = snapshot.Max - snapshot.occupied()
+	return snapshot
+}
+
+var polecatCapacityTestNames = []string{
+	"brahmin", "chrome", "crater", "deathclaw", "dust", "ghoul", "guzzle",
+	"mirelurk", "mutant", "nitro", "nuka", "pipboy", "rust", "shiny",
+	"thunder", "vault", "warboy", "toast", "slit", "coma", "morsov",
+}
+
+func TestPolecatCapacityUnverifiedPopulationPinsVerifiedReusableAtZero(t *testing.T) {
+	snapshot := polecatCapacityUnverifiedPopulation(t, 21)
+
+	// The premise of the defect: the count nobody populates reads zero while
+	// the pool it is read as measuring is 21 deep and entirely free.
+	if snapshot.VerifiedReusableIdle != 0 {
+		t.Fatalf("verified_reusable_idle = %d, want 0 — no git check ran", snapshot.VerifiedReusableIdle)
+	}
+	if snapshot.UnverifiedIdle != 21 {
+		t.Fatalf("unverified_idle = %d, want 21", snapshot.UnverifiedIdle)
+	}
+	// The load-bearing correction: none of them occupies a slot.
+	if snapshot.occupied() != 0 || snapshot.Free != 25 {
+		t.Fatalf("occupied=%d free=%d, want 0/25 — unverified idle must not consume capacity",
+			snapshot.occupied(), snapshot.Free)
+	}
+}
+
+func TestPolecatCapacityUnverifiedNoteRefusesToLeaveTheZeroBare(t *testing.T) {
+	note := polecatCapacityUnverifiedNote(polecatCapacityUnverifiedPopulation(t, 21))
+	if note == "" {
+		t.Fatal("no note beside verified_reusable_idle=0 with 21 unverified idle polecats")
+	}
+	for _, want := range []string{
+		"21 idle polecats",                          // the population the zero is hiding
+		"WITHOUT a git check",                       // why the zero is there
+		"is a floor",                                // what the zero does not mean
+		"counts against free",                       // the claim that defuses the scarcity reading
+		"gt polecat check-recovery gastown/brahmin", // how to resolve it, named
+	} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("note %q missing %q", note, want)
+		}
+	}
+}
+
+// A note that never goes away is a note nobody reads. With nothing unverified,
+// the verified count is the whole answer and needs no disclaimer.
+func TestPolecatCapacityUnverifiedNoteSilentWhenEverythingWasMeasured(t *testing.T) {
+	measured := polecatCapacitySnapshot{Max: 25, VerifiedReusableIdle: 21, Free: 25}
+	if note := polecatCapacityUnverifiedNote(measured); note != "" {
+		t.Fatalf("note = %q, want none when unverified_idle is 0", note)
+	}
+	// Nor when nothing was measured at all: at max<=0 the counters are struct
+	// zeros, and a note about them would be a claim about facts never gathered.
+	if note := polecatCapacityUnverifiedNote(polecatCapacitySnapshot{Max: -1, UnverifiedIdle: 21}); note != "" {
+		t.Fatalf("note = %q, want none while admission is disabled", note)
+	}
+}
+
+func TestPolecatCapacityJSONCarriesTheNoteBesideTheZero(t *testing.T) {
+	data, err := json.Marshal(polecatCapacityUnverifiedPopulation(t, 21))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["verified_reusable_idle"] != float64(0) {
+		t.Fatalf("capacity JSON %s: verified_reusable_idle = %v, want 0", data, got["verified_reusable_idle"])
+	}
+	// The old key must be gone rather than kept as an alias: a reader who finds
+	// it will read it as "reusable", which is exactly the misreading.
+	if _, ok := got["reusable_idle"]; ok {
+		t.Fatalf("capacity JSON %s still carries the ambiguous reusable_idle key", data)
+	}
+	note, _ := got["unverified_idle_note"].(string)
+	if !strings.Contains(note, "WITHOUT a git check") {
+		t.Fatalf("capacity JSON %s: unverified_idle_note = %q", data, note)
+	}
+}
+
+func TestPolecatCapacityJSONOmitsNoteWhenNothingIsUnverified(t *testing.T) {
+	data, err := json.Marshal(polecatCapacitySnapshot{Max: 4, VerifiedReusableIdle: 2, Free: 2})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := got["unverified_idle_note"]; ok {
+		t.Fatalf("capacity JSON %s carries a note with nothing to disclaim", data)
+	}
+	// The absence above is only readable because the count itself is not
+	// omitempty: 0 unverified is stated, not left to inference.
+	if got["unverified_idle"] != float64(0) {
+		t.Fatalf("capacity JSON %s dropped unverified_idle", data)
+	}
+}
+
+// Every surface that prints the breakdown must carry the disclaimer with it —
+// the defect was one surface consuming another's output as though it meant
+// something that surface explicitly disclaims.
+func TestPolecatCapacitySurfacesCarryTheDisclaimerForward(t *testing.T) {
+	snapshot := polecatCapacityUnverifiedPopulation(t, 21)
+	snapshot.Free = 0 // force the capacity-exhausted branch on every surface
+
+	surfaces := map[string]func() string{
+		"gt scheduler status": func() string {
+			return captureStdout(t, func() {
+				fmt.Printf("  Capacity:  %d free of %d (%s)\n", snapshot.Free, snapshot.Max, polecatCapacityBreakdown(snapshot))
+				printPolecatCapacityUnverifiedNote(os.Stdout, snapshot)
+			})
+		},
+		"dispatch no-op": func() string {
+			return captureStdout(t, func() {
+				printDispatchNoOp(capacity.DispatchReport{Reason: "capacity", Skipped: 3}, snapshot)
+			})
+		},
+		"dispatch dry run": func() string {
+			return captureStdout(t, func() {
+				printDryRunPlan(capacity.DispatchPlan{Skipped: 3, Reason: "capacity"}, snapshot, 5)
+			})
+		},
+		"admission denial": func() string {
+			return (&polecatCapacityAdmissionError{Snapshot: snapshot, Reason: "capacity is full"}).Error()
+		},
+	}
+
+	for name, render := range surfaces {
+		t.Run(name, func(t *testing.T) {
+			out := render()
+			if !strings.Contains(out, "verified_reusable_idle: 0") {
+				t.Fatalf("%s output %q does not name the field it is reporting", name, out)
+			}
+			if !strings.Contains(out, "WITHOUT a git check") {
+				t.Fatalf("%s output %q reports the zero without its disclaimer", name, out)
+			}
+			if strings.Contains(out, "reusable idle:") {
+				t.Fatalf("%s output %q still labels the count plain 'reusable idle'", name, out)
+			}
+		})
 	}
 }

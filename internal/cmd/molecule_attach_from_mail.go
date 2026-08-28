@@ -80,7 +80,10 @@ func runMoleculeAttachFromMail(cmd *cobra.Command, args []string) error {
 	b := beads.New(workDir)
 
 	// Find the agent's pinned bead (hook)
-	pinnedBeads, err := b.List(beads.ListOptions{
+	// Every assignee form: the mail this molecule came from and the hook it is
+	// being attached to are written by different commands, which need not have
+	// agreed on an address form (gt-gbv4).
+	pinnedBeads, err := b.ListAcrossAgentAddressForms(beads.ListOptions{
 		Status:   beads.StatusPinned,
 		Assignee: agentIdentity,
 		Priority: -1,

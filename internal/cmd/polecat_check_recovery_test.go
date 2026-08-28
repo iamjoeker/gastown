@@ -22,18 +22,42 @@ func (f fakeIssueShower) Show(issueID string) (*beads.Issue, error) {
 	return f.issue, f.err
 }
 
+// fakeCleanupUpdater is a write-and-read-back double. The read-back returns
+// whatever the last write stored, so a fake that "succeeds" without storing
+// (readBackErr, or storing nothing) reproduces the shape this reconcile has to
+// catch: a write that reported success and did not land.
 type fakeCleanupUpdater struct {
-	err    error
-	id     string
-	status string
-	calls  int
+	err         error
+	readBackErr error
+	// skipStore makes the write return nil without changing what the read-back
+	// sees — the "write reported success and did not land" shape.
+	skipStore bool
+	stored    string
+	id        string
+	status    string
+	calls     int
+	readBacks int
 }
 
 func (f *fakeCleanupUpdater) UpdateAgentCleanupStatus(id string, cleanupStatus string) error {
 	f.calls++
 	f.id = id
 	f.status = cleanupStatus
-	return f.err
+	if f.err != nil {
+		return f.err
+	}
+	if !f.skipStore {
+		f.stored = cleanupStatus
+	}
+	return nil
+}
+
+func (f *fakeCleanupUpdater) GetAgentBead(id string) (*beads.Issue, *beads.AgentFields, error) {
+	f.readBacks++
+	if f.readBackErr != nil {
+		return nil, nil, f.readBackErr
+	}
+	return &beads.Issue{ID: id}, &beads.AgentFields{CleanupStatus: f.stored}, nil
 }
 
 type fakeActiveMRRemovalChecker struct {
@@ -285,20 +309,57 @@ func TestStaleCleanupStatusCanBeIgnoredForRecovery(t *testing.T) {
 	}
 }
 
+// safeReconcileInput is the WorkstateInput of a polecat whose every predicate
+// OTHER than cleanup_status has been measured safe: idle, no hook, clean tree,
+// and a branch the merge-queue check found already submitted.
+//
+// It is the state gt-hm0v is about. The reconcile is asked its question here
+// and nowhere else that matters — cleanup_status is the last thing standing,
+// which is exactly when the flag has to act and exactly when it did not.
+func safeReconcileInput(previous polecat.CleanupStatus) polecat.WorkstateInput {
+	return polecat.WorkstateInput{
+		State:              polecat.StateIdle,
+		CleanupStatus:      previous,
+		Branch:             "polecat/nitro",
+		ReuseFactsMeasured: true,
+		MQCheckRequired:    true,
+		HasSubmittableWork: true,
+		MRSubmitted:        true,
+	}
+}
+
+func safeReconcileStatus(previous polecat.CleanupStatus) *RecoveryStatus {
+	// The verdict a polecat in this state actually arrives with: the stale
+	// cleanup_status is a blocker, so the pre-repair verdict is NEEDS_RECOVERY
+	// and the merge-queue tail was never reached, leaving MQStatus empty.
+	return &RecoveryStatus{
+		CleanupStatus: previous,
+		Verdict:       "NEEDS_RECOVERY",
+		NeedsRecovery: true,
+		Branch:        "polecat/nitro",
+		Blockers:      []string{cleanupStatusBlocker(previous)},
+	}
+}
+
+func idleAgentFields(previous polecat.CleanupStatus) *beads.AgentFields {
+	return &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(previous),
+	}
+}
+
+// TestReconcileCleanupStatusIfSafe covers the missing value alongside the dirty
+// ones. "" is listed FIRST because it is the one the flag skipped by name: every
+// polecat this bug stranded carried cleanup_status=<missing>, and the one flag
+// that exists to clear that blocker excluded it before any predicate ran
+// (gt-hm0v).
 func TestReconcileCleanupStatusIfSafe(t *testing.T) {
-	for _, previous := range []polecat.CleanupStatus{polecat.CleanupUnpushed, polecat.CleanupStash, polecat.CleanupUncommitted} {
-		t.Run(string(previous), func(t *testing.T) {
-			status := &RecoveryStatus{
-				CleanupStatus: previous,
-				Verdict:       "SAFE_TO_NUKE",
-				Branch:        "polecat/nitro",
-				MQStatus:      "submitted",
-			}
+	for _, previous := range []polecat.CleanupStatus{"", polecat.CleanupUnknown, polecat.CleanupUnpushed, polecat.CleanupStash, polecat.CleanupUncommitted} {
+		t.Run(cleanupStatusLabel(previous), func(t *testing.T) {
+			status := safeReconcileStatus(previous)
+			fields := idleAgentFields(previous)
 			updater := &fakeCleanupUpdater{}
-			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
-				AgentState:    string(beads.AgentStateIdle),
-				CleanupStatus: string(previous),
-			})
+			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, fields, safeReconcileInput(previous))
 
 			if updater.calls != 1 {
 				t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 1", updater.calls)
@@ -306,58 +367,344 @@ func TestReconcileCleanupStatusIfSafe(t *testing.T) {
 			if updater.id != "gt-gastown-polecat-nitro" || updater.status != string(polecat.CleanupClean) {
 				t.Fatalf("update = (%q, %q), want clean update for agent", updater.id, updater.status)
 			}
+			if updater.readBacks != 1 {
+				t.Fatalf("GetAgentBead calls = %d, want 1 — the write must confirm itself", updater.readBacks)
+			}
 			if status.CleanupStatus != polecat.CleanupClean || !status.Reconciled {
 				t.Fatalf("status after reconcile = (%q, reconciled=%v), want clean true", status.CleanupStatus, status.Reconciled)
+			}
+			// The verdict has to move with the field. A caller that reads
+			// NEEDS_RECOVERY off a run that just repaired the only blocker is
+			// back where it started, and the witness's slot-open check reads
+			// exactly that field.
+			if status.Verdict != "SAFE_TO_NUKE" || status.NeedsRecovery {
+				t.Fatalf("verdict after reconcile = %q needs=%v, want SAFE_TO_NUKE false", status.Verdict, status.NeedsRecovery)
+			}
+			if len(status.Blockers) != 0 {
+				t.Fatalf("blockers after reconcile = %v, want none", status.Blockers)
+			}
+			// The in-memory fields must track the store they just changed, or
+			// anything re-reading them describes a polecat that no longer exists.
+			if fields.CleanupStatus != string(polecat.CleanupClean) {
+				t.Fatalf("fields.CleanupStatus = %q, want clean", fields.CleanupStatus)
+			}
+			assertReconcileOutcome(t, status.Reconcile, "cleanup_status", reconcileActionWritten)
+			if err := reconcileExitError(status.Reconcile); err != nil {
+				t.Fatalf("reconcileExitError() = %v, want nil after a successful write", err)
 			}
 		})
 	}
 }
 
 func TestReconcileCleanupStatusIfSafe_FailsClosed(t *testing.T) {
-	status := &RecoveryStatus{
-		CleanupStatus: polecat.CleanupUnpushed,
-		Verdict:       "SAFE_TO_NUKE",
-		Branch:        "polecat/nitro",
-		MQStatus:      "submitted",
-	}
-	reconcileCleanupStatusIfSafe(status, &fakeCleanupUpdater{err: errors.New("bd update failed")}, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
-		AgentState:    string(beads.AgentStateIdle),
-		CleanupStatus: string(polecat.CleanupUnpushed),
-	})
-
-	if status.Verdict != "NEEDS_RECOVERY" || !status.NeedsRecovery {
-		t.Fatalf("failed update verdict = %q needs=%v, want NEEDS_RECOVERY true", status.Verdict, status.NeedsRecovery)
-	}
-	if len(status.Blockers) == 0 || !strings.Contains(status.Blockers[0], "cleanup_reconcile_failed") {
-		t.Fatalf("blockers = %v, want cleanup_reconcile_failed", status.Blockers)
-	}
-}
-
-func TestCleanupStatusReconcileCandidateRequiresStrictPredicates(t *testing.T) {
-	baseStatus := &RecoveryStatus{Verdict: "SAFE_TO_NUKE", Branch: "polecat/nitro", MQStatus: "submitted"}
-	basePolecat := &polecat.Polecat{State: polecat.StateIdle}
-	baseFields := &beads.AgentFields{AgentState: string(beads.AgentStateIdle), CleanupStatus: string(polecat.CleanupUnpushed)}
-
 	tests := []struct {
-		name   string
-		status *RecoveryStatus
-		p      *polecat.Polecat
-		fields *beads.AgentFields
+		name    string
+		updater *fakeCleanupUpdater
+		want    string
 	}{
-		{name: "stale clean is not rewritten", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{AgentState: string(beads.AgentStateIdle), CleanupStatus: string(polecat.CleanupClean)}},
-		{name: "working polecat blocks", status: baseStatus, p: &polecat.Polecat{State: polecat.StateWorking}, fields: baseFields},
-		{name: "working agent bead blocks", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{AgentState: string(beads.AgentStateWorking), CleanupStatus: string(polecat.CleanupUnpushed)}},
-		{name: "needs recovery blocks", status: &RecoveryStatus{Verdict: "NEEDS_RECOVERY", NeedsRecovery: true, Branch: "polecat/nitro", MQStatus: "submitted"}, p: basePolecat, fields: baseFields},
-		{name: "unknown mq blocks", status: &RecoveryStatus{Verdict: "SAFE_TO_NUKE", Branch: "polecat/nitro", MQStatus: "unknown"}, p: basePolecat, fields: baseFields},
+		{name: "write errors", updater: &fakeCleanupUpdater{err: errors.New("bd update failed")}, want: "bd update failed"},
+		{name: "read back errors", updater: &fakeCleanupUpdater{readBackErr: errors.New("dolt unreachable")}, want: "could not be re-read"},
+		// The shape the read-back exists for: bd returns nil and the row is
+		// unchanged. Without the read-back this reports a repair that did not
+		// happen — the same silent-success family as the bug itself.
+		{name: "write reports success and does not land", updater: &fakeCleanupUpdater{skipStore: true}, want: "still reads <missing>"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, ok := cleanupStatusReconcileCandidate(tt.status, tt.p, tt.fields); ok {
-				t.Fatal("cleanupStatusReconcileCandidate() allowed unsafe reconciliation")
+			status := safeReconcileStatus("")
+			reconcileCleanupStatusIfSafe(status, tt.updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, idleAgentFields(""), safeReconcileInput(""))
+
+			if status.Verdict != "NEEDS_RECOVERY" || !status.NeedsRecovery {
+				t.Fatalf("failed update verdict = %q needs=%v, want NEEDS_RECOVERY true", status.Verdict, status.NeedsRecovery)
+			}
+			if !containsSubstring(status.Blockers, "cleanup_reconcile_failed") {
+				t.Fatalf("blockers = %v, want cleanup_reconcile_failed", status.Blockers)
+			}
+			out := assertReconcileOutcome(t, status.Reconcile, "cleanup_status", reconcileActionFailed)
+			if !strings.Contains(out.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", out.Detail, tt.want)
+			}
+			// A failed repair must reach the caller as a non-zero exit. Exit 0
+			// over an unwritten field is the defect (gt-hm0v).
+			if err := reconcileExitError(status.Reconcile); err == nil {
+				t.Fatal("reconcileExitError() = nil after a failed write, want an error")
 			}
 		})
 	}
+}
+
+// TestCleanupStatusReconcilePlanRefusesWithAReason is the anti-silence test.
+// Every refusal must name the predicate that stopped it: the old candidate
+// function returned a bare false on each of these roads, and the command then
+// exited 0 having said nothing about the action it was asked to perform.
+func TestCleanupStatusReconcilePlanRefusesWithAReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     *RecoveryStatus
+		p          *polecat.Polecat
+		fields     *beads.AgentFields
+		input      polecat.WorkstateInput
+		wantAction string
+		wantDetail string
+	}{
+		{
+			name:       "already clean is not a refusal",
+			status:     safeReconcileStatus(polecat.CleanupClean),
+			p:          &polecat.Polecat{State: polecat.StateIdle},
+			fields:     idleAgentFields(polecat.CleanupClean),
+			input:      safeReconcileInput(polecat.CleanupClean),
+			wantAction: reconcileActionNoChange,
+			wantDetail: "already clean",
+		},
+		{
+			name:       "working polecat blocks",
+			status:     safeReconcileStatus(polecat.CleanupUnpushed),
+			p:          &polecat.Polecat{State: polecat.StateWorking},
+			fields:     idleAgentFields(polecat.CleanupUnpushed),
+			input:      safeReconcileInput(polecat.CleanupUnpushed),
+			wantAction: reconcileActionRefused,
+			wantDetail: "polecat_state=working",
+		},
+		{
+			name:       "working agent bead blocks",
+			status:     safeReconcileStatus(polecat.CleanupUnpushed),
+			p:          &polecat.Polecat{State: polecat.StateIdle},
+			fields:     &beads.AgentFields{AgentState: string(beads.AgentStateWorking), CleanupStatus: string(polecat.CleanupUnpushed)},
+			input:      safeReconcileInput(polecat.CleanupUnpushed),
+			wantAction: reconcileActionRefused,
+			wantDetail: "agent_state=working",
+		},
+		{
+			// The distinction the fix turns on: a blocker that is NOT
+			// cleanup_status survives the repair, so the repair is refused —
+			// and the refusal names the survivor rather than going quiet.
+			name:   "a blocker other than cleanup_status still refuses",
+			status: safeReconcileStatus(polecat.CleanupUnpushed),
+			p:      &polecat.Polecat{State: polecat.StateIdle},
+			fields: idleAgentFields(polecat.CleanupUnpushed),
+			input: func() polecat.WorkstateInput {
+				in := safeReconcileInput(polecat.CleanupUnpushed)
+				in.GitDirty = true
+				return in
+			}(),
+			wantAction: reconcileActionRefused,
+			wantDetail: "git_state=has_uncommitted",
+		},
+		{
+			name:   "unknown mq blocks",
+			status: safeReconcileStatus(polecat.CleanupUnpushed),
+			p:      &polecat.Polecat{State: polecat.StateIdle},
+			fields: idleAgentFields(polecat.CleanupUnpushed),
+			input: func() polecat.WorkstateInput {
+				in := safeReconcileInput(polecat.CleanupUnpushed)
+				in.MQLookupFailed = true
+				return in
+			}(),
+			wantAction: reconcileActionRefused,
+			wantDetail: "mq_status=unknown",
+		},
+		{
+			// A branch nobody ran the queue check for. The zeros of a surface
+			// too cheap to look are the zeros of a branch with nothing to
+			// submit, and only the caller knows which it was (gt-49dp).
+			name:   "a branch with no merge-queue check blocks",
+			status: safeReconcileStatus(polecat.CleanupUnpushed),
+			p:      &polecat.Polecat{State: polecat.StateIdle},
+			fields: idleAgentFields(polecat.CleanupUnpushed),
+			input: func() polecat.WorkstateInput {
+				in := safeReconcileInput(polecat.CleanupUnpushed)
+				in.MQCheckRequired = false
+				return in
+			}(),
+			wantAction: reconcileActionRefused,
+			wantDetail: "no merge-queue check was run",
+		},
+		{
+			name:       "no facts at all",
+			status:     nil,
+			p:          nil,
+			fields:     nil,
+			input:      polecat.WorkstateInput{},
+			wantAction: reconcileActionRefused,
+			wantDetail: "no agent bead",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, out, ok := cleanupStatusReconcilePlan(tt.status, tt.p, tt.fields, tt.input)
+			if ok {
+				t.Fatal("cleanupStatusReconcilePlan() allowed unsafe reconciliation")
+			}
+			if out.Action != tt.wantAction {
+				t.Fatalf("action = %q, want %q", out.Action, tt.wantAction)
+			}
+			// The whole point. A refusal with an empty detail is the silent
+			// no-op wearing a struct.
+			if strings.TrimSpace(out.Detail) == "" {
+				t.Fatal("refusal carried no detail — this is the silent no-op (gt-hm0v)")
+			}
+			if !strings.Contains(out.Detail, tt.wantDetail) {
+				t.Fatalf("detail = %q, want it to contain %q", out.Detail, tt.wantDetail)
+			}
+			if out.Field != "cleanup_status" {
+				t.Fatalf("field = %q, want cleanup_status", out.Field)
+			}
+			if out.Previous == "" {
+				t.Fatal("previous was blank — a missing cleanup_status must render as <missing>, not as nothing")
+			}
+		})
+	}
+}
+
+// TestReconcileCleanupStatusNeverSilent is the property the bead asks for, held
+// over every road at once: the flag may write, decline, or fail, but it may
+// never come back with nothing to say.
+func TestReconcileCleanupStatusNeverSilent(t *testing.T) {
+	roads := []struct {
+		name    string
+		status  *RecoveryStatus
+		p       *polecat.Polecat
+		fields  *beads.AgentFields
+		input   polecat.WorkstateInput
+		updater cleanupStatusUpdater
+	}{
+		{name: "writes", status: safeReconcileStatus(""), p: &polecat.Polecat{State: polecat.StateIdle}, fields: idleAgentFields(""), input: safeReconcileInput(""), updater: &fakeCleanupUpdater{}},
+		{name: "already clean", status: safeReconcileStatus(polecat.CleanupClean), p: &polecat.Polecat{State: polecat.StateIdle}, fields: idleAgentFields(polecat.CleanupClean), input: safeReconcileInput(polecat.CleanupClean), updater: &fakeCleanupUpdater{}},
+		{name: "refuses", status: safeReconcileStatus(""), p: &polecat.Polecat{State: polecat.StateWorking}, fields: idleAgentFields(""), input: safeReconcileInput(""), updater: &fakeCleanupUpdater{}},
+		{name: "fails", status: safeReconcileStatus(""), p: &polecat.Polecat{State: polecat.StateIdle}, fields: idleAgentFields(""), input: safeReconcileInput(""), updater: &fakeCleanupUpdater{err: errors.New("boom")}},
+		{name: "no updater", status: safeReconcileStatus(""), p: &polecat.Polecat{State: polecat.StateIdle}, fields: idleAgentFields(""), input: safeReconcileInput(""), updater: nil},
+	}
+
+	for _, road := range roads {
+		t.Run(road.name, func(t *testing.T) {
+			reconcileCleanupStatusIfSafe(road.status, road.updater, "gt-gastown-polecat-nitro", road.p, road.fields, road.input)
+			if len(road.status.Reconcile) != 1 {
+				t.Fatalf("outcomes = %d, want exactly 1 — every road must report (gt-hm0v)", len(road.status.Reconcile))
+			}
+			out := road.status.Reconcile[0]
+			if out.Action == "" || strings.TrimSpace(out.Detail) == "" {
+				t.Fatalf("outcome = %+v, want a named action and a detail on every road", out)
+			}
+
+			// And the human surface must render it. An operator reading an
+			// ordinary refusal report with no mention of the repair concludes
+			// "the safe path did not apply here" — which is the reasoning that
+			// reaches for nuke.
+			var buf bytes.Buffer
+			printReconcileOutcomes(&buf, true, road.status.Reconcile)
+			if !strings.Contains(buf.String(), "Reconcile:") || !strings.Contains(buf.String(), out.Detail) {
+				t.Fatalf("printed output = %q, want a Reconcile section naming the detail", buf.String())
+			}
+		})
+	}
+}
+
+// TestPrintReconcileOutcomesSilentWithoutTheFlag keeps the report scoped to
+// runs that asked for it: a plain `check-recovery` must look exactly as it did.
+func TestPrintReconcileOutcomesSilentWithoutTheFlag(t *testing.T) {
+	var buf bytes.Buffer
+	printReconcileOutcomes(&buf, false, []ReconcileOutcome{{Field: "cleanup_status", Action: reconcileActionWritten, Detail: "d"}})
+	if buf.Len() != 0 {
+		t.Fatalf("printed %q without --reconcile-cleanup, want nothing", buf.String())
+	}
+}
+
+// TestPushFailedReconcilePlanNamesItsRefusals holds the second reconcile to the
+// same bar. It shares the defect and it shares the fix.
+func TestPushFailedReconcilePlanNamesItsRefusals(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     *RecoveryStatus
+		input      polecat.WorkstateInput
+		fields     *beads.AgentFields
+		wantAction string
+		wantDetail string
+	}{
+		{
+			name:       "not set",
+			status:     &RecoveryStatus{Verdict: "SAFE_TO_NUKE"},
+			fields:     &beads.AgentFields{},
+			wantAction: reconcileActionNoChange,
+			wantDetail: "not set",
+		},
+		{
+			name:       "set but unrefuted",
+			status:     &RecoveryStatus{Verdict: "SAFE_TO_NUKE"},
+			fields:     &beads.AgentFields{PushFailed: true},
+			wantAction: reconcileActionRefused,
+			wantDetail: "did not refute it",
+		},
+		{
+			name:       "refuted but the verdict blocks",
+			status:     &RecoveryStatus{Verdict: "NEEDS_RECOVERY", Blockers: []string{"has work on hook (gt-abc)"}},
+			input:      polecat.WorkstateInput{PushFailedRefuted: true},
+			fields:     &beads.AgentFields{PushFailed: true},
+			wantAction: reconcileActionRefused,
+			wantDetail: "has work on hook (gt-abc)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, ok := pushFailedReconcilePlan(tt.status, tt.input, tt.fields)
+			if ok {
+				t.Fatal("pushFailedReconcilePlan() allowed the write")
+			}
+			if out.Action != tt.wantAction {
+				t.Fatalf("action = %q, want %q", out.Action, tt.wantAction)
+			}
+			if !strings.Contains(out.Detail, tt.wantDetail) {
+				t.Fatalf("detail = %q, want it to contain %q", out.Detail, tt.wantDetail)
+			}
+			// pushFailedReconcileCandidate must keep answering exactly as the
+			// plan does, or the SAFE_TO_NUKE arm's repair hint drifts from the
+			// repair itself.
+			if pushFailedReconcileCandidate(tt.status, tt.input, tt.fields) {
+				t.Fatal("pushFailedReconcileCandidate() disagreed with pushFailedReconcilePlan()")
+			}
+		})
+	}
+}
+
+// TestReconcileExitErrorSeparatesRefusedFromDone is the caller-facing half: a
+// caller cannot tell "refused" from "done" by reading prose, so the exit status
+// has to carry it. Exit 0 over an unwritten field is the bug.
+func TestReconcileExitErrorSeparatesRefusedFromDone(t *testing.T) {
+	done := []ReconcileOutcome{
+		{Field: "push_failed", Action: reconcileActionNoChange, Detail: "not set"},
+		{Field: "cleanup_status", Action: reconcileActionWritten, Detail: "rewritten"},
+	}
+	if err := reconcileExitError(done); err != nil {
+		t.Fatalf("reconcileExitError(done) = %v, want nil", err)
+	}
+
+	refused := append(append([]ReconcileOutcome{}, done...),
+		ReconcileOutcome{Field: "cleanup_status", Action: reconcileActionRefused, Detail: "git_state=has_uncommitted"})
+	err := reconcileExitError(refused)
+	if err == nil {
+		t.Fatal("reconcileExitError(refused) = nil, want an error")
+	}
+	// The error has to name the predicate, not merely fail. "It declined" with
+	// no reason is as unactionable as silence.
+	if !strings.Contains(err.Error(), "git_state=has_uncommitted") {
+		t.Fatalf("error = %q, want it to name the predicate", err)
+	}
+}
+
+func assertReconcileOutcome(t *testing.T, outcomes []ReconcileOutcome, field, action string) ReconcileOutcome {
+	t.Helper()
+	for _, o := range outcomes {
+		if o.Field == field {
+			if o.Action != action {
+				t.Fatalf("%s action = %q, want %q (detail: %s)", field, o.Action, action, o.Detail)
+			}
+			return o
+		}
+	}
+	t.Fatalf("no outcome reported for %s; got %+v", field, outcomes)
+	return ReconcileOutcome{}
 }
 
 func TestAssessHookBead(t *testing.T) {
@@ -884,5 +1231,84 @@ func runCmd(t *testing.T, dir, name string, args ...string) {
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+}
+
+// TestPolecatWorkingEvidenceNamesItsSource is the gt-mkpm regression on the
+// remedy surface.
+//
+// check-recovery is what agents are told to reach for when `gt polecat list` is
+// untrustworthy, and its WORKING arm printed "The agent's pane shows it
+// mid-turn" on BOTH roads to that verdict — including the one that reads the
+// agent bead and never looks at a pane. Measured wrong twice in one evening
+// (gastown/crater, parked with no interrupt line and "Churned for 13m 51s";
+// gastown/brahmin, parked, and a re-run a minute later gave NEEDS_RECOVERY and
+// named push_failed) and right once (gastown/foundation, genuinely mid-turn).
+// The same sentence, three times, with nothing separating the cases — and its
+// prescription is leave-alone, which on the brahmin instance argued for NOT
+// acting on an unhealthy polecat.
+func TestPolecatWorkingEvidenceNamesItsSource(t *testing.T) {
+	setupPolecatTestRegistry(t)
+
+	var measured bytes.Buffer
+	printPolecatWorkingEvidence(&measured, polecat.WorkstateReasonSessionBusy, "gastown", "foundation")
+	if !strings.Contains(measured.String(), "pane was read") {
+		t.Fatalf("session-busy must say the pane was read:\n%s", measured.String())
+	}
+
+	var beadDerived bytes.Buffer
+	printPolecatWorkingEvidence(&beadDerived, polecat.WorkstateReasonNotIdle, "gastown", "crater")
+	got := beadDerived.String()
+	// The retracted claim must be gone from this road. Matched
+	// case-insensitively and on the CONTENT phrase, not on a heading: the
+	// sentence is prose and could legitimately be reworded, but any wording that
+	// still asserts what the pane shows is the defect.
+	if strings.Contains(strings.ToLower(got), "pane shows it mid-turn") {
+		t.Fatalf("bead-derived WORKING must not assert what the pane shows:\n%s", got)
+	}
+	if !strings.Contains(got, "AGENT BEAD") || !strings.Contains(got, "NOT measured busy") {
+		t.Fatalf("bead-derived WORKING must name what it did read:\n%s", got)
+	}
+	// And it must hand over the discriminator that disagreed correctly all five
+	// times this bead recorded, rather than leaving the reader to know it.
+	if !strings.Contains(got, "esc to interrupt") {
+		t.Fatalf("bead-derived WORKING must give the pane check:\n%s", got)
+	}
+	// The control: the two roads must actually differ. If they ever converge
+	// again, the assertions above can both pass on identical text.
+	if got == measured.String() {
+		t.Fatal("both roads to WORKING print the same prose again — that is the whole defect")
+	}
+}
+
+// TestPolecatListMeasurementFooter pins the acceptance criterion of gt-mkpm: a
+// reader of `gt polecat list` alone can tell a measured blocker from an
+// unmeasured one, without consulting source and without running a second
+// command.
+func TestPolecatListMeasurementFooter(t *testing.T) {
+	var out bytes.Buffer
+	printPolecatListMeasurementFooter(&out, []PolecatListItem{
+		{Rig: "gastown", Name: "ghoul", ReuseStatus: polecat.ReuseStatusMQUnchecked},
+		{Rig: "gastown", Name: "synth", ReuseStatus: polecat.ReuseStatusRecoveryNeeded},
+		{Rig: "gastown", Name: "crater", ReuseStatus: polecat.ReuseStatusUnverified},
+	})
+	got := out.String()
+	if !strings.Contains(got, "2 of 3") {
+		t.Fatalf("footer must count only the unmeasured rows:\n%s", got)
+	}
+	if !strings.Contains(got, "gt polecat check-recovery gastown/ghoul") {
+		t.Fatalf("footer must name the surface that measures, on a real row:\n%s", got)
+	}
+
+	// The control, and it is the one that keeps the footer meaningful: a listing
+	// where every verdict was earned prints nothing. A footer that always fires
+	// is a footer readers stop seeing.
+	var quiet bytes.Buffer
+	printPolecatListMeasurementFooter(&quiet, []PolecatListItem{
+		{Rig: "gastown", Name: "synth", ReuseStatus: polecat.ReuseStatusRecoveryNeeded},
+		{Rig: "gastown", Name: "dag", ReuseStatus: polecat.ReuseStatusPreserved},
+	})
+	if quiet.String() != "" {
+		t.Fatalf("a fully measured listing must print no footer:\n%s", quiet.String())
 	}
 }

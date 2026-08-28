@@ -299,6 +299,14 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		_ = TrackSessionPID(cfg.TownRoot, cfg.SessionID, t)
 	}
 
+	// 15. Start the background nudge-queue poller, so a nudge queued for this
+	// session while it sits parked at its prompt has something that will drain
+	// it. Non-fatal: the session is already up, and a delayed nudge is a better
+	// outcome than killing a working agent (gt-xmq6).
+	if err := EnsureNudgePoller(cfg.TownRoot, cfg.SessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+	}
+
 	// 14. Stream agent conversation events to VictoriaLogs (opt-in).
 	// Reads ~/.claude/projects/<hash>/<session>.jsonl and emits agent.event logs.
 	// Non-fatal: observability failures must never block agent startup.

@@ -1,7 +1,7 @@
 // Package tmpgc reclaims orphaned build and test scratch directories from a
 // temporary directory.
 //
-// Two families strand directories under TMPDIR on a gastown host:
+// Three families strand directories under TMPDIR on a gastown host:
 //
 //   - Go toolchain work directories. The toolchain creates one ($WORK) for
 //     every build, test, and vet invocation and removes it on normal exit. A
@@ -10,6 +10,10 @@
 //   - beads test fixture directories. The beads suite creates a Dolt data
 //     directory per run; a suite killed mid-flight leaves it, LOCK file and
 //     all.
+//   - beads hermetic test environment roots. The beads suite creates one per
+//     wrapper invocation to hold a private $HOME, $XDG_CONFIG_HOME and Dolt
+//     root, and — because the run also builds itself a private copy of the bd
+//     binary — each one costs about 201MB.
 //
 // Where TMPDIR is a RAM-backed tmpfs, a few dozen strandings exhaust it, and
 // the first symptom is unrelated to either: gastown's own disk-space guard
@@ -30,14 +34,31 @@
 //   - It is owned by the current user.
 //   - Every file in it can be walked; a single unreadable subtree refuses the
 //     whole candidate, because what cannot be inspected cannot be cleared.
-//   - Nothing anywhere in the tree has been modified within MinAge. A live
-//     build writes constantly, so a quiet tree is the primary liveness signal.
 //   - No live process references the path in its argv, has it as its working
 //     directory, or holds a file descriptor inside it. See liveReferences for
 //     why all three are needed and why /proc rather than lsof answers them.
+//   - Nothing anywhere in the tree has been modified within MinAge. A live
+//     build writes constantly, so a quiet tree is the secondary liveness
+//     signal, covering the startup window in which a build has created $WORK
+//     but named it to nothing yet.
 //
 // If the process table cannot be read at all, the sweep is inconclusive and
 // removes NOTHING, however old the directories look.
+//
+// # Liveness is consulted before age
+//
+// The two liveness checks are ordered, and the order is deliberate: process
+// evidence is asked FIRST and age only decides what the process table left
+// alone. Both answers refuse removal, so the order changes no outcome today —
+// it fixes what a candidate is REPORTED as, and it fixes precedence for any
+// future check that treats "not young" as "eligible".
+//
+// The case that forces the order is a directory being written to right now.
+// The sweep snapshots its clock before it walks, so a tree the Go driver is
+// still compiling into can carry an mtime at or after that snapshot; its age
+// then comes out zero or negative and it reads as merely young, when the
+// stronger and more specific fact — a running process is holding it — was
+// available the whole time (gt-5q6u).
 package tmpgc
 
 import (
@@ -101,6 +122,22 @@ var workDirPattern = regexp.MustCompile(`^go-(build|link)-?[0-9]+$`)
 // might create by hand — are not candidates.
 var beadsTestDirPattern = regexp.MustCompile(`^beads-(test-dolt|bd-tests)-.+$`)
 
+// beadsTestEnvDirPattern matches the beads suite's hermetic environment roots:
+// "beads-test-env-<suffix>", created by
+//
+//	mktemp -d "${TMPDIR:-/tmp}/beads-test-env-XXXXXX"
+//
+// in the beads repo's scripts/ci/lib/test-env.sh. The suffix is restricted to
+// mktemp's own substitution alphabet rather than the ".+" the families above
+// use, because these roots are the ones an operator is most likely to keep a
+// copy of while debugging a failed run: every real name is exactly six
+// alphanumerics, so "beads-test-env-zX8yTM.bak" and "beads-test-env-zX8yTM-keep"
+// are outside the family and a copy someone parked under TMPDIR is not
+// swept. Measured on this host on 2026-08-19, all 63 stranded roots matched
+// `[A-Za-z0-9]{6}` exactly; the length itself is not pinned, so a wrapper that
+// widens XXXXXX keeps working.
+var beadsTestEnvDirPattern = regexp.MustCompile(`^beads-test-env-[A-Za-z0-9]+$`)
+
 // A Family is a class of temporary directory the sweep knows how to identify
 // by name. Membership is the FIRST safety check and the narrowest one: a
 // directory whose name is not exactly a member of some family is never
@@ -135,9 +172,47 @@ var FamilyBeadsTest = Family{
 	Summary: "beads test fixture directories (beads-test-dolt-*, beads-bd-tests-*)",
 }
 
+// FamilyBeadsTestEnv is the beads suite's per-invocation hermetic environment
+// root.
+//
+// beads_test_env_enter() in the beads repo's scripts/ci/lib/test-env.sh points
+// $HOME, $XDG_CONFIG_HOME, $DOLT_ROOT_PATH and $GIT_CONFIG_GLOBAL inside a
+// fresh mktemp directory, and scripts/test.sh then go-builds a private copy of
+// cmd/bd into $BEADS_TEST_ENV_ROOT/prebuilt-bd/bd. That binary is why each root
+// costs about 201MB. Nothing reuses one: every invocation mktemps its own and
+// rebuilds, so a stranded root is dead weight and not a warm cache. The
+// wrapper removes it from a bash `trap ... EXIT`, which does not run when the
+// run is SIGKILLed — the usual end of a long suite on a loaded host.
+//
+// # Only an open descriptor proves this family is live
+//
+// A run in flight is invisible to the other two kinds of evidence. Measured on
+// this host on 2026-08-19 with a beads suite running, a full sweep of /proc
+// found:
+//
+//   - 0 processes naming any beads-test-env path in argv. The wrapper exports
+//     the root through the ENVIRONMENT, so the command line is a plain
+//     `go test -p 4 -parallel 4 -timeout 25m ./cmd/bd`.
+//   - 0 processes with one as their working directory. The suite chdirs to the
+//     repo, not into its environment root.
+//   - 1 process holding a descriptor inside one — /proc/2698443/fd/4, on
+//     xdg-config/go/telemetry/local/go@....v1.count, a counter file the Go
+//     toolchain keeps mapped for the life of the command because
+//     $XDG_CONFIG_HOME points into the root.
+//
+// So for this family the descriptor scan is not one signal among three, it is
+// the only one that fires, and a sweep that judged liveness from argv or cwd
+// would have deleted a running suite's $HOME. That is the whole argument for
+// adding the family here rather than to any check that cannot read /proc.
+var FamilyBeadsTestEnv = Family{
+	Name:    "beads-test-env",
+	Pattern: beadsTestEnvDirPattern,
+	Summary: "beads hermetic test environment roots (beads-test-env-*, ~201 MB each)",
+}
+
 // DefaultFamilies is what a sweep considers when Options.Families is empty.
 func DefaultFamilies() []Family {
-	return []Family{FamilyGoWork, FamilyBeadsTest}
+	return []Family{FamilyGoWork, FamilyBeadsTest, FamilyBeadsTestEnv}
 }
 
 // matchFamily returns the family a base name belongs to, and whether it
@@ -313,7 +388,7 @@ func sweep(opts Options, remove bool) (*Result, error) {
 		if !ok {
 			continue
 		}
-		c := inspect(filepath.Join(dir, entry.Name()), now, res.MinAge)
+		c := inspect(filepath.Join(dir, entry.Name()), now)
 		c.Family = family.Name
 		res.Candidates = append(res.Candidates, c)
 	}
@@ -322,7 +397,11 @@ func sweep(opts Options, remove bool) (*Result, error) {
 	}
 
 	// Liveness evidence is gathered once, for every candidate that survived the
-	// cheap checks. A candidate already refused stays refused: asking the
+	// cheap checks — INCLUDING the ones the age check is about to call young,
+	// because a directory being written to right now is the case where age is
+	// least able to speak and process evidence is most specific. Asking about
+	// them is close to free: liveReferences walks /proc once whatever the size
+	// of the path set. A candidate already refused stays refused: asking the
 	// process table about it cannot un-refuse an unreadable tree.
 	var ask []string
 	for _, c := range res.Candidates {
@@ -337,18 +416,24 @@ func sweep(opts Options, remove bool) (*Result, error) {
 			// Could not look. That is not permission to delete.
 			res.Inconclusive = true
 			res.Errors = append(res.Errors, fmt.Sprintf("live-process evidence unavailable: %v", err))
-			for i := range res.Candidates {
-				if res.Candidates[i].Status == StatusReclaimable {
-					res.Candidates[i].Status = StatusRefused
-					res.Candidates[i].Reason = "live-process evidence unavailable"
-				}
+		}
+		for i := range res.Candidates {
+			c := &res.Candidates[i]
+			if c.Status != StatusReclaimable {
+				continue
 			}
-		} else {
-			for i := range res.Candidates {
-				if res.Candidates[i].Status == StatusReclaimable && ev.Refs[res.Candidates[i].Path] {
-					res.Candidates[i].Status = StatusLive
-					res.Candidates[i].Reason = "referenced by a running process"
-				}
+			switch {
+			case err == nil && ev.Refs[c.Path]:
+				c.Status = StatusLive
+				c.Reason = "referenced by a running process"
+			case c.Age < res.MinAge:
+				c.Status = StatusYoung
+				c.Reason = fmt.Sprintf("modified %s ago (min age %s)", c.Age.Round(time.Second), res.MinAge)
+			case err != nil:
+				// Old, and unheld as far as anyone can tell — but nobody could
+				// look, so there is no "as far as anyone can tell".
+				c.Status = StatusRefused
+				c.Reason = "live-process evidence unavailable"
 			}
 		}
 	}
@@ -402,7 +487,11 @@ func validateSweepDir(dir string) error {
 }
 
 // inspect applies every check that can be answered from the filesystem alone.
-func inspect(path string, now time.Time, minAge time.Duration) Candidate {
+//
+// It measures age but does not judge it. StatusReclaimable here means only
+// "nothing on disk refuses this"; the caller consults the process table first
+// and applies MinAge to whatever that left alone. See the package comment.
+func inspect(path string, now time.Time) Candidate {
 	c := Candidate{Path: path}
 
 	fi, err := os.Lstat(path)
@@ -442,13 +531,15 @@ func inspect(path string, now time.Time, minAge time.Duration) Candidate {
 	}
 	c.SizeBytes = size
 	c.Newest = newest
-	c.Age = now.Sub(newest)
-
-	if c.Age < minAge {
-		c.Status = StatusYoung
-		c.Reason = fmt.Sprintf("modified %s ago (min age %s)", c.Age.Round(time.Second), minAge)
-		return c
+	// now was snapshotted before the walk, so a tree still being written to can
+	// carry an mtime AFTER it and measure as negative age. Clamp to zero: a
+	// directory cannot have been quiet for less than no time, and a negative
+	// duration in a report reads as a clock fault rather than as what it is —
+	// something writing here while we looked.
+	if c.Age = now.Sub(newest); c.Age < 0 {
+		c.Age = 0
 	}
+
 	c.Status = StatusReclaimable
 	return c
 }

@@ -58,38 +58,55 @@ func runPruneBranches(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Warning: git fetch --prune failed: %v\n", style.Warning.Render("⚠"), err)
 	}
 
-	pruned, err := g.PruneStaleBranches(pruneBranchesPattern, pruneBranchesDryRun)
+	report, err := g.PruneStaleBranchesReport(pruneBranchesPattern, pruneBranchesDryRun)
 	if err != nil {
 		return fmt.Errorf("pruning branches: %w", err)
 	}
 
-	if len(pruned) == 0 {
+	if report.Candidates() == 0 {
 		fmt.Printf("%s No stale branches found matching %q\n", style.Bold.Render("✓"), pruneBranchesPattern)
 		return nil
 	}
 
 	if pruneBranchesDryRun {
-		fmt.Printf("%s Would prune %d branch(es):\n\n", style.Warning.Render("⚠"), len(pruned))
+		fmt.Printf("%s Would prune %d branch(es):\n\n", style.Warning.Render("⚠"), len(report.Pruned))
 	} else {
-		fmt.Printf("%s Pruned %d branch(es):\n\n", style.Bold.Render("✓"), len(pruned))
+		fmt.Printf("%s Pruned %d branch(es):\n\n", style.Bold.Render("✓"), len(report.Pruned))
 	}
 
-	for _, b := range pruned {
-		reasonStr := ""
-		switch b.Reason {
-		case "merged":
-			reasonStr = "merged to main"
-		case "no-remote":
-			reasonStr = "remote branch deleted"
-		case "no-remote-merged":
-			reasonStr = "remote deleted, merged to main"
-		}
+	for _, b := range report.Pruned {
 		fmt.Printf("  %s %s (%s)\n",
 			style.Dim.Render("•"),
 			b.Name,
-			style.Dim.Render(reasonStr))
+			style.Dim.Render(pruneReasonText(b.Reason)))
 	}
 	fmt.Println()
 
+	if len(report.Skipped) > 0 {
+		fmt.Printf("%s Kept %d stale branch(es) that could not be deleted:\n\n",
+			style.Warning.Render("⚠"), len(report.Skipped))
+		for _, b := range report.Skipped {
+			fmt.Printf("  %s %s (%s): %s\n",
+				style.Dim.Render("•"),
+				b.Name,
+				style.Dim.Render(pruneReasonText(b.Reason)),
+				b.Detail)
+		}
+		fmt.Println()
+	}
+
 	return nil
+}
+
+// pruneReasonText renders a PruneReport reason code for humans.
+func pruneReasonText(reason string) string {
+	switch reason {
+	case "merged":
+		return "merged to main"
+	case "no-remote":
+		return "remote branch deleted"
+	case "no-remote-merged":
+		return "remote deleted, merged to main"
+	}
+	return reason
 }

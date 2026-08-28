@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/util"
@@ -129,13 +131,95 @@ func (g *Git) run(args ...string) (string, error) {
 // (e.g. GitLab) is unreachable or slow.
 const pushTimeout = 60 * time.Second
 
+// lsRemoteTimeout bounds every `git ls-remote` round trip. ls-remote contacts
+// the remote, so it inherits every way a network call can fail to return: an
+// unreachable host, a stalled TCP connection, ssh waiting on a host-key prompt
+// with nothing to read it.
+//
+// Unbounded, that hangs the caller rather than failing it. `gt patrol scan`
+// reaches ls-remote once per polecat through activeMRGitSafe, and a witness
+// that entered completion discovery on such a remote never came back out — the
+// patrol parked indefinitely on an idle rig with nothing to find, which is half
+// of why the command sits under a hold (gt-nof6).
+//
+// It matches pushTimeout because it is the same trade: long enough that a slow
+// but responsive remote finishes, short enough that a dead one is an error
+// instead of a parked agent.
+const lsRemoteTimeout = 60 * time.Second
+
+// fetchTimeout bounds every `git fetch` that contacts a remote.
+//
+// git has no native fetch timeout, and nothing underneath it supplies one
+// either. Measured on 2026-08-23 (gt-i9wz), the whole chain was blocked and no
+// layer of it had a deadline: gt waiting on the pipe from git, git waiting on
+// the pipe from ssh, ssh in wait_woken on a TCP connection that had gone dead.
+// Both wedged ssh processes had finished their handshake, written 22 bytes, and
+// then moved ZERO bytes across a 25-second sample, still alive at 4:27 elapsed.
+// A fresh ssh to the same host during the stall authenticated in under a
+// second, so it was neither an outage nor an auth failure — it was a connection
+// that died with nothing watching for it. Two rigs hit it in the same moment.
+//
+// It is longer than lsRemoteTimeout because a fetch transfers objects where
+// ls-remote only reads a ref advertisement. It bounds the INCREMENTAL fetch
+// helpers below; cloneInternal's first fetch of a fresh repository is left
+// unbounded deliberately, because there is no honest deadline for "download an
+// entire repository" and picking one would fail big clones to fix a stall.
+//
+// It is a var solely so tests can shorten it; TestFetchTimeoutDefault asserts
+// the shipped value, because a fixture that pins a timeout can otherwise hide
+// what production actually runs with.
+var fetchTimeout = 120 * time.Second
+
+// ErrRemoteUnresponsive marks a git command that was killed for exceeding its
+// network deadline.
+//
+// It is a sentinel rather than only a message because a caller that contacts
+// the remote once per ref has to tell two situations apart: "this one ref could
+// not be compared", which is a single unknown row, and "the remote is not
+// answering anybody", which is every remaining ref — each paid for at the full
+// deadline. A per-call timeout alone converts one unbounded hang into N bounded
+// ones, which is not obviously an improvement; recognising the second case is
+// what makes it one.
+var ErrRemoteUnresponsive = errors.New("remote did not respond within the deadline")
+
+// IsRemoteUnresponsive reports whether err came from a network deadline kill.
+func IsRemoteUnresponsive(err error) bool {
+	return errors.Is(err, ErrRemoteUnresponsive)
+}
+
+// deadlineKillWaitDelay bounds how long Wait blocks after the deadline kill.
+//
+// Killing the process group closes the pipes in the normal case. WaitDelay is
+// for the case that is not normal: a descendant that put itself in another
+// process group survives the kill, keeps the inherited stdout pipe open, and
+// Wait blocks on the copy goroutine forever — the hang re-entering through the
+// door the timeout just closed.
+const deadlineKillWaitDelay = 5 * time.Second
+
+// deadlineError renders a timeout kill as an error carrying ErrRemoteUnresponsive.
+func deadlineError(sub string, timeout time.Duration) error {
+	if sub == "" {
+		sub = "command"
+	}
+	return fmt.Errorf("git %s timed out after %v and its process group was killed: %w", sub, timeout, ErrRemoteUnresponsive)
+}
+
 // runWithTimeout executes a git command with a deadline. If the command does
-// not finish within the timeout, the process is killed and an error is returned.
+// not finish within the timeout, the process GROUP is killed and an error
+// wrapping ErrRemoteUnresponsive is returned.
+//
+// The group, not the process, and that distinction is the whole fix. Measured
+// on the wedged chain (gt-i9wz), each layer had to be signalled individually:
+// killing gt left `git fetch` running, killing git left ssh running and
+// reparented to init, holding a dead TCP connection with no parent left to
+// attribute it to. A deadline that kills only the immediate child does not end
+// the stall, it launders it into an orphan nothing will ever reap.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
 	if err := g.guardUnsafeTownRootMutation(args); err != nil {
 		return "", err
 	}
 
+	sub, _ := gitSubcommand(args)
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}
@@ -144,7 +228,10 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", args...)
-	util.SetDetachedProcessGroup(cmd)
+	// After CommandContext, which installs a Cancel that kills the process
+	// alone. SetProcessGroup replaces it with one that signals the negative pgid.
+	util.SetProcessGroup(cmd)
+	cmd.WaitDelay = deadlineKillWaitDelay
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -155,8 +242,11 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 
 	err := cmd.Run()
 	if err != nil {
+		// ctx.Err(), not errors.Is(err, context.DeadlineExceeded): os/exec
+		// prefers the process's own error when it has one, and a killed process
+		// always has one, so the context error never reaches the caller.
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
+			return "", deadlineError(sub, timeout)
 		}
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
@@ -176,14 +266,15 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 		return "", err
 	}
 
+	sub, _ := gitSubcommand(args)
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}
 
 	var cmd *exec.Cmd
+	var ctx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
-		var ctx context.Context
 		ctx, cancel = context.WithTimeout(context.Background(), timeout)
 		cmd = exec.CommandContext(ctx, "git", args...)
 	} else {
@@ -192,7 +283,14 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	if cancel != nil {
 		defer cancel()
 	}
-	util.SetDetachedProcessGroup(cmd)
+	if timeout > 0 {
+		// Same reasoning as runWithTimeout: the deadline has to reach the ssh
+		// grandchild, and only the process group does.
+		util.SetProcessGroup(cmd)
+		cmd.WaitDelay = deadlineKillWaitDelay
+	} else {
+		util.SetDetachedProcessGroup(cmd)
+	}
 
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
@@ -205,16 +303,60 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		if timeout > 0 {
-			// Check if the context's deadline was exceeded
-			if errors.Is(err, context.DeadlineExceeded) {
-				return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
-			}
+		// ctx.Err() rather than errors.Is(err, context.DeadlineExceeded). The
+		// latter was here and could not fire: os/exec keeps the process's own
+		// error when it has one, and a process killed by the deadline always
+		// has one, so a timeout reported itself as a plain exit failure.
+		if ctx != nil && ctx.Err() == context.DeadlineExceeded {
+			return "", deadlineError(sub, timeout)
 		}
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
+
+// runFetch runs `git fetch` under fetchTimeout with ssh keepalives installed.
+//
+// Every incremental fetch goes through here so that bounding one caller does
+// not leave the same hang reachable from its neighbours: the stall is a
+// property of the transport, not of the call site.
+func (g *Git) runFetch(args ...string) error {
+	_, err := g.runWithEnvAndTimeout(append([]string{"fetch"}, args...), g.sshKeepaliveEnv(), fetchTimeout)
+	return err
+}
+
+// sshKeepaliveEnv makes ssh notice a dead peer itself.
+//
+// This is the second layer, and it is not redundant with the deadline above:
+// the deadline only works while gt is alive to enforce it. A caller-side
+// `timeout 240 gt patrol branches` — exactly what the gastown witness was
+// using — kills gt and nothing else, and the measured result was a git fetch
+// and an ssh that outlived it, reparented to init, still holding a dead
+// connection to github. Nothing in the town knows those exist. ServerAlive*
+// is the only thing that can end them, because it runs INSIDE the orphan:
+// four missed probes at fifteen seconds turns an unbounded hang into a ~60s
+// error. ConnectTimeout bounds the other end of the same call, the connect
+// that never completes.
+//
+// It yields nothing when the operator has configured their own ssh invocation.
+// GIT_SSH_COMMAND overrides both core.sshCommand and GIT_SSH, so setting it
+// unconditionally would replace a rig's configured transport — breaking
+// authentication to fix a timeout is not a trade worth making silently.
+func (g *Git) sshKeepaliveEnv() []string {
+	if strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND")) != "" || strings.TrimSpace(os.Getenv("GIT_SSH")) != "" {
+		return nil
+	}
+	// A local config read: no network, and an unset key exits non-zero, which
+	// correctly reads as "nothing configured".
+	if out, err := g.run("config", "--get", "core.sshCommand"); err == nil && strings.TrimSpace(out) != "" {
+		return nil
+	}
+	return []string{"GIT_SSH_COMMAND=" + sshKeepaliveCommand}
+}
+
+// sshKeepaliveCommand is the ssh invocation that will not wait forever on a
+// peer that has stopped answering.
+const sshKeepaliveCommand = "ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=10"
 
 func (g *Git) guardUnsafeTownRootMutation(args []string) error {
 	cmd, rest := gitSubcommand(args)
@@ -950,23 +1092,24 @@ func (g *Git) CheckoutResetBranch(branch, startPoint string) error {
 	return err
 }
 
-// Fetch fetches from the remote.
+// Fetch fetches from the remote, under fetchTimeout.
 func (g *Git) Fetch(remote string) error {
-	_, err := g.run("fetch", remote)
-	return err
+	return g.runFetch(remote)
 }
 
 // FetchPrune fetches from the remote and prunes stale remote-tracking refs.
 // This removes remote-tracking branches for branches that no longer exist on the remote.
+//
+// It runs under fetchTimeout: this is the call `gt patrol branches` makes to
+// refresh its comparison target, and the one measured hanging past four minutes
+// on two rigs at once (gt-i9wz).
 func (g *Git) FetchPrune(remote string) error {
-	_, err := g.run("fetch", "--prune", remote)
-	return err
+	return g.runFetch("--prune", remote)
 }
 
-// FetchBranch fetches a specific branch from the remote.
+// FetchBranch fetches a specific branch from the remote, under fetchTimeout.
 func (g *Git) FetchBranch(remote, branch string) error {
-	_, err := g.run("fetch", remote, branch)
-	return err
+	return g.runFetch(remote, branch)
 }
 
 // FetchBranchShallow fetches a single branch with --depth 1 and creates the
@@ -974,8 +1117,7 @@ func (g *Git) FetchBranch(remote, branch string) error {
 // clones to add a branch that wasn't included in the initial clone.
 func (g *Git) FetchBranchShallow(remote, branch string) error {
 	refspec := branch + ":refs/remotes/" + remote + "/" + branch
-	_, err := g.run("fetch", "--depth", "1", remote, refspec)
-	return err
+	return g.runFetch("--depth", "1", remote, refspec)
 }
 
 // Pull pulls from the remote branch.
@@ -1043,6 +1185,15 @@ func (g *Git) ForkBackedRemote(remote string) bool {
 // for default-branch work. In split push-url setups origin still fetches from
 // upstream, so origin/<default> is clean. When origin itself is a fork and a
 // distinct upstream remote is present, upstream/<default> is the clean base.
+//
+// This is the CONSERVATIVE base: the furthest-downstream ref work has to reach
+// before it is safe to consider it gone for good. Deletion paths want it — a
+// branch whose commits have only reached the fork has not landed anywhere
+// permanent, so pruning it would destroy the only copy.
+//
+// It is NOT the ref a polecat branch merges into on a fork-backed rig. Use
+// MergeTargetDefaultBranchBaseRef for that; the two answers differ exactly where
+// the fork's default branch is authoritative (gt-lj2n).
 func (g *Git) CleanDefaultBranchBaseRef(remote, defaultBranch string) string {
 	if defaultBranch == "" {
 		defaultBranch = "main"
@@ -1055,13 +1206,64 @@ func (g *Git) CleanDefaultBranchBaseRef(remote, defaultBranch string) string {
 	return remote + "/" + defaultBranch
 }
 
+// MergeTargetDefaultBranchBaseRef returns the ref that default-branch work on
+// this rig is actually merged into — the base to measure a branch against, to
+// rebase it onto, and to take its pre-verified base's merge-base with.
+//
+// gt-lj2n: CleanDefaultBranchBaseRef's premise is that a fork's default branch
+// is a stale subset of upstream's, so upstream is the truer base. That is false
+// under the Refinery topology, where every MR is merged into the rig's OWN
+// origin/<default> and upstream is a public repo carrying none of it (measured
+// on the beads rig: origin/main 112 ahead, upstream/main 57 ahead). Measuring
+// polecat work against upstream/<default> there inflated commits-ahead by the
+// whole divergence, so gt done's zero-commit no-MR early return was never
+// entered, and control fell through to an auto-rebase onto a foreign base that
+// could only conflict — failing before any MR was created. Every polecat on such
+// a rig was blocked, including one with nothing to submit, which is also how the
+// no-changes escape hatch that bounds spawn storms got blocked.
+//
+// So a fork whose default branch carries commits upstream does not have is
+// authoritative for this rig's work and is its own merge target. Only a fork
+// that is behind-or-equal is stale enough for upstream to be the base. The check
+// is self-evidencing from git state and needs no new config; where the
+// comparison cannot be made — crew checkouts configure upstream but never fetch
+// it, so the ref does not resolve — the answer is unknown, not diverged, and the
+// conservative base is kept.
+func (g *Git) MergeTargetDefaultBranchBaseRef(remote, defaultBranch string) string {
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	base := g.CleanDefaultBranchBaseRef(remote, defaultBranch)
+	if base != "upstream/"+defaultBranch {
+		return base
+	}
+	if ahead, err := g.CommitsAhead("upstream/"+defaultBranch, remote+"/"+defaultBranch); err == nil && ahead > 0 {
+		return remote + "/" + defaultBranch
+	}
+	return base
+}
+
 // CleanBaseRef returns a fully qualified base ref for a target branch. Explicit
 // origin/ or upstream/ refs are preserved; default-branch targets use the clean
 // fork-aware base.
 func (g *Git) CleanBaseRef(remote, defaultBranch, target string) string {
+	return baseRefForTarget(remote, defaultBranch, target, g.CleanDefaultBranchBaseRef)
+}
+
+// MergeTargetBaseRef is CleanBaseRef for merge-bound work: an explicit target is
+// still honoured verbatim, and only the default-branch case consults the rig's
+// real merge target.
+func (g *Git) MergeTargetBaseRef(remote, defaultBranch, target string) string {
+	return baseRefForTarget(remote, defaultBranch, target, g.MergeTargetDefaultBranchBaseRef)
+}
+
+// baseRefForTarget holds the target-qualification rules the two base-ref
+// resolvers share, so an explicit target can never be interpreted differently
+// depending on which of them the caller reached for.
+func baseRefForTarget(remote, defaultBranch, target string, defaultBase func(string, string) string) string {
 	target = strings.TrimSpace(target)
 	if target == "" || target == defaultBranch {
-		return g.CleanDefaultBranchBaseRef(remote, defaultBranch)
+		return defaultBase(remote, defaultBranch)
 	}
 	if strings.HasPrefix(target, "origin/") || strings.HasPrefix(target, "upstream/") {
 		return target
@@ -1136,6 +1338,117 @@ func (g *Git) Push(remote, branch string, force bool) error {
 		args = append(args, "--force")
 	}
 	_, err := g.runWithTimeout(pushTimeout, args...)
+	return err
+}
+
+// nonFastForwardMarkers are the phrases git prints when it refuses a push
+// because the ref being updated is not an ancestor of what is being pushed.
+// Matched case-insensitively against the failed command's output.
+var nonFastForwardMarkers = []string{
+	"(non-fast-forward)",
+	"(fetch first)",
+	"updates were rejected because",
+}
+
+// IsNonFastForwardPushError reports whether err is a push that git refused for
+// being a non-fast-forward update.
+//
+// That refusal is the EXPECTED outcome of publishing a branch whose history was
+// rewritten: a rebase gives every commit a new sha, so the tip already on the
+// remote stops being an ancestor of the local tip and git declines without a
+// force. It is a statement about the two refs, not about whether the CONTENT
+// reached the remote — and callers must not read it as a failed push (gt-3bzt).
+// A polecat that rebased onto current origin/main, pushed, and was rejected here
+// had its work already merged into main; the flag set from this exit status
+// stranded it anyway, twice in 45 minutes.
+func IsNonFastForwardPushError(err error) bool {
+	if err == nil {
+		return false
+	}
+	haystack := err.Error()
+	var gitErr *GitError
+	if errors.As(err, &gitErr) {
+		// The wrapped Error() renders stderr only; read both streams so a rejection
+		// git happened to print on stdout is still classified.
+		haystack = gitErr.Stdout + "\n" + gitErr.Stderr
+	}
+	haystack = strings.ToLower(haystack)
+	for _, marker := range nonFastForwardMarkers {
+		if strings.Contains(haystack, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// PushWithLease republishes a branch this caller owns after its history was
+// rewritten, typically by a rebase onto the target branch.
+//
+// It is a force push, so the guard has to be the content and not the flag. Two
+// things stand between it and a lost commit, and they answer different questions:
+//
+//   - Before pushing, the remote's current tip is fetched and checked for
+//     preservation IN the branch about to replace it, by patch-id. A rebase
+//     passes that trivially — same patches, new shas — while a push that would
+//     actually drop someone's commit does not, and is refused. This is the check
+//     that matters, because --force-with-lease alone would happily overwrite a
+//     tip it had just read.
+//   - The lease itself is then pinned to that fetched sha rather than left to
+//     git's default, which leases against the local remote-tracking ref: a
+//     polecat worktree's refs/remotes/origin/<branch> is routinely stale or
+//     absent, and a bare --force-with-lease there fails for a reason that has
+//     nothing to do with the remote. It closes the window between the check
+//     above and the write.
+//
+// dstBranch must be a branch this caller owns. Pushing over the remote's default
+// branch is refused outright — a rewrite there is never this path's business.
+func (g *Git) PushWithLease(remote, srcBranch, dstBranch string) error {
+	srcBranch = strings.TrimSpace(srcBranch)
+	dstBranch = strings.TrimSpace(dstBranch)
+	if srcBranch == "" || dstBranch == "" {
+		return fmt.Errorf("lease push needs both a source and a destination branch")
+	}
+	defaultBranch := g.RemoteDefaultBranch()
+	refspec := srcBranch + ":" + dstBranch
+	if err := g.RefuseForkBackedDefaultPush(remote, refspec, defaultBranch); err != nil {
+		return err
+	}
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	if dstBranch == defaultBranch {
+		return fmt.Errorf("refusing to lease-push over the default branch %s/%s", remote, dstBranch)
+	}
+
+	// Fetched rather than read by ls-remote: the preservation check below needs
+	// the remote tip's OBJECTS, and a tip another actor pushed is not in this
+	// repository until something brings it in. Without the fetch that check would
+	// error on every case it exists to catch.
+	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+dstBranch)
+	if err != nil {
+		return fmt.Errorf("reading %s/%s before lease push: %w", remote, dstBranch, err)
+	}
+	defer cleanup()
+	tip, err := g.Rev(fetched)
+	if err != nil {
+		return fmt.Errorf("resolving %s/%s before lease push: %w", remote, dstBranch, err)
+	}
+	tip = strings.TrimSpace(tip)
+	if tip == "" {
+		return fmt.Errorf("no tip at %s/%s to lease against", remote, dstBranch)
+	}
+
+	preservation, err := g.preservationOfRefAgainstRef(fetched, srcBranch)
+	if err != nil {
+		return fmt.Errorf("checking whether %s/%s survives in %s: %w", remote, dstBranch, srcBranch, err)
+	}
+	if !preservation.Preserved {
+		return fmt.Errorf("refusing to lease-push %s over %s/%s: %d commit(s) on the remote are not preserved in %s",
+			srcBranch, remote, dstBranch, preservation.UnpreservedPatchCount, srcBranch)
+	}
+
+	lease := "--force-with-lease=refs/heads/" + dstBranch + ":" + tip
+	_, err = g.runWithTimeout(pushTimeout, "push", lease, remote, refspec)
 	return err
 }
 
@@ -1518,10 +1831,9 @@ func (g *Git) HasUpstreamRemote() (bool, error) {
 	return true, nil
 }
 
-// FetchUpstream fetches from the upstream remote.
+// FetchUpstream fetches from the upstream remote, under fetchTimeout.
 func (g *Git) FetchUpstream() error {
-	_, err := g.run("fetch", "upstream")
-	return err
+	return g.runFetch("upstream")
 }
 
 // Remotes returns the list of configured remote names.
@@ -1601,10 +1913,98 @@ func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 }
 
 // DeleteRemoteBranchIfAt deletes a remote branch only if it still points at expectedHash.
+//
+// The "[deleted]" line and the zero exit status are not proof the ref is gone. A
+// delete was seen to print exactly that while ls-remote returned the old sha
+// immediately afterwards, with the branch's polecat already done and nothing
+// live to re-push it; an identical second delete then took, and the ref was
+// gone. Any cleanup that trusts the push report can therefore leave a live ref
+// behind while reporting success — so verify, and re-issue once. (gt-wkcz)
+//
+// The push error is subordinate to the verification: a second attempt that fails
+// because the ref is already gone has still achieved the caller's goal.
 func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error {
 	ref := "refs/heads/" + branch
-	_, err := g.runWithTimeout(pushTimeout, "push", "--force-with-lease="+ref+":"+expectedHash, remote, ":"+ref)
-	return err
+	lease := "--force-with-lease=" + ref + ":" + expectedHash
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		_, pushErr := g.runWithTimeout(pushTimeout, "push", lease, remote, ":"+ref)
+
+		tip, tipErr := g.remoteBranchDeleteTip(remote, branch)
+		if tipErr == nil && tip == "" {
+			return nil
+		}
+		if pushErr != nil {
+			return pushErr
+		}
+		if tipErr != nil {
+			lastErr = fmt.Errorf("delete of %s/%s reported success but could not be verified: %w", remote, branch, tipErr)
+			continue
+		}
+		lastErr = fmt.Errorf("delete of %s/%s reported success but the branch is still at %s", remote, branch, shortSHA(tip))
+	}
+	return lastErr
+}
+
+// remoteBranchDeleteTip reports the branch tip a delete must have cleared, read
+// from every URL the remote has, and "" when no URL still carries the ref.
+//
+// A split fetch/push origin means the delete writes to one URL while every other
+// agent reads from the other, so a ref cleared from the push URL but still
+// visible to fetchers is still live, and only checking both settles it.
+func (g *Git) remoteBranchDeleteTip(remote, branch string) (string, error) {
+	for _, target := range nonEmptyUnique([]string{g.pushTarget(remote), remote}) {
+		tip, err := g.RemoteBranchTip(target, branch)
+		if err != nil {
+			return "", err
+		}
+		if tip = strings.TrimSpace(tip); tip != "" {
+			return tip, nil
+		}
+	}
+	return "", nil
+}
+
+// ResolveMergedBranchDeleteHead returns the head value a merged-branch delete
+// should lease against, or "" when the remote branch is already gone.
+//
+// recordedHead (an MR's submitted commit_sha) goes stale by design. Resolving a
+// conflict by merging the target INTO the branch advances the branch head after
+// the MR was created — the refinery workflow actively instructs resolvers to do
+// this — and git then rejects the delete with "stale info". The recorded sha was
+// only ever a proxy for the property that matters, that the branch is contained
+// in target, so when the proxy no longer matches, re-establish the property
+// directly against the current head rather than failing on the proxy. (gt-yog2)
+//
+// Returns an error when the current head is NOT contained in target: that head
+// carries work the merge did not take, and deleting the branch would lose it.
+func (g *Git) ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead string) (string, error) {
+	tip, err := g.PushRemoteBranchTip(remote, branch)
+	if err != nil {
+		return "", fmt.Errorf("read remote branch tip: %w", err)
+	}
+	tip = strings.TrimSpace(tip)
+	if tip == "" {
+		return "", nil
+	}
+	if tip == strings.TrimSpace(recordedHead) {
+		return tip, nil
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and has no target branch to verify it against",
+			branch, shortSHA(tip), shortSHA(recordedHead))
+	}
+	// Contained by sha OR by content, for the same reason the merge proof itself
+	// accepts both: a landing that rebased carries the branch's work under
+	// rewritten shas, and refusing the delete there strands a branch whose work
+	// is provably on the target (gt-umq0).
+	if _, err := g.VerifyCommitLandedOnPushTarget(remote, target, tip); err != nil {
+		return "", fmt.Errorf("branch %s was refreshed to %s after submission (recorded %s) and that head is not contained in %s: %w",
+			branch, shortSHA(tip), shortSHA(recordedHead), target, err)
+	}
+	return tip, nil
 }
 
 // HasOpenPR checks whether the given branch has an open pull request on GitHub.
@@ -1863,7 +2263,7 @@ type RemoteRef struct {
 // The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
 // Returns full ref names like "refs/heads/polecat/furiosa-abc123".
 func (g *Git) ListRemoteRefsWithHashes(remote, prefix string) ([]RemoteRef, error) {
-	out, err := g.run("ls-remote", "--refs", remote, prefix+"*")
+	out, err := g.runWithTimeout(lsRemoteTimeout, "ls-remote", "--refs", remote, prefix+"*")
 	if err != nil {
 		return nil, err
 	}
@@ -1902,7 +2302,7 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 // includes tags so callers can distinguish a truly empty repo from a non-empty
 // repo with no branch refs or a broken remote HEAD.
 func (g *Git) RemoteHasRefs(remote string) (bool, error) {
-	out, err := g.run("ls-remote", "--refs", remote)
+	out, err := g.runWithTimeout(lsRemoteTimeout, "ls-remote", "--refs", remote)
 	if err != nil {
 		return false, err
 	}
@@ -2109,7 +2509,7 @@ func (g *Git) IsEmpty() (bool, error) {
 // NOTE: For named remotes with a separate pushurl, this checks the fetch URL.
 // Use PushRemoteBranchExists to verify branches that were pushed.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(lsRemoteTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return false, err
 	}
@@ -2119,7 +2519,7 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 // RemoteBranchTip returns the SHA at refs/heads/<branch> on the remote.
 // An empty SHA with nil error means the branch is missing.
 func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(lsRemoteTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return "", err
 	}
@@ -2136,7 +2536,7 @@ func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 	if pushTarget == remote {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.run("ls-remote", "--heads", pushTarget, branch)
+	out, err := g.runWithTimeout(lsRemoteTimeout, "ls-remote", "--heads", pushTarget, branch)
 	if err != nil {
 		return false, err
 	}
@@ -2205,11 +2605,18 @@ func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit s
 		return nil
 	}
 
-	fetchTarget := g.pushTarget(remote)
-	if _, err := g.run("fetch", "--no-tags", fetchTarget, "refs/heads/"+branch); err != nil {
+	// Into a private ref, not FETCH_HEAD: that file is per-repository and any
+	// concurrent fetch in the same gitdir overwrites it (gt-880s). Here the
+	// clobbered value would be some other ref's tip, and the failure could go
+	// either way — a real push reported unverified, or worse, a stale push
+	// "verified" because commit happened to be an ancestor of whatever landed in
+	// FETCH_HEAD instead.
+	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
+	if err != nil {
 		return fmt.Errorf("verified_push_failed: unable to fetch %s/%s for ancestry check: %w", remote, branch, err)
 	}
-	reachable, err := g.IsAncestor(commit, "FETCH_HEAD")
+	defer cleanup()
+	reachable, err := g.IsAncestor(commit, fetched)
 	if err != nil {
 		return fmt.Errorf("verified_push_failed: unable to verify commit %s on %s/%s: %w", shortSHA(commit), remote, branch, err)
 	}
@@ -2217,6 +2624,110 @@ func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit s
 		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s)", shortSHA(commit), remote, branch, shortSHA(tip))
 	}
 	return nil
+}
+
+// MergeProofMethod names how a landing was proven.
+type MergeProofMethod string
+
+const (
+	// MergeProofSHA is the strong form: the target literally contains the
+	// submitted commit, so the landing was a fast-forward or a merge.
+	MergeProofSHA MergeProofMethod = "sha_containment"
+	// MergeProofContent is the rebase form: the target does not contain the
+	// submitted sha because the landing rewrote it, but the work that sha
+	// carried is demonstrably present on the target.
+	MergeProofContent MergeProofMethod = "content_equivalence"
+)
+
+// MergeProof records how VerifyCommitLandedOnPushTarget proved a landing, so a
+// caller can report the evidence rather than a bare "verified".
+type MergeProof struct {
+	Method MergeProofMethod
+	// Evidence names the underlying content check that carried a
+	// MergeProofContent proof: "merge_tree_noop" or "cherry" (patch-id).
+	Evidence string
+	// TargetTip is the target head the proof was taken against.
+	TargetTip string
+}
+
+// ErrMergeProofUnprovable means the question could not be answered — the
+// submitted commit is unreadable here, or the target could not be fetched or
+// compared. It is NOT a statement that the work is missing, and it wants a
+// different operator response from one.
+var ErrMergeProofUnprovable = errors.New("merge proof unprovable")
+
+// ErrCommitNotLanded means the question was answered and the answer is no: the
+// target carries neither the submitted commit nor its content.
+var ErrCommitNotLanded = errors.New("commit not landed on target")
+
+// VerifyCommitLandedOnPushTarget proves that the work of commit is on the push
+// target branch, and reports which proof carried it.
+//
+// Sha containment is the strong form and is tried first. It is also, on its own,
+// unable to describe the refinery's own prescribed workflow: MRs are merged one
+// at a time with sequential rebasing, and a rebase rewrites the sha, so from the
+// second MR of any batch onward the submitted sha is by construction absent from
+// the target however cleanly the work landed. Measured on two MRs fifteen
+// minutes apart with nothing wrong with either, the only difference being
+// whether another MR happened to land in between — queue timing, not submission
+// quality (gt-umq0). A check that refuses correct work trains its operators to
+// route around it.
+//
+// So when containment fails the same question is put to the CONTENT: is this
+// commit's work already represented on the target? Merging it into the fetched
+// target in the object store answers that directly — if the merge changes
+// nothing, the target already has it — with patch-id equality (`git cherry`) as
+// the fallback when the merge cannot be computed.
+//
+// The merge-tree form is deliberately the first content check rather than
+// patch-id, because patch-id hashes context lines: a rebase across an adjacent
+// change legitimately alters it while leaving the merge a no-op. Reaching for
+// patch-id first would refuse exactly the busy-queue landings this exists for.
+//
+// Absence of proof is reported apart from proof of absence:
+// ErrMergeProofUnprovable when the comparison could not be made, ErrCommitNotLanded
+// when it was made and the work is not there.
+func (g *Git) VerifyCommitLandedOnPushTarget(remote, branch, commit string) (MergeProof, error) {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return MergeProof{}, fmt.Errorf("%w: empty commit for %s/%s", ErrMergeProofUnprovable, remote, branch)
+	}
+	containErr := g.VerifyPushedCommitReachableFromPushTarget(remote, branch, commit)
+	if containErr == nil {
+		return MergeProof{Method: MergeProofSHA}, nil
+	}
+
+	// Nothing can be said about the content of a commit this repository cannot
+	// read. cat-file -e rather than rev-parse: a full 40-hex sha rev-parses to
+	// itself whether or not the object exists.
+	if _, err := g.run("cat-file", "-e", commit+"^{commit}"); err != nil {
+		return MergeProof{}, fmt.Errorf("%w: commit %s is not readable here, so its content cannot be compared against %s/%s (containment said: %v)",
+			ErrMergeProofUnprovable, shortSHA(commit), remote, branch, containErr)
+	}
+
+	fetched, cleanup, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
+	if err != nil {
+		return MergeProof{}, fmt.Errorf("%w: unable to fetch %s/%s to compare content: %v", ErrMergeProofUnprovable, remote, branch, err)
+	}
+	defer cleanup()
+
+	status, err := g.preservationOfRefAgainstRef(commit, fetched)
+	if err != nil {
+		return MergeProof{}, fmt.Errorf("%w: unable to compare commit %s against %s/%s: %v",
+			ErrMergeProofUnprovable, shortSHA(commit), remote, branch, err)
+	}
+	tip, _ := g.Rev(fetched)
+	tip = strings.TrimSpace(tip)
+	if !status.Preserved {
+		return MergeProof{}, fmt.Errorf("%w: commit %s has %d commit(s) that %s/%s carries neither by sha nor by content (target tip %s)",
+			ErrCommitNotLanded, shortSHA(commit), status.UnpreservedPatchCount, remote, branch, shortSHA(tip))
+	}
+	// An "ancestor" verdict here means containment held after all and the read
+	// above failed for some transient reason; report the proof that is true.
+	if status.Evidence == "ancestor" {
+		return MergeProof{Method: MergeProofSHA, TargetTip: tip}, nil
+	}
+	return MergeProof{Method: MergeProofContent, Evidence: status.Evidence, TargetTip: tip}, nil
 }
 
 func parseLSRemoteTip(out, branch string) string {
@@ -2349,6 +2860,20 @@ func (g *Git) CommitMeta(ref string) (*CommitIdentity, error) {
 		CommitterEmail: strings.TrimSpace(parts[4]),
 		CommittedAt:    committedAt,
 	}, nil
+}
+
+// MergeBase returns the best common ancestor of two commits. For a submitted
+// branch and its target that is the commit the branch was actually built on,
+// which is the question callers usually mean when they reach for the target's
+// current tip instead. The two coincide only while nothing has landed since the
+// branch was cut, so the tip is a correct answer exactly when it is a redundant
+// one.
+func (g *Git) MergeBase(a, b string) (string, error) {
+	out, err := g.run("merge-base", a, b)
+	if err != nil {
+		return "", fmt.Errorf("merge-base %s %s: %w", a, b, err)
+	}
+	return strings.TrimSpace(out), nil
 }
 
 // IsAncestor checks if ancestor is an ancestor of descendant.
@@ -3094,6 +3619,17 @@ func (g *Git) preservationOfRefAgainstRef(head, ref string) (BranchPreservationS
 	if err != nil {
 		return status, err
 	}
+	// A blank listing is not a clean bill of health, and callers that delete on
+	// Preserved must never read it as one. `git cherry` prints one line per
+	// commit on head, so no lines means the range held nothing — which is
+	// exactly the case the ancestor check above already settles. Reaching here
+	// with empty output means the two readings disagree, and an undetermined
+	// measurement must fall to KEEP rather than to the destructive side. This is
+	// the shape that read an empty query as "every table is missing" (hq-emgkr);
+	// on a delete path the same default is unrecoverable rather than alarming.
+	if strings.TrimSpace(out) == "" {
+		return status, fmt.Errorf("git cherry %s %s listed no commits while %s is not an ancestor of %s: containment undetermined", ref, head, head, ref)
+	}
 	status.UnpreservedPatchCount = CountCherryUnmergedCommits(out)
 	status.Preserved = status.UnpreservedPatchCount == 0
 	if status.Preserved {
@@ -3104,6 +3640,113 @@ func (g *Git) preservationOfRefAgainstRef(head, ref string) (BranchPreservationS
 
 func (g *Git) mergeTreeNoopAgainstRef(ref string) (bool, error) {
 	return g.mergeTreeNoopBetweenRefs("HEAD", ref)
+}
+
+// MergeConflicts reports the files that would conflict if branch were merged
+// into base, using `git merge-tree --write-tree` — a real three-way merge
+// against the actual merge base, run entirely in the object store with no
+// worktree, no index and no state to unwind.
+//
+// It answers the question branch EXISTENCE cannot: a branch can exist, be
+// pushed, and carry hundreds of commits over its target while still being
+// unmergeable. Measured on gastown 2026-08-23 (gt-0w2l), two branches that
+// every existence-and-content check called fine conflicted in 17 and 12 files
+// respectively, because their merge base was 700 commits back.
+//
+// A nil slice with a nil error means the merge is clean.
+//
+// Exit 1 is NOT sufficient to conclude "conflicts". The docs promise 1 for a
+// conflicted merge and >1 for a failure, but git 2.55 also exits 1 for an
+// unresolvable ref ("merge-tree: no/such/branch - not something we can merge"),
+// with the message on stderr and stdout EMPTY. A reader that trusts the exit
+// code alone parses that empty stdout into zero conflicted files and reports the
+// merge CLEAN — the same class of non-answer-reading-as-a-verdict this whole
+// check exists to end (gt-0w2l). So the OUTPUT is the discriminator: a real
+// merge always writes the resulting tree's OID on the first line, and its
+// absence means git answered nothing.
+func (g *Git) MergeConflicts(base, branch string) ([]string, error) {
+	stdout, code, err := g.runAllowingConflictExit("merge-tree", "--write-tree", "--name-only", base, branch)
+	if err != nil {
+		return nil, err
+	}
+	if code == 0 {
+		return nil, nil
+	}
+	names, ok := parseMergeTreeConflictNames(stdout)
+	if !ok {
+		return nil, fmt.Errorf("git merge-tree %s %s: conflicted exit with no merge result on stdout (unmergeable or unresolvable ref)", base, branch)
+	}
+	if len(names) == 0 {
+		// git said the merge conflicted and then named nothing. Whatever this
+		// is, it is not evidence of a clean merge.
+		return nil, fmt.Errorf("git merge-tree %s %s: reported a conflict but named no files", base, branch)
+	}
+	return names, nil
+}
+
+// mergeTreeOIDPattern matches the object id merge-tree writes on its first line.
+// Both sha1 (40) and sha256 (64) repositories are in scope.
+var mergeTreeOIDPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
+// parseMergeTreeConflictNames extracts the conflicted paths from `merge-tree
+// --write-tree --name-only` output.
+//
+// The format is a tree OID on the first line, then one path per line, then a
+// blank line, then human-readable "CONFLICT (content): ..." messages. Reading
+// past the blank line would count prose as filenames, so the scan stops there.
+//
+// The bool reports whether the output was a merge result at all. False means
+// there was no OID to anchor on, so nothing after it can be trusted as paths.
+func parseMergeTreeConflictNames(out string) ([]string, bool) {
+	lines := strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
+	if len(lines) == 0 || !mergeTreeOIDPattern.MatchString(strings.TrimSpace(lines[0])) {
+		return nil, false
+	}
+	var names []string
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+		names = append(names, line)
+	}
+	return names, true
+}
+
+// runAllowingConflictExit runs git and returns stdout together with the exit
+// code, instead of discarding stdout the way run() does on any non-zero exit.
+//
+// merge-tree is the reason: its whole answer for the conflicted case is on
+// stdout AND its exit code is 1, so a runner that treats non-zero as failure
+// throws away the result it was called for. Exit codes above 1 are still errors.
+func (g *Git) runAllowingConflictExit(args ...string) (string, int, error) {
+	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+		return "", 0, err
+	}
+
+	fullArgs := args
+	if g.gitDir != "" {
+		fullArgs = append([]string{"--git-dir=" + g.gitDir}, args...)
+	}
+
+	cmd := exec.Command("git", fullArgs...)
+	util.SetDetachedProcessGroup(cmd)
+	if g.workDir != "" {
+		cmd.Dir = g.workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err == nil {
+		return stdout.String(), 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return stdout.String(), 1, nil
+	}
+	return "", 0, g.wrapError(err, stdout.String(), stderr.String(), fullArgs)
 }
 
 func (g *Git) mergeTreeNoopBetweenRefs(head, ref string) (bool, error) {
@@ -3123,10 +3766,12 @@ func (g *Git) mergeTreeNoopBetweenRefs(head, ref string) (bool, error) {
 // fetch/push remotes are classified against the listed hash, not stale tracking
 // refs.
 func (g *Git) PushRemoteRefTargetStatus(remote string, ref RemoteRef, target string) (BranchPreservationStatus, error) {
-	if err := g.fetchPushRemoteRefExactly(remote, ref); err != nil {
+	candidate, cleanup, err := g.fetchPushRemoteRefExactly(remote, ref)
+	if err != nil {
 		return BranchPreservationStatus{}, err
 	}
-	return g.preservationOfRefAgainstRef("FETCH_HEAD", target)
+	defer cleanup()
+	return g.preservationOfRefAgainstRef(candidate, target)
 }
 
 // PushRemoteRefTargetStatusAny checks a push-remote ref against several targets
@@ -3149,14 +3794,16 @@ func (g *Git) PushRemoteRefTargetStatusAny(remote string, ref RemoteRef, targets
 	if len(targets) == 0 {
 		return BranchPreservationStatus{}, fmt.Errorf("no comparison targets given")
 	}
-	if err := g.fetchPushRemoteRefExactly(remote, ref); err != nil {
+	candidate, cleanup, err := g.fetchPushRemoteRefExactly(remote, ref)
+	if err != nil {
 		return BranchPreservationStatus{}, err
 	}
+	defer cleanup()
 
 	var first BranchPreservationStatus
 	var firstErr error
 	for i, target := range targets {
-		status, err := g.preservationOfRefAgainstRef("FETCH_HEAD", target)
+		status, err := g.preservationOfRefAgainstRef(candidate, target)
 		if i == 0 {
 			first, firstErr = status, err
 		}
@@ -3167,28 +3814,127 @@ func (g *Git) PushRemoteRefTargetStatusAny(remote string, ref RemoteRef, targets
 	return first, firstErr
 }
 
-// fetchPushRemoteRefExactly brings the listed hash into the object store and
-// verifies the remote has not moved underneath the listing. Classifying against
-// a stale remote-tracking ref instead would answer about a different commit.
-func (g *Git) fetchPushRemoteRefExactly(remote string, ref RemoteRef) error {
+// privateFetchRefNamespace holds the refs a fetch-and-compare writes for its own
+// use. It is outside refs/heads/ and refs/remotes/ deliberately: nothing that
+// lists branches, and no branch-hygiene rule, should ever see these.
+const privateFetchRefNamespace = "refs/gt/fetched/"
+
+// privateFetchRefSeq numbers private fetch refs within one process. Together
+// with the pid it makes a name no concurrent fetch can collide with.
+var privateFetchRefSeq atomic.Uint64
+
+// fetchPushRemoteRefToPrivateRef fetches refName from remote's PUSH url into a
+// ref private to this call, and returns that ref with a func that removes it.
+//
+// The destination is the whole point, and FETCH_HEAD is why (gt-880s). FETCH_HEAD
+// is ONE FILE PER REPOSITORY, rewritten by every fetch that runs in that gitdir.
+// A rig's .repo.git is shared by every polecat worktree, the deacon's dogs and
+// the refinery, and most gt paths that touch git go through it — so a plain
+// `git fetch` anywhere in the town could overwrite the value between our fetch
+// and our read of it. Measured on gastown: `gt patrol branches` fetched a polecat
+// tip, read back origin/main's tip instead, and reported the BRANCH as
+// unclassifiable. The count of such branches tracked how busy the repo happened
+// to be, which is why successive runs against an unchanged remote disagreed.
+//
+// A named destination also keeps the fetched objects reachable for as long as the
+// comparison needs them, rather than relying on an unreferenced fetch surviving
+// until the next gc.
+func (g *Git) fetchPushRemoteRefToPrivateRef(remote, refName string) (ref string, cleanup func(), err error) {
+	refName = strings.TrimSpace(refName)
+	if refName == "" {
+		return "", func() {}, fmt.Errorf("remote ref is missing a name")
+	}
+	dest := fmt.Sprintf("%s%d/%d", privateFetchRefNamespace, os.Getpid(), privateFetchRefSeq.Add(1))
+	remove := func() { _, _ = g.run("update-ref", "-d", dest) }
+
+	// --no-write-fetch-head is the other half of the fix, and it is about being a
+	// good neighbour rather than about this call: a destination refspec still
+	// rewrites FETCH_HEAD, so a sweep of nine branches used to clobber it nine
+	// times under every other agent working in the same shared gitdir. Nothing
+	// here reads it, so nothing here should write it. (git 2.29+; the repo already
+	// requires 2.38 for `merge-tree --write-tree`.)
+	//
+	// --force because a crashed run can leave a ref at this name behind: pids are
+	// reused, and a non-fast-forward update would otherwise fail on the leftover
+	// rather than on anything real.
+	// Under fetchTimeout, and the per-branch shape is why it matters: a sweep
+	// pays this once per polecat branch, so an unbounded one parks the caller on
+	// the FIRST branch and never reaches the rest (gt-i9wz). %w carries
+	// ErrRemoteUnresponsive out to the sweep, which uses it to stop asking.
+	if err := g.runFetch("--no-tags", "--no-write-fetch-head", "--force", g.pushTarget(remote), refName+":"+dest); err != nil {
+		remove()
+		return "", func() {}, fmt.Errorf("fetching candidate %s: %w", refName, err)
+	}
+	return dest, remove, nil
+}
+
+// FetchPushRemoteBranchTip returns the current tip of branch on remote's push
+// target, having brought that commit into the local object store first.
+//
+// `git ls-remote` would answer the "what is the tip" half on its own, but the
+// answer would be a bare hash the local repository does not have, so no
+// ancestry, count or diff question could be asked about it. Callers that must
+// compare against the remote — not against a remote-tracking ref that only a
+// fetch updates — need the objects, not just the hash.
+//
+// The commit is held by a ref private to this call, so the caller MUST invoke
+// cleanup once it has finished querying: until then the objects stay reachable
+// even against a concurrent gc. A failure return yields a no-op cleanup.
+func (g *Git) FetchPushRemoteBranchTip(remote, branch string) (commit string, cleanup func(), err error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return "", func() {}, fmt.Errorf("branch is missing a name")
+	}
+	dest, remove, err := g.fetchPushRemoteRefToPrivateRef(remote, "refs/heads/"+branch)
+	if err != nil {
+		return "", func() {}, err
+	}
+	hash, err := g.Rev(dest)
+	if err != nil {
+		remove()
+		return "", func() {}, fmt.Errorf("resolving fetched tip of %s/%s: %w", remote, branch, err)
+	}
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		remove()
+		return "", func() {}, fmt.Errorf("fetched tip of %s/%s resolved to nothing", remote, branch)
+	}
+	return hash, remove, nil
+}
+
+// fetchPushRemoteRefExactly brings the listed hash into the object store under a
+// private ref and verifies the remote has not moved underneath the listing.
+// Classifying against a stale remote-tracking ref instead would answer about a
+// different commit.
+//
+// The caller must invoke the returned cleanup func. It is safe to call after a
+// failure return too, though callers get a no-op then.
+func (g *Git) fetchPushRemoteRefExactly(remote string, ref RemoteRef) (fetched string, cleanup func(), err error) {
 	refName := strings.TrimSpace(ref.Name)
 	expectedHash := strings.TrimSpace(ref.Hash)
 	if refName == "" || expectedHash == "" {
-		return fmt.Errorf("remote ref is missing name or hash")
+		return "", func() {}, fmt.Errorf("remote ref is missing name or hash")
 	}
 
-	if _, err := g.run("fetch", "--no-tags", g.pushTarget(remote), refName); err != nil {
-		return fmt.Errorf("fetching candidate %s: %w", refName, err)
-	}
-	fetchedHash, err := g.Rev("FETCH_HEAD")
+	dest, remove, err := g.fetchPushRemoteRefToPrivateRef(remote, refName)
 	if err != nil {
-		return fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
+		return "", func() {}, err
+	}
+	fetchedHash, err := g.Rev(dest)
+	if err != nil {
+		remove()
+		return "", func() {}, fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
 	}
 	fetchedHash = strings.TrimSpace(fetchedHash)
 	if fetchedHash != expectedHash {
-		return fmt.Errorf("candidate %s changed while pruning: expected %s, fetched %s", refName, shortSHA(expectedHash), shortSHA(fetchedHash))
+		remove()
+		// This can now mean only one thing: the tip moved on the remote between
+		// the listing and the fetch. Say that, because the reader's next move is
+		// to re-run — it is not a fact about the branch's contents.
+		return "", func() {}, fmt.Errorf("remote tip for %s moved between listing and fetch: listed %s, fetched %s (re-run to classify it)",
+			refName, shortSHA(expectedHash), shortSHA(fetchedHash))
 	}
-	return nil
+	return dest, remove, nil
 }
 
 // CountCherryUnmergedCommits counts `git cherry` lines whose patches are not
@@ -3434,7 +4180,36 @@ func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error
 // PrunedBranch represents a local branch that was pruned (or would be pruned in dry-run).
 type PrunedBranch struct {
 	Name   string // Branch name (e.g., "polecat/rictus-mkb0vq9f")
-	Reason string // Why it was pruned: "merged", "no-remote", "no-remote-merged"
+	Reason string // Why it was pruned: "merged", "rebase-landed", "no-remote", "no-remote-merged"
+}
+
+// SkippedBranch represents a local branch that matched the staleness predicate
+// but survived the prune, and why it survived.
+//
+// A skip must never be silent. An empty prune list with a non-empty skip list
+// means "found candidates, deleted none" — a different answer from "found
+// none", and the two must not be reported the same way.
+type SkippedBranch struct {
+	Name   string // Branch name
+	Reason string // Why it was a candidate: "merged", "rebase-landed", "no-remote", "no-remote-merged"
+	Detail string // Why it survived (worktree checkout, git branch -d refusal, ...)
+}
+
+// PruneReport is the full outcome of a prune pass: what went, and what stayed
+// despite matching. Callers that only want the deletions can use
+// PruneStaleBranches.
+type PruneReport struct {
+	Pruned  []PrunedBranch
+	Skipped []SkippedBranch
+}
+
+// Candidates is the number of branches that matched the staleness predicate,
+// whether or not they were deleted.
+func (r *PruneReport) Candidates() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.Pruned) + len(r.Skipped)
 }
 
 // PruneStaleBranches finds and deletes local branches matching a pattern that are
@@ -3447,8 +4222,35 @@ type PrunedBranch struct {
 // tracking ref but the local branch persists indefinitely.
 //
 // Safety: never deletes the current branch or the default branch (main/master).
-// Uses git branch -d (not -D), so only fully-merged branches are deleted.
+// Uses git branch -d (not -D) except for branches proven patch-identical to the
+// target, where -d's ancestry check is the very thing being answered a better
+// way; see PruneStaleBranchesReport.
 func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, error) {
+	report, err := g.PruneStaleBranchesReport(pattern, dryRun)
+	if err != nil {
+		return nil, err
+	}
+	return report.Pruned, nil
+}
+
+// PruneStaleBranchesReport is PruneStaleBranches with the survivors included.
+//
+// The dry-run and the real run share this one discovery step, so the preview is
+// only as honest as its ability to predict a refusal. Two refusals are modelled:
+//
+//   - A branch checked out in any worktree. git branch -d always refuses these,
+//     so they are reported as skipped in dry-run too — the preview must not
+//     promise a deletion the action cannot perform.
+//   - A git branch -d failure at delete time, reported with git's own message
+//     rather than dropped.
+//
+// Staleness is ancestry OR proven patch identity. A branch the refinery rebased
+// before landing is contained in the target without being an ancestor of it, so
+// an ancestry-only predicate leaves it behind on every future pass; a predicate
+// that took every non-ancestor would destroy genuinely unlanded work instead.
+// Patch identity is the third answer, and it only ever counts when it is
+// proven — an unreadable or contradictory comparison keeps the branch (gt-wbvx).
+func (g *Git) PruneStaleBranchesReport(pattern string, dryRun bool) (*PruneReport, error) {
 	if pattern == "" {
 		pattern = "polecat/*"
 	}
@@ -3457,13 +4259,25 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 	currentBranch, _ := g.CurrentBranch()
 	defaultBranch := g.RemoteDefaultBranch()
 
+	// Branches checked out in a worktree cannot be deleted by git branch -d,
+	// in dry-run or otherwise. Best effort: if the listing fails we fall back
+	// to reporting the delete failure at action time.
+	checkedOut := map[string]string{}
+	if worktrees, wtErr := g.WorktreeList(); wtErr == nil {
+		for _, wt := range worktrees {
+			if wt.Branch != "" {
+				checkedOut[wt.Branch] = wt.Path
+			}
+		}
+	}
+
 	// List all local branches matching the pattern
 	branches, err := g.ListBranches(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("listing branches: %w", err)
 	}
 
-	var pruned []PrunedBranch
+	report := &PruneReport{}
 	for _, branch := range branches {
 		branch = strings.TrimSpace(branch)
 		if branch == "" || branch == currentBranch || branch == defaultBranch {
@@ -3477,7 +4291,8 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 		}
 
 		// Check if the branch is merged to the default branch
-		merged, err := g.IsAncestor(branch, "origin/"+defaultBranch)
+		target := "origin/" + defaultBranch
+		merged, err := g.IsAncestor(branch, target)
 		if err != nil {
 			// If we can't determine merge status, only prune if remote is gone
 			if hasRemote {
@@ -3487,33 +4302,75 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 			continue
 		}
 
+		// Ancestry proves containment one way only. The refinery rebases before
+		// landing, so the landed commits are patch-identical to the branch tip
+		// without descending from it, and ancestry-only hygiene can never
+		// collect those branches — measured on gastown at 17 of 41, with every
+		// rebase-merge adding one more (gt-wbvx).
+		//
+		// Both naive predicates are wrong: delete only ancestors and the 17 stay
+		// forever; delete every non-ancestor and 6 branches holding real
+		// unlanded work are destroyed. So the second question is patch identity,
+		// and it must be PROVEN — preservationOfRefAgainstRef errors rather than
+		// answering when it cannot read, and an error here falls through to KEEP.
+		rebaseLanded := false
+		if !merged {
+			if status, presErr := g.preservationOfRefAgainstRef(branch, target); presErr == nil && status.Preserved {
+				rebaseLanded = true
+			}
+		}
+
 		var reason string
-		if merged && !hasRemote {
+		switch {
+		case merged && !hasRemote:
 			reason = "no-remote-merged"
-		} else if merged {
+		case merged:
 			reason = "merged"
-		} else if !hasRemote {
+		case rebaseLanded:
+			reason = "rebase-landed"
+		case !hasRemote:
 			reason = "no-remote"
-		} else {
-			continue // Branch has remote and is not merged — keep it
+		default:
+			continue // Branch has remote and is not landed — keep it
+		}
+
+		// A checked-out branch is refused by git branch -d in every mode, so it
+		// is a skip in the preview as well as in the action.
+		if wtPath, inUse := checkedOut[branch]; inUse {
+			report.Skipped = append(report.Skipped, SkippedBranch{
+				Name:   branch,
+				Reason: reason,
+				Detail: fmt.Sprintf("checked out at %s", wtPath),
+			})
+			continue
 		}
 
 		if !dryRun {
 			// Use -d (not -D) for safety — only deletes fully merged branches.
 			// For "no-remote" branches that aren't merged, -d will fail safely.
-			if err := g.DeleteBranch(branch, false); err != nil {
-				// If -d fails (not merged), skip this branch
+			//
+			// "rebase-landed" is the one case that must force, because git's own
+			// -d check is the ancestry check this predicate just went past. The
+			// force is earned, not assumed: it is reachable only when patch
+			// identity was proven above, and every unproven or unreadable answer
+			// left rebaseLanded false and never gets here.
+			if err := g.DeleteBranch(branch, reason == "rebase-landed"); err != nil {
+				report.Skipped = append(report.Skipped, SkippedBranch{
+					Name:   branch,
+					Reason: reason,
+					Detail: strings.TrimSpace(err.Error()),
+				})
 				continue
 			}
 		}
 
-		pruned = append(pruned, PrunedBranch{
+		report.Pruned = append(report.Pruned, PrunedBranch{
 			Name:   branch,
 			Reason: reason,
 		})
 	}
 
-	return pruned, nil
+	return report, nil
 }
 
 // SubmoduleChange represents a changed submodule pointer between two refs.
@@ -3742,12 +4599,15 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
-	util.SetDetachedProcessGroup(cmd)
+	// The GROUP, for the same reason as runWithTimeout: killing git alone
+	// leaves its ssh child holding the connection, orphaned and unbounded.
+	util.SetProcessGroup(cmd)
+	cmd.WaitDelay = deadlineKillWaitDelay
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("pushing submodule %s timed out after %v (remote may be unreachable)", submodulePath, pushTimeout)
+			return fmt.Errorf("pushing submodule %s timed out after %v: %w", submodulePath, pushTimeout, ErrRemoteUnresponsive)
 		}
 		abbrev := sha
 		if len(abbrev) > 8 {
@@ -3784,11 +4644,15 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 		}
 	}
 
-	// Fallback: network query via ls-remote
+	// Fallback: network query via ls-remote, bounded like every other one
+	// (see lsRemoteTimeout) so an unreachable remote fails instead of hanging.
 	for _, candidate := range []string{"main", "master"} {
-		check := exec.Command("git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
+		ctx, cancel := context.WithTimeout(context.Background(), lsRemoteTimeout)
+		check := exec.CommandContext(ctx, "git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
 		util.SetDetachedProcessGroup(check)
-		if check.Run() == nil {
+		err := check.Run()
+		cancel()
+		if err == nil {
 			return candidate, nil
 		}
 	}

@@ -84,7 +84,13 @@ func runHeartbeat(cmd *cobra.Command, args []string) error {
 // deaconBeadHeartbeatSyncThreshold throttles agent-bead label refreshes from
 // gt heartbeat: each refresh is a Dolt commit, so only sync when the label is
 // stale enough to matter to watchers.
-const deaconBeadHeartbeatSyncThreshold = deacon.HeartbeatStaleThreshold / 2
+//
+// This used to be deacon.HeartbeatStaleThreshold/2. It is a Dolt write cadence,
+// not a health verdict, and it has nothing to do with how long a Deacon may
+// legitimately park — so tying it to that threshold meant recalibrating the
+// health signal silently retuned how often the town commits to Dolt. Kept at
+// the value that coupling produced, now stated outright.
+const deaconBeadHeartbeatSyncThreshold = 2*time.Minute + 30*time.Second
 
 var deaconAgentBeadHeartbeatSync = syncDeaconAgentBeadHeartbeat
 

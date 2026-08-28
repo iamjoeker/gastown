@@ -1257,6 +1257,18 @@ func getSessionPane(sessionName string) (string, error) {
 	return lines[0], nil
 }
 
+// handoffMailLabels builds the label list for a handoff mail bead, matching the
+// mail router's format.
+//
+// msg-type is not optional here. This path shells out to bd create instead of
+// going through Router.buildLabels, which is the only other site that stamps
+// the label, so handoff mail carried no message type at all: 18 of 18 untyped
+// gt:message beads on the hq store were handoffs, which is why msg-type:handoff
+// measured zero (gt-do5c). gt:message is appended by the caller.
+func handoffMailLabels(agentID string) string {
+	return fmt.Sprintf("from:%s,msg-type:%s", agentID, mail.TypeHandoff)
+}
+
 // sendHandoffMail sends a handoff mail to self and auto-hooks it.
 // Returns the created bead ID and any error.
 func sendHandoffMail(subject, message string) (string, error) {
@@ -1287,8 +1299,7 @@ func sendHandoffMail(subject, message string) (string, error) {
 		return "", fmt.Errorf("cannot detect town root")
 	}
 
-	// Build labels for mail metadata (matches mail router format)
-	labels := fmt.Sprintf("from:%s", agentID)
+	labels := handoffMailLabels(agentID)
 
 	// Close stale hooked mail beads from previous sessions before creating a new one.
 	// Without this, each handoff cycle accumulates beads in status=hooked. (GH#3859)

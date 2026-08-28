@@ -90,13 +90,18 @@ fi
 }
 
 // openBeads builds n ordinary open beads attributed to a store.
+//
+// The type key is issue_type because that is what `bd list --json` emits. A
+// fixture that says "type" instead agrees with a decoder tagged the same way
+// and proves nothing about either — which is how the type arm of isInternal sat
+// unreachable against live bd while these tests were green.
 func openBeads(store string, n int) []map[string]any {
 	beads := make([]map[string]any, 0, n)
 	for i := 0; i < n; i++ {
 		beads = append(beads, map[string]any{
 			"id":         fmt.Sprintf("%s-%d", store, i),
 			"title":      fmt.Sprintf("work item %d in %s", i, store),
-			"type":       "task",
+			"issue_type": "task",
 			"priority":   2,
 			"created_at": time.Now().Add(-time.Hour).Format(time.RFC3339),
 		})
@@ -221,10 +226,11 @@ func TestFetchIssues_NamesStoreThatCouldNotAnswer(t *testing.T) {
 
 // TestFetchIssues_TruncationCountsBeadsNotVisibleRows pins the ordering the
 // panel depends on: the town root is mostly internal beads, so a store can fill
-// its whole allowance and still display almost nothing. Filtering before the
-// resolver counts would report that store as complete.
+// the whole safety cap and still display almost nothing. Filtering before the
+// resolver counts would report that store as complete, and the count beside the
+// panel would then be a wrong number rather than a stated floor.
 func TestFetchIssues_TruncationCountsBeadsNotVisibleRows(t *testing.T) {
-	// A full allowance of beads the panel hides, plus two it shows.
+	// A full safety cap of beads the panel hides, plus two it shows.
 	internal := make([]map[string]any, 0, issuesPerStoreLimit)
 	for i := 0; i < issuesPerStoreLimit; i++ {
 		internal = append(internal, map[string]any{
@@ -280,6 +286,132 @@ func TestFetchIssues_PerStoreLimitDoesNotStarveRigs(t *testing.T) {
 	}
 	if byStore["beads"] != 3 || byStore["gastown"] != 4 {
 		t.Errorf("rig rows = beads:%d gastown:%d, want 3 and 4", byStore["beads"], byStore["gastown"])
+	}
+}
+
+// internalBeads builds n Gas Town plumbing beads the Work panel must hide.
+func internalBeads(prefix, label string, n int) []map[string]any {
+	beads := make([]map[string]any, 0, n)
+	for i := 0; i < n; i++ {
+		beads = append(beads, map[string]any{
+			"id":     fmt.Sprintf("%s-%d", prefix, i),
+			"title":  "plumbing",
+			"labels": []string{label},
+		})
+	}
+	return beads
+}
+
+// TestFetchIssues_CountFallsWhenWorkIsClosed is gt-eolg stated as a behaviour.
+//
+// The panel used to fetch 50 beads per store and show the size of that sample
+// as the size of the backlog. Measured, the gastown rig held 59 non-internal
+// open beads against that cap, so it contributed exactly 50 whether it held 51
+// or 500: closing a bead only slid the next one into the sampled window and the
+// number could not move until the store fell below 50. Two fixtures one bead
+// apart must therefore differ by exactly one.
+func TestFetchIssues_CountFallsWhenWorkIsClosed(t *testing.T) {
+	// Comfortably above the 50-per-store cap this replaced, so the store is in
+	// the region where the old code was pinned.
+	const backlog = 120
+
+	count := func(t *testing.T, open int) int {
+		t.Helper()
+		f := panelFetcher(t, map[string]fakeBdStore{
+			townStoreName: {"open": openBeads("town", 2)},
+			"beads":       {"open": openBeads("beads", 3)},
+			"gastown":     {"open": openBeads("gastown", open)},
+		})
+		result, err := f.FetchIssues()
+		if err != nil {
+			t.Fatalf("FetchIssues() error = %v", err)
+		}
+		if result.Partial() {
+			t.Fatalf("Partial() = true for a backlog well under the safety cap, warning = %q", result.Warning())
+		}
+		return len(result.Rows)
+	}
+
+	full := count(t, backlog)
+	if want := 2 + 3 + backlog; full != want {
+		t.Errorf("rows = %d, want %d — a store above the old cap must contribute all of its beads, not a sample", full, want)
+	}
+
+	afterOneClosed := count(t, backlog-1)
+	if afterOneClosed != full-1 {
+		t.Errorf("closing one bead moved the count %d -> %d, want a drop of exactly 1", full, afterOneClosed)
+	}
+}
+
+// TestFetchIssues_MailDoesNotDisplaceWorkFromTheCount pins the inversion, which
+// is the worse half of gt-eolg. 28 of the 50 rows the town root contributed
+// were gt:message: fetched, counted against the cap, and only then hidden. The
+// store displayed 22 of its 186 real work items, and each new message pushed
+// one more work bead out of the sample — so the displayed number FELL while the
+// backlog ROSE.
+//
+// The mail is ordered first so a truncating fetch spends its allowance on rows
+// the panel will hide, exactly as the live town root did.
+func TestFetchIssues_MailDoesNotDisplaceWorkFromTheCount(t *testing.T) {
+	const work = 60
+
+	townOpen := append(internalBeads("town-msg", "gt:message", 400), openBeads("town", work)...)
+
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {"open": townOpen},
+		"beads":       {"open": openBeads("beads", 3)},
+		"gastown":     {"open": openBeads("gastown", 4)},
+	})
+
+	result, err := f.FetchIssues()
+	if err != nil {
+		t.Fatalf("FetchIssues() error = %v", err)
+	}
+
+	byStore := map[string]int{}
+	for _, row := range result.Rows {
+		byStore[strings.SplitN(row.ID, "-", 2)[0]]++
+	}
+	if byStore["town"] != work {
+		t.Errorf("town rows = %d, want %d — mail must not consume the town root's allowance", byStore["town"], work)
+	}
+	if byStore["beads"] != 3 || byStore["gastown"] != 4 {
+		t.Errorf("rig rows = beads:%d gastown:%d, want 3 and 4", byStore["beads"], byStore["gastown"])
+	}
+}
+
+// TestFetchIssues_InternalBeadsAreRecognisedByBdsTypeKey covers the half of
+// isInternal that could never fire. bd emits the type as "issue_type" and has
+// no "type" key at all, so a decoder tagged "type" read "" on every bead ever
+// fetched: a merge-request or wisp bead carrying no gt: label counted as work.
+// These fixtures carry no labels, so only the type key can hide them.
+func TestFetchIssues_InternalBeadsAreRecognisedByBdsTypeKey(t *testing.T) {
+	plumbing := []map[string]any{
+		{"id": "town-mr-1", "title": "merge request", "issue_type": "merge-request"},
+		{"id": "town-wisp-1", "title": "heartbeat", "issue_type": "wisp"},
+		{"id": "town-agent-1", "title": "identity", "issue_type": "agent"},
+	}
+
+	f := panelFetcher(t, map[string]fakeBdStore{
+		townStoreName: {"open": append(plumbing, openBeads("town", 2)...)},
+		"beads":       {"open": openBeads("beads", 3)},
+		"gastown":     {"open": openBeads("gastown", 4)},
+	})
+
+	result, err := f.FetchIssues()
+	if err != nil {
+		t.Fatalf("FetchIssues() error = %v", err)
+	}
+
+	if want := 2 + 3 + 4; len(result.Rows) != want {
+		t.Errorf("rows = %d, want %d — plumbing beads are not work even when they carry no gt: label", len(result.Rows), want)
+	}
+	for _, row := range result.Rows {
+		for _, hidden := range []string{"town-mr-1", "town-wisp-1", "town-agent-1"} {
+			if row.ID == hidden {
+				t.Errorf("row %s is Gas Town plumbing and must not be counted as work", hidden)
+			}
+		}
 	}
 }
 

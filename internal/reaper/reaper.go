@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -157,9 +158,27 @@ type PurgeResult struct {
 	// because they are pinned, carry a protected label with no archive
 	// configured, or could not be archived. Reported so a purge that declines
 	// to delete says so, rather than looking like a smaller purge.
-	WispsProtected int       `json:"wisps_protected,omitempty"`
-	DryRun         bool      `json:"dry_run,omitempty"`
-	Anomalies      []Anomaly `json:"anomalies,omitempty"`
+	WispsProtected int `json:"wisps_protected,omitempty"`
+	// WispsPurgedByType breaks WispsPurged down by wisp_type, keyed 'unknown'
+	// for rows that carry none. It exists because a purge count that names no
+	// population is not a readable number (gt-mkuw).
+	//
+	// The digest was already being computed here and thrown away, so
+	// `reaper: purge 29 closed wisps from beads` was all any later reader had.
+	// On 2026-08-26 that line, three times over, was read as ~40 destroyed
+	// merge-request records and filed as a P1 second-deleter incident. Nothing
+	// was missing: the rows were molecule steps and sling-context wisps, and
+	// purgeProtectWhere makes this path STRUCTURALLY INCAPABLE of taking a
+	// merge-request or escalation row — it selects only what is neither pinned
+	// nor label-protected. The count could not say so and the breakdown can.
+	//
+	// Counted from the candidate set immediately before the delete pass. If the
+	// delete then removes a different number, that disagreement is reported as
+	// a purge_digest_mismatch anomaly rather than being smoothed over — a
+	// breakdown that does not sum to its total is worse than no breakdown.
+	WispsPurgedByType map[string]int `json:"wisps_purged_by_type,omitempty"`
+	DryRun            bool           `json:"dry_run,omitempty"`
+	Anomalies         []Anomaly      `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -210,6 +229,29 @@ const (
 	// against production Dolt until the context deadline; reaching it is an
 	// anomaly, not a normal outcome.
 	maxReapPasses = 20
+	// StrandedMoleculeAge is how long an open molecule wisp with no dispatch
+	// record may sit before the scan calls it stranded.
+	//
+	// A molecule is poured to be RUN by somebody. One that is still open, older
+	// than this, and carries no dispatch record at all was poured for an executor
+	// that never arrived — which is the shape of the gt-bnpw leak: a daemon timer
+	// minted ~1000 dog-molecule wisps a day for a formula nothing slings, and the
+	// accumulation was only ever noticed because a human went looking. Nothing
+	// reported it, because every other reaper number is about AGE, and these were
+	// individually young and collectively unbounded.
+	//
+	// "No dispatch record" is two conditions, not one — see strandedMoleculeIDs.
+	// The wisp must carry no assignee AND no hook bead may name it in an
+	// attached_molecule line. Testing only the first called every in-flight
+	// root-only molecule stranded, because attachment-dispatched work never
+	// writes an assignee onto the molecule wisp (gt-id8x).
+	//
+	// An hour is long enough that a molecule waiting on a busy dispatcher is not
+	// flagged, and short enough that a broken emitter surfaces within one cycle
+	// rather than after a day of growth. Reap does not close on this signal: an
+	// undispatched molecule may be legitimately queued, and the count is a prompt
+	// to look at the emitter, not a licence to delete its output.
+	StrandedMoleculeAge = 1 * time.Hour
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
@@ -263,6 +305,143 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 }
 
 const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
+
+// parseAttachedMoleculeID returns the molecule ID a bead description records as
+// attached to it, or "" if it records none.
+//
+// It mirrors beads.ParseAttachmentFields' handling of the attached_molecule key
+// exactly — same key aliases, same trimming, same last-line-wins overwrite. The
+// duplication is deliberate: this package is free of gastown-internal imports so
+// the reaper can be linked into the daemon without dragging the bd exec layer
+// along. TestParseAttachedMoleculeIDMatchesBeads pins the two together so they
+// cannot drift apart silently.
+func parseAttachedMoleculeID(desc string) string {
+	id := ""
+	for _, line := range strings.Split(desc, "\n") {
+		line = strings.TrimSpace(line)
+		colonIdx := strings.Index(line, ":")
+		if colonIdx == -1 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(line[:colonIdx])) {
+		case "attached_molecule", "attached-molecule", "attachedmolecule":
+		default:
+			continue
+		}
+		if value := strings.TrimSpace(line[colonIdx+1:]); value != "" {
+			id = value
+		}
+	}
+	return id
+}
+
+// attachedMoleculeIDs returns every molecule ID that some bead in this database
+// records as attached to it — that is, every molecule with a dispatch record.
+//
+// The attachment IS the dispatch record, and it lives in the HOOK BEAD's
+// description as an "attached_molecule: <id>" line, never on the molecule wisp.
+// A root-only molecule therefore has an empty wisps.assignee for its whole
+// working life: the assignment sits on the issue it is attached to, and it
+// materializes no child wisps to carry one either. Reading wisps.assignee asked
+// "does this row carry an assignee" when the question was "was this dispatched";
+// those come apart for the entire mol-polecat-work family, so the old predicate
+// called every in-flight polecat molecule stranded (gt-id8x).
+//
+// Both tables are scanned. Base beads live in `issues`, but a hook bead can
+// itself be a wisp, and a molecule attached to either one was dispatched.
+//
+// The LIKE is only a prefilter to keep the scan off descriptions that cannot
+// match; every returned row is parsed as a field, so a description that merely
+// discusses attachment inline contributes nothing.
+//
+// One case it cannot separate: a bead that reproduces "attached_molecule: <id>"
+// on a line of its own — a verbatim paste of a real attachment block into a bug
+// report — is indistinguishable from an attachment, and will suppress the
+// anomaly for that molecule. That is the direction to err in. The failure this
+// replaces was the opposite one, a confident false claim about healthy work that
+// cost three agents a day and five escalations; a rare missed report costs a
+// count that was already documented as a prompt to look, not a clearance.
+func attachedMoleculeIDs(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	attached := make(map[string]bool)
+	for _, table := range []string{"issues", "wisps"} {
+		query := "SELECT description FROM " + table + " WHERE description LIKE '%attached%molecule%'"
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			if isTableNotFound(err) {
+				// No such table on this server — it holds no attachments either.
+				continue
+			}
+			return nil, fmt.Errorf("read %s attachments: %w", table, err)
+		}
+		scanErr := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var desc sql.NullString
+				if err := rows.Scan(&desc); err != nil {
+					return fmt.Errorf("scan %s attachment: %w", table, err)
+				}
+				if id := parseAttachedMoleculeID(desc.String); id != "" {
+					attached[id] = true
+				}
+			}
+			return rows.Err()
+		}()
+		if scanErr != nil {
+			return nil, fmt.Errorf("read %s attachments: %w", table, scanErr)
+		}
+	}
+	return attached, nil
+}
+
+// strandedMoleculeIDs returns the open molecule wisps older than cutoff for
+// which no dispatch record exists: no assignee on the wisp AND no hook bead
+// naming them in an attached_molecule line.
+//
+// The attachment lookup runs only when the column-level filter yields
+// candidates, so a database with no stranded molecules pays one COUNT-shaped
+// SELECT and nothing else.
+func strandedMoleculeIDs(ctx context.Context, db *sql.DB, cutoff time.Time) ([]string, error) {
+	query := fmt.Sprintf(`
+		SELECT w.id FROM wisps w
+		WHERE w.issue_type = 'molecule'
+		AND %s
+		AND (w.assignee IS NULL OR w.assignee = '')
+		AND w.created_at < ?`, openWispStatusWhere)
+	rows, err := db.QueryContext(ctx, query, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("query unassigned molecules: %w", err)
+	}
+	var candidates []string
+	scanErr := func() error {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			candidates = append(candidates, id)
+		}
+		return rows.Err()
+	}()
+	if scanErr != nil {
+		return nil, fmt.Errorf("query unassigned molecules: %w", scanErr)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	attached, err := attachedMoleculeIDs(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var stranded []string
+	for _, id := range candidates {
+		if !attached[id] {
+			stranded = append(stranded, id)
+		}
+	}
+	return stranded, nil
+}
 
 // ProtectedWispLabels lists labels whose wisps purge must never delete,
 // whatever their age, status, or caller.
@@ -321,7 +500,7 @@ var ProtectedWispLabels = []string{"gt:merge-request", "gt:escalation"}
 // absent. An escalation record has no parent at all, so it is always eligible,
 // and reap closing it is not a harmless bookkeeping change: `gt escalate list`
 // renders the delivered copies and hides any copy whose RECORD is closed
-// (dropResolvedEscalations). So a reaped record silently removes a live,
+// (partitionResolvedEscalations). So a reaped record silently removes a live,
 // unacknowledged escalation from the only surface an operator reads — the
 // escalation still exists and still needs attention, and now nothing shows it.
 // Purge protection alone does not cover this: the record survives as a row and
@@ -704,6 +883,31 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		})
 	}
 
+	// Anomaly detection: stranded molecules — poured, never picked up, still open.
+	//
+	// This is the leak-surfaces-itself half of gt-bnpw. Every other count here
+	// asks "what is old enough to clean up"; none of them can say "something is
+	// minting molecules nobody runs", because the emitter's output is always
+	// younger than max_age and the total is dominated by healthy wisps. An
+	// open molecule past StrandedMoleculeAge with no dispatch record is that
+	// signal directly.
+	//
+	// Errors are swallowed the same way the dangling-ref probe swallows them:
+	// this is a diagnostic on top of a scan whose real job is the candidate
+	// counts, and a database without the column must not fail the scan. Note the
+	// consequence — a probe that errors reports zero, so a zero here means "none
+	// found OR not asked", which is why the count is a prompt to look rather than
+	// a clearance.
+	if stranded, err := strandedMoleculeIDs(ctx, db, now.Add(-StrandedMoleculeAge)); err == nil && len(stranded) > 0 {
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type: "stranded_molecules",
+			Message: fmt.Sprintf(
+				"%d molecule wisp(s) are open, older than %s, carry no assignee, and are attached to no hook bead — no dispatch record exists for them; look for the emitter rather than closing them by hand",
+				len(stranded), StrandedMoleculeAge),
+			Count: len(stranded),
+		})
+	}
+
 	return result, nil
 }
 
@@ -1003,13 +1207,14 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	purged, archived, protected, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive)
+	counts, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
-	result.WispsPurged = purged
-	result.WispsArchived = archived
-	result.WispsProtected = protected
+	result.WispsPurged = counts.purged
+	result.WispsArchived = counts.archived
+	result.WispsProtected = counts.protected
+	result.WispsPurgedByType = counts.byType
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
 	// Purge old mail. Its anomalies are appended before the error check: a
@@ -1025,17 +1230,31 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	return result, nil
 }
 
+// purgedWispCounts is what one purge pass did to the closed-past-cutoff window.
+//
+// purged, archived and protected PARTITION that window; byType breaks purged
+// down further. It is a struct rather than the four positional ints it replaced
+// because this function's whole subject is counts that must not be confused
+// with one another, and the caller assigning them by position is where such a
+// confusion would land silently.
+type purgedWispCounts struct {
+	purged    int
+	archived  int
+	protected int
+	byType    map[string]int
+}
+
 // purgeClosedWisps deletes closed wisps past purgeAge and, when an archive is
 // configured, exports the label-protected ones before deleting those too.
 //
-// Returns (purged, archived, protected, anomalies, error). The three counts
-// partition the closed-past-cutoff window; see PurgeResult.
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver) (int, int, int, []Anomaly, error) {
+// The counts partition the closed-past-cutoff window; see PurgeResult.
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver) (purgedWispCounts, []Anomaly, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	deleteCutoff := time.Now().UTC().Add(-purgeAge)
 	var anomalies []Anomaly
+	counts := purgedWispCounts{}
 	protectWhere := purgeProtectWhere()
 
 	// Count what protection holds back, before anything is deleted. Taken from
@@ -1045,7 +1264,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	var protectedTotal int
 	protectedQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND NOT (" + protectWhere + ")"
 	if err := db.QueryRowContext(ctx, protectedQuery, deleteCutoff).Scan(&protectedTotal); err != nil {
-		return 0, 0, 0, nil, fmt.Errorf("count protected wisps: %w", err)
+		return counts, nil, fmt.Errorf("count protected wisps: %w", err)
 	}
 
 	// Retention (gt-6xwt): export the label-protected rows, then release them.
@@ -1071,39 +1290,50 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	// than re-counting keeps the partition exact when only some rows made it:
 	// an archive that exported 4 of 7 reports 4 archived and 3 protected.
 	protectedTotal -= archived
+	counts.archived = archived
+	counts.protected = protectedTotal
 
 	// Digest: count by wisp_type.
 	// No parent check — closed unprotected wisps past the delete age are purgeable.
 	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
 	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
+	//
+	// The breakdown is KEPT, not just summed. For as long as only digestTotal
+	// survived this loop, the sole trace a purge left anywhere was
+	// `reaper: purge N closed wisps from <db>` — see PurgeResult.WispsPurgedByType
+	// for what that cost (gt-mkuw).
 	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND " + protectWhere + " GROUP BY wtype"
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
-		return 0, archived, protectedTotal, nil, fmt.Errorf("digest query: %w", err)
+		return counts, nil, fmt.Errorf("digest query: %w", err)
 	}
 	digestTotal := 0
+	byType := map[string]int{}
 	for rows.Next() {
 		var wtype string
 		var cnt int
 		if err := rows.Scan(&wtype, &cnt); err != nil {
 			rows.Close()
-			return 0, archived, protectedTotal, nil, fmt.Errorf("digest scan: %w", err)
+			return counts, nil, fmt.Errorf("digest scan: %w", err)
 		}
 		digestTotal += cnt
+		byType[wtype] += cnt
 	}
 	rows.Close()
 
 	if digestTotal == 0 {
-		return 0, archived, protectedTotal, anomalies, nil
+		return counts, anomalies, nil
 	}
 
 	if dryRun {
-		return digestTotal, archived, protectedTotal, anomalies, nil
+		counts.purged = digestTotal
+		counts.byType = byType
+		return counts, anomalies, nil
 	}
 
 	session, err := beginWriteSession(ctx, db)
 	if err != nil {
-		return 0, archived, protectedTotal, nil, err
+		return counts, nil, err
 	}
 	defer session.release()
 
@@ -1118,7 +1348,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
-		return 0, archived, protectedTotal, anomalies, err
+		return counts, anomalies, err
 	}
 
 	if totalDeleted > 0 {
@@ -1127,9 +1357,10 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 				Type:    "sql_commit_failed",
 				Message: fmt.Sprintf("sql commit after purge failed, deletes rolled back: %v", err),
 			})
-			return 0, archived, protectedTotal, anomalies, nil
+			return counts, anomalies, nil
 		}
-		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
+		commitMsg := fmt.Sprintf("reaper: purge %d closed unprotected wisps from %s (%s)",
+			totalDeleted, dbName, FormatWispTypeDigest(byType))
 		if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal — log but continue.
 			anomalies = append(anomalies, Anomaly{
@@ -1139,13 +1370,74 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		}
 	}
 
-	return totalDeleted, archived, protectedTotal, anomalies, nil
+	counts.purged = totalDeleted
+	counts.byType = byType
+	// The digest was taken from the candidate set a moment before the delete
+	// pass. If the two disagree, the breakdown no longer describes what was
+	// deleted, and saying so is the whole point of having one: a breakdown that
+	// silently fails to sum to its total is a worse instrument than none.
+	if totalDeleted != digestTotal {
+		anomalies = append(anomalies, Anomaly{
+			Type: "purge_digest_mismatch",
+			Message: fmt.Sprintf(
+				"purge digest counted %d candidates in %s but %d rows were deleted; the by-type breakdown describes the candidates, not the deletions",
+				digestTotal, dbName, totalDeleted),
+			Count: digestTotal - totalDeleted,
+		})
+	}
+
+	return counts, anomalies, nil
+}
+
+// FormatWispTypeDigest renders a wisp_type breakdown for a one-line message, as
+// "patrol 12, unknown 3", commonest first and ties broken by name so the same
+// population always renders the same string.
+//
+// It exists so a purge names a POPULATION and not just a number.
+// `reaper: purge 29 closed wisps from beads` is the entire record those
+// deletions left — wisp tables are in dolt_ignore, so the commit itself is
+// empty and its message is all there is to read afterwards. On 2026-08-26 that
+// message was read, honestly and by several agents, as ~40 destroyed
+// merge-request records; they were molecule steps, and this path cannot take a
+// merge-request row at all (purgeProtectWhere). "unprotected" plus the
+// breakdown is what lets the message refuse that reading on its own (gt-mkuw).
+//
+// Single quotes are stripped because the commit-message caller interpolates the
+// result into a SQL string literal, where one would end the literal early. No
+// wisp_type gastown writes contains one; stripping is cheaper than discovering
+// otherwise inside a DOLT_COMMIT.
+func FormatWispTypeDigest(byType map[string]int) string {
+	if len(byType) == 0 {
+		return "no types recorded"
+	}
+	types := make([]string, 0, len(byType))
+	for wispType := range byType {
+		types = append(types, wispType)
+	}
+	sort.Slice(types, func(i, j int) bool {
+		if byType[types[i]] != byType[types[j]] {
+			return byType[types[i]] > byType[types[j]]
+		}
+		return types[i] < types[j]
+	})
+	parts := make([]string, 0, len(types))
+	for _, wispType := range types {
+		parts = append(parts, fmt.Sprintf("%s %d", strings.ReplaceAll(wispType, "'", ""), byType[wispType]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // wispArchiveAuxTables are the tables whose rows go with a wisp when it is
 // deleted. Identical to the purge path's list, because the retention path
 // deletes exactly what purge deletes — the difference is only that these rows
 // were written out first.
+//
+// "written out first" is a claim about collectArchivableWisps, and for
+// wisp_events it was false from the day this list was written until gt-wv8h:
+// the table was named here and read nowhere, so every released wisp lost its
+// event history unrecorded while this comment said it had not. The two lists
+// are kept equal by TestArchiveRecordsEveryTableTheReleaseDeletes, because a
+// comment cannot notice when a fifth table is added to one of them.
 var wispArchiveAuxTables = []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
 // archiveProtectedWisps exports closed, label-protected, unpinned wisps past the

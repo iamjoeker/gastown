@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install sync-plugins check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -10,14 +10,25 @@ E2E_RUN_FLAGS ?= --rm
 E2E_BUILD_RETRIES ?= 1
 E2E_RUN_RETRIES ?= 1
 
-# Get version info for ldflags
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Get version info for ldflags.
+#
+# Every git call is pinned with -C to the directory holding THIS makefile, so
+# the stamp always describes the gastown source tree being compiled — never
+# whatever repository the caller happened to be standing in (`make -C`,
+# `make -f`, a build driven from the town repo). Deriving provenance from an
+# ambient repo is exactly the defect gt-5mvj filed against `gt version`.
+SRC_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+SRC_GIT := git -C $(SRC_DIR)
+
+VERSION := $(shell $(SRC_GIT) describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT := $(shell $(SRC_GIT) rev-parse HEAD 2>/dev/null || echo "")
+BRANCH := $(shell $(SRC_GIT) symbolic-ref --short HEAD 2>/dev/null || echo "")
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 LDFLAGS := -s -w \
            -X github.com/steveyegge/gastown/internal/cmd.Version=$(VERSION) \
            -X github.com/steveyegge/gastown/internal/cmd.Commit=$(COMMIT) \
+           -X github.com/steveyegge/gastown/internal/cmd.Branch=$(BRANCH) \
            -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$(BUILD_TIME) \
            -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1
 
@@ -70,22 +81,41 @@ endif
 # check-forward-only: Ensure HEAD is a descendant of the currently installed binary's commit.
 # Prevents rebuilding to an older or diverged commit, which caused a crash loop where
 # the replaced binary broke session startup hooks → witness respawned → loop every 1-2 min.
+#
+# The binary's commit comes from `gt version --commit`, which reports only a
+# link-time stamp and prints "unknown" otherwise. The older `@sha` scrape is
+# kept as a fallback because this target runs against the *installed* binary,
+# which may predate --commit; it is only accepted when it looks like a sha, so
+# an "unknown flag" usage message cannot be mistaken for one. Note the scrape
+# was itself unreliable: with no branch stamped there is no `@` in the line, so
+# it silently yielded nothing and the downgrade guard skipped. (gt-5mvj)
 check-forward-only:
 ifndef SKIP_FORWARD_CHECK
-	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@'); \
+	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --commit 2>/dev/null | head -1); \
+	case "$$BINARY_COMMIT" in \
+		unknown|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; \
+		*) BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@') ;; \
+	esac; \
 	if [ -n "$$BINARY_COMMIT" ] && [ "$$BINARY_COMMIT" != "unknown" ]; then \
-		HEAD_COMMIT=$$(git rev-parse HEAD 2>/dev/null); \
-		if [ "$$BINARY_COMMIT" = "$$HEAD_COMMIT" ] || [ "$$(git rev-parse --short HEAD)" = "$$BINARY_COMMIT" ]; then \
+		RESOLVED=$$($(SRC_GIT) rev-parse --verify --quiet --end-of-options "$$BINARY_COMMIT^{commit}" 2>/dev/null); \
+		if [ -z "$$RESOLVED" ]; then \
+			echo "ERROR: installed binary reports commit $$BINARY_COMMIT, which does not exist in $(SRC_DIR)"; \
+			echo "Its provenance cannot be checked against this repo, so forward-only cannot be proven."; \
+			echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)."; \
+			exit 1; \
+		fi; \
+		HEAD_COMMIT=$$($(SRC_GIT) rev-parse HEAD 2>/dev/null); \
+		if [ "$$RESOLVED" = "$$HEAD_COMMIT" ]; then \
 			echo "Binary is already at HEAD, nothing to do"; \
 			exit 1; \
 		fi; \
-		if ! git merge-base --is-ancestor "$$BINARY_COMMIT" HEAD 2>/dev/null; then \
-			echo "ERROR: HEAD ($$(git rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)"; \
+		if ! $(SRC_GIT) merge-base --is-ancestor "$$RESOLVED" HEAD 2>/dev/null; then \
+			echo "ERROR: HEAD ($$($(SRC_GIT) rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)"; \
 			echo "This would be a DOWNGRADE. Refusing to rebuild."; \
 			echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)."; \
 			exit 1; \
 		fi; \
-		echo "Forward-only check passed: $$BINARY_COMMIT → $$(git rev-parse --short HEAD)"; \
+		echo "Forward-only check passed: $$BINARY_COMMIT → $$($(SRC_GIT) rev-parse --short HEAD)"; \
 	else \
 		echo "Warning: cannot determine installed binary commit, skipping forward check"; \
 	fi
@@ -122,10 +152,48 @@ install: check-up-to-date build
 			echo "Daemon restarted." || \
 			echo "Warning: daemon restart failed (start manually with: gt daemon start)"; \
 	fi
-	@# Sync plugins from build repo to town runtime directories.
-	@# Prevents drift when plugin fixes merge but runtime dirs are stale.
-	@$(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
-		echo "Plugins synced." || true
+	@$(MAKE) --no-print-directory sync-plugins
+
+# sync-plugins: Deploy this checkout's plugins into the town runtime directory.
+#
+# Plugins EXECUTE from <townRoot>/plugins/, never from this repo, so landing a
+# plugin fix on main does not deploy it — this copy is the only thing that
+# does. A fix split across Go and shell therefore deploys in two halves at two
+# different times: the Go half rides the binary, the shell half rides nothing.
+#
+# It hangs off BOTH install paths deliberately. It used to hang off `install`
+# alone — and `install` is the path a HUMAN takes. The only path that runs by
+# itself is rebuild-gt's hourly `safe-install`, which had no sync at all, so
+# the automated deploy path was the one with the hole in it. Measured
+# 2026-08-26: seven plugins in the town differed from main and rebuild-gt's
+# executing copy was dated 2026-08-02, missing both guards merged since.
+#
+# This does NOT deploy itself, and the reason is worth stating so nobody waits
+# for it. rebuild-gt reaches this recipe only through `make safe-install` in the
+# rig checkout, and `check-up-to-date` exits 1 whenever that checkout differs
+# from its upstream. Measured 2026-08-26: the rig checkout was 12 commits behind
+# origin/main, and the plugin copy executing in the town is the 2026-08-02 one,
+# which predates the step that fast-forwards it. So the checkout cannot advance
+# on its own, safe-install cannot complete, and this recipe is unreachable until
+# someone fast-forwards that checkout once by hand. After that one bootstrap the
+# loop closes: the sync below replaces the town's plugin copies with current
+# ones, including rebuild-gt's, and every later cycle carries both halves.
+#
+# Failure warns rather than fails: the binary is already in place by the time
+# this runs, and a non-zero exit here would report the install itself as broken.
+# But the REASON is printed. It was previously sent to /dev/null under
+# `|| true`, which made a sync that could not run look exactly like a sync that
+# ran and found nothing to do.
+sync-plugins:
+	@if [ ! -x $(INSTALL_DIR)/$(BINARY) ]; then \
+		echo "Warning: $(INSTALL_DIR)/$(BINARY) is not executable; plugins NOT synced" >&2; \
+	elif out=$$($(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>&1); then \
+		echo "$$out"; \
+	else \
+		echo "Warning: plugin sync failed; the town keeps executing the plugins it already had" >&2; \
+		echo "$$out" | sed 's/^/  /' >&2; \
+		echo "  Retry with: $(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins" >&2; \
+	fi
 
 # safe-install: Replace binary WITHOUT restarting daemon or killing sessions.
 # Use this for automated rebuilds (e.g., rebuild-gt plugin). Sessions pick up
@@ -144,6 +212,9 @@ safe-install: check-up-to-date check-forward-only build
 	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
 	@$(MAKE) --no-print-directory check-install-path
+	@# The binary is only half the deploy. Plugins run from the town, not from
+	@# here, and this is the automated path — if it does not sync, nothing does.
+	@$(MAKE) --no-print-directory sync-plugins
 	@echo "Sessions will pick up new binary on next cycle."
 
 # check-version-tag: Verify that if HEAD is tagged vX.Y.Z, the Version constant
@@ -192,13 +263,18 @@ test-nested-modules:
 
 test-makefile:
 	bash scripts/check-install-path_test.sh
+	bash scripts/sync-plugins_test.sh
 	bash -n plugins/stuck-agent-dog/run.sh
 	bash -n plugins/stuck-agent-dog/run_test.sh
 	bash plugins/stuck-agent-dog/run_test.sh
 	bash -n plugins/git-hygiene/run.sh
+	bash -n plugins/git-hygiene/run_test.sh
+	bash plugins/git-hygiene/run_test.sh
 	bash -n plugins/gitignore-reconcile/run.sh
 	bash -n plugins/submodule-commit/run.sh
 	bash -n plugins/rebuild-gt/run.sh
+	bash -n plugins/rebuild-gt/run_test.sh
+	bash plugins/rebuild-gt/run_test.sh
 	bash -n plugins/dolt-log-rotate/run.sh
 	bash -n plugins/rig_repos_contract_test.sh
 	bash plugins/rig_repos_contract_test.sh

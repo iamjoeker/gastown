@@ -2479,7 +2479,22 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	// entitled to a reuse verdict. It is set here rather than at the end so a
 	// future early return cannot drop it and silently turn the reuse gate into a
 	// gate that refuses everything (gt-49dp).
-	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown, SessionBusy: m.SessionBusy(name), ReuseFactsMeasured: true}
+	input := WorkstateInput{
+		State:         state,
+		CleanupStatus: CleanupUnknown,
+		SessionBusy:   m.SessionBusy(name),
+		// Read alongside SessionBusy so the reuse gate and `gt polecat list`
+		// stop reporting a logged-out polecat as working (gt-acb1).
+		SessionLoggedOut: m.SessionLoggedOut(name),
+		// And whether there is a session at all, for the same reason both of
+		// those exist: they answer "is it doing something", never "is it there".
+		// Nothing in the reuse verdict changes — a polecat holding work is
+		// already not reusable — but the gate now refuses it for the reason that
+		// is true (no session) rather than for the MR that is masking it, so this
+		// surface and check-recovery cannot diverge again (gt-9f67).
+		SessionPresence:    m.SessionPresenceFor(name),
+		ReuseFactsMeasured: true,
+	}
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""
@@ -2493,6 +2508,14 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		hookSafe, hookTerminal = m.hookBeadSafeForWorkstate(fields.HookBead)
 		if !hookSafe {
 			input.HookBead = fields.HookBead
+		}
+		// The reuse gate was blind to agent_state the same way check-recovery was:
+		// loadFromBeads maps it onto State for "done" only, so a polecat parked at
+		// stuck arrived here as StateIdle and FindIdlePolecat would hand its slot
+		// to the next sling — silently discarding a pause somebody set on purpose.
+		// Now it refuses, and `gt polecat clear-state` is the way back (gt-fbgq).
+		if state := beads.AgentState(strings.TrimSpace(fields.AgentState)); state.IsPaused() {
+			input.PausedAgentState = string(state)
 		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
@@ -2529,9 +2552,15 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	} else {
 		input.GitCheckFailed = true
 	}
+	// Tracked, not inferred: BranchPreservationStatus returns 0 unpreserved
+	// patches both when every commit is durable on the remote and when it could
+	// resolve no comparison ref at all, and only the first of those refutes
+	// anything (gt-3bzt).
+	preservationMeasured := false
 	if branch != "" {
 		if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
 			input.UnpushedCommits = preservation.UnpreservedPatchCount
+			preservationMeasured = true
 		} else {
 			input.GitCheckFailed = true
 		}
@@ -2540,6 +2569,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	// no local work at risk, treat the missing cleanup_status as clean; otherwise
 	// DecideSlotReuse will continue to fail closed on CleanupUnknown.
 	gitSafe := !input.GitCheckFailed && !input.GitDirty && input.StashCount == 0 && input.UnpushedCommits == 0
+	input.PushFailedRefuted = GitFactsRefutePushFailed(preservationMeasured, input.GitCheckFailed, input.GitDirty, input.StashCount, input.UnpushedCommits)
 	if input.CleanupStatus == CleanupUnknown && gitSafe {
 		input.CleanupStatus = CleanupClean
 	}
@@ -2567,6 +2597,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = m.mqNotRequiredSource(workIssue)
+	input.SourceCloseDischargesMQ = m.sourceCloseDischargesMQ(workIssue)
 	// A terminal source bead no longer skips this lookup: the closed bead IS the
 	// stranding signature, so skipping it blinded the check to both directions
 	// of the fact — no MR at all, and an MR someone else submitted (gt-46rk).
@@ -2577,6 +2608,28 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		} else if mr != nil {
 			ApplyBranchMRToWorkstateInput(&input, mr.ID, !beads.IssueStatus(mr.Status).IsTerminal())
 		}
+	}
+	// Last, so it matches against the MR this gate would actually cite. Set on
+	// this surface too, for the reason gt-9f67 set SessionPresence on all three:
+	// the exemption and the precondition it exempts must travel together, or the
+	// gate and check-recovery diverge on the same polecat again.
+	//
+	// It is currently inert here by construction — this gate sets neither
+	// AssignedWorkBead nor ActiveWorkBlocker, and HookBead only when the hook is
+	// unsafe — so sessionAbsentHoldingWork has almost nothing to fire on. That is
+	// exactly why it is wired now rather than when it first matters: the day
+	// someone gives this gate the issue-store lookup, the precondition arrives
+	// with its exemption already attached.
+	//
+	// workIssue and sourceHint are NOT passed as held work. Both fall back to
+	// fields.LastSourceIssue, which is half of the record being matched.
+	if err == nil && fields != nil {
+		input.CompletionCoverage = CompletionCoverage(CompletionRecord{
+			ExitType:        fields.ExitType,
+			MRID:            fields.MRID,
+			LastSourceIssue: fields.LastSourceIssue,
+			CompletionTime:  fields.CompletionTime,
+		}, input.ActiveMR, input.HookBead)
 	}
 	return input
 }
@@ -2618,6 +2671,33 @@ func (m *Manager) mqNotRequiredSource(issueID string) bool {
 	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
 }
 
+// sourceCloseDischargesMQ reads the source bead's CLOSE REASON — not merely its
+// status — and reports whether it declares that no merge request was ever owed.
+//
+// Status alone is the wrong instrument and was already available here as
+// AssignedBeadTerminal: a bead closed because its work merged and a bead closed
+// as a duplicate are both terminal and mean opposite things about the branch
+// still sitting in the polecat's sandbox (gt-xm6w).
+func (m *Manager) sourceCloseDischargesMQ(issueID string) bool {
+	if issueID == "" {
+		return false
+	}
+	issue, err := m.beads.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	if !beads.IssueStatus(issue.Status).IsTerminal() {
+		return false
+	}
+	return CloseReasonDischargesMergeQueue(issue.CloseReason)
+}
+
+// hasSubmittableWorkForWorkstate answers "does this branch hold patches the
+// target lacks", which is NOT the same question as "does this branch hold work
+// still owed to the merge queue" — it is a divergence measure, and a branch
+// abandoned behind main keeps answering yes forever. Nothing here can tell the
+// two apart; the discharge that can lives in the classifier, on
+// WorkstateInput.SourceCloseDischargesMQ (gt-xm6w).
 func hasSubmittableWorkForWorkstate(worktreePath string, targetRefs []string) bool {
 	g := git.NewGit(worktreePath)
 	branch, _ := g.CurrentBranch()
@@ -3043,6 +3123,81 @@ func (m *Manager) SessionBusy(name string) bool {
 	return m.tmux.IsBusy(sessionName)
 }
 
+// SessionLoggedOut reports whether the polecat's tmux session is demonstrably
+// sitting at an auth wall right now, waiting on a human to run /login.
+//
+// It is the live counterpart to SessionBusy and shares its contract: positive
+// evidence only, so no tmux, no session, or an unreadable pane all return false.
+// See Tmux.IsLoggedOut for why the pane scan is anchored (gt-acb1).
+func (m *Manager) SessionLoggedOut(name string) bool {
+	if m.tmux == nil {
+		return false
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	if running, err := m.tmux.HasSession(sessionName); err != nil || !running {
+		return false
+	}
+	return m.tmux.IsLoggedOut(sessionName)
+}
+
+// SessionLiveness reports what the polecat's pane says the agent is actually
+// doing: working, blocking-wait, logged-out, or parked (gt-y39t).
+//
+// It is the successor to SessionBusy and SessionLoggedOut rather than a third
+// peer — both of those answer a yes/no question about the same status region,
+// and between them they have two states where the pane has four. A polecat
+// inside `sleep 300` and a wedged one are both "busy" to SessionBusy, because
+// both render the busy marker; only the token counter separates them.
+//
+// window is how long to wait between the two samples this needs. Pass zero for
+// the cheap read: logged-out and parked are decided from one sample, and a turn
+// in flight is reported as such rather than guessed at. Pass at least
+// tmux.MinLivenessWindow to separate working from blocking-wait — and note that
+// this then BLOCKS for that long.
+//
+// Same positive-evidence contract as SessionBusy: no tmux, no session, or an
+// unreadable pane all produce LivenessUnknown, which callers must not act on.
+func (m *Manager) SessionLiveness(name string, window time.Duration) tmux.LivenessReading {
+	if m.tmux == nil {
+		return tmux.LivenessReading{}
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	if running, err := m.tmux.HasSession(sessionName); err != nil || !running {
+		return tmux.LivenessReading{}
+	}
+	return m.tmux.Liveness(sessionName, window)
+}
+
+// SessionPresenceFor reports whether the polecat's tmux session EXISTS. It is a
+// different question from SessionLiveness above, which asks what a session that
+// exists is doing — and every one of that function's four readings requires a
+// session to read.
+//
+// It is also not a third bool alongside SessionBusy and SessionLoggedOut, and
+// that difference is the point. Those two carry positive evidence only: no tmux,
+// no session, and an unreadable pane all return false, so the answer a caller
+// most needs here — "the agent is GONE" — is the one they cannot express.
+// SessionLiveness collapses the same distinction, returning its zero value for
+// both "no session" and "could not read", so it cannot supply this either.
+//
+// This returns SessionAbsent only when HasSession actually ran and said no, and
+// SessionPresenceUnknown when there is no tmux client or the check errored, so a
+// failed probe can never be mistaken for a dead agent (gt-9f67).
+func (m *Manager) SessionPresenceFor(name string) SessionPresence {
+	if m.tmux == nil {
+		return SessionPresenceUnknown
+	}
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+	running, err := m.tmux.HasSession(sessionName)
+	if err != nil {
+		return SessionPresenceUnknown
+	}
+	if running {
+		return SessionPresent
+	}
+	return SessionAbsent
+}
+
 func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	if m.tmux == nil {
 		return false, false
@@ -3057,10 +3212,14 @@ func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	return true, NewSessionManager(m.tmux, m.rig).isSessionStale(sessionName)
 }
 
+// isCurrentHookedIssueForAssignee reports whether issue is the hooked work this
+// agent currently holds. The assignee comparison goes through
+// beads.SameAgentAddress because the bead's assignee and the address handed in
+// here come from different writers and need not have chosen the same form.
 func isCurrentHookedIssueForAssignee(issue *beads.Issue, assignee string) bool {
 	return issue != nil &&
 		issue.Status == beads.StatusHooked &&
-		issue.Assignee == assignee
+		beads.SameAgentAddress(issue.Assignee, assignee)
 }
 
 // setupSharedBeads creates a redirect file so the polecat uses the rig's shared .beads database.

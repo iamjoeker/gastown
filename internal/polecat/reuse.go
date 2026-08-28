@@ -32,6 +32,18 @@ type SlotReuseInput struct {
 	MQLookupFailed       bool
 	MRRefused            bool
 
+	// SourceCloseDischargesMQ carries the gt-xm6w discharge: the source bead was
+	// closed with an explicit terminal category, so the merge queue is owed
+	// nothing and the slot is not stranded. See
+	// WorkstateInput.SourceCloseDischargesMQ.
+	SourceCloseDischargesMQ bool
+
+	// PushFailedRefuted must be set only by callers whose measured git facts
+	// contradict push_failed. Carried through so this gate and check-recovery
+	// cannot reach opposite conclusions about the same polecat from the same
+	// measurement. See WorkstateInput.PushFailedRefuted (gt-3bzt).
+	PushFailedRefuted bool
+
 	// ReuseFactsMeasured must be set by callers that ran the git and
 	// merge-queue checks. Reuse is destructive — it force-deletes the branch —
 	// so an unmeasured caller is told UNVERIFIED rather than Reusable. See
@@ -54,6 +66,7 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		CleanupStatus:        in.CleanupStatus,
 		IgnoreCleanupStatus:  in.IgnoreCleanupStatus,
 		PushFailed:           in.PushFailed,
+		PushFailedRefuted:    in.PushFailedRefuted,
 		MRFailed:             in.MRFailed,
 		Branch:               in.Branch,
 		GitDirty:             in.GitDirty,
@@ -72,6 +85,8 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		MQLookupFailed:       in.MQLookupFailed,
 		MRRefused:            in.MRRefused,
 		ReuseFactsMeasured:   in.ReuseFactsMeasured,
+
+		SourceCloseDischargesMQ: in.SourceCloseDischargesMQ,
 	})
 	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
 }

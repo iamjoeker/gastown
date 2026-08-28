@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // SetupHandler handles the setup flow when no workspace exists.
@@ -268,6 +270,9 @@ func (h *SetupAPIHandler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		h.sendError(w, "Failed to start dashboard: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// This handler runs inside a long-lived server, so the child's exit status
+	// must be collected somewhere or it accumulates as a zombie per request.
+	util.ReapDetached(cmd)
 
 	// Wait for the new server to be ready.
 	// Use the bind address for the health check; if binding to all interfaces,

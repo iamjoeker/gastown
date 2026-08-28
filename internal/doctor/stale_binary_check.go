@@ -36,7 +36,14 @@ func (c *StaleBinaryCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	return staleResult(c.Name(), version.CheckStaleBinary(repoRoot))
+	// Read the build branch from the remote. Without it this check answers
+	// against $GT_ROOT/gastown/mayor/rig, a working clone nothing fast-forwards,
+	// and its "Binary is up to date" is then a statement about how recently
+	// someone pulled — the exact false all-clear that kept a stale binary
+	// installed for hours (gt-ympl). One bounded fetch per doctor run.
+	return staleResult(c.Name(), version.CheckStaleBinaryWithOptions(repoRoot, version.StaleOptions{
+		RefreshRemote: true,
+	}))
 }
 
 // staleResult maps a completed staleness check to a doctor CheckResult.

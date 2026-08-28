@@ -477,6 +477,11 @@ func formatFeedSummary(e events.Event) string {
 			return fmt.Sprintf("Sent mail to %s", to)
 		}
 		return "Sent mail"
+	case events.TypePoolReuseRefused, events.TypePoolReuseSkipped:
+		// Shared with the feed curator on purpose: these are the two surfaces a
+		// reader reaches the event through, and both used to print the bare
+		// type name — which named the wrong outcome (gt-ibtb).
+		return events.PoolReuseSummary(e.Type, e.Payload)
 	default:
 		return e.Type
 	}

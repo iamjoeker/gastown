@@ -11,9 +11,15 @@ import "time"
 //   - Working: Session active, doing assigned work (normal operation)
 //   - Idle: Available before assignment, with no pending completion cleanup
 //   - Done: Work completed, session retired, cleanup/refinery still owns state
+//   - HandedOff: Session gone, an OPEN MR for its branch found — work is queued
 //   - ReviewNeeded: Session is live but no active work bead is attached
 //   - Stalled: Session stopped unexpectedly, was never nudged back to life
 //   - Zombie: Session called 'gt done' but cleanup failed - tried to die but couldn't
+//
+// HandedOff and Stalled are the same observation — a dead session with work
+// still attached — separated by one lookup. Without the lookup they were the
+// same word, and a polecat that had SUCCEEDED read as one that died for the
+// entire in-flight-MR window (gt-mkpm).
 //
 // The distinction matters: idle polecats are available capacity. Done polecats
 // completed work and are waiting for cleanup/refinery state to clear. Stalled
@@ -66,7 +72,39 @@ const (
 	// This is a detected condition: the polecat was incompletely nuked or has a
 	// session naming mismatch, leaving an orphaned tmux session.
 	StateZombie State = "zombie"
+
+	// StateHandedOff means the session is gone and an OPEN merge request for this
+	// polecat's branch was positively found. The work is in the refinery's queue;
+	// the polecat succeeded and the session ending was completion.
+	//
+	// It exists because the vocabulary had no word for it, so the window between
+	// `gt done` and the refinery's merge fell back to StateStalled — the word for
+	// the failure case. Measured on gastown/chrome and beads/ace, two rigs and
+	// three observers: both flipped from "stalled" to "done" on the merge of
+	// their MR with nothing else changed, and one observer filed the misreading
+	// as evidence for an unrelated pool-leak bead (gt-mkpm).
+	//
+	// It is DETECTED, never stored: no path writes it to a bead. Assign it only
+	// where an open MR was actually looked up — the whole point is that it
+	// carries more evidence than StateStalled, not less. HandedOffState is the
+	// one promotion helper; use it rather than assigning this directly.
+	StateHandedOff State = "handed-off"
 )
+
+// HandedOffState promotes a detected StateStalled to StateHandedOff when an open
+// merge request for the polecat's branch was positively found.
+//
+// openMRProven must mean PROVEN: an MR bead looked up and read back non-terminal.
+// A fail-closed "we could not rule an MR out" is not proof and must leave the
+// state alone — reporting "handed off" from an unconsulted queue would be the
+// same defect in the opposite direction as reporting "stalled" from a consulted
+// one (gt-mkpm).
+func HandedOffState(state State, openMRProven bool) State {
+	if state == StateStalled && openMRProven {
+		return StateHandedOff
+	}
+	return state
+}
 
 // IsWorking returns true if the polecat is currently working.
 func (s State) IsWorking() bool {

@@ -225,13 +225,7 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 	// Ensure runtime settings exist in the shared refinery parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 
-	// Resolve CLAUDE_CONFIG_DIR from accounts.json so refinery sessions
-	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
-	accountsPath := constants.MayorAccountsPath(townRoot)
-	runtimeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
-	if runtimeConfigDir == "" {
-		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
-	}
+	runtimeConfigDir := config.ResolveTownRuntimeConfigDir(townRoot)
 
 	runtimeConfig := config.ResolveRoleAgentConfig("refinery", townRoot, m.rig.Path)
 	refinerySettingsDir := config.RoleSettingsDir("refinery", m.rig.Path)
@@ -701,6 +695,9 @@ type RejectResult struct {
 	// SourceIssueErr is non-fatal: the MR was rejected, but the source issue's
 	// state could not be read or corrected.
 	SourceIssueErr error
+	// Notify is what the notification half actually did. Zero value means
+	// --notify was not requested.
+	Notify NotifyReport
 }
 
 // RejectMR manually rejects a merge request.
@@ -764,8 +761,16 @@ func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*Reje
 	}
 
 	// Optionally notify worker
-	if notify && !closeResult.AlreadyTerminal {
-		m.notifyWorkerRejected(mr, reason)
+	if notify {
+		if closeResult.AlreadyTerminal {
+			result.Notify = NotifyReport{
+				Outcome:    NotifySkipped,
+				Target:     rejectNotifyTarget(m.rig.Name, mr.Worker),
+				SkipReason: "MR was already closed before this rejection",
+			}
+		} else {
+			result.Notify = m.notifyWorkerRejected(mr, reason)
+		}
 	}
 
 	return result, nil
@@ -834,6 +839,13 @@ func (m *Manager) postMergeMR(b *beads.Beads, mr *MergeRequest) (*PostMergeResul
 	if closeResult.AlreadyTerminal {
 		_, _ = fmt.Fprintf(m.output, "  %s MR already closed\n", style.Dim.Render("—"))
 		result.MRClosed = true
+		// This path does NOT repair a record that says something other than
+		// merged, and must not: `gt mq post-merge <id>` is run by hand, its
+		// ExpectedMR is filled from the record it is checking, and it holds no
+		// evidence from git that anything landed. It refuses, exactly as
+		// before. The repair for a record closed out from under a real merge
+		// belongs to the engineer's landing path, which has the proof
+		// (gt-fe1e; see recordMergeOnTerminalMR).
 		if mr.CloseReason != CloseReasonMerged {
 			if mr.CloseReason == "" {
 				return result, fmt.Errorf("post-merge retry for already-closed MR %s requires close_reason=%s", mr.ID, CloseReasonMerged)
@@ -866,19 +878,167 @@ func (m *Manager) postMergeMR(b *beads.Beads, mr *MergeRequest) (*PostMergeResul
 	return result, nil
 }
 
-// notifyWorkerRejected sends a rejection notification to a polecat.
-func (m *Manager) notifyWorkerRejected(mr *MergeRequest, reason string) {
-	// Nudge polecat about rejection instead of sending permanent mail.
-	polecatName := strings.TrimPrefix(mr.Worker, "polecats/")
-	target := fmt.Sprintf("%s/%s", m.rig.Name, polecatName)
-	nudgeMsg := fmt.Sprintf("MR rejected: branch=%s issue=%s reason=%s — review feedback and resubmit with 'gt done'",
-		mr.Branch, mr.IssueID, reason)
-	nudgeCmd := exec.Command("gt", "nudge", target, nudgeMsg)
-	util.SetDetachedProcessGroup(nudgeCmd)
-	nudgeCmd.Dir = m.workDir
-	if err := nudgeCmd.Run(); err != nil {
-		log.Printf("warning: nudging worker about rejection for %s: %v", mr.IssueID, err)
+// NotifyOutcome names what actually happened to a rejection notification.
+//
+// The point of the type is that "sent" is one value among several and has to be
+// earned: the caller used to print "Worker notified via mail" from the mere fact
+// that --notify was passed, so a nudge at a worker with no tmux session at all
+// reported success three times running (gt-sfcl).
+type NotifyOutcome string
+
+const (
+	// NotifyNotRequested is the zero value: --notify was not passed.
+	NotifyNotRequested NotifyOutcome = ""
+	// NotifySkipped means no channel was tried, for the reason in SkipReason.
+	NotifySkipped NotifyOutcome = "skipped"
+	// NotifyNudged means the worker's live session took the nudge.
+	NotifyNudged NotifyOutcome = "nudged"
+	// NotifyMailed means the nudge did not land — typically no live session —
+	// but durable mail did, so the notice survives until the worker respawns.
+	NotifyMailed NotifyOutcome = "mailed"
+	// NotifyFailed means neither channel delivered and the worker knows nothing.
+	NotifyFailed NotifyOutcome = "failed"
+)
+
+// NotifyReport is what the notification half of a rejection actually did.
+//
+// NudgeErr is kept even on success-by-mail: "the live session was gone" is the
+// fact the operator needs, and it is only visible in the nudge error.
+type NotifyReport struct {
+	Outcome NotifyOutcome
+	// Target is the address the notice was addressed to.
+	Target string
+	// NudgeErr is why the live-session nudge did not land, nil when it did.
+	NudgeErr error
+	// MailErr is why the durable fallback did not land. Nil both when mail
+	// succeeded and when it was never needed (Outcome == NotifyNudged).
+	MailErr error
+	// SkipReason names why nothing was attempted, set only for NotifySkipped.
+	SkipReason string
+}
+
+// rejectNotifier is the pair of channels a rejection notice can travel over,
+// injected so the decision logic is testable without a tmux session or Dolt.
+type rejectNotifier struct {
+	nudge func(target, msg string) error
+	mail  func(target, subject, body string) error
+}
+
+// rejectNotifyTarget converts an MR's worker field into a mail/nudge address.
+func rejectNotifyTarget(rigName, worker string) string {
+	return fmt.Sprintf("%s/%s", rigName, strings.TrimPrefix(worker, "polecats/"))
+}
+
+// notifyRejectedWorker delivers the rejection notice and reports which channel
+// carried it, if any.
+//
+// A nudge reaches a worker that is awake right now; it cannot reach one whose
+// session has died, which is exactly the case where the notice matters most —
+// reject leaves the source issue HOOKED to that worker, so a rejected polecat
+// that never hears about it waits on a merge that will never come. So a failed
+// nudge falls back to durable mail, which survives session death and is waiting
+// in the inbox when the worker (or its replacement) primes.
+func notifyRejectedWorker(n rejectNotifier, target, branch, issueID, reason string) NotifyReport {
+	report := NotifyReport{Target: target}
+
+	msg := fmt.Sprintf("MR rejected: branch=%s issue=%s reason=%s — review feedback and resubmit with 'gt done'",
+		branch, issueID, reason)
+	nudgeErr := n.nudge(target, msg)
+	if nudgeErr == nil {
+		report.Outcome = NotifyNudged
+		return report
 	}
+	report.NudgeErr = nudgeErr
+
+	subject := fmt.Sprintf("MR rejected: %s", issueID)
+	body := fmt.Sprintf("Your merge request was rejected.\n\nBranch: %s\nIssue:  %s\n\nReason:\n%s\n\nThe issue is still hooked to you. Review the feedback and resubmit with 'gt done'.",
+		branch, issueID, reason)
+	if err := n.mail(target, subject, body); err != nil {
+		report.MailErr = err
+		report.Outcome = NotifyFailed
+		return report
+	}
+	report.Outcome = NotifyMailed
+	return report
+}
+
+// notifyWorkerRejected sends a rejection notification to a polecat and reports
+// whether it landed.
+func (m *Manager) notifyWorkerRejected(mr *MergeRequest, reason string) NotifyReport {
+	target := rejectNotifyTarget(m.rig.Name, mr.Worker)
+	report := notifyRejectedWorker(rejectNotifier{
+		nudge: func(target, msg string) error {
+			return m.runNotifyCommand("nudge", target, msg)
+		},
+		mail: func(target, subject, body string) error {
+			// --no-notify: the nudge half has already been tried and failed, so
+			// mail's own idle-aware nudge would only fail again — and its failure
+			// must not be confused with the message failing to store.
+			// --permanent: a rejection notice has to outlive wisp GC.
+			return m.runNotifyCommand("mail", "send", target,
+				"-s", subject, "-m", body, "--permanent", "--no-notify")
+		},
+	}, target, mr.Branch, mr.IssueID, reason)
+
+	switch report.Outcome {
+	case NotifyMailed:
+		log.Printf("warning: nudging worker about rejection for %s: %v (notice sent as durable mail instead)", mr.IssueID, report.NudgeErr)
+	case NotifyFailed:
+		log.Printf("error: worker %s NOT notified of rejection for %s: nudge: %v; mail: %v", target, mr.IssueID, report.NudgeErr, report.MailErr)
+	}
+	return report
+}
+
+// runNotifyCommand runs a gt subcommand and folds its output into the error, so
+// the reason a notification failed ("session \"gt-chrome\" not found") reaches
+// the caller instead of being written to a discarded pipe.
+func (m *Manager) runNotifyCommand(args ...string) error {
+	cmd := exec.Command("gt", args...)
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Dir = m.workDir
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if detail := errorLine(string(out)); detail != "" {
+		return fmt.Errorf("%w: %s", err, detail)
+	}
+	return err
+}
+
+// errorLineMaxLen caps how much of a failing command's output reaches the
+// summary block. The diagnosis is always in the first line; the rest is a
+// usage banner.
+const errorLineMaxLen = 200
+
+// errorLine picks the diagnosis out of a failing gt command's combined output.
+//
+// It looks for the "Error:" line specifically rather than taking the first or
+// last line. Cobra prints its usage banner AFTER the error on a usage failure,
+// so "the last line" is a flag description, and a command that warns before it
+// fails ("Watching gt-chrome for idle...") puts noise on the first.
+func errorLine(s string) string {
+	var firstNonEmpty string
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Error:") {
+			return truncate(trimmed, errorLineMaxLen)
+		}
+		if firstNonEmpty == "" {
+			firstNonEmpty = trimmed
+		}
+	}
+	return truncate(firstNonEmpty, errorLineMaxLen)
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // Town root is computed in Start() as filepath.Dir(m.rig.Path) and passed

@@ -1502,7 +1502,11 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 			return fmt.Errorf("verifying hook after %d attempts: %w", maxRetries, lastErr)
 		}
 
-		if verifyInfo.Status != "hooked" || verifyInfo.Assignee != targetAgent {
+		// Read back through beads.SameAgentAddress: the hook write and this
+		// verification are two different processes reading the assignee column,
+		// and a form disagreement between them would burn every retry and then
+		// fail a sling whose hook is in fact exactly where it belongs.
+		if verifyInfo.Status != "hooked" || !beads.SameAgentAddress(verifyInfo.Assignee, targetAgent) {
 			lastErr = fmt.Errorf("hook did not stick: status=%s, assignee=%s (expected hooked, %s)",
 				verifyInfo.Status, verifyInfo.Assignee, targetAgent)
 			if attempt < maxRetries {

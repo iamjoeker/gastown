@@ -30,6 +30,17 @@ const (
 	// auto-close. This prevents a race where the daemon's stranded scan
 	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
 	convoyGracePeriod = 5 * time.Minute
+
+	// slingFailureRepeatInterval bounds how often an unchanged sling failure is
+	// re-logged. The feeder retries every scan, so an issue that cannot be slung
+	// at all writes an identical line to daemon.log every 30s forever (gt-s1id),
+	// burying the lines that are new. See noteSlingFailure.
+	slingFailureRepeatInterval = 10 * time.Minute
+
+	// slingFailureStateTTL drops suppression state for an issue the feeder has
+	// stopped attempting, so the map cannot grow without bound and a failure
+	// that recurs much later is reported as new rather than as a repeat.
+	slingFailureStateTTL = 1 * time.Hour
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
@@ -41,6 +52,28 @@ type strandedConvoyInfo struct {
 	ReadyIssues  []string  `json:"ready_issues"`
 	CreatedAt    time.Time `json:"created_at"`
 	BaseBranch   string    `json:"base_branch,omitempty"`
+
+	// Reason and Evidence carry the scan's verdict and what it observed
+	// ("2 blocked", "1 deferred"). Logged rather than branched on: the counts
+	// already decide the action, and an older gt omits both. (gt-bel1)
+	Reason   string         `json:"reason,omitempty"`
+	Evidence map[string]int `json:"evidence,omitempty"`
+}
+
+// describe renders the evidence for a log line, falling back to the bare
+// tracked count when talking to a gt that predates the field.
+func (c strandedConvoyInfo) describe() string {
+	order := []string{"ready", "working", "in-queue", "scheduled", "deferred", "blocked", "not-slingable", "unknown", "closed"}
+	var parts []string
+	for _, dispo := range order {
+		if n := c.Evidence[dispo]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, dispo))
+		}
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%d tracked", c.TrackedCount)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // ConvoyManager monitors beads events for issue closes and periodically scans for stranded convoys.
@@ -112,6 +145,21 @@ type ConvoyManager struct {
 	// been handled. This allows the 1s overlap window above without replaying
 	// the same lifecycle events on every poll.
 	processedLifecycleEvents sync.Map // map[string]bool
+
+	// slingFailures suppresses repeated identical sling-failure log lines,
+	// keyed by convoyID + "\x00" + issueID. Read and written only from scan()
+	// and its callees, which are serialized by scanMu, so it needs no lock of
+	// its own.
+	slingFailures map[string]*slingFailureState
+}
+
+// slingFailureState tracks one issue's unchanged sling failure across scans.
+type slingFailureState struct {
+	msg        string    // the failure text, compared verbatim to detect a change
+	repeats    int       // retries since the message last changed
+	firstSeen  time.Time // when this message was first observed
+	lastSeen   time.Time // when it was last observed (drives TTL pruning)
+	lastLogged time.Time // when it was last written to the log
 }
 
 // NewConvoyManager creates a new convoy manager.
@@ -470,6 +518,8 @@ func (m *ConvoyManager) scan() {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
 
+	m.pruneSlingFailures(time.Now())
+
 	stranded, err := m.findStranded()
 	if err != nil {
 		m.logger("Convoy: stranded scan failed: %s", util.FirstLine(err.Error()))
@@ -498,9 +548,11 @@ func (m *ConvoyManager) scan() {
 		} else {
 			// Tracked issues exist but none are ready. This could mean:
 			// (a) all tracked issues are closed → convoy should auto-close
-			// (b) issues are blocked/in-progress → needs agent review
+			// (b) issues are blocked or unroutable → needs agent review
 			// Run convoy check to handle case (a); it's a no-op for (b).
-			m.logger("Convoy %s: %d tracked issues, 0 ready — checking completion", c.ID, c.TrackedCount)
+			// Convoys that are merely waiting (deferred, scheduled, worked, or
+			// queued to merge) never reach here — the scan withholds them.
+			m.logger("Convoy %s: 0 ready (%s) — checking completion", c.ID, c.describe())
 			m.checkConvoyCompletion(c.ID)
 		}
 	}
@@ -572,13 +624,75 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 		cmd.Stderr = &stderr
 
 		if err := cmd.Run(); err != nil {
-			m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, util.FirstLine(stderr.String()))
+			msg := util.FirstLine(stderr.String())
+			if msg == "" {
+				msg = util.FirstLine(err.Error())
+			}
+			if line, log := m.noteSlingFailure(c.ID, issueID, msg, time.Now()); log {
+				m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, line)
+			}
 			continue
 		}
+		m.clearSlingFailure(c.ID, issueID)
 		return // Successfully dispatched one issue
 	}
 
 	m.logger("Convoy %s: no dispatchable issues (all %d skipped)", c.ID, len(c.ReadyIssues))
+}
+
+// noteSlingFailure records one sling failure and returns the line to log, or
+// ("", false) to stay quiet.
+//
+// A convoy whose only ready issue cannot be slung is retried every scan, and
+// before gt-s1id each retry wrote a byte-identical line to daemon.log — one
+// stranded issue produced 120 lines an hour indefinitely, and the operator
+// reading the log had no way to tell a fresh failure from the thousandth copy
+// of an old one. The failure itself is not lost by staying quiet: the convoy
+// is still reported by `gt convoy stranded`, which is where a stuck convoy
+// belongs.
+//
+// Logged on first sight, on any change in the message (a different failure is
+// news), and thereafter once per slingFailureRepeatInterval carrying how many
+// retries the unchanged failure has now survived.
+func (m *ConvoyManager) noteSlingFailure(convoyID, issueID, msg string, now time.Time) (string, bool) {
+	if m.slingFailures == nil {
+		m.slingFailures = make(map[string]*slingFailureState)
+	}
+	key := convoyID + "\x00" + issueID
+	st, ok := m.slingFailures[key]
+	if !ok || st.msg != msg {
+		m.slingFailures[key] = &slingFailureState{
+			msg:        msg,
+			firstSeen:  now,
+			lastSeen:   now,
+			lastLogged: now,
+		}
+		return msg, true
+	}
+
+	st.repeats++
+	st.lastSeen = now
+	if now.Sub(st.lastLogged) < slingFailureRepeatInterval {
+		return "", false
+	}
+	st.lastLogged = now
+	return fmt.Sprintf("%s (unchanged after %d retries over %s)",
+		msg, st.repeats, now.Sub(st.firstSeen).Round(time.Minute)), true
+}
+
+// clearSlingFailure forgets an issue's suppression state after a successful
+// sling, so a later failure is reported as new.
+func (m *ConvoyManager) clearSlingFailure(convoyID, issueID string) {
+	delete(m.slingFailures, convoyID+"\x00"+issueID)
+}
+
+// pruneSlingFailures drops suppression state the feeder has stopped touching.
+func (m *ConvoyManager) pruneSlingFailures(now time.Time) {
+	for key, st := range m.slingFailures {
+		if now.Sub(st.lastSeen) > slingFailureStateTTL {
+			delete(m.slingFailures, key)
+		}
+	}
 }
 
 // checkConvoyCompletion runs gt convoy check to auto-close a convoy whose

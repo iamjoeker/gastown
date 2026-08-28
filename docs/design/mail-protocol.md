@@ -230,6 +230,93 @@ attached_at: <timestamp>
 
 ## Format Conventions
 
+### `--type`: does a reply come back?
+
+Every mail bead carries a `msg-type:<value>` label. The subject prefixes above
+say what a message is *about*; `msg-type` answers one narrower question:
+
+> After the recipient reads this, do they still owe you something?
+
+That is the only question, and it is the one that decides whether a message may
+be closed on read or must stay open in the recipient's work queue. It is **not**
+a record of how the mail was sent.
+
+| `--type` | Reply owed? | Meaning |
+|---|---|---|
+| `notification` (default) | no | Informational. Nothing can be replied to; reading consumes it. |
+| `reply` | no | An answer to someone else's question. Set automatically by `--reply-to`. |
+| `handoff` | no | Session-cycling context mailed to self. Set automatically by `gt handoff`. |
+| `query` | **yes** | A question. **Stays open until answered.** |
+| `task` | **yes** | Work assigned to the recipient. Reading it is not doing it. |
+| `scavenge` | **yes** | Optional first-come work. Still work until claimed. |
+| `escalation` | **yes** | Has its own ack surface (`gt escalate ack`). Never auto-closed. |
+
+**Pass `--type query` when you are blocked on the answer.** The default is
+`notification`, so a question sent without it is indistinguishable from a
+"convoy complete" — which is exactly how the mayor's inbox reached 375 unread
+with a HIGH escalation sitting unactioned for 3.7 days (gt-do5c).
+
+An unrecognised `--type` is now rejected. It used to be rewritten to
+`notification` and reported as sent, so `--type query` silently produced
+`msg-type:notification` and the sender was never told.
+
+In code, do not re-derive the rule from the type name — call the predicate:
+
+```go
+msg.Type.ExpectsReply()        // is the recipient still on the hook?
+msg.Type.SafeToCloseOnRead()   // may this be closed the moment it is read?
+```
+
+Both fail closed: an unset or unrecognised type is never safe to auto-close,
+because an unset type is precisely what a writer that forgot to stamp one
+produces, and those are indistinguishable from real questions.
+
+**Pass a `*Message`, not a type, when deciding to auto-close.**
+`mail.ConsumedByReading(msg)` is the predicate to use — `SafeToCloseOnRead` on
+its own is not enough, for the reason in the next section.
+
+### What reading a message does to it
+
+Reading marks a message read. Whether it also **closes** it — takes it out of
+the recipient's work queue — depends on whether anything is still owed:
+
+| | outcome |
+|---|---|
+| automated traffic with a stamped, reply-free type | closed |
+| everything else | marked read, stays open |
+
+`gt mail read` says which happened; a bulk `gt mail mark-read` reports the split
+("Marked 12 messages as read (7 closed, 5 still owed a reply or an archive)").
+A message left open is cleared by answering it or by `gt mail archive`.
+
+Closing requires **three** things, not one (`mail.ConsumedByReading` plus
+`Mailbox.MarkReadConsumed`):
+
+1. **The type was stamped.** A missing `msg-type` label is not the same as
+   `msg-type:notification`, even though both read back as `notification`
+   through `Message.Type` — use `Message.RawType` when the difference matters.
+2. **The stamped type says a read consumes it** — `notification`, `reply` or
+   `handoff`.
+3. **For `notification`, the subject is automated traffic**: `Convoy complete:`,
+   `SCHEDULER_OPEN`, `MERGED`, `LIFECYCLE:`. `reply` and `handoff` need no such
+   corroboration.
+
+That third condition looks redundant and is not. Until gt-do5c every message
+was typed by a DEFAULT rather than by its sender, so for the beads already on
+the store `notification` means *nobody said*, not *no reply possible* — and
+sampling found real questions among them (gt-ac1l). The subject is a second,
+independent signal that works on mail already written, which no change to the
+send path can.
+
+The reader also has to be entitled to close: a **CC copy** is a second view of
+one bead (clear it with `gt mail archive`, which dismisses just your copy), and
+a **hooked** bead is somebody's `gt hook` context.
+
+**If you are blocked on an answer, send `--type query`.** A question sent under
+the default type is indistinguishable from a "convoy complete", which is how
+the mayor's inbox reached 375 unread with a HIGH escalation unactioned for
+3.7 days.
+
 ### Subject Line
 
 - **Type prefix**: Uppercase, identifies message type

@@ -327,6 +327,37 @@ where:
 
 Active polecats are counted by scanning tmux sessions and matching role via `session.ParseSessionName()`. This counts **all** polecats (both scheduler-dispatched and directly-slung) because API rate limits, memory, and CPU are shared resources.
 
+### Reading the capacity breakdown
+
+`gt scheduler status`, the dispatch no-op line, the dry-run plan and the
+admission-denial error all print the same per-disposition breakdown:
+
+```
+Capacity:  22 free of 25 (working: 1, recovery_blocked: 2, reservations: 0,
+                          verified_reusable_idle: 0, unverified_idle: 21, pending_mr: 1)
+```
+
+**`verified_reusable_idle` is a floor, not a count of what is available.** The
+snapshot is built from the bead-only inventory constructor, which runs no git
+and no merge-queue lookup, so an idle polecat is only promoted out of
+`unverified_idle` by a check that nothing performs on its own —
+`gt polecat check-recovery` is operator-invoked. The verified count is therefore
+pinned near zero by construction and cannot rise through ordinary operation.
+
+The number that actually gates dispatch is **`free`**. Unverified idle polecats
+consume no capacity; they were never counted as occupied. A low
+`verified_reusable_idle` beside a high `free` means "nobody has looked", not
+"the town is full" — and reading it as scarcity is pressure toward destructive
+reclamation of polecats that are in fact available (gt-rjhr).
+
+Every surface that prints the breakdown carries this disclaimer inline whenever
+`unverified_idle > 0`, and `--json` output carries it as `unverified_idle_note`.
+To resolve the uncertainty rather than read around it, measure per polecat:
+
+```bash
+gt polecat check-recovery gastown/<name>
+```
+
 ---
 
 ## Circuit Breaker

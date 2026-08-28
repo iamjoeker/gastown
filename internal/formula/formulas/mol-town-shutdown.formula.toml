@@ -127,10 +127,31 @@ Rotate logs to prevent unbounded growth.
 ```bash
 # Rotate daemon logs
 gt daemon rotate-logs
-
-# Clean up old session captures (but not current sandboxes)
-gt doctor --fix
 ```
+
+🚨 **The `gt doctor --fix` that used to be in this step is HELD.**
+**(Mayor ruling 2026-08-22, hq-5dj0d, P0)**
+
+```bash
+# PROHIBITED — shown commented out ON PURPOSE so it is inert if copied verbatim.
+# Do NOT uncomment. Do NOT reconstruct it by hand.
+# gt doctor --fix
+```
+
+The comment that accompanied it — "clean up old session captures (but not current
+sandboxes)" — **claimed a narrow scope the command does not have.** Bare
+`gt doctor --fix` is unfiltered and runs ~90 checks: it deletes tracked
+`settings.json`, rewrites `daemon.json`, and re-appends the Dolt section to the
+town `CLAUDE.md`, which is injected into every agent context. Town `CLAUDE.md`
+was found carrying that section twice, committed (hq-tiwt3).
+
+This was a THIRD path to the same command, alongside the two held in
+`mol-deacon-patrol` (step `session-gc`) and `mol-session-gc` (step `execute-gc`).
+It is the most dangerous of the three by timing: it runs at town shutdown, when
+no agent is watching and the run is least likely to be reviewed.
+
+If log rotation needs more than `gt daemon rotate-logs`, name the specific checks
+rather than restoring the unfiltered form.
 
 Old logs are moved to `$GT_ROOT/logs/archive/` with timestamps.
 """

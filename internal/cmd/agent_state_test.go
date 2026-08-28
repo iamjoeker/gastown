@@ -2,6 +2,11 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -312,5 +317,224 @@ func TestParseAgentBeadLabels(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLabelSetsEqual(t *testing.T) {
+	tests := []struct {
+		name    string
+		current []string
+		next    []string
+		want    bool
+	}{
+		{
+			name:    "identical order",
+			current: []string{"gt:agent", "idle:0"},
+			next:    []string{"gt:agent", "idle:0"},
+			want:    true,
+		},
+		{
+			name:    "same labels, different order",
+			current: []string{"idle:0", "gt:agent", "heartbeat:17"},
+			next:    []string{"heartbeat:17", "gt:agent", "idle:0"},
+			want:    true,
+		},
+		{
+			name:    "value differs",
+			current: []string{"gt:agent", "idle:3"},
+			next:    []string{"gt:agent", "idle:0"},
+			want:    false,
+		},
+		{
+			name:    "label added",
+			current: []string{"gt:agent"},
+			next:    []string{"gt:agent", "idle:0"},
+			want:    false,
+		},
+		{
+			name:    "label removed",
+			current: []string{"gt:agent", "idle:0"},
+			next:    []string{"gt:agent"},
+			want:    false,
+		},
+		{
+			name:    "both empty",
+			current: nil,
+			next:    nil,
+			want:    true,
+		},
+		// A bead carrying the same label twice is not equivalent to one
+		// carrying it once: the rebuild collapses the duplicate, and that
+		// repair must still be written. A set-membership comparison would
+		// call these equal and leave the bead malformed forever.
+		{
+			name:    "duplicate collapsed to single",
+			current: []string{"idle:0", "idle:0", "gt:agent"},
+			next:    []string{"idle:0", "gt:agent"},
+			want:    false,
+		},
+		// Same length, disjoint contents — catches a comparator that only
+		// checks length.
+		{
+			name:    "same length, different labels",
+			current: []string{"idle:0", "gt:agent"},
+			next:    []string{"idle:0", "gt:witness"},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := labelSetsEqual(tt.current, tt.next); got != tt.want {
+				t.Errorf("labelSetsEqual(%v, %v) = %v, want %v",
+					tt.current, tt.next, got, tt.want)
+			}
+		})
+	}
+}
+
+// agentStateModifyRun is the observable result of one modifyAgentState call
+// against a stateful fake bd: every bd argv line it saw, and the labels left
+// on the agent bead afterwards.
+type agentStateModifyRun struct {
+	log         string
+	finalLabels []string
+}
+
+// updateCalls returns the bd update invocations from the run's log.
+func (r agentStateModifyRun) updateCalls() []string {
+	var updates []string
+	for _, line := range strings.Split(r.log, "\n") {
+		if strings.HasPrefix(line, "update ") {
+			updates = append(updates, line)
+		}
+	}
+	return updates
+}
+
+// runAgentStateModify drives modifyAgentState against a throwaway town root
+// and a stateful fake bd, so nothing reaches the production Dolt server.
+//
+// The stub is stateful — update --set-labels replaces the label set the next
+// show returns — because modifyAgentState is a read-modify-write and a
+// fixed-response stub could not show whether the write landed.
+func runAgentStateModify(t *testing.T, labels []string, setOps []string) agentStateModifyRun {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fake bd")
+	}
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0o755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Chdir(root)
+
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	logPath := filepath.Join(root, "bd.log")
+	statePath := filepath.Join(root, "labels.txt")
+	if err := os.WriteFile(statePath, []byte(strings.Join(labels, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write initial labels: %v", err)
+	}
+
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+STATE=%q
+case "$1" in
+show)
+  out=
+  while IFS= read -r l; do
+    [ -z "$l" ] && continue
+    if [ -z "$out" ]; then out="\"$l\""; else out="$out,\"$l\""; fi
+  done < "$STATE"
+  printf '[{"labels":[%%s]}]\n' "$out"
+  ;;
+update)
+  : > "$STATE.tmp"
+  for a in "$@"; do
+    case "$a" in
+      --set-labels=?*) printf '%%s\n' "${a#--set-labels=}" >> "$STATE.tmp" ;;
+    esac
+  done
+  mv "$STATE.tmp" "$STATE"
+  ;;
+esac
+exit 0
+`, logPath, statePath)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	oldSet, oldIncr, oldDel := agentStateSet, agentStateIncr, agentStateDel
+	t.Cleanup(func() {
+		agentStateSet, agentStateIncr, agentStateDel = oldSet, oldIncr, oldDel
+	})
+	agentStateSet, agentStateIncr, agentStateDel = setOps, "", nil
+
+	if err := modifyAgentState("gt-test-witness", beadsDir, false); err != nil {
+		t.Fatalf("modifyAgentState() error = %v", err)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	stateData, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read final labels: %v", err)
+	}
+	var final []string
+	for _, l := range strings.Split(strings.TrimSpace(string(stateData)), "\n") {
+		if l != "" {
+			final = append(final, l)
+		}
+	}
+	return agentStateModifyRun{log: strings.TrimSpace(string(logData)), finalLabels: final}
+}
+
+// TestAgentStateSkipsNoOpWrite is the gt-i7g9 guard. Every bd update is a Dolt
+// commit that lives forever, and the busiest caller of this path is the "reset
+// idle" step in the witness, refinery and deacon patrol formulas — which runs
+// on every signal wake against a counter await-signal already reset in-process
+// (gt-609). Writing idle:0 over idle:0 buys nothing and costs a commit per
+// wake, per patrol agent, forever.
+func TestAgentStateSkipsNoOpWrite(t *testing.T) {
+	run := runAgentStateModify(t, []string{"gt:agent", "idle:0"}, []string{"idle=0"})
+
+	if got := run.updateCalls(); len(got) != 0 {
+		t.Errorf("setting idle=0 on a bead already at idle:0 issued %d bd update(s), want 0: %v",
+			len(got), got)
+	}
+	// The bead must still hold what it held — skipping the write must not be
+	// implemented by skipping the state.
+	if !labelSetsEqual(run.finalLabels, []string{"gt:agent", "idle:0"}) {
+		t.Errorf("labels after no-op = %v, want [gt:agent idle:0]", run.finalLabels)
+	}
+}
+
+// TestAgentStateWritesRealChange is the positive control for the test above: a
+// zero update count is only evidence of the skip if the same harness records a
+// write when the value genuinely changes.
+func TestAgentStateWritesRealChange(t *testing.T) {
+	run := runAgentStateModify(t, []string{"gt:agent", "idle:3"}, []string{"idle=0"})
+
+	if got := run.updateCalls(); len(got) != 1 {
+		t.Fatalf("setting idle=0 on a bead at idle:3 issued %d bd update(s), want 1: %v\nlog:\n%s",
+			len(got), got, run.log)
+	}
+	if !labelSetsEqual(run.finalLabels, []string{"gt:agent", "idle:0"}) {
+		t.Errorf("labels after reset = %v, want [gt:agent idle:0]", run.finalLabels)
 	}
 }

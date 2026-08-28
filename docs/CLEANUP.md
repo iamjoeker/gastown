@@ -24,7 +24,8 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 | `gt polecat gc <rig>` | GC stale polecat branches (orphaned, old timestamped) |
 | `gt polecat stale <rig>` | Detects stale polecats; `--cleanup` auto-nukes them (same identity restriction) |
 | `gt polecat check-recovery` | Reports whether work is at risk (SAFE_TO_NUKE vs NEEDS_RECOVERY) and what the witness may do about it (`witness_action`) |
-| `gt session restart <rig>/<polecat>` | How the **witness** reclaims a slot — preserves worktree and branch |
+| `gt polecat clear-state <rig>/<polecat>` | Lifts a deliberate `agent_state` pause (stuck, awaiting-gate, paused, escalated) back to idle. **Witness-runnable** — writes one agent-bead field, touches no worktree/branch/session. Refuses unless the pause is the only blocker (gt-fbgq) |
+| `gt session restart <rig>/<polecat>` | How the **witness** reclaims a slot — preserves worktree and branch. Writes **no** `agent_state`, so it does not lift a pause; use `clear-state` for that |
 | `gt polecat identity remove <rig> <name>` | Removes a polecat identity |
 | `gt done` | Polecat self-cleaning: pushes branch, submits MR/PR path as configured, preserves handoff metadata, kills own session. MR skipped for `--status ESCALATED\|DEFERRED` or `no_merge` paths |
 
@@ -78,6 +79,31 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 | `gt krc config reset` | Resets KRC TTL configuration to defaults |
 | `gt krc decay` | Shows forensic value decay report (pruning guidance) |
 
+> **`gt compact report` is not a query.** It runs a real compaction to produce
+> its digest, so the bare command and `--json` both delete. Only `--dry-run`
+> previews — and until gt-hv3p it did not: the flag never reached the compaction
+> subprocess, so `gt compact report --dry-run` deleted 454 wisps on 2026-08-22
+> while suppressing the audit bead and the digest mail that would have recorded
+> it. Verify a change to this path by measuring the delete-pool count either
+> side of the command, never by reading its output.
+
+> **Deletions are archived first.** Every wisp `gt compact` is about to delete is
+> written and fsynced to the wisp archive — the same one the reaper writes and
+> `gt reaper archive` reads — BEFORE the delete pass starts, so an interrupted
+> run leaves records with no deletion and never the reverse. A run that cannot
+> write its archive deletes nothing and reports the wisps as held. To enumerate
+> what a run removed, take the archived ids and subtract the ids still in
+> `wisps`. Relocate the archive with `GT_WISP_ARCHIVE_DIR`.
+
+> **Age never releases a live molecule.** `gt compact` will not delete a wisp
+> whose own status is anything but `closed`, nor one under a molecule — at any
+> depth — whose root is not closed. Before gt-98hh the `molecule step past TTL`
+> branch was reached only by steps that were still open, hooked, blocked or
+> in_progress, so the one thing it deleted was an agent's current work. Held
+> wisps are reported under **Protected**, naming the molecule that held them.
+> The release arm is a wisp whose parent row is gone: that molecule has already
+> been swept, so it cannot be live.
+
 > `gt compact` acts only on wisps whose `wisp_type` is set. Rows with an empty
 > `wisp_type` are counted as **Unclassified** and left untouched — no TTL policy
 > can be chosen for them, and defaulting them to 24h would delete 7d escalation,
@@ -100,9 +126,19 @@ should happen to the wisp at that age.
 
 The vocabulary is bd's and it is closed: bd rejects any other value at create
 time. There is deliberately no type for merge-request, sling-context or
-work-molecule wisps, so those stay unclassified and take the 24h default.
-Leave them that way rather than borrowing a bucket whose retention was reasoned
-about for something else.
+work-molecule wisps, so those stay unclassified and, per the paragraph above,
+are left untouched. Leave them that way rather than borrowing a bucket whose
+retention was reasoned about for something else.
+
+That is also the whole explanation for a large `Unclassified` count, and it is
+worth stating because the number invites a different reading. Measured on live
+`hq` 2026-08-23: 8,957 of 14,470 wisps (62%) untyped — 3,329 molecule roots and
+4,327 of their steps, 673 `gt:message` mail wisps and 637 `type:plugin-run`
+receipts. Every one of those is written by a path with no member of bd's
+seven-value vocabulary to write, so the column is empty for the reason the
+paragraph above gives and the rows are in the SAFE bucket. `Unclassified` is
+not a population awaiting deletion, and closing the gap by stamping a type
+would move 62% of the corpus from untouchable to TTL-enforced in one edit.
 
 Two write paths exist, because bd only offers one and it does not cover
 molecules:

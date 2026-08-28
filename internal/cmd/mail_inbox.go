@@ -10,10 +10,28 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 )
+
+// clearNudgesForMessage removes queued nudges announcing a message the reader
+// has just dealt with, so the notification does not outlive the message.
+//
+// Best-effort and deliberately quiet: DrainLive filters spent notifications at
+// delivery time regardless, so a failure here costs nothing but a wasted queue
+// entry. Clearing eagerly keeps the queue from counting dead entries against
+// its depth cap in the meantime.
+func clearNudgesForMessage(address, messageID, threadID string) {
+	workDir, err := findMailWorkDir()
+	if err != nil {
+		return
+	}
+	if err := mail.NewRouter(workDir).ClearMessageNudges(address, messageID, threadID); err != nil {
+		fmt.Fprintf(os.Stderr, "gt mail: could not clear queued nudges for %s: %v\n", messageID, err)
+	}
+}
 
 // getMailbox returns the mailbox for the given address.
 func getMailbox(address string) (*mail.Mailbox, error) {
@@ -249,12 +267,17 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting message: %w", err)
 	}
 
-	// Mark as read when viewed (adds "read" label, does not close/archive).
-	// Handoff messages are preserved via the hook mechanism, so marking
-	// read here is safe — hooked mail is found via gt hook, not the inbox.
-	if err := mailbox.MarkReadOnly(msgID); err != nil {
+	// Mark as read when viewed. Automated traffic that owes nothing back is
+	// closed here; anything that might still be owed keeps its "read" label and
+	// stays in the work queue (gt-qffl). Reuse the message already fetched
+	// above rather than paying for a second lookup.
+	readResult, err := mailbox.MarkReadConsumed(msgID, msg)
+	if err != nil {
 		// Non-fatal: message was retrieved, just couldn't mark
 		style.PrintWarning("could not mark message as read: %v", err)
+	} else {
+		// "You have new mail" is spent the moment the mail is read (gt-loz6).
+		clearNudgesForMessage(address, msgID, msg.ThreadID)
 	}
 
 	// JSON output
@@ -310,6 +333,14 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 
 	if msg.Body != "" {
 		fmt.Printf("\n%s\n", msg.Body)
+	}
+
+	// Say which of the two things happened. "Marked as read" reads identically
+	// whether the bead closed or is still sitting in the work queue, and that
+	// ambiguity is most of why nobody noticed 520 acknowledged messages had
+	// never closed (gt-qffl).
+	if readResult == mail.ReadClosed {
+		fmt.Printf("\n%s\n", style.Dim.Render("(closed — automated notice, nothing owed back)"))
 	}
 
 	// Ack after output (non-fatal).
@@ -371,7 +402,33 @@ func runMailPeek(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// printOwnershipRefusalHint explains a beads ownership refusal in terms of the
+// command the reader actually ran.
+//
+// bd's refusal ends "reclaim or use --force to override". That advice is only
+// followable from a command that exposes --force: `gt mail archive` does,
+// `gt mail delete` does not, and repeating bd's wording there sends the reader
+// after a flag that command has never had. Name the command that carries the
+// flag instead (gt-gbv4).
+func printOwnershipRefusalHint(err error, msgID, address, verb string) {
+	if !mail.IsOwnershipRefusal(err) {
+		return
+	}
+	fmt.Printf("  %s %s is addressed to another agent — only its assignee can close it.\n",
+		style.Dim.Render("hint"), msgID)
+	fmt.Printf("  %s If you expected a cc copy, this message carries no cc label for %s.\n",
+		style.Dim.Render("hint"), address)
+	if verb != "archive" {
+		fmt.Printf("  %s To override anyway, use `%s mail archive %s --force` — `%s mail %s` has no --force.\n",
+			style.Dim.Render("hint"), cli.Name(), msgID, cli.Name(), verb)
+	}
+}
+
 func runMailDelete(cmd *cobra.Command, args []string) error {
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
+
 	// Determine which inbox
 	address := detectSender()
 
@@ -386,6 +443,7 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 	for _, msgID := range args {
 		if err := mailbox.Delete(msgID); err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
+			printOwnershipRefusalHint(err, msgID, address, "delete")
 		} else {
 			deleted++
 		}
@@ -409,7 +467,51 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// validateMessageIDArgs rejects arguments that cannot be a single message ID.
+//
+// It runs before anything is archived, so a bad batch fails whole rather than
+// half-applied.
+//
+// The multi-ID forms these commands document are one argument per ID, and a
+// caller that joins them into ONE argument used to be answered with a
+// fabricated reassurance instead of an error. mailbox.Get returns
+// ErrMessageNotFound for any identifier it does not recognise — including one
+// that could never have been an ID — and archive reads that as "the underlying
+// bead was already GC'd", counts it as a success, prints "✓ Message archived"
+// in the singular and exits 0. Measured (gt-f0b3): 514 archives submitted as 13
+// joined batches reported 13 successes and moved the inbox by 2; the same list
+// one ID per invocation moved it by 512.
+//
+// A not-found is evidence that a bead was GC'd only if the identifier could
+// have been a bead ID in the first place. Whitespace is the discriminator that
+// costs nothing: no bead ID contains any.
+func validateMessageIDArgs(args []string) error {
+	for i, arg := range args {
+		fields := strings.Fields(arg)
+		switch {
+		case len(fields) == 0:
+			return fmt.Errorf("argument %d is empty: a message ID is required", i+1)
+		case len(fields) > 1:
+			return fmt.Errorf("%q is not a message ID: it looks like %d IDs passed as a single argument.\n"+
+				"Pass them as separate arguments: %s", arg, len(fields), strings.Join(fields, " "))
+		case fields[0] != arg:
+			return fmt.Errorf("message ID %q has surrounding whitespace; pass it as %q", arg, fields[0])
+		}
+	}
+	return nil
+}
+
 func runMailArchive(cmd *cobra.Command, args []string) error {
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
+
+	// Past argument validation, every remaining failure is operational: the
+	// message would not archive, not the command was called wrong. Cobra prints
+	// usage below the error, and a flag listing under "Error: ..." reads as a
+	// command that never ran (gt-khq8).
+	cmd.SilenceUsage = true
+
 	// Determine which inbox
 	address := detectSender()
 
@@ -458,23 +560,24 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 			// The bead stays open and stays the assignee's: only this
 			// recipient's cc copy left the inbox (gt-58s).
 			ccCleared++
+			// The bead stays open for its assignee, but this reader is done with
+			// it — so is its notification, which is per-recipient anyway.
+			clearNudgesForMessage(address, msgID, "")
 			fmt.Printf("  %s %s: cc copy cleared; the message itself remains open for its assignee\n",
 				style.Dim.Render("note"), msgID)
 		case err == nil:
 			archived++
+			clearNudgesForMessage(address, msgID, "")
 		case errors.Is(err, mail.ErrMessageNotFound):
 			gcd++
+			// The bead is gone but its notification may not be — that pairing is
+			// exactly what leaves a pointer to nothing in the queue (gt-loz6).
+			clearNudgesForMessage(address, msgID, "")
 			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), msgID)
 		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, err))
-			if mail.IsOwnershipRefusal(err) {
-				// Naming only the refusal leaves the reader with no next step.
-				fmt.Printf("  %s %s is addressed to another agent — only its assignee can close it.\n",
-					style.Dim.Render("hint"), msgID)
-				fmt.Printf("  %s If you expected a cc copy, this message carries no cc label for %s.\n",
-					style.Dim.Render("hint"), address)
-			}
+			printOwnershipRefusalHint(err, msgID, address, "archive")
 		}
 	}
 
@@ -488,12 +591,23 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to archive %d messages", len(errMsgs))
 	}
 
+	// Always a count, and always against the number asked for. The singular
+	// "Message archived" carried no number at all, so a batch that had collapsed
+	// to one operation was indistinguishable from a batch that worked (gt-f0b3).
 	total := archived + gcd + ccCleared
-	if total == 1 {
-		fmt.Printf("%s Message archived\n", style.Bold.Render("✓"))
-	} else {
-		fmt.Printf("%s Archived %d messages\n", style.Bold.Render("✓"), total)
+	var detail []string
+	if gcd > 0 {
+		detail = append(detail, fmt.Sprintf("%d underlying bead%s already gone", gcd, map[bool]string{true: "", false: "s"}[gcd == 1]))
 	}
+	if ccCleared > 0 {
+		detail = append(detail, fmt.Sprintf("%d cc cop%s cleared", ccCleared, map[bool]string{true: "y", false: "ies"}[ccCleared == 1]))
+	}
+	suffix := ""
+	if len(detail) > 0 {
+		suffix = " (" + strings.Join(detail, ", ") + ")"
+	}
+	fmt.Printf("%s Archived %d of %d message%s%s\n",
+		style.Bold.Render("✓"), total, len(args), map[bool]string{true: "", false: "s"}[len(args) == 1], suffix)
 	return nil
 }
 
@@ -553,8 +667,10 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 		switch {
 		case err == nil:
 			archived++
+			clearNudgesForMessage(address, stale.Message.ID, stale.Message.ThreadID)
 		case errors.Is(err, mail.ErrMessageNotFound):
 			gcd++
+			clearNudgesForMessage(address, stale.Message.ID, stale.Message.ThreadID)
 			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), stale.Message.ID)
 		default:
@@ -613,30 +729,48 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		marked := 0
+		closed := 0
 		for _, msg := range messages {
-			if err := mailbox.MarkReadOnly(msg.ID); err != nil {
+			// Pass the message we already listed: this loop runs over a whole
+			// inbox, and re-fetching each one would turn a bulk mark into N
+			// extra bd subprocesses.
+			result, err := mailbox.MarkReadConsumed(msg.ID, msg)
+			if err != nil {
 				style.PrintWarning("could not mark %s as read: %v", msg.ID, err)
-			} else {
-				marked++
+				continue
 			}
+			marked++
+			if result == mail.ReadClosed {
+				closed++
+			}
+			clearNudgesForMessage(address, msg.ID, msg.ThreadID)
 		}
-		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		printMarkReadSummary(marked, closed)
 		return nil
 	}
 
 	if len(args) == 0 {
 		return fmt.Errorf("message ID required (or use --all to mark all as read)")
 	}
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
 
 	// Mark all specified messages as read
 	marked := 0
+	closed := 0
 	var errors []string
 	for _, msgID := range args {
-		if err := mailbox.MarkReadOnly(msgID); err != nil {
+		result, err := mailbox.MarkReadConsumed(msgID, nil)
+		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
-		} else {
-			marked++
+			continue
 		}
+		marked++
+		if result == mail.ReadClosed {
+			closed++
+		}
+		clearNudgesForMessage(address, msgID, "")
 	}
 
 	// Report results
@@ -649,15 +783,38 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to mark %d messages", len(errors))
 	}
 
+	if len(args) == 1 && closed == 1 {
+		fmt.Printf("%s Message marked as read and closed\n", style.Bold.Render("✓"))
+		return nil
+	}
 	if len(args) == 1 {
 		fmt.Printf("%s Message marked as read\n", style.Bold.Render("✓"))
-	} else {
-		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		return nil
 	}
+	printMarkReadSummary(marked, closed)
 	return nil
 }
 
+// printMarkReadSummary reports a bulk mark-read, naming how many beads closed.
+//
+// The count of closed beads is the whole point of the line. Before gt-qffl this
+// path printed "Marked N messages as read" over an operation that closed
+// nothing, so an inbox could be marked read every day and still grow without
+// bound — 520 messages on the hq store were read, acknowledged, and open.
+func printMarkReadSummary(marked, closed int) {
+	if closed == 0 {
+		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		return
+	}
+	fmt.Printf("%s Marked %d messages as read (%d closed, %d still owed a reply or an archive)\n",
+		style.Bold.Render("✓"), marked, closed, marked-closed)
+}
+
 func runMailMarkUnread(cmd *cobra.Command, args []string) error {
+	if err := validateMessageIDArgs(args); err != nil {
+		return err
+	}
+
 	// Determine which inbox
 	address := detectSender()
 

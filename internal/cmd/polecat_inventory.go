@@ -32,6 +32,13 @@ type polecatActiveWorkEvidence struct {
 	CountsTowardCapacity bool
 	Blocker              string
 	AssignedIssue        string
+
+	// PausedAgentState carries a deliberate pause (stuck, awaiting-gate, paused,
+	// escalated) separately from Blocker. It blocks cleanup like active work does,
+	// but it is not work: nothing is running and nothing is at risk, so it routes
+	// to WorkstateInput.PausedAgentState — whose remedy is `gt polecat clear-state`
+	// — instead of ActiveWorkBlocker, whose remedy is escalation (gt-fbgq).
+	PausedAgentState string
 }
 
 func newPolecatSessionSet(sessionNames []string) polecatSessionSet {
@@ -52,6 +59,24 @@ func (s polecatSessionSet) lookup(rigName, polecatName string) (string, bool) {
 	}
 	sessionName, ok := s[polecatSessionKey(rigName, polecatName)]
 	return sessionName, ok
+}
+
+// liveness translates this listing into the tri-state DecideWorkstate consumes.
+//
+// A nil set is the only thing that maps to Unknown, and that is precise rather
+// than cautious: both production callers abort outright when `tmux
+// list-sessions` fails, so a non-nil set is always a real enumeration and an
+// absent polecat is a real absence. Nil reaches here only from a caller that
+// never enumerated at all, and it must not be read as "every polecat is dead" —
+// which is exactly what an empty map would say (gt-9f67).
+func (s polecatSessionSet) presence(rigName, polecatName string) polecat.SessionPresence {
+	if s == nil {
+		return polecat.SessionPresenceUnknown
+	}
+	if _, running := s.lookup(rigName, polecatName); running {
+		return polecat.SessionPresent
+	}
+	return polecat.SessionAbsent
 }
 
 func (s polecatSessionSet) namesForRig(rigName string) []string {
@@ -210,7 +235,14 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		SessionName:    sessionName,
 	}
 
-	input := polecat.WorkstateInput{State: polecat.StateIdle}
+	input := polecat.WorkstateInput{
+		State: polecat.StateIdle,
+		// This surface already had the session listing — it is where
+		// SessionRunning above comes from — and still classified without it,
+		// because the classifier had no field to put it in. That is how a polecat
+		// with no session read PENDING_MR / leave-alone here (gt-9f67).
+		SessionPresence: sessions.presence(rigName, polecatName),
+	}
 	if fields != nil {
 		item.CleanupStatus = strings.TrimSpace(fields.CleanupStatus)
 		item.ActiveMR = strings.TrimSpace(fields.ActiveMR)
@@ -261,11 +293,15 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		}
 		input.ActiveWorkBlocker = activeWorkEvidence.Blocker
 		input.ActiveWorkCountsTowardCapacity = activeWorkEvidence.CountsTowardCapacity
+		input.PausedAgentState = activeWorkEvidence.PausedAgentState
 	} else if item.State == polecat.StateIdle && running && !polecat.CleanupStatus(item.CleanupStatus).IsSafe() {
 		item.State = polecat.StateReviewNeeded
 	}
 
-	if fields != nil && !activeWorkEvidence.BlocksCleanup {
+	// Keyed on the blocker being empty rather than on BlocksCleanup: a pause
+	// blocks cleanup without accounting for the hook, and the hook outranks it.
+	// Under the old condition a stuck polecat's unaccounted hook went unreported.
+	if fields != nil && input.ActiveWorkBlocker == "" {
 		if hookBead := strings.TrimSpace(fields.HookBead); hookBead != "" {
 			input.ActiveWorkBlocker = fmt.Sprintf("hook_bead=%s status=unverified", hookBead)
 		}
@@ -278,6 +314,12 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 	// classifier the recovery and reuse paths use: a terminal MR only stops
 	// blocking when its source issue is proven terminal too, and an unconsulted
 	// queue stays blocking as status=unverified.
+	//
+	// openMRProven tracks the STRONG half of ActiveMRBlocker: an MR bead that was
+	// looked up and read back open. ActiveMRBlocker is deliberately fail-closed
+	// and also carries status=unverified and lookup_error, which prove nothing —
+	// so the handed-off promotion below keys on this instead (gt-mkpm).
+	openMRProven := false
 	if item.ActiveMR != "" {
 		assessment := polecat.AssessActiveMR(mrIndex.issueReader(), polecat.ActiveMRInput{
 			ActiveMR:        item.ActiveMR,
@@ -285,10 +327,12 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		})
 		if assessment.Pending {
 			input.ActiveMRBlocker = assessment.Reason
+			openMRProven = !assessment.Stale && assessment.MRStatus != ""
 		}
 	}
 	if input.ActiveMRBlocker == "" {
 		if openMR := mrIndex.openMRFor(item.Branch); openMR != "" {
+			openMRProven = true
 			// An open MR nobody recorded on this agent bead — the rescue-submit case
 			// (gt-46rk). The branch it points at is the only copy of that work, and
 			// the polecat would otherwise read SAFE_TO_NUKE right up until recycling
@@ -300,6 +344,30 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 			input.ActiveMRBlocker = "active_mr=" + openMR + " status=open source=branch-index"
 		}
 	}
+
+	// Computed here, after the branch-index fallback above has settled which MR
+	// this item cites, and set on this surface as well as check-recovery so the
+	// two cannot answer the same polecat differently (gt-9f67's own rule).
+	//
+	// The held-work IDs come from the issue store and the agent bead's hook slot.
+	// fields.LastSourceIssue is deliberately NOT among them: it is half of the
+	// record being matched, and comparing it against itself would grant coverage
+	// to every polecat that ever completed anything.
+	if fields != nil {
+		input.CompletionCoverage = polecat.CompletionCoverage(polecat.CompletionRecord{
+			ExitType:        fields.ExitType,
+			MRID:            fields.MRID,
+			LastSourceIssue: fields.LastSourceIssue,
+			CompletionTime:  fields.CompletionTime,
+		}, item.ActiveMR, item.Issue, strings.TrimSpace(fields.HookBead))
+	}
+
+	// A dead session with work still attached is "stalled" only until you ask
+	// whether the work is in the queue. This surface has the answer already — it
+	// indexed the rig's merge requests once for the whole listing — so ask before
+	// printing the word for the failure case over a polecat that succeeded
+	// (gt-mkpm).
+	item.State = polecat.HandedOffState(item.State, openMRProven)
 
 	input.State = item.State
 	item.Disposition = polecat.DecideWorkstate(input)
@@ -401,10 +469,10 @@ func assessPolecatAgentStateWork(state beads.AgentState) polecatActiveWorkEviden
 			Blocker:              fmt.Sprintf("agent_state=%s", state),
 		}
 	}
-	if state.ProtectsFromCleanup() || state == beads.AgentStateEscalated {
+	if state.IsPaused() {
 		return polecatActiveWorkEvidence{
-			BlocksCleanup: true,
-			Blocker:       fmt.Sprintf("agent_state=%s", state),
+			BlocksCleanup:    true,
+			PausedAgentState: string(state),
 		}
 	}
 	return polecatActiveWorkEvidence{}

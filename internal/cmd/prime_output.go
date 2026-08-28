@@ -643,8 +643,11 @@ func outputAttachmentStatus(ctx RoleContext) {
 		return
 	}
 
-	// Find pinned beads for this agent
-	pinnedBeads, err := b.List(beads.ListOptions{
+	// Find pinned beads for this agent. Across every assignee form: a
+	// false-empty here silently downgrades an agent with attached work to
+	// interactive mode, which is the propulsion failure this whole command
+	// exists to prevent.
+	pinnedBeads, err := b.ListAcrossAgentAddressForms(beads.ListOptions{
 		Status:   beads.StatusPinned,
 		Assignee: assignee,
 		Priority: -1,

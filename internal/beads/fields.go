@@ -642,9 +642,14 @@ type MRFields struct {
 	// Pre-verification fields (Phase 3: polecat-owned rebasing)
 	// When a polecat rebases onto the target and runs gates before submission,
 	// these fields allow the refinery to fast-path merge without re-running gates.
-	PreVerified     bool   // Polecat ran full gates after rebasing onto target
-	PreVerifiedAt   string // ISO 8601 timestamp when verification completed
-	PreVerifiedBase string // Target branch SHA at verification time
+	PreVerified   bool   // Polecat ran full gates after rebasing onto target
+	PreVerifiedAt string // ISO 8601 timestamp when verification completed
+	// PreVerifiedBase is the branch's merge-base with the target — the commit
+	// the gates actually ran against. It used to be the target's tip at
+	// submission time, which is a different commit whenever the branch was not
+	// rebased, and is a self-report either way: the refinery confirms it
+	// against git rather than deciding on it (gt-eygw).
+	PreVerifiedBase string
 }
 
 // ParseMRFields extracts structured merge-request fields from an issue's description.

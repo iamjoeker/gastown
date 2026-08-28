@@ -432,6 +432,15 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				}
 				fmt.Printf("%s: %spurged %d wisps, %d mail\n",
 					r.Database, prefix, r.WispsPurged, r.MailPurged)
+				// Say WHAT was purged, not only how many. A bare count here is
+				// what got read as ~40 destroyed merge-request records on
+				// 2026-08-26; this path deletes only rows that are neither
+				// pinned nor label-protected, and the breakdown is how the
+				// output says so (gt-mkuw).
+				if len(r.WispsPurgedByType) > 0 {
+					fmt.Printf("  By wisp_type (unprotected only): %s\n",
+						reaper.FormatWispTypeDigest(r.WispsPurgedByType))
+				}
 				// Name the archive alongside the count: a deletion that reports
 				// only a number is the shape of the loss this replaced.
 				if r.WispsArchived > 0 && archive != nil {
@@ -764,7 +773,43 @@ func printArchivedWisp(rec reaper.ArchivedWisp) {
 	for _, c := range rec.Comments {
 		fmt.Printf("\n  --- comment ---\n  %s\n", strings.ReplaceAll(c, "\n", "\n  "))
 	}
+	printArchivedEvents(rec)
 	fmt.Println()
+}
+
+// printArchivedEvents renders the event history, and says so when there is none
+// to render.
+//
+// The empty and the missing case print DIFFERENT lines on purpose (gt-wv8h).
+// Records written before events were archived carry no key at all, and their
+// history is gone with the row — an operator reading such a record has to know
+// that "no events" is a fact about the writer, not about the wisp. Since the
+// JSON decodes both to a nil slice, the distinction is not recoverable per
+// record after the fact, so the line names both readings rather than picking
+// one.
+func printArchivedEvents(rec reaper.ArchivedWisp) {
+	if len(rec.Events) == 0 {
+		fmt.Printf("\n  --- events ---\n  none recorded (this wisp had none, or the record " +
+			"predates gt-wv8h and its history was deleted with the row)\n")
+		return
+	}
+	fmt.Printf("\n  --- events (%d) ---\n", len(rec.Events))
+	for _, e := range rec.Events {
+		when := "-"
+		if e.CreatedAt != nil {
+			when = e.CreatedAt.Format(time.RFC3339)
+		}
+		// old -> new is the whole content of a status_changed row, and the wisps
+		// row it was deleted alongside kept only the final value.
+		transition := ""
+		if e.OldValue != "" || e.NewValue != "" {
+			transition = fmt.Sprintf("  %s -> %s", e.OldValue, e.NewValue)
+		}
+		fmt.Printf("  %s  %-16s %s%s\n", when, e.EventType, e.Actor, transition)
+		if e.Comment != "" {
+			fmt.Printf("      %s\n", strings.ReplaceAll(e.Comment, "\n", "\n      "))
+		}
+	}
 }
 
 func init() {

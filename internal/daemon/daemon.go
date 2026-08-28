@@ -1564,6 +1564,14 @@ func (d *Daemon) deaconGracePeriod() time.Duration {
 	return d.loadOperationalConfig().GetDaemonConfig().DeaconGracePeriodD()
 }
 
+// deaconHealthThresholds returns the heartbeat thresholds this daemon judges
+// the Deacon against, honouring operational.deacon overrides. Read fresh on
+// each check, like every other daemon threshold, so a config edit takes effect
+// without a daemon restart.
+func (d *Daemon) deaconHealthThresholds() deacon.HealthThresholds {
+	return deacon.HealthThresholdsFrom(d.loadOperationalConfig().GetDeaconConfig())
+}
+
 // checkDeaconHeartbeat checks if the Deacon is making progress.
 // This is a belt-and-suspenders fallback in case Boot doesn't detect stuck states.
 // Uses the heartbeat file that the Deacon updates on each patrol cycle.
@@ -1633,9 +1641,12 @@ func (d *Daemon) checkDeaconHeartbeat() {
 	}
 
 	age := hb.Age()
+	th := d.deaconHealthThresholds()
 
-	// If heartbeat is fresh (< 5 min), nothing to do
-	if hb.IsFresh() {
+	// If the heartbeat is fresh, nothing to do. "Fresh" has to cover a whole
+	// patrol cycle plus the await-signal park, because the heartbeat only
+	// stamps at fixed points in that cycle — see deacon.HeartbeatStaleThreshold.
+	if hb.IsFreshFor(th.Stale) {
 		return
 	}
 
@@ -1655,15 +1666,15 @@ func (d *Daemon) checkDeaconHeartbeat() {
 	}
 
 	// Session exists but heartbeat is stale - Deacon may be stuck.
-	// Two-tier response: nudge for stale (5-20 min), kill and restart
-	// only for very stale (>= 20 min). Kill threshold must be > backoff-max
-	// to avoid false positive kills during legitimate await-signal sleep.
-	if hb.IsVeryStale() {
+	// Two-tier response: nudge in the stale band, kill and restart only past
+	// very-stale. Both thresholds must be > patrol backoff-max to avoid false
+	// positives during legitimate await-signal sleep.
+	if hb.IsVeryStaleFor(th.VeryStale) {
 		// Stuck-agent-dog: kill and restart
 		d.logger.Printf("STUCK DEACON: heartbeat stale for %s, session %s needs restart", age.Round(time.Minute), sessionName)
 		d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat stale for %s", age.Round(time.Minute)))
 	} else {
-		// Stale but not very stale (5-20 min) - nudge to wake up (unless idle).
+		// Stale but not very stale - nudge to wake up (unless idle).
 		//
 		// Idle guard: skip nudge if no beads are actively in flight.
 		// This mirrors the Boot idle guard (ensureBootRunning). When the Deacon's

@@ -393,8 +393,8 @@ func TestDeleteWispRefusesProtectedLabel(t *testing.T) {
 	}
 
 	result := &compactResult{}
-	deleteWisp(nil, protectedWisp, "TTL expired", result)
-	deleteWisp(nil, plainWisp, "TTL expired", result)
+	deleteWisp(nil, protectedWisp, "TTL expired", result, finishedOwnership())
+	deleteWisp(nil, plainWisp, "TTL expired", result, finishedOwnership())
 
 	if len(result.Protected) != 1 || result.Protected[0].ID != "w-mr" {
 		t.Errorf("Protected = %+v, want exactly [w-mr] — a closed gt:merge-request wisp "+
@@ -425,7 +425,7 @@ func TestDeleteWispSharesReaperProtectedList(t *testing.T) {
 	}
 
 	before := &compactResult{}
-	deleteWisp(nil, w, "TTL expired", before)
+	deleteWisp(nil, w, "TTL expired", before, finishedOwnership())
 	if len(before.Deleted) != 1 {
 		t.Fatalf("control failed: gt:test-protected is not in the list yet, so the wisp "+
 			"must be deletable; Deleted = %+v", before.Deleted)
@@ -436,7 +436,7 @@ func TestDeleteWispSharesReaperProtectedList(t *testing.T) {
 	t.Cleanup(func() { reaper.ProtectedWispLabels = original })
 
 	after := &compactResult{}
-	deleteWisp(nil, w, "TTL expired", after)
+	deleteWisp(nil, w, "TTL expired", after, finishedOwnership())
 	if len(after.Protected) != 1 || len(after.Deleted) != 0 {
 		t.Errorf("after adding gt:test-protected to reaper.ProtectedWispLabels: "+
 			"Protected = %+v, Deleted = %+v; want the wisp held. compact is not "+
@@ -805,8 +805,8 @@ func TestDeleteWispRefusesPinnedWisp(t *testing.T) {
 	}
 
 	result := &compactResult{}
-	deleteWisp(nil, pinned, "TTL expired", result)
-	deleteWisp(nil, unpinned, "TTL expired", result)
+	deleteWisp(nil, pinned, "TTL expired", result, finishedOwnership())
+	deleteWisp(nil, unpinned, "TTL expired", result, finishedOwnership())
 
 	if len(result.Protected) != 1 || result.Protected[0].ID != "w-pinned" {
 		t.Errorf("Protected = %+v, want exactly [w-pinned]", result.Protected)

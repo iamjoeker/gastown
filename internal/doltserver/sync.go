@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/gcprotect"
 )
 
 // SyncOptions controls the behavior of SyncDatabases.
@@ -606,6 +607,39 @@ func buildPurgeArgs(dryRun bool) []string {
 	return args
 }
 
+// purgeRunner returns a gcprotect.Runner that reaches the same database the
+// purge will run against — same hardened env, same working directory. Routing
+// is the whole point: a guard configured against a different store would
+// confirm a protection the purge never sees.
+func purgeRunner(env []string, workDir string) gcprotect.Runner {
+	return func(args ...string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "bd", args...)
+		cmd.Dir = workDir
+		cmd.Env = env
+		setProcessGroup(cmd)
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		if err := cmd.Run(); err != nil {
+			// stderr first: `bd config set` reports real failures there. Its
+			// "not a recognized config key" warning also lands there on a
+			// SUCCESSFUL set, which is exactly why nothing here reads stderr to
+			// decide anything — only the exit status, and then the re-read.
+			detail := strings.TrimSpace(stderr.String())
+			if detail == "" {
+				detail = strings.TrimSpace(stdout.String())
+			}
+			return nil, fmt.Errorf("bd %s: %w (%s)", strings.Join(args, " "), err, detail)
+		}
+		return stdout.Bytes(), nil
+	}
+}
+
 func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// Resolve the beads directory for this rig (read-only — never create dirs during purge)
 	beadsDir := FindRigBeadsDir(townRoot, dbName)
@@ -659,6 +693,18 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// The age matches the reaper's purge_age so the two destructive paths cannot
 	// disagree about what "old enough to delete" means.
 	args := beads.MaybePrependAllowStaleWithEnv(env, buildPurgeArgs(dryRun))
+
+	// gt-x6yk: `bd purge` spares only the labels in the target database's
+	// `gc.protected_labels`, which is not reaper.ProtectedWispLabels and by
+	// default omits gt:escalation. This argv passes no --force, so the call is a
+	// preview and EnsureForArgs does nothing at all — no read, no config write
+	// against hq or any other database this runs over. It is wired here anyway
+	// so the guard travels with the argv: adding --force to buildPurgeArgs turns
+	// this into a real deleter, and it must not be possible to do that and
+	// inherit no protection. That is the shape gt-6dp died of.
+	if err := gcprotect.EnsureForArgs(purgeRunner(env, filepath.Dir(beadsDir)), args); err != nil {
+		return 0, fmt.Errorf("bd purge for %s: %w", dbName, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

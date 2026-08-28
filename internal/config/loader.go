@@ -925,6 +925,29 @@ func ResolveAccountConfigDir(accountsPath, accountFlag string) (configDir, handl
 	return "", "", nil
 }
 
+// ResolveTownRuntimeConfigDir resolves the CLAUDE_CONFIG_DIR that agent sessions
+// spawned for townRoot must run under. Every spawn path should call this and
+// pass the result as AgentEnvConfig.RuntimeConfigDir.
+//
+// accounts.json is consulted first and the ambient CLAUDE_CONFIG_DIR is only a
+// fallback, because the process doing the spawning frequently does not have the
+// variable itself. The daemon that spawns dogs and Boot is the case that
+// matters: reading only the environment there yields empty, the session comes up
+// on the default ~/.claude account, and when that account's credentials expire
+// every agent it spawned is silently logged out with nothing reporting it as an
+// auth failure — the town's execution tier just stops (gt-gllf, hq-nms9g).
+//
+// An empty return means no account is configured and no ambient value exists.
+// Callers pass it through unchanged, which leaves CLAUDE_CONFIG_DIR unset
+// exactly as it was before.
+func ResolveTownRuntimeConfigDir(townRoot string) string {
+	dir, _, _ := ResolveAccountConfigDir(constants.MayorAccountsPath(townRoot), "")
+	if dir == "" {
+		dir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+	return dir
+}
+
 // expandPath expands ~ to home directory.
 func expandPath(path string) string {
 	if strings.HasPrefix(path, "~/") {

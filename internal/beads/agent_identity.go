@@ -72,10 +72,22 @@ func CanonicalAgentAddress(addr string) string {
 // canonical form first. For town-level singleton roles that is both the
 // slash form and the bare form; for everything else it is the single address.
 //
+// This is the QUERY inventory, and it is deliberately narrower than
+// AgentAddressKey's comparison rule. A query costs a bd subprocess per form, so
+// only the trailing-slash dimension is enumerated: that is the one dimension
+// where both forms are demonstrably written into the same column for the same
+// agent, still today (hq.wisps holds 339 rows assigned "deacon" and 125 assigned
+// "deacon/", the newest of each less than half an hour apart). The nested-path
+// dimension does not need enumerating, because no bead is ever written to a
+// polecat in the collapsed form in a status any of these queries ask for.
+//
 // Readers must query all returned forms. Beads already written with a
 // non-canonical form otherwise stay invisible forever — this town has at least
 // one such bead in its history (gt patrol report wrote assignee "deacon" while
 // gt hook queried "deacon/").
+//
+// Compare with SameAgentAddress, never by walking this list: a comparison is
+// free, so it must accept every form, not just the ones worth a query.
 func AgentAddressForms(addr string) []string {
 	canonical := CanonicalAgentAddress(addr)
 	if canonical == "" {
@@ -86,6 +98,125 @@ func AgentAddressForms(addr string) []string {
 		return []string{canonical}
 	}
 	return []string{canonical, bare}
+}
+
+// AgentAddressKey reduces an agent address to the one string every convention
+// in this system agrees on, so that two addresses naming the same agent compare
+// equal no matter which writer produced them.
+//
+// It collapses all three ways gt disagrees with itself about an address:
+//
+//   - trailing slash — "deacon" vs "deacon/" (gt writes the slashed form, the
+//     deacon's own patrol workaround rewrites it bare on every cycle)
+//   - nested path — "gastown/polecats/toast" vs "gastown/toast" (sling keeps the
+//     container segment, mail's AddressToIdentity strips it, and both forms are
+//     live in the same store for the same agent)
+//   - letter case — polecat names are written capitalized in some surfaces
+//
+// The key is for comparison only. Never store it, never query with it, and
+// never show it to anyone: it is lossy on purpose, and a collapsed address
+// cannot be expanded back without guessing between "crew" and "polecats".
+func AgentAddressKey(addr string) string {
+	bare := strings.ToLower(BareAgentAddress(addr))
+	if bare == "" {
+		return ""
+	}
+	parts := strings.Split(bare, "/")
+	if len(parts) == 3 && isAgentPathContainer(parts[1]) && !isRigLevelRoleName(parts[2]) {
+		return parts[0] + "/" + parts[2]
+	}
+	return bare
+}
+
+// isAgentPathContainer reports whether seg is a container segment that some
+// writers include between a rig and an agent name and others omit.
+//
+// "dogs" is deliberately absent: dogs are only ever addressed
+// "deacon/dogs/<name>", so collapsing that segment would make every dog compare
+// equal to a hypothetical "deacon/<name>" agent instead of fixing anything.
+func isAgentPathContainer(seg string) bool {
+	switch seg {
+	case "polecats", "polecat", constants.RoleCrew:
+		return true
+	}
+	return false
+}
+
+// isRigLevelRoleName reports whether seg names a rig-level role rather than an
+// individual agent.
+//
+// It blocks the one collapse that would be worse than the disagreement it
+// fixes: "gastown/polecats/witness" is a polecat that happens to be named
+// witness, and collapsing it to "gastown/witness" would hand it the rig
+// witness's beads. Two agents comparing equal is a far more expensive mistake
+// than one agent's two spellings comparing unequal, so the ambiguous case keeps
+// its full path on both sides.
+func isRigLevelRoleName(seg string) bool {
+	switch seg {
+	case constants.RoleWitness, constants.RoleRefinery, constants.RoleMayor, constants.RoleDeacon:
+		return true
+	}
+	return false
+}
+
+// SameAgentAddress reports whether two addresses name the same agent.
+//
+// This is the single comparison boundary the address-form mess is resolved at.
+// Every ownership, hook-slot and hook-verification decision must ask it rather
+// than compare raw strings: the two sides of such a comparison routinely come
+// from different writers, and a raw == is how "assignee is \"mayor/\", actor is
+// \"mayor\"" became a refusal to close one's own mail.
+//
+// Empty is nobody, and nobody is not the same agent as anybody — including
+// another nobody. Callers that mean "unassigned" must test for that explicitly.
+func SameAgentAddress(a, b string) bool {
+	keyA := AgentAddressKey(a)
+	if keyA == "" {
+		return false
+	}
+	return keyA == AgentAddressKey(b)
+}
+
+// ListAcrossAgentAddressForms runs List once per address form the assignee's
+// beads may carry and merges the results, deduplicated by ID and preserving the
+// order the forms were queried in.
+//
+// Any listing that filters on an agent's assignee must go through this rather
+// than call List directly. A single-form listing is a silent false-empty in the
+// one direction that costs the most: it reports "this agent holds nothing" for
+// an agent that holds something, and the caller acts on the absence.
+//
+// With no assignee filter, or with an assignee that has only one form, this is
+// exactly List and costs no extra query.
+func (b *Beads) ListAcrossAgentAddressForms(opts ListOptions) ([]*Issue, error) {
+	forms := AgentAddressForms(opts.Assignee)
+	if len(forms) <= 1 {
+		return b.List(opts)
+	}
+
+	limit := opts.Limit
+	seen := make(map[string]bool)
+	var merged []*Issue
+	for _, form := range forms {
+		formOpts := opts
+		formOpts.Assignee = form
+		formOpts.Limit = 0
+		found, err := b.List(formOpts)
+		if err != nil {
+			return nil, err
+		}
+		for _, issue := range found {
+			if issue == nil || seen[issue.ID] {
+				continue
+			}
+			seen[issue.ID] = true
+			merged = append(merged, issue)
+		}
+	}
+	if limit > 0 && len(merged) > limit {
+		return merged[:limit], nil
+	}
+	return merged, nil
 }
 
 // IsTownScopedAgent reports whether an agent's beads live in the town database

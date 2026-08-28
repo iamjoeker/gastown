@@ -1296,6 +1296,268 @@ func TestPruneStaleBranches_SkipsUnmerged(t *testing.T) {
 	}
 }
 
+// makeStaleMergedBranch creates a polecat branch, merges it to main, then
+// deletes its remote so it classifies as "no-remote-merged" — the exact
+// predicate the prune preview matches on.
+func makeStaleMergedBranch(t *testing.T, g *Git, localDir, mainBranch, branch, file string) {
+	t.Helper()
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, file), []byte(file), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add(file); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("work on " + branch); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", branch)
+
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	if err := g.Merge(branch); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", mainBranch)
+	runGit(t, localDir, "push", "origin", "--delete", branch)
+	if err := g.FetchPrune("origin"); err != nil {
+		t.Fatalf("FetchPrune: %v", err)
+	}
+}
+
+// The refinery rebases before landing, so a landed branch's commits are
+// patch-identical to what is on the target without descending from it. An
+// ancestry-only hygiene predicate can never collect those branches, and they
+// accumulate forever — measured on gastown at 17 of 41 polecat branches, with
+// every rebase-merge adding one more (gt-wbvx).
+//
+// The two naive predicates are both wrong: delete only ancestors and the 17
+// stay; delete every non-ancestor and genuinely unlanded work is destroyed.
+// TestPruneStaleBranches_SkipsUnmerged is the other half of this pair and must
+// keep passing — this test alone is satisfied by the destructive predicate.
+func TestPruneStaleBranchesReport_CollectsRebaseLandedBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const branch = "polecat/rebase-landed"
+
+	makeRebaseLandedBranch(t, g, localDir, mainBranch, branch, "landed.txt")
+
+	report, err := g.PruneStaleBranchesReport("polecat/*", false)
+	if err != nil {
+		t.Fatalf("PruneStaleBranchesReport: %v", err)
+	}
+	if len(report.Pruned) != 1 || report.Pruned[0].Name != branch {
+		t.Fatalf("pruned = %+v skipped = %+v, want %s collected", report.Pruned, report.Skipped, branch)
+	}
+	if report.Pruned[0].Reason != "rebase-landed" {
+		t.Errorf("pruned reason = %q, want rebase-landed", report.Pruned[0].Reason)
+	}
+
+	branches, err := g.ListBranches("polecat/*")
+	if err != nil {
+		t.Fatalf("ListBranches: %v", err)
+	}
+	if len(branches) != 0 {
+		t.Fatalf("branch survived the prune: %v", branches)
+	}
+}
+
+// makeRebaseLandedBranch pushes a polecat branch, then lands its patch on main
+// under a different sha the way the refinery's rebase does. The branch stays on
+// the remote, contained by content and not by ancestry. Returns the branch tip.
+//
+// The remote half of the same question is already covered by
+// TestPushRemoteRefTargetStatusPreservesRebasedRemoteBranch, which is why this
+// fixture only feeds the local predicate.
+func makeRebaseLandedBranch(t *testing.T, g *Git, localDir, mainBranch, branch, file string) string {
+	t.Helper()
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, file), []byte(file+"\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add(file); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("work that will land rebased"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	tip, err := g.Rev(branch)
+	if err != nil {
+		t.Fatalf("Rev: %v", err)
+	}
+	tip = strings.TrimSpace(tip)
+	runGit(t, localDir, "push", "origin", branch)
+
+	// Main moves on first, then the work is replayed on top: same patch, new
+	// sha, no ancestry. This is the majority path under load, not an exception.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "before-"+file), []byte("someone else landed first\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("before-" + file); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("someone else landed first"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "cherry-pick", tip)
+	runGit(t, localDir, "push", "origin", mainBranch)
+	if err := g.FetchPrune("origin"); err != nil {
+		t.Fatalf("FetchPrune: %v", err)
+	}
+
+	// The fixture is only a fixture if ancestry genuinely fails on it: if the
+	// branch were an ancestor, an ancestry-only predicate would pass too.
+	ancestor, err := g.IsAncestor(branch, "origin/"+mainBranch)
+	if err != nil {
+		t.Fatalf("IsAncestor: %v", err)
+	}
+	if ancestor {
+		t.Fatalf("fixture is not a rebase landing: %s is an ancestor of origin/%s", branch, mainBranch)
+	}
+	return tip
+}
+
+// A branch checked out in a worktree can never be deleted by git branch -d.
+// The preview must say so, and the real run must not report it as "found none"
+// (gt-p12r: --dry-run promised 11 deletions, the real run deleted nothing and
+// reported no stale branches at all — every one was held by a live worktree).
+func TestPruneStaleBranchesReport_WorktreeHeldBranchSkippedInBothModes(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const branch = "polecat/worktree-held"
+
+	makeStaleMergedBranch(t, g, localDir, mainBranch, branch, "held.txt")
+
+	wtPath := filepath.Join(t.TempDir(), "held-worktree")
+	runGit(t, localDir, "worktree", "add", wtPath, branch)
+
+	for _, dryRun := range []bool{true, false} {
+		report, err := g.PruneStaleBranchesReport("polecat/*", dryRun)
+		if err != nil {
+			t.Fatalf("PruneStaleBranchesReport(dryRun=%v): %v", dryRun, err)
+		}
+		if len(report.Pruned) != 0 {
+			t.Errorf("dryRun=%v: pruned %d branch(es), want 0: %+v", dryRun, len(report.Pruned), report.Pruned)
+		}
+		if len(report.Skipped) != 1 {
+			t.Fatalf("dryRun=%v: skipped %d branch(es), want 1: %+v", dryRun, len(report.Skipped), report.Skipped)
+		}
+		if report.Skipped[0].Name != branch {
+			t.Errorf("dryRun=%v: skipped name = %q, want %q", dryRun, report.Skipped[0].Name, branch)
+		}
+		if report.Skipped[0].Reason != "no-remote-merged" {
+			t.Errorf("dryRun=%v: skipped reason = %q, want no-remote-merged", dryRun, report.Skipped[0].Reason)
+		}
+		if !strings.Contains(report.Skipped[0].Detail, wtPath) {
+			t.Errorf("dryRun=%v: skipped detail = %q, want it to name the worktree %q", dryRun, report.Skipped[0].Detail, wtPath)
+		}
+		// Candidates() is what separates "found none" from "deleted none".
+		if report.Candidates() != 1 {
+			t.Errorf("dryRun=%v: Candidates() = %d, want 1", dryRun, report.Candidates())
+		}
+	}
+
+	if _, err := g.run("rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		t.Errorf("branch %s should still exist after a refused prune: %v", branch, err)
+	}
+}
+
+// The preview and the action must agree on the same repository. This is the
+// property gt-p12r violated: 11 promised, 0 delivered, and no way to tell from
+// the output that anything had been refused.
+func TestPruneStaleBranchesReport_DryRunPredictsRealRun(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	makeStaleMergedBranch(t, g, localDir, mainBranch, "polecat/deletable", "free.txt")
+	makeStaleMergedBranch(t, g, localDir, mainBranch, "polecat/pinned", "pinned.txt")
+	runGit(t, localDir, "worktree", "add", filepath.Join(t.TempDir(), "pinned-wt"), "polecat/pinned")
+
+	preview, err := g.PruneStaleBranchesReport("polecat/*", true)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	actual, err := g.PruneStaleBranchesReport("polecat/*", false)
+	if err != nil {
+		t.Fatalf("real run: %v", err)
+	}
+
+	if len(preview.Pruned) != len(actual.Pruned) {
+		t.Errorf("preview promised %d deletion(s), real run made %d", len(preview.Pruned), len(actual.Pruned))
+	}
+	if len(actual.Pruned) != 1 || actual.Pruned[0].Name != "polecat/deletable" {
+		t.Errorf("pruned = %+v, want just polecat/deletable", actual.Pruned)
+	}
+	if len(actual.Skipped) != 1 || actual.Skipped[0].Name != "polecat/pinned" {
+		t.Errorf("skipped = %+v, want just polecat/pinned", actual.Skipped)
+	}
+}
+
+// git branch -d refusals that are not predictable up front must still be
+// reported, never swallowed into an empty result.
+func TestPruneStaleBranchesReport_DeleteFailureIsReported(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const branch = "polecat/unmerged-no-remote"
+
+	// Unmerged work whose remote has gone away: matches the "no-remote"
+	// predicate, but git branch -d refuses to delete it.
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "wip.txt"), []byte("wip"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("wip.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("unmerged work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", branch)
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", "--delete", branch)
+	if err := g.FetchPrune("origin"); err != nil {
+		t.Fatalf("FetchPrune: %v", err)
+	}
+
+	report, err := g.PruneStaleBranchesReport("polecat/*", false)
+	if err != nil {
+		t.Fatalf("PruneStaleBranchesReport: %v", err)
+	}
+	if len(report.Pruned) != 0 {
+		t.Errorf("pruned = %+v, want none", report.Pruned)
+	}
+	if len(report.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want 1 entry naming the refusal", report.Skipped)
+	}
+	if report.Skipped[0].Detail == "" {
+		t.Error("skipped entry has no detail; git's refusal message was dropped")
+	}
+	if _, err := g.run("rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		t.Errorf("branch %s should survive a refused delete: %v", branch, err)
+	}
+}
+
 func TestListPushRemoteRefsWithHashesClassifiesRemoteOnlyMergedBranch(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
@@ -2846,6 +3108,173 @@ func TestForkBackedDefaultPushGuard_OriginForkWithUpstream(t *testing.T) {
 	}
 }
 
+// initTestRepoWithForkAndUpstream mirrors a Refinery-topology rig: origin is the
+// rig's own fork (fetch AND push) and upstream is the public repo, and BOTH are
+// fetched so refs/remotes/upstream/<default> actually resolves. Crew checkouts
+// configure upstream without ever fetching it; that case is covered separately
+// because a non-resolving ref must read as unknown, never as diverged.
+func initTestRepoWithForkAndUpstream(t *testing.T) (string, string, string, string) {
+	t.Helper()
+	localDir, upstream, fork, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Fatalf("ClearPushURL: %v", err)
+	}
+	if _, err := g.SetRemoteURL("origin", fork); err != nil {
+		t.Fatalf("SetRemoteURL origin fork: %v", err)
+	}
+	if err := g.AddUpstreamRemote(upstream); err != nil {
+		t.Fatalf("AddUpstreamRemote: %v", err)
+	}
+	runGitTestCmd(t, localDir, "fetch", "origin")
+	runGitTestCmd(t, localDir, "fetch", "upstream")
+	return localDir, upstream, fork, mainBranch
+}
+
+// commitInTestRepo writes a file and commits it on the current branch.
+func commitInTestRepo(t *testing.T, dir, name, message string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(name+"\n"), 0644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	runGitTestCmd(t, dir, "add", name)
+	runGitTestCmd(t, dir, "commit", "-m", message)
+}
+
+// TestMergeTargetDefaultBranchBaseRef_ForkAheadOfUpstreamUsesOrigin covers
+// gt-lj2n: the Refinery merges MRs into the rig's own origin/<default>, so once
+// the fork carries commits upstream has never seen it is authoritative and is
+// its own merge target. Basing on upstream/<default> there measured polecat
+// branches against a foreign base and blocked every MQ submission.
+func TestMergeTargetDefaultBranchBaseRef_ForkAheadOfUpstreamUsesOrigin(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+	g := NewGit(localDir)
+
+	// A Refinery merge lands on the fork's default branch only.
+	commitInTestRepo(t, localDir, "refinery.txt", "Merge polecat/crater/gt-lj2n into "+mainBranch)
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "fetch", "origin")
+
+	if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "origin/"+mainBranch {
+		t.Fatalf("MergeTargetDefaultBranchBaseRef fork-ahead = %q, want origin/%s", got, mainBranch)
+	}
+	// The conservative base is unchanged: work that has only reached the fork
+	// has not landed anywhere permanent, so deletion paths must still wait for
+	// upstream.
+	if got := g.CleanDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+		t.Fatalf("CleanDefaultBranchBaseRef fork-ahead = %q, want upstream/%s", got, mainBranch)
+	}
+
+	// The zero-commit half of the bug: a polecat branch with nothing of its own
+	// must measure as zero commits ahead, so gt done takes the no-MR early
+	// return instead of falling through to the auto-rebase. The upstream count
+	// is the control — it proves the fixture really reproduces the divergence,
+	// so a passing assertion above cannot be a vacuous zero.
+	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/crater/gt-lj2n")
+	ahead, err := g.CommitsAhead(g.MergeTargetDefaultBranchBaseRef("origin", mainBranch), "HEAD")
+	if err != nil {
+		t.Fatalf("CommitsAhead against clean base: %v", err)
+	}
+	if ahead != 0 {
+		t.Fatalf("zero-commit branch is %d commits ahead of the clean base, want 0", ahead)
+	}
+	staleAhead, err := g.CommitsAhead("upstream/"+mainBranch, "HEAD")
+	if err != nil {
+		t.Fatalf("CommitsAhead against upstream: %v", err)
+	}
+	if staleAhead == 0 {
+		t.Fatal("control failed: upstream base also reports 0 ahead, so this fixture does not reproduce the divergence")
+	}
+}
+
+// TestMergeTargetBaseRef_ExplicitTargetMatchesCleanBaseRef pins the two
+// resolvers to the same answer everywhere except the default-branch case. An
+// explicit target that meant different things depending on which helper the
+// caller reached for would be a worse bug than the one gt-lj2n fixed.
+func TestMergeTargetBaseRef_ExplicitTargetMatchesCleanBaseRef(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+	g := NewGit(localDir)
+
+	// Put the rig in the state where the default-branch answers diverge, so a
+	// match on the explicit targets below is not a coincidence of both helpers
+	// agreeing about everything.
+	commitInTestRepo(t, localDir, "refinery.txt", "Merge polecat/crater/gt-lj2n into "+mainBranch)
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "fetch", "origin")
+	if g.MergeTargetDefaultBranchBaseRef("origin", mainBranch) == g.CleanDefaultBranchBaseRef("origin", mainBranch) {
+		t.Fatal("control failed: the two default-branch bases agree, so this fixture proves nothing")
+	}
+
+	for _, target := range []string{"release-1.0", "origin/release-1.0", "upstream/" + mainBranch, "  release-1.0  "} {
+		clean := g.CleanBaseRef("origin", mainBranch, target)
+		merge := g.MergeTargetBaseRef("origin", mainBranch, target)
+		if clean != merge {
+			t.Fatalf("target %q: CleanBaseRef = %q but MergeTargetBaseRef = %q", target, clean, merge)
+		}
+	}
+}
+
+// TestMergeTargetDefaultBranchBaseRef_ForkNotAheadKeepsUpstream is the
+// regression guard: where the fork is a stale subset of upstream, the base is
+// unchanged.
+func TestMergeTargetDefaultBranchBaseRef_ForkNotAheadKeepsUpstream(t *testing.T) {
+	t.Run("mains identical", func(t *testing.T) {
+		localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+		g := NewGit(localDir)
+		if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+			t.Fatalf("MergeTargetDefaultBranchBaseRef equal = %q, want upstream/%s", got, mainBranch)
+		}
+	})
+
+	t.Run("fork behind upstream", func(t *testing.T) {
+		localDir, _, _, mainBranch := initTestRepoWithForkAndUpstream(t)
+		g := NewGit(localDir)
+
+		runGitTestCmd(t, localDir, "checkout", "-b", "upstream-work")
+		commitInTestRepo(t, localDir, "upstream.txt", "upstream-only commit")
+		runGitTestCmd(t, localDir, "push", "upstream", "HEAD:"+mainBranch)
+		runGitTestCmd(t, localDir, "checkout", mainBranch)
+		runGitTestCmd(t, localDir, "fetch", "upstream")
+
+		behind, err := g.CommitsAhead("origin/"+mainBranch, "upstream/"+mainBranch)
+		if err != nil {
+			t.Fatalf("CommitsAhead: %v", err)
+		}
+		if behind == 0 {
+			t.Fatal("control failed: upstream is not ahead of the fork, so this fixture does not exercise the stale-fork case")
+		}
+		if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+			t.Fatalf("MergeTargetDefaultBranchBaseRef fork-behind = %q, want upstream/%s", got, mainBranch)
+		}
+	})
+}
+
+// TestMergeTargetDefaultBranchBaseRef_UnfetchedUpstreamIsUnknownNotDiverged
+// covers the crew-checkout shape: upstream is configured but never fetched, so
+// the comparison cannot be made. An unresolvable ref must not be read as
+// divergence — behaviour there is left exactly as it was.
+func TestMergeTargetDefaultBranchBaseRef_UnfetchedUpstreamIsUnknownNotDiverged(t *testing.T) {
+	localDir, upstream, fork, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Fatalf("ClearPushURL: %v", err)
+	}
+	if _, err := g.SetRemoteURL("origin", fork); err != nil {
+		t.Fatalf("SetRemoteURL origin fork: %v", err)
+	}
+	if err := g.AddUpstreamRemote(upstream); err != nil {
+		t.Fatalf("AddUpstreamRemote: %v", err)
+	}
+	runGitTestCmd(t, localDir, "fetch", "origin")
+
+	// Control: the upstream ref genuinely does not resolve here.
+	runGitTestCmdWantFailure(t, localDir, "rev-parse", "--verify", "refs/remotes/upstream/"+mainBranch)
+
+	if got := g.MergeTargetDefaultBranchBaseRef("origin", mainBranch); got != "upstream/"+mainBranch {
+		t.Fatalf("MergeTargetDefaultBranchBaseRef unfetched = %q, want upstream/%s", got, mainBranch)
+	}
+}
+
 func TestForkBackedDefaultPushGuard_AllowsNormalDefaultPush(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
@@ -3291,6 +3720,151 @@ func TestDeleteRemoteBranchIfAtRejectsChangedBranch(t *testing.T) {
 	}
 	if err := g.Checkout(mainBranch); err != nil {
 		t.Fatalf("Checkout main: %v", err)
+	}
+}
+
+// commitFileTo writes, commits and pushes a file on the current branch and
+// returns the resulting head.
+func commitFileTo(t *testing.T, g *Git, dir, branch, name, body string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	if err := g.Add(name); err != nil {
+		t.Fatalf("Add %s: %v", name, err)
+	}
+	if err := g.Commit(name + ": " + body); err != nil {
+		t.Fatalf("Commit %s: %v", name, err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push %s: %v", branch, err)
+	}
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+	return head
+}
+
+// The branch a resolver refreshed (merging the target INTO it to clear a
+// conflict) no longer points at the sha the MR recorded, so a lease taken on
+// that sha is rejected as "stale info". Resolving the head at cleanup time
+// deletes the branch that the recorded sha could not. (gt-yog2)
+func TestResolveMergedBranchDeleteHeadFollowsRefreshedBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	branch := "polecat/refresh/gt-yog2"
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	recordedHead := commitFileTo(t, g, localDir, branch, "work.txt", "polecat work")
+
+	// Another MR lands on the target while this one waits.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	commitFileTo(t, g, localDir, mainBranch, "other.txt", "someone else")
+
+	// The resolver refreshes the branch: target merged INTO it, ancestry
+	// preserved, submitted head not rewritten.
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch for refresh: %v", err)
+	}
+	if err := g.MergeNoFF(mainBranch, "merge "+mainBranch+" into "+branch); err != nil {
+		t.Fatalf("MergeNoFF into branch: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push refreshed branch: %v", err)
+	}
+	refreshedHead, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev refreshed head: %v", err)
+	}
+	if refreshedHead == recordedHead {
+		t.Fatal("fixture did not refresh the branch head")
+	}
+
+	// The refinery then lands the branch.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main to land: %v", err)
+	}
+	if err := g.MergeNoFF(branch, "land "+branch); err != nil {
+		t.Fatalf("MergeNoFF land: %v", err)
+	}
+	if err := g.Push("origin", mainBranch, false); err != nil {
+		t.Fatalf("Push main: %v", err)
+	}
+
+	// Control: the old behaviour still fails here, so a pass below is the fix
+	// and not a fixture that stopped reproducing the bug.
+	if err := g.DeleteRemoteBranchIfAt("origin", branch, recordedHead); err == nil {
+		t.Fatal("lease on the recorded sha was accepted; fixture no longer reproduces gt-yog2")
+	}
+
+	head, err := g.ResolveMergedBranchDeleteHead("origin", branch, mainBranch, recordedHead)
+	if err != nil {
+		t.Fatalf("ResolveMergedBranchDeleteHead: %v", err)
+	}
+	if head != refreshedHead {
+		t.Fatalf("resolved head = %s, want refreshed head %s", head, refreshedHead)
+	}
+	if err := g.DeleteRemoteBranchIfAt("origin", branch, head); err != nil {
+		t.Fatalf("DeleteRemoteBranchIfAt at resolved head: %v", err)
+	}
+	exists, err := g.RemoteBranchExists("origin", branch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists: %v", err)
+	}
+	if exists {
+		t.Fatal("branch should be gone after deleting at the resolved head")
+	}
+}
+
+// Containment in the target is the property the recorded sha stood in for, so a
+// head the target never took must keep its branch.
+func TestResolveMergedBranchDeleteHeadRejectsUnmergedHead(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	branch := "polecat/unmerged/gt-yog2"
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	recordedHead := commitFileTo(t, g, localDir, branch, "work.txt", "submitted")
+	commitFileTo(t, g, localDir, branch, "work.txt", "never merged")
+
+	if _, err := g.ResolveMergedBranchDeleteHead("origin", branch, mainBranch, recordedHead); err == nil {
+		t.Fatal("ResolveMergedBranchDeleteHead accepted a head the target does not contain")
+	}
+	exists, err := g.RemoteBranchExists("origin", branch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists: %v", err)
+	}
+	if !exists {
+		t.Fatal("branch should survive an unverifiable head")
+	}
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+}
+
+func TestResolveMergedBranchDeleteHeadReportsAbsentBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	head, err := g.ResolveMergedBranchDeleteHead("origin", "polecat/never-existed", mainBranch, "abc123")
+	if err != nil {
+		t.Fatalf("ResolveMergedBranchDeleteHead for absent branch: %v", err)
+	}
+	if head != "" {
+		t.Fatalf("resolved head = %q, want \"\" for an absent branch", head)
 	}
 }
 

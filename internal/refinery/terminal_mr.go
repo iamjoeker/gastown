@@ -14,6 +14,15 @@ type terminalMRCloseOptions struct {
 	AgentBeadHint string
 	MissingOK     bool
 	ExpectedMR    *MergeRequest
+	// MergeProven says this caller has independently established, against git,
+	// that the branch landed — not that it believes it did. Only a caller that
+	// has run a post-merge proof may set it, and only it may rewrite an
+	// already-closed record (see recordMergeOnTerminalMR).
+	//
+	// ExpectedMR is deliberately NOT that evidence. Manager.PostMerge fills it
+	// from the very record it is about to check, so the comparison is a record
+	// against itself and passes for a rejected MR as readily as a merged one.
+	MergeProven bool
 }
 
 type terminalMRCloseResult struct {
@@ -24,6 +33,20 @@ type terminalMRCloseResult struct {
 	AlreadyTerminal       bool
 	AgentActiveMRCleared  bool
 	AgentActiveMRClearErr error
+
+	// RecordedCloseReason is the outcome the MR description already carried
+	// when this close found it already terminal. Empty means the record named
+	// no outcome at all, which is the shape a supersede leaves behind: the
+	// supersede writes the bead's close_reason FIELD and never touches the
+	// description, so the two carriers disagree and the description is silent.
+	RecordedCloseReason string
+	// OutcomeCorrected is true when an already-terminal record said something
+	// other than merged and this call rewrote it to merged.
+	OutcomeCorrected bool
+	// OutcomeCorrectErr is non-fatal. The merge is a fact in git either way;
+	// failing the close because its record could not be repaired would trade a
+	// wrong record for a wrong outcome.
+	OutcomeCorrectErr error
 }
 
 func closeTerminalMR(b *beads.Beads, mrID string, opts terminalMRCloseOptions) (*terminalMRCloseResult, error) {
@@ -82,6 +105,8 @@ func closeTerminalMR(b *beads.Beads, mrID string, opts terminalMRCloseOptions) (
 		result.Closed = true
 	case status.IsTerminal():
 		result.AlreadyTerminal = true
+		result.RecordedCloseReason = strings.TrimSpace(fields.CloseReason)
+		recordMergeOnTerminalMR(b, mrID, issue, fields, opts, result)
 	default:
 		return result, nil
 	}
@@ -92,6 +117,72 @@ func closeTerminalMR(b *beads.Beads, mrID string, opts terminalMRCloseOptions) (
 		result.AgentActiveMRClearErr = clearErr
 	}
 	return result, nil
+}
+
+// recordMergeOnTerminalMR stamps the merge outcome onto an MR that was already
+// closed by the time the merge completed.
+//
+// Without it, an MR closed as superseded mid-flight keeps "superseded" forever:
+// the open-status branch above is the only writer of the description's
+// close_reason, so a real merge on main ends up with no merged-record behind
+// it. Four branches on beads/main are in exactly that state (gt-fe1e), and one
+// of them carries no description close_reason at all — the record does not even
+// say it was superseded, it says nothing.
+//
+// Three things bound the rewrite, because overwriting a settled record is not a
+// small act:
+//
+//   - Only toward merged. A merge is a physical fact in git that this caller
+//     has already proved. A rejection is a DECISION, and a later "rejected"
+//     must never erase an earlier "merged" — that would invert the defect
+//     rather than fix it.
+//   - Only when the record disagrees. An already-merged record is left byte-
+//     identical, so a post-merge retry is still idempotent.
+//   - Only for a caller holding a post-merge PROOF. `gt mq post-merge <id>` is
+//     run by hand and takes the operator's word that a merge happened; letting
+//     it repair would let a typo stamp "merged" onto a rejected record, which
+//     is the defect inverted rather than fixed. Manager.PostMerge therefore
+//     keeps its refusal, and only the engineer's landing path — downstream of
+//     verifyMRInfoPostMergeProof — sets MergeProven.
+//
+// validateTerminalMRCloseSnapshot has also already run by this point, binding
+// branch, source_issue and commit_sha to the merge that was verified, so the
+// rewrite lands on the record for the branch that actually merged and not on a
+// neighbour.
+//
+// The bead's own close_reason FIELD still reads "superseded by X" afterwards.
+// It cannot be amended from here, and it is the honest history of what the
+// queue did; the description carrier is what states the OUTCOME, and an audit
+// that reads both now sees a merge with a merged-record and the supersede that
+// nearly hid it.
+func recordMergeOnTerminalMR(
+	b *beads.Beads,
+	mrID string,
+	issue *beads.Issue,
+	fields *beads.MRFields,
+	opts terminalMRCloseOptions,
+	result *terminalMRCloseResult,
+) {
+	if !opts.MergeProven {
+		return
+	}
+	if normalizedMRCloseReason(opts.Reason) != string(CloseReasonMerged) {
+		return
+	}
+	if result.RecordedCloseReason == string(CloseReasonMerged) {
+		return
+	}
+
+	fields.CloseReason = string(CloseReasonMerged)
+	if opts.MergeCommit != "" {
+		fields.MergeCommit = opts.MergeCommit
+	}
+	newDesc := beads.SetMRFields(issue, fields)
+	if err := b.Update(mrID, beads.UpdateOptions{Description: &newDesc}); err != nil {
+		result.OutcomeCorrectErr = fmt.Errorf("recording merge on already-closed MR %s: %w", mrID, err)
+		return
+	}
+	result.OutcomeCorrected = true
 }
 
 func validateTerminalMRCloseSnapshot(mrID string, fields *beads.MRFields, expected *MergeRequest) error {

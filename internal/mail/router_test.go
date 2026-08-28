@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -2252,6 +2253,128 @@ func TestClearReplyReminders(t *testing.T) {
 	}
 }
 
+// TestClearReplyRemindersTo covers the one event that used to leave a reminder
+// standing: the recipient answered, over the channel the town tells agents to
+// prefer, and no mail record existed for the mail-only trigger to find
+// (gt-w4ba).
+func TestClearReplyRemindersTo(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	sessionID := session.CrewSessionName(session.PrefixFor("gastown"), "bob")
+
+	for _, n := range []nudge.QueuedNudge{
+		// Two threads with the same counterparty: answering retires both, which
+		// is the difference from ClearReplyReminders' per-thread scope.
+		{Sender: "system", Message: "owed-witness-1", Kind: "reply-reminder", ReplyTo: "gastown/witness", ThreadID: "thread-1"},
+		{Sender: "system", Message: "owed-witness-2", Kind: "reply-reminder", ReplyTo: "gastown/witness", ThreadID: "thread-2"},
+		// Nesting and case differ from the address the nudger typed. Both name
+		// the witness's rig-mate toast, and both must go.
+		{Sender: "system", Message: "owed-toast-nested", Kind: "reply-reminder", ReplyTo: "gastown/polecats/Toast", ThreadID: "thread-3"},
+		{Sender: "system", Message: "keep-mayor", Kind: "reply-reminder", ReplyTo: "mayor/", ThreadID: "thread-4"},
+		{Sender: "system", Message: "keep-mail", Kind: "mail", ThreadID: "thread-1"},
+	} {
+		if err := nudge.Enqueue(townRoot, sessionID, n); err != nil {
+			t.Fatalf("Enqueue(%q): %v", n.Message, err)
+		}
+	}
+
+	if err := r.ClearReplyRemindersTo("gastown/crew/bob", "gastown/witness"); err != nil {
+		t.Fatalf("ClearReplyRemindersTo(witness): %v", err)
+	}
+	if err := r.ClearReplyRemindersTo("gastown/crew/bob", "gastown/toast"); err != nil {
+		t.Fatalf("ClearReplyRemindersTo(toast): %v", err)
+	}
+
+	nudges, err := nudge.Drain(townRoot, sessionID)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	var left []string
+	for _, n := range nudges {
+		left = append(left, n.Message)
+	}
+	want := []string{"keep-mayor", "keep-mail"}
+	if len(left) != len(want) {
+		t.Fatalf("remaining nudges = %v, want %v", left, want)
+	}
+	for _, w := range want {
+		if !slices.Contains(left, w) {
+			t.Errorf("%q was cleared; only reminders owed to the nudged agent may be", w)
+		}
+	}
+}
+
+// An empty address is nobody. Clearing on one would retire every reminder in
+// the queue the first time a role lookup came back blank.
+func TestClearReplyRemindersToIgnoresEmptyAddresses(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	sessionID := session.CrewSessionName(session.PrefixFor("gastown"), "bob")
+
+	if err := nudge.Enqueue(townRoot, sessionID, nudge.QueuedNudge{
+		Sender: "system", Message: "owed-witness", Kind: "reply-reminder", ReplyTo: "gastown/witness", ThreadID: "thread-1",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if err := r.ClearReplyRemindersTo("gastown/crew/bob", ""); err != nil {
+		t.Fatalf("ClearReplyRemindersTo(empty repliedTo): %v", err)
+	}
+	if err := r.ClearReplyRemindersTo("", "gastown/witness"); err != nil {
+		t.Fatalf("ClearReplyRemindersTo(empty address): %v", err)
+	}
+
+	pending, err := nudge.Pending(townRoot, sessionID)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending = %d, want 1 — an empty address cleared a reminder", pending)
+	}
+}
+
+// TestEnqueueReplyReminder_RecordsReplyTo pins the field the nudge-side retirement
+// reads. Without it the reminder records what it is about but not who it is to,
+// and only a mail reply on the same thread can retire it (gt-w4ba).
+func TestEnqueueReplyReminder_RecordsReplyTo(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	sessionID := session.CrewSessionName(session.PrefixFor("gastown"), "alice")
+	msg := &Message{
+		From:    "gastown/witness",
+		To:      "gastown/crew/alice",
+		Subject: "status check",
+		Type:    TypeNotification,
+	}
+
+	r.enqueueReplyReminder(msg, sessionID)
+
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", sessionID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 queued reminder, got %d", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var q nudge.QueuedNudge
+	if err := json.Unmarshal(data, &q); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if q.ReplyTo != msg.From {
+		t.Errorf("ReplyTo = %q, want %q", q.ReplyTo, msg.From)
+	}
+	// The reminder is the only instruction the recipient sees, so it must name
+	// the cheap channel that now satisfies it, not mail alone.
+	if !strings.Contains(q.Message, "gt nudge "+msg.From) {
+		t.Errorf("reminder should offer `gt nudge %s`, got %q", msg.From, q.Message)
+	}
+}
+
 // TestEnqueueReplyReminder_SkipsReply verifies that reply-type messages do not
 // trigger a reply reminder (would be redundant noise).
 func TestEnqueueReplyReminder_SkipsReply(t *testing.T) {
@@ -2309,5 +2432,61 @@ func TestEnqueueReplyReminder_DisabledByConfig(t *testing.T) {
 	pending, _ := nudge.Pending(townRoot, "gt-gastown-crew-bob")
 	if pending != 0 {
 		t.Errorf("reply_reminder_delay=0s should disable reminders, got %d pending", pending)
+	}
+}
+
+// TestEverySendPathStampsMsgType is the guard for gt-do5c. The queue, announce
+// and channel writers each hand-rolled a label slice under a comment promising
+// "labels for type, from/thread/reply-to/cc" and all three omitted the type, so
+// their mail could never be classified by any query. Adding a fourth writer that
+// forgets it should fail here rather than on the hq store months later.
+func TestEverySendPathStampsMsgType(t *testing.T) {
+	msg := &Message{
+		From:     "gastown/witness",
+		To:       "mayor/",
+		Subject:  "Why was gt-wisp-0an54 rejected?",
+		Body:     "Blocked on the answer.",
+		Type:     TypeQuery,
+		ThreadID: "t-do5c",
+	}
+	r := &Router{}
+
+	paths := map[string][]string{
+		"direct":   r.buildLabels(msg),
+		"queue":    queueLabels(msg, "merge"),
+		"announce": announceLabels(msg, "townhall"),
+		"channel":  channelLabels(msg, "ops"),
+	}
+
+	for name, labels := range paths {
+		if !containsLabel(labels, "msg-type:query") {
+			t.Errorf("%s path labels %v carry no msg-type:query", name, labels)
+		}
+		// Control: assert a label this path is known to write, so a bug that
+		// returned an empty slice would fail as a missing gt:message rather
+		// than passing some weaker version of the check above.
+		if !containsLabel(labels, "gt:message") {
+			t.Errorf("%s path labels %v carry no gt:message — probe is not reading real labels", name, labels)
+		}
+	}
+}
+
+// TestMsgTypeLabelTracksTheMessage: a hardcoded "msg-type:notification" in each
+// writer would satisfy the presence check above while reproducing the original
+// bug exactly. This pins the label to the message's actual type.
+func TestMsgTypeLabelTracksTheMessage(t *testing.T) {
+	r := &Router{}
+	for _, mt := range ValidMessageTypes() {
+		msg := &Message{From: "deacon/", To: "mayor/", Subject: "s", Body: "b", Type: mt}
+		for name, labels := range map[string][]string{
+			"direct":   r.buildLabels(msg),
+			"queue":    queueLabels(msg, "q"),
+			"announce": announceLabels(msg, "a"),
+			"channel":  channelLabels(msg, "c"),
+		} {
+			if !containsLabel(labels, "msg-type:"+string(mt)) {
+				t.Errorf("%s path with Type=%q wrote %v", name, mt, labels)
+			}
+		}
 	}
 }

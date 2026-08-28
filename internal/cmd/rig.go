@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/deps"
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -1592,26 +1593,7 @@ func runResetStale(bd *beads.Beads, dryRun bool) error {
 // to tmux session name.
 // Returns the session name and whether this is a persistent identity (crew).
 func assigneeToSessionName(assignee string) (sessionName string, isPersistent bool) {
-	parts := strings.Split(assignee, "/")
-
-	switch len(parts) {
-	case 2:
-		// rig/polecatName -> gt-rig-polecatName
-		return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[1]), false
-	case 3:
-		// rig/crew/name -> gt-rig-crew-name
-		if parts[1] == "crew" {
-			return session.CrewSessionName(session.PrefixFor(parts[0]), parts[2]), true
-		}
-		// rig/polecats/name -> gt-rig-name
-		if parts[1] == "polecats" {
-			return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[2]), false
-		}
-		// Other 3-part formats not recognized
-		return "", false
-	default:
-		return "", false
-	}
+	return convoyops.AssigneeSessionName(assignee)
 }
 
 // Helper to check if path exists
@@ -1994,6 +1976,20 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 		state      polecat.State
 		issue      string
 		hasSession bool
+		// liveness: what the pane says the agent is DOING. This is NOT derivable
+		// from the two fields above — a logged-out or wedged agent's process is
+		// alive, so hasSession is true, and its bead still says working. Both
+		// inputs to the display state below therefore say "healthy", and the
+		// polecat rendered as working for eighteen minutes while it could not
+		// execute a single turn (gt-acb1, gt-y39t).
+		//
+		// Read with a zero window: one capture, no blocking. That settles
+		// logged-out and parked, which are the two states this surface was
+		// getting wrong. Separating working from blocking-wait needs a token
+		// delta over at least a minute, and a status command is the wrong place
+		// to spend a minute per polecat — `gt polecat check-recovery
+		// --liveness-window` is where that lives.
+		liveness tmux.LivenessReading
 	}
 	var pInfos []polecatInfo
 	type crewInfo struct {
@@ -2015,6 +2011,7 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 				defer sessionWg.Done()
 				sessionName := session.PolecatSessionName(session.PrefixFor(rigName), p.Name)
 				pInfos[idx].hasSession = isAgentSessionHealthy(t, sessionName)
+				pInfos[idx].liveness = polecatMgr.SessionLiveness(p.Name, 0)
 			}(i, p)
 		}
 	}
@@ -2094,6 +2091,33 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 				stateStr = fmt.Sprintf("%s → %s", displayState, pi.issue)
 			}
 
+			// The auth wall outranks the reconciliation above, because it
+			// contradicts both of that reconciliation's inputs at once: the
+			// process is alive AND the bead says working, and the agent is
+			// executing nothing. Printed rather than folded into displayState so
+			// it cannot be mistaken for a lifecycle state a restart could move —
+			// no restart path supplies credentials (gt-acb1).
+			if pi.liveness.State == tmux.LivenessLoggedOut {
+				fmt.Printf("  %s %s: %s %s\n",
+					style.Error.Render("●"), pi.name,
+					style.Error.Render("LOGGED OUT"),
+					style.Dim.Render("(needs a human /login; "+stateStr+")"))
+				continue
+			}
+
+			// Every other pane state is APPENDED rather than substituted. The
+			// lifecycle state is still the thing a reader came for, and the two
+			// disagreeing is itself the information: "working → gt-abcd (pane:
+			// parked)" is a polecat that stopped without saying so, and it is
+			// exactly what this surface used to render as plain "working"
+			// because hooked-ness was the only input it had (gt-y39t).
+			//
+			// The auth wall above is the one exception because its remedy is not
+			// a remedy for anything else on this line.
+			if note := rigStatusLivenessNote(pi.liveness.State, displayState); note != "" {
+				stateStr += " " + style.Dim.Render(note)
+			}
+
 			fmt.Printf("  %s %s: %s\n", sessionIcon, pi.name, stateStr)
 		}
 	}
@@ -2121,6 +2145,41 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// rigStatusLivenessNote renders the pane-derived liveness beside a polecat's
+// lifecycle state, and returns "" when there is nothing worth saying.
+//
+// It reports only DISAGREEMENT. A polecat whose bead says working and whose
+// pane shows a turn in flight is the ordinary case and annotating it would bury
+// the interesting lines in a wall of agreeing ones; a polecat whose bead says
+// working and whose pane is parked is a polecat that stopped without telling
+// anyone, and that line is the whole point of the annotation (gt-y39t).
+//
+// LivenessUnknown never renders. It is the value an unreadable pane, a missing
+// session and a non-agent pane all produce, and printing it would put "pane:
+// unknown" next to every polecat on a host without tmux — turning a silent
+// absence of evidence into visible noise that reads like a fault.
+func rigStatusLivenessNote(live tmux.Liveness, displayState polecat.State) string {
+	working := displayState == polecat.StateWorking
+
+	switch live {
+	case tmux.LivenessParked:
+		if working {
+			return "(pane: parked — no turn running; the agent stopped without saying so)"
+		}
+	case tmux.LivenessBlockingWait:
+		// Deliberately not called a stall. Tokens-static means not thinking, and
+		// an agent inside a long test run looks exactly like this; whether it is
+		// a fault is decided by the command in flight, which this surface does
+		// not sample for (see SUSPECT_STALL in gt polecat check-recovery).
+		return "(pane: blocking-wait — turn open, consuming no tokens)"
+	case tmux.LivenessTurnInFlight, tmux.LivenessWorking:
+		if !working {
+			return "(pane: turn in flight — the agent is still running)"
+		}
+	}
+	return ""
 }
 
 func runRigStop(cmd *cobra.Command, args []string) error {

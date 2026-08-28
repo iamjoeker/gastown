@@ -107,10 +107,18 @@ func (t *Table) Render() string {
 			if i < len(row) {
 				val = row[i]
 			}
-			// Truncate if too long
+			// Truncate if too long. A cut cell always shows "..." so it is
+			// visible as cut — a silently shortened value reads as a complete
+			// one, and for identifiers that turns a query into a false zero
+			// (gt-2izk). Columns narrower than the ellipsis cannot show it, so
+			// they cut bare rather than slicing to a negative index.
 			plainVal := stripAnsi(val)
 			if len(plainVal) > col.Width {
-				val = plainVal[:col.Width-3] + "..."
+				if col.Width > 3 {
+					val = plainVal[:col.Width-3] + "..."
+				} else {
+					val = plainVal[:col.Width]
+				}
 			}
 			// Apply column style if set
 			if col.Style.Value() != "" {

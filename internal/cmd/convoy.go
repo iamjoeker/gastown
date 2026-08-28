@@ -2,14 +2,10 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -318,13 +314,18 @@ var convoyStrandedCmd = &cobra.Command{
 	Use:   "stranded",
 	Short: "Find stranded convoys (ready work, stuck, or empty) needing attention",
 	Long: `Find convoys that have ready issues but no workers processing them,
-stuck convoys (tracked issues but none ready), or empty convoys that need cleanup.
+convoys nothing explains, or convoys that need closing.
 
-A convoy is "stranded" when:
-- Convoy is open AND either:
-  - Has tracked issues that are ready but unassigned, OR
-  - Has tracked issues but none are ready (stuck — waiting on dependencies/workers), OR
-  - Has 0 tracked issues (empty — needs auto-close via convoy check)
+A convoy is "stranded" when it is open AND one of:
+  - feedable     — has tracked issues that are ready but unassigned
+  - needs-review — tracked issues are blocked, unroutable, or not slingable
+  - complete     — every tracked issue is closed (needs auto-close via convoy check)
+  - empty        — 0 tracked issues (needs auto-close via convoy check)
+
+A convoy whose issues are merely WAITING is not stranded and is not reported:
+deferred beads (postponed on purpose — no review can clear them), beads already
+scheduled for dispatch, beads being worked by a live session, and beads whose
+work is sitting in the merge queue.
 
 Use this to detect convoys that need feeding or cleanup. The Deacon patrol
 runs this periodically and dispatches dogs to feed stranded convoys.
@@ -535,94 +536,11 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 }
 
 func bdDepListRawIDsViaDolt(dir, issueID, direction, depType string) ([]string, error) {
-	beadsDir := beads.ResolveBeadsDir(dir)
-	cfg, ok := readBeadsRuntimeConfig(beadsDir)
-	if !ok || cfg.Database == "" || cfg.Port == 0 {
-		return nil, fmt.Errorf("missing server metadata for %s", beadsDir)
-	}
-	host := cfg.Host
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	dsn := fmt.Sprintf("root@tcp(%s)/%s?parseTime=true", net.JoinHostPort(host, strconv.Itoa(cfg.Port)), url.PathEscape(cfg.Database))
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	typedQuery, typedArgs := rawDepSQLArgs(issueID, direction, depType, false)
-	ids, err := queryRawDepIDs(ctx, db, typedQuery, typedArgs)
-	if err == nil {
-		return ids, nil
-	}
-	legacyQuery, legacyArgs := rawDepSQLArgs(issueID, direction, depType, true)
-	return queryRawDepIDs(ctx, db, legacyQuery, legacyArgs)
-}
-
-func rawDepSQLArgs(issueID, direction, depType string, legacy bool) (string, []any) {
-	var query string
-	var args []any
-	if direction == "up" {
-		if legacy {
-			query = "SELECT issue_id FROM dependencies WHERE depends_on_id = ?"
-			args = append(args, issueID)
-		} else {
-			query = "SELECT issue_id FROM dependencies WHERE (depends_on_issue_id = ? OR depends_on_wisp_id = ? OR depends_on_external LIKE ? ESCAPE '!')"
-			args = append(args, issueID, issueID, "%:"+strings.ReplaceAll(issueID, "_", "!_"))
-		}
-	} else if legacy {
-		query = "SELECT depends_on_id FROM dependencies WHERE issue_id = ?"
-		args = append(args, issueID)
-	} else {
-		query = "SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id FROM dependencies WHERE issue_id = ?"
-		args = append(args, issueID)
-	}
-	if depType != "" {
-		query += " AND type = ?"
-		args = append(args, depType)
-	}
-	return query, args
+	return convoyops.RawDepIDsViaDolt(dir, issueID, direction, depType)
 }
 
 func rawDepSQLLiteral(issueID, direction, depType string, legacy bool) string {
-	query, args := rawDepSQLArgs(issueID, direction, depType, legacy)
-	for _, arg := range args {
-		query = strings.Replace(query, "?", "'"+arg.(string)+"'", 1)
-	}
-	return query
-}
-
-func queryRawDepIDs(ctx context.Context, db *sql.DB, query string, args []any) ([]string, error) {
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	seen := make(map[string]bool)
-	var ids []string
-	for rows.Next() {
-		var rawID sql.NullString
-		if err := rows.Scan(&rawID); err != nil {
-			return nil, err
-		}
-		if !rawID.Valid {
-			continue
-		}
-		id := beads.ExtractIssueID(rawID.String)
-		if id != "" && !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return ids, nil
+	return convoyops.RawDepSQL(issueID, direction, depType, legacy)
 }
 
 func parseRawDepRows(out []byte, parseKey string) ([]string, error) {
@@ -651,15 +569,7 @@ func sqlExternalDepTargetClause(issueID string) string {
 // isValidBeadID checks that a string is safe for SQL interpolation in dep queries.
 // Bead IDs contain only alphanumeric chars, hyphens, dots, and underscores.
 func isValidBeadID(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_') {
-			return false
-		}
-	}
-	return true
+	return convoyops.IsValidBeadID(s)
 }
 
 // collectEpicChildren does a BFS walk of an epic's parent-child hierarchy and
@@ -1509,7 +1419,32 @@ type strandedConvoyInfo struct {
 	ReadyIssues  []string `json:"ready_issues"`
 	CreatedAt    string   `json:"created_at,omitempty"`
 	BaseBranch   string   `json:"base_branch,omitempty"`
+
+	// Reason names why the convoy is on this list — one of the strandedReason*
+	// constants. It exists so a reader (or the deacon) never has to re-derive
+	// the verdict from the counts, which is how "0 ready" came to mean four
+	// different things. (gt-bel1)
+	Reason string `json:"reason,omitempty"`
+
+	// Evidence counts the tracked issues by disposition, so the surface states
+	// what it observed alongside what it concluded. "0 ready (1 deferred)" is
+	// self-diagnosing; a bare "0 ready" is not.
+	Evidence map[string]int `json:"evidence,omitempty"`
 }
+
+// Why a convoy appears in the stranded list. Each names a different action, so
+// callers can act without inferring one from tracked_count/ready_count.
+//
+// These are the shared classifier's reasons, not a second set: the dashboard
+// renders the same verdict at finer grain, and the two surfaces disagreeing
+// about a convoy is what gt-skzk.1 was.
+const (
+	strandedReasonFeedable    = convoyops.ReasonFeedable    // ready work with no worker — sling it
+	strandedReasonEmpty       = convoyops.ReasonEmpty       // 0 tracked issues — clean it up
+	strandedReasonComplete    = convoyops.ReasonComplete    // every tracked issue closed — close the convoy
+	strandedReasonNeedsReview = convoyops.ReasonNeedsReview // genuinely unexplained — an agent must look
+	strandedReasonWaiting     = convoyops.ReasonWaiting     // benign wait; NOT returned as stranded
+)
 
 // readyIssueInfo holds info about a ready (stranded) issue.
 type readyIssueInfo struct {
@@ -1524,12 +1459,14 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	stranded, err := findStrandedConvoys(townBeads)
+	stranded, waiting, err := scanConvoys(townBeads)
 	if err != nil {
 		return err
 	}
 
 	if convoyStrandedJSON {
+		// Waiting convoys are withheld: every consumer of this array treats its
+		// entries as needing action. (gt-bel1)
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(stranded)
@@ -1537,17 +1474,21 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 
 	if len(stranded) == 0 {
 		fmt.Println("No stranded convoys found.")
+		printWaitingConvoys(waiting)
 		return nil
 	}
 
 	fmt.Printf("%s Found %d stranded convoy(s):\n\n", style.Warning.Render("⚠"), len(stranded))
 	for _, s := range stranded {
 		fmt.Printf("  🚚 %s: %s\n", s.ID, s.Title)
-		if s.ReadyCount == 0 && s.TrackedCount == 0 {
+		switch s.Reason {
+		case strandedReasonEmpty:
 			fmt.Printf("     Empty convoy (0 tracked issues) — needs cleanup\n")
-		} else if s.ReadyCount == 0 && s.TrackedCount > 0 {
-			fmt.Printf("     %d tracked issues, 0 ready — needs agent review\n", s.TrackedCount)
-		} else {
+		case strandedReasonComplete:
+			fmt.Printf("     %d tracked issues, all closed — convoy should close\n", s.TrackedCount)
+		case strandedReasonNeedsReview:
+			fmt.Printf("     %d tracked, 0 ready (%s) — needs agent review\n", s.TrackedCount, formatEvidence(s.Evidence))
+		default:
 			fmt.Printf("     Ready issues: %d (of %d tracked)\n", s.ReadyCount, s.TrackedCount)
 			for _, issueID := range s.ReadyIssues {
 				fmt.Printf("       • %s\n", issueID)
@@ -1557,14 +1498,15 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 	}
 
 	// Separate feed advice, needs-attention convoys, and cleanup advice.
-	var feedable, needsAttention, empty []strandedConvoyInfo
+	var feedable, needsAttention, cleanup []strandedConvoyInfo
 	for _, s := range stranded {
-		if s.ReadyCount > 0 {
+		switch s.Reason {
+		case strandedReasonFeedable:
 			feedable = append(feedable, s)
-		} else if s.TrackedCount > 0 {
+		case strandedReasonNeedsReview:
 			needsAttention = append(needsAttention, s)
-		} else {
-			empty = append(empty, s)
+		default:
+			cleanup = append(cleanup, s)
 		}
 	}
 
@@ -1580,32 +1522,64 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("Needs agent review (tracked issues exist but none are ready):")
 		for _, s := range needsAttention {
-			fmt.Printf("  🚚 %s (%d tracked, 0 ready)\n", s.ID, s.TrackedCount)
+			fmt.Printf("  🚚 %s (%d tracked, 0 ready: %s)\n", s.ID, s.TrackedCount, formatEvidence(s.Evidence))
 		}
 	}
-	if len(empty) > 0 {
+	if len(cleanup) > 0 {
 		if len(feedable) > 0 || len(needsAttention) > 0 {
 			fmt.Println()
 		}
-		fmt.Println("To close empty convoys, run:")
-		for _, s := range empty {
+		fmt.Println("To close finished convoys, run:")
+		for _, s := range cleanup {
 			fmt.Printf("  gt convoy check %s\n", s.ID)
 		}
 	}
+	printWaitingConvoys(waiting)
 	fmt.Println()
 	fmt.Println(style.Dim.Render("  Note: Pool dispatch auto-creates dogs if pool is under capacity."))
 
 	return nil
 }
 
-// findStrandedConvoys finds convoys with ready work but no workers,
-// or empty convoys (0 tracked issues) that need cleanup.
+// printWaitingConvoys reports the convoys that were considered and deliberately
+// not flagged. It names the evidence and prescribes no action — the point is
+// that a reader can tell "nothing to do here" from "nothing was looked at".
+func printWaitingConvoys(waiting []strandedConvoyInfo) {
+	if len(waiting) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println(style.Dim.Render(fmt.Sprintf("Waiting, not stranded (%d):", len(waiting))))
+	for _, s := range waiting {
+		fmt.Println(style.Dim.Render(fmt.Sprintf("  🚚 %s — %s", s.ID, formatEvidence(s.Evidence))))
+	}
+}
+
+// findStrandedConvoys finds convoys with ready work but no workers, empty
+// convoys (0 tracked issues) that need cleanup, completed convoys that should
+// close, and convoys whose state nothing explains.
+//
+// It deliberately does NOT return convoys that are merely waiting — every
+// non-closed issue deferred, scheduled, actively worked, or sitting in the merge
+// queue. Those were reported as "needs agent review" for as long as the
+// condition lasted, which for a deferred bead is forever: no review can clear
+// it, so the flag trained readers to ignore the surface that would also report a
+// genuine stranding. (gt-bel1)
 func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
-	stranded := []strandedConvoyInfo{} // Initialize as empty slice for proper JSON encoding
+	stranded, _, err := scanConvoys(townBeads)
+	return stranded, err
+}
+
+// scanConvoys classifies every open convoy, returning the ones that need action
+// (stranded) separately from the ones that are benignly waiting. The waiting
+// list is reported to humans as context and withheld from --json, because the
+// daemon and deacon treat everything in that array as needing action.
+func scanConvoys(townBeads string) (stranded, waiting []strandedConvoyInfo, err error) {
+	stranded = []strandedConvoyInfo{} // Initialize as empty slice for proper JSON encoding
 
 	convoys, err := listConvoyIssues(townBeads, "open", false)
 	if err != nil {
-		return nil, fmt.Errorf("listing convoys: %w", err)
+		return nil, nil, fmt.Errorf("listing convoys: %w", err)
 	}
 
 	// Check each convoy for stranded state
@@ -1634,133 +1608,180 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 				ReadyIssues:  []string{},
 				CreatedAt:    convoy.CreatedAt,
 				BaseBranch:   baseBranch,
+				Reason:       strandedReasonEmpty,
 			})
 			continue
 		}
-
-		// Find ready issues (open, not blocked, no live assignee, slingable).
-		// Town-level beads (hq- prefix with path=".") are excluded because
-		// they can't be dispatched via gt sling -- they're handled by the deacon.
-		// Non-slingable types (epics, convoys, etc.) are also excluded.
 
 		// Batch-check scheduling status for all tracked issues (single DB query).
 		var trackedIDs []string
 		for _, t := range tracked {
 			trackedIDs = append(trackedIDs, t.ID)
 		}
-		scheduledSet := areScheduled(trackedIDs)
+		env := liveTrackedIssueEnv(townBeads, areScheduled(trackedIDs))
 
-		var readyIssues []string
-		for _, t := range tracked {
-			if isReadyIssue(t, scheduledSet) {
-				if !isSlingableBead(townBeads, t.ID) {
-					continue
-				}
-				if !convoyops.IsSlingableType(t.IssueType) {
-					continue
-				}
-				readyIssues = append(readyIssues, t.ID)
-			}
-		}
+		readyIssues, evidence := classifyTrackedIssues(townBeads, tracked, env)
 
-		if len(readyIssues) > 0 {
-			stranded = append(stranded, strandedConvoyInfo{
-				ID:           convoy.ID,
-				Title:        convoy.Title,
-				TrackedCount: len(tracked),
-				ReadyCount:   len(readyIssues),
-				ReadyIssues:  readyIssues,
-				CreatedAt:    convoy.CreatedAt,
-				BaseBranch:   baseBranch,
-			})
-		} else {
-			// Has tracked issues but none are ready — include in stranded
-			// list so callers can distinguish from truly empty convoys.
-			stranded = append(stranded, strandedConvoyInfo{
-				ID:           convoy.ID,
-				Title:        convoy.Title,
-				TrackedCount: len(tracked),
-				ReadyCount:   0,
-				ReadyIssues:  []string{},
-				CreatedAt:    convoy.CreatedAt,
-				BaseBranch:   baseBranch,
-			})
+		info := strandedConvoyInfo{
+			ID:           convoy.ID,
+			Title:        convoy.Title,
+			TrackedCount: len(tracked),
+			ReadyCount:   len(readyIssues),
+			ReadyIssues:  readyIssues,
+			CreatedAt:    convoy.CreatedAt,
+			BaseBranch:   baseBranch,
+			Evidence:     evidence,
+			Reason:       convoyReason(len(tracked), evidence),
 		}
+		if info.ReadyIssues == nil {
+			info.ReadyIssues = []string{}
+		}
+		if info.Reason == strandedReasonWaiting {
+			waiting = append(waiting, info)
+			continue
+		}
+		stranded = append(stranded, info)
 	}
 
-	return stranded, nil
+	return stranded, waiting, nil
+}
+
+// classifyTrackedIssues classifies every tracked issue, returning the IDs that
+// can be dispatched now and a per-disposition tally of all of them.
+//
+// Town-level beads (hq- prefix with path=".") are not dispatchable via gt sling
+// — they're handled by the deacon — and neither are non-slingable types (epics,
+// convoys). Those are recorded as not-slingable rather than dropped, so they
+// still explain the ready count they reduce.
+func classifyTrackedIssues(townBeads string, tracked []trackedIssueInfo, env trackedIssueEnv) ([]string, map[string]int) {
+	return convoyops.ClassifyAll(townBeads, toSharedTrackedIssues(tracked), env.shared())
+}
+
+// toSharedTrackedIssues narrows dep-list rows to the fields that decide a
+// disposition.
+func toSharedTrackedIssues(tracked []trackedIssueInfo) []convoyops.TrackedIssue {
+	out := make([]convoyops.TrackedIssue, 0, len(tracked))
+	for _, t := range tracked {
+		out = append(out, convoyops.TrackedIssue{
+			ID:        t.ID,
+			Status:    t.Status,
+			IssueType: t.IssueType,
+			Assignee:  t.Assignee,
+			Blocked:   t.Blocked,
+		})
+	}
+	return out
+}
+
+// convoyReason turns the evidence into the one verdict a caller should act on.
+// It is the shared work-status verdict, reported at this surface's grain — the
+// dashboard reads the same call at finer grain, so neither can contradict the
+// other about a convoy (gt-skzk.1).
+func convoyReason(trackedCount int, evidence map[string]int) string {
+	return convoyops.Reason(convoyops.WorkStatus(trackedCount, evidence))
+}
+
+// formatEvidence renders an evidence tally in a stable order, e.g.
+// "1 deferred, 2 working". Closed issues are omitted unless they are all there
+// is: they are the normal end state and add noise to every other verdict.
+func formatEvidence(evidence map[string]int) string {
+	return convoyops.FormatEvidence(evidence)
+}
+
+// How a tracked issue stands relative to dispatch. Only dispoReady is work the
+// convoy can be fed; the rest each name a distinct answer to "why not", which is
+// what the old bare "0 ready" threw away. (gt-bel1)
+const (
+	dispoReady        = convoyops.DispoReady        // dispatchable right now
+	dispoClosed       = convoyops.DispoClosed       // done
+	dispoDeferred     = convoyops.DispoDeferred     // intentionally postponed — waiting on a stated condition
+	dispoScheduled    = convoyops.DispoScheduled    // open sling context — waiting for dispatch capacity
+	dispoWorking      = convoyops.DispoWorking      // assignee's session is alive — being worked
+	dispoInQueue      = convoyops.DispoInQueue      // assignee gone, but its work is an open MR
+	dispoBlocked      = convoyops.DispoBlocked      // has open blockers
+	dispoNotSlingable = convoyops.DispoNotSlingable // town-level or non-slingable type — deacon/mayor's job
+	dispoUnknown      = convoyops.DispoUnknown      // status unresolved (cross-rig DB unreachable)
+)
+
+// dispositionOrder fixes the rendering order of evidence so two runs of the same
+// state read identically.
+var dispositionOrder = convoyops.DispositionOrder
+
+// waitingDispositions are the states with a benign explanation: something is
+// already happening, or the bead is deliberately not to be dispatched. A convoy
+// where every non-closed issue is in one of these is WAITING, not stranded.
+var waitingDispositions = convoyops.WaitingDispositions
+
+// trackedIssueEnv carries the live-system lookups classifyTrackedIssue needs.
+// Injecting them keeps the classification testable without tmux or a beads DB.
+type trackedIssueEnv struct {
+	// scheduled is a pre-computed set of bead IDs with open sling contexts.
+	scheduled map[string]bool
+	// sessionAlive reports whether a tmux session name currently exists.
+	sessionAlive func(sessionName string) bool
+	// queuedMR reports whether the bead's work is already an open merge request.
+	queuedMR func(beadID string) bool
+}
+
+// shared adapts this env to the one the shared classifier takes.
+func (e trackedIssueEnv) shared() convoyops.Env {
+	return convoyops.Env{
+		Scheduled:    e.scheduled,
+		SessionAlive: e.sessionAlive,
+		QueuedMR:     e.queuedMR,
+	}
+}
+
+// classifyTrackedIssue decides how a tracked issue stands relative to dispatch.
+// The rules — and the orderings that carry them — live in internal/convoy so
+// the dashboard classifies a convoy from the same evidence this command does.
+func classifyTrackedIssue(t trackedIssueInfo, env trackedIssueEnv) string {
+	return convoyops.Classify(convoyops.TrackedIssue{
+		ID:        t.ID,
+		Status:    t.Status,
+		IssueType: t.IssueType,
+		Assignee:  t.Assignee,
+		Blocked:   t.Blocked,
+	}, env.shared())
+}
+
+// liveTrackedIssueEnv builds the classification environment against the real
+// tmux server and merge queue.
+func liveTrackedIssueEnv(townRoot string, scheduledSet map[string]bool) trackedIssueEnv {
+	return trackedIssueEnv{
+		scheduled:    scheduledSet,
+		sessionAlive: tmuxSessionExists,
+		queuedMR:     func(beadID string) bool { return hasQueuedMergeRequest(townRoot, beadID) },
+	}
+}
+
+// tmuxSessionExists reports whether a tmux session with this name is running.
+func tmuxSessionExists(sessionName string) bool {
+	return tmux.BuildCommand("has-session", "-t", sessionName).Run() == nil
+}
+
+// hasQueuedMergeRequest reports whether the bead's work is already sitting in
+// the merge queue as an open MR. Errors read as "no" — this only ever suppresses
+// a stranded flag, so failing closed would restore the false positive it exists
+// to remove.
+func hasQueuedMergeRequest(townRoot, beadID string) bool {
+	return convoyops.HasQueuedMergeRequest(townRoot, beadID)
 }
 
 // isReadyIssue checks if an issue is ready for dispatch (stranded).
-// An issue is ready if:
-// - status = "open" AND (no assignee OR assignee session is dead)
-// - OR status = "in_progress"/"hooked" AND assignee session is dead (orphaned molecule)
-// - AND not blocked (cross-rig-aware from issue details)
 // scheduledSet is a pre-computed set of bead IDs with open sling contexts (from areScheduled).
 func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
-	status := strings.TrimSpace(t.Status)
-
-	// Unresolved issues are not safe to dispatch.
-	if status == "" || status == trackedStatusUnknown {
-		return false
-	}
-
-	// Closed issues are never ready
-	if status == "closed" || status == "tombstone" {
-		return false
-	}
-
-	// Must not be blocked
-	if t.Blocked {
-		return false
-	}
-
-	// Scheduled beads are not stranded — they're waiting for dispatch capacity.
-	if scheduledSet[t.ID] {
-		return false
-	}
-
-	// Open issues with no assignee are trivially ready
-	if status == "open" && t.Assignee == "" {
-		return true
-	}
-
-	// For issues with an assignee (or non-open status with molecule attached),
-	// check if the worker session is still alive
-	if t.Assignee == "" {
-		// Non-open status but no assignee is an edge case (shouldn't happen
-		// normally, but could occur if molecule detached improperly)
-		return true
-	}
-
-	// Has assignee - check if session is alive
-	// Use the shared assigneeToSessionName from rig.go
-	sessionName, _ := assigneeToSessionName(t.Assignee)
-	if sessionName == "" {
-		return true // Can't determine session = treat as ready
-	}
-
-	// Check if tmux session exists
-	checkCmd := tmux.BuildCommand("has-session", "-t", sessionName)
-	if err := checkCmd.Run(); err != nil {
-		// Session doesn't exist = orphaned molecule or dead worker
-		// This is the key fix: issues with in_progress/hooked status but
-		// dead workers are now correctly detected as stranded
-		return true
-	}
-
-	return false // Session exists = worker is active
+	return classifyTrackedIssue(t, trackedIssueEnv{
+		scheduled:    scheduledSet,
+		sessionAlive: tmuxSessionExists,
+	}) == dispoReady
 }
 
 // isSlingableBead reports whether a bead can be dispatched via gt sling.
 // Town-level beads (hq- prefix with path=".") and beads with unknown
 // prefixes are not slingable — they're handled by the deacon/mayor.
 func isSlingableBead(townRoot, beadID string) bool {
-	prefix := beads.ExtractPrefix(beadID)
-	if prefix == "" {
-		return true // No prefix info, assume slingable
-	}
-	return beads.GetRigNameForPrefix(townRoot, prefix) != ""
+	return convoyops.IsSlingableBead(townRoot, beadID)
 }
 
 // checkAndCloseCompletedConvoys finds open convoys where all tracked issues are closed

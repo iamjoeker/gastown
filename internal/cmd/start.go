@@ -921,11 +921,28 @@ func cleanupPolecats(townRoot string) {
 				continue
 			}
 
-			// Delete the polecat branch from mayor's clone
-			branchName := fmt.Sprintf("polecat/%s", p.Name)
+			// Delete the polecat's branches from mayor's clone.
+			//
+			// Not "polecat/<name>" (gt-x6ji): real branch names are three
+			// components, polecat/<name>/<bead>+<suffix>, and git's D/F rule
+			// forbids a "polecat/<name>" ref existing alongside them. This
+			// deleted nothing on every invocation, and the discarded error hid
+			// it. Enumerate the namespace, and use -d so unmerged work is
+			// refused rather than force-deleted during a shutdown sweep.
 			mayorPath := filepath.Join(r.Path, "mayor", "rig")
 			mayorGit := git.NewGit(mayorPath)
-			_ = mayorGit.DeleteBranch(branchName, true) // Ignore errors
+			branches, err := mayorGit.ListBranches(fmt.Sprintf("polecat/%s/*", p.Name))
+			if err != nil {
+				fmt.Printf("  %s %s/%s: could not list branches in mayor clone: %v\n",
+					style.Dim.Render("○"), r.Name, p.Name, err)
+			}
+			for _, branchName := range branches {
+				if err := mayorGit.DeleteBranch(branchName, false); err != nil {
+					// A refusal is unmerged work. Say so and leave it alone.
+					fmt.Printf("  %s %s/%s: kept branch %s (%v)\n",
+						style.Dim.Render("○"), r.Name, p.Name, branchName, err)
+				}
+			}
 
 			fmt.Printf("  %s %s/%s: cleaned up\n", style.Bold.Render("✓"), r.Name, p.Name)
 			totalCleaned++

@@ -16,9 +16,9 @@ var (
 	mailType          string
 	mailReplyTo       string
 	mailNotify        bool
-	mailNoNotify      bool // Suppress auto-nudge notification to recipient
-	mailTo            string   // --to flag (alternative to positional arg)
-	mailFrom          string   // --from flag (override sender, for relay/bridge use)
+	mailNoNotify      bool   // Suppress auto-nudge notification to recipient
+	mailTo            string // --to flag (alternative to positional arg)
+	mailFrom          string // --from flag (override sender, for relay/bridge use)
 	mailSendSelf      bool
 	mailCC            []string // CC recipients
 	mailInboxJSON     bool
@@ -32,13 +32,17 @@ var (
 	mailThreadJSON    bool
 	mailReplySubject  string
 	mailReplyMessage  string
-	mailStdin         bool // Read message body from stdin
+	mailReplyCC       []string // CC recipients on a reply (its own var, not mailCC)
+	mailStdin         bool     // Read message body from stdin
+	mailAllowEmpty    bool     // Permit a subject-only message (gt-gxxm)
 
 	// Search flags
 	mailSearchFrom    string
 	mailSearchSubject bool
 	mailSearchBody    bool
 	mailSearchArchive bool
+	mailSearchSent    bool
+	mailSearchAll     bool
 	mailSearchJSON    bool
 
 	// Announces flags
@@ -126,6 +130,12 @@ Priority levels:
   4 - backlog
 
 Use --urgent as shortcut for --priority 0.
+
+A message with an empty (or whitespace-only) body is refused, whatever the
+source: a harness that does not attach stdin used to deliver a subject with
+nothing under it while printing the same success line as a real send, and the
+recipient could not tell that from a body that was never written. Pass
+--allow-empty when a subject-only message is genuinely what you want.
 
 Examples:
   gt mail send greenplace/Toast -s "Status check" -m "How's that bug fix going?"
@@ -322,7 +332,8 @@ The message body can be provided as a positional argument or via -m flag.
 Examples:
   gt mail reply msg-abc123 "Thanks, working on it now"
   gt mail reply msg-abc123 -m "Thanks, working on it now"
-  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"`,
+  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"
+  gt mail reply msg-abc123 --cc gastown/witness -m "Reply body"`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runMailReply,
 }
@@ -405,28 +416,43 @@ Examples:
 var mailSearchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search messages by content",
-	Long: `Search inbox for messages matching a pattern.
+	Long: `Search your mail for messages containing some text.
 
 SYNTAX:
   gt mail search <query> [flags]
 
-The query is a regular expression pattern. Search is case-insensitive by default.
+The query is literal text, not a regular expression: "." matches a dot and
+nothing else. Matching is case-insensitive.
+
+SCOPE — this is what a zero means:
+  The inbox is always searched. Your inbox holds OPEN mail only, and archiving
+  a message closes it, so an inbox-only search stops finding a message the
+  moment you archive it. Widen with:
+
+  --archive   also search mail you received and archived
+  --sent      also search mail you sent
+  --all       both of the above
+
+  Every run prints the scope it searched, so a result of 0 says which stores
+  were consulted rather than leaving you to assume it covered everything.
 
 FLAGS:
   --from <sender>   Filter by sender address (substring match)
   --subject         Only search subject lines
   --body            Only search message body
-  --archive         Include archived (closed) messages
+  --archive         Also search archived mail
+  --sent            Also search sent mail
+  --all             Search inbox, archived, and sent
   --json            Output as JSON
 
 By default, searches both subject and body text.
 
 Examples:
-  gt mail search "urgent"                    # Find messages with "urgent"
-  gt mail search "status.*check" --subject   # Regex in subjects only
+  gt mail search "urgent"                    # Inbox only
+  gt mail search "deadlock" --all            # Inbox + archived + sent
+  gt mail search "checkpoint" --sent         # Did I already report this?
   gt mail search "error" --from witness      # From witness, containing "error"
-  gt mail search "handoff" --archive         # Include archived messages
-  gt mail search "" --from mayor/            # All messages from mayor`,
+  gt mail search "" --from mayor/ --all      # Every message from mayor`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMailSearch,
 }
@@ -469,9 +495,12 @@ func init() {
 	mailSendCmd.Flags().StringVarP(&mailBody, "message", "m", "", "Message body")
 	mailSendCmd.Flags().StringVar(&mailBody, "body", "", "Alias for --message")
 	mailSendCmd.Flags().BoolVar(&mailStdin, "stdin", false, "Read message body from stdin (avoids shell quoting issues)")
+	// An empty body is refused by default (gt-gxxm): it delivers a subject with
+	// nothing under it and neither end can tell that from a real send.
+	mailSendCmd.Flags().BoolVar(&mailAllowEmpty, "allow-empty", false, "Send even when the body is empty (subject-only message)")
 	mailSendCmd.Flags().IntVar(&mailPriority, "priority", 2, "Message priority (0=urgent, 1=high, 2=normal, 3=low, 4=backlog)")
 	mailSendCmd.Flags().BoolVar(&mailUrgent, "urgent", false, "Set priority=0 (urgent)")
-	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type (task, scavenge, notification, reply)")
+	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type — does a reply come back? notification|reply|handoff owe nothing and are consumed by being read; query|task|scavenge|escalation stay open until answered")
 	mailSendCmd.Flags().StringVar(&mailReplyTo, "reply-to", "", "Message ID this is replying to")
 	mailSendCmd.Flags().BoolVarP(&mailNotify, "notify", "n", false, "Bump priority to high (notification is automatic; use --no-notify to suppress)")
 	mailSendCmd.Flags().BoolVar(&mailNoNotify, "no-notify", false, "Suppress auto-nudge notification to recipient")
@@ -516,12 +545,19 @@ func init() {
 	mailReplyCmd.Flags().StringVarP(&mailReplySubject, "subject", "s", "", "Override reply subject (default: Re: <original>)")
 	mailReplyCmd.Flags().StringVarP(&mailReplyMessage, "message", "m", "", "Reply message body")
 	mailReplyCmd.Flags().StringVar(&mailReplyMessage, "body", "", "Reply message body (alias for --message)")
+	// `gt mail send` has had --cc all along; reply was the odd one out, so
+	// reaching for it here printed a flag listing and sent nothing. The operator
+	// who hit that archived the original on the next line, and the reply left no
+	// trace anywhere (gt-1t0v #5, carried to gt-khq8).
+	mailReplyCmd.Flags().StringArrayVar(&mailReplyCC, "cc", nil, "CC recipients (can be used multiple times)")
 
 	// Search flags
 	mailSearchCmd.Flags().StringVar(&mailSearchFrom, "from", "", "Filter by sender address")
 	mailSearchCmd.Flags().BoolVar(&mailSearchSubject, "subject", false, "Only search subject lines")
 	mailSearchCmd.Flags().BoolVar(&mailSearchBody, "body", false, "Only search message body")
-	mailSearchCmd.Flags().BoolVar(&mailSearchArchive, "archive", false, "Include archived messages")
+	mailSearchCmd.Flags().BoolVar(&mailSearchArchive, "archive", false, "Also search archived mail")
+	mailSearchCmd.Flags().BoolVar(&mailSearchSent, "sent", false, "Also search mail you sent")
+	mailSearchCmd.Flags().BoolVar(&mailSearchAll, "all", false, "Search inbox, archived, and sent mail")
 	mailSearchCmd.Flags().BoolVar(&mailSearchJSON, "json", false, "Output as JSON")
 
 	// Announces flags

@@ -88,6 +88,22 @@ type ArchivedDependency struct {
 	DependsOnExternal string `json:"depends_on_external,omitempty"`
 }
 
+// ArchivedEvent is one row of a wisp's event history: who changed what, when.
+//
+// For a merge-request wisp the events ARE the record of its state transitions —
+// the wisps row carries only the CURRENT status, so submitted -> merged and
+// submitted -> rejected are indistinguishable in the row once it is closed. The
+// same holds for an escalation's acknowledgement. Archiving the row without its
+// events keeps the outcome and loses the history that explains it.
+type ArchivedEvent struct {
+	EventType string     `json:"event_type,omitempty"`
+	Actor     string     `json:"actor,omitempty"`
+	OldValue  string     `json:"old_value,omitempty"`
+	NewValue  string     `json:"new_value,omitempty"`
+	Comment   string     `json:"comment,omitempty"`
+	CreatedAt *time.Time `json:"created_at,omitempty"`
+}
+
 // ArchivedWisp is the durable record of one wisp, written before purge deletes
 // its row.
 //
@@ -125,6 +141,24 @@ type ArchivedWisp struct {
 	Labels       []string             `json:"labels,omitempty"`
 	Comments     []string             `json:"comments,omitempty"`
 	Dependencies []ArchivedDependency `json:"dependencies,omitempty"`
+
+	// Events is NOT omitempty, and the exception is the point (gt-wv8h).
+	//
+	// Until this field existed the delete named wisp_events among the tables it
+	// removed while nothing ever read that table into a record, so every wisp
+	// released between 2026-08-19 and 2026-08-25 lost its history with no trace:
+	// 98 records on this host, ~4 events each on the merge-request class.
+	// Measured, the archive and the live table disagreed by construction, and
+	// the code comment above the delete list asserted the opposite.
+	//
+	// An `omitempty` events key would render "this writer did not collect
+	// events" and "this wisp had none" as the same absence — which is the exact
+	// unreadable-zero this bug was reported as. Emitting `"events":null` instead
+	// makes the KEY the discriminator: a record without it predates the fix and
+	// its history is gone, a record with it is complete as written. Labels,
+	// Comments and Dependencies stay omitempty because the events key already
+	// dates the record, and the same writer fills all four.
+	Events []ArchivedEvent `json:"events"`
 }
 
 // Archiver stores wisp records durably so purge may delete their rows.
@@ -428,6 +462,11 @@ const archiveWispColumns = `w.id, w.title, w.description, w.design, w.notes, w.c
 // where a rejection rationale that did not fit the close reason ends up, and
 // protecting the wisp row while its comments are deleted would leave a husk
 // (the same point the gt-nmg tests assert about the protected path).
+//
+// The set collected here MUST stay equal to wispArchiveAuxTables, the tables
+// the caller then deletes. Any table in that list with no attach* call below is
+// a deletion with no record — which is what wisp_events was, for as long as the
+// comment on that list claimed the two lists were the same thing (gt-wv8h).
 func collectArchivableWisps(ctx context.Context, runner sqlRunner, dbName string, ids []string, archivedAt time.Time) ([]ArchivedWisp, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -494,6 +533,9 @@ func collectArchivableWisps(ctx context.Context, runner sqlRunner, dbName string
 	if err := attachArchiveDependencies(ctx, runner, byID, inClause, args); err != nil {
 		return nil, err
 	}
+	if err := attachArchiveEvents(ctx, runner, byID, inClause, args); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -557,6 +599,47 @@ func attachArchiveDependencies(ctx context.Context, runner sqlRunner, byID map[s
 		dep.DependsOnExternal = external.value()
 		if rec := byID[id]; rec != nil {
 			rec.Dependencies = append(rec.Dependencies, dep)
+		}
+	}
+	return rows.Err()
+}
+
+// attachArchiveEvents reads wisp_events into the records, oldest first.
+//
+// Ordered by created_at and then id because the value of an event list is the
+// SEQUENCE — submitted, then rejected, then resubmitted — and the id ordering
+// alone is only incidentally chronological once ids come from an
+// AUTO_INCREMENT shared with concurrent writers.
+//
+// Every column but issue_id is nullable in production or scanned through
+// nullText, so a row with no actor or an empty comment costs a field and never
+// the record: the caller answers an error here by leaving the rows in place,
+// and holding a wisp forever because one of its events had a NULL old_value
+// would be its own outage.
+func attachArchiveEvents(ctx context.Context, runner sqlRunner, byID map[string]*ArchivedWisp, inClause string, args []interface{}) error {
+	query := `SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+		FROM wisp_events WHERE issue_id IN ` + inClause + ` ORDER BY issue_id, created_at, id`
+	rows, err := runner.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("select archive events: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var eventType, actor, oldValue, newValue, comment nullText
+		var createdAt nullTime
+		if err := rows.Scan(&id, &eventType, &actor, &oldValue, &newValue, &comment, &createdAt); err != nil {
+			return fmt.Errorf("scan archive event: %w", err)
+		}
+		if rec := byID[id]; rec != nil {
+			rec.Events = append(rec.Events, ArchivedEvent{
+				EventType: eventType.value(),
+				Actor:     actor.value(),
+				OldValue:  oldValue.value(),
+				NewValue:  newValue.value(),
+				Comment:   comment.value(),
+				CreatedAt: createdAt.value(),
+			})
 		}
 	}
 	return rows.Err()

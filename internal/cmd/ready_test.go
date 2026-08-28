@@ -226,3 +226,76 @@ func TestFilterReadyIssuesByRoute(t *testing.T) {
 		t.Fatalf("rig filtered IDs = %v, want %v", got, want)
 	}
 }
+
+// --- Mail exclusion (gt-cw1u) ------------------------------------------------
+//
+// Mail is filed as an ordinary bead so it survives a session death, which also
+// puts every unread message in the work queue. Measured on the hq store
+// 2026-08-25: `bd ready -n 0` returned 605 rows, 358 of them (59%) gt:message,
+// and all eleven that reached this command's town section were P0 — eleven of
+// the seventeen slots at the top of the queue.
+
+func TestFilterMailBeads(t *testing.T) {
+	issues := []*beads.Issue{
+		{ID: "gt-work", Type: "bug", Title: "Real bug"},
+		{ID: "hq-mail", Type: "task", Title: "MAYOR RULING", Labels: []string{"gt:message", "from:mayor/"}},
+		{ID: "hq-typed", Type: "message", Title: "Legacy typed message"},
+		{ID: "gt-work2", Type: "task", Title: "Real task", Labels: []string{"area:refinery"}},
+	}
+
+	got := filterMailBeads(issues)
+
+	var ids []string
+	for _, issue := range got {
+		ids = append(ids, issue.ID)
+	}
+	want := []string{"gt-work", "gt-work2"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Errorf("filterMailBeads kept %v, want %v", ids, want)
+	}
+}
+
+func TestFilterMailBeadsIncludeMail(t *testing.T) {
+	prev := readyIncludeMail
+	readyIncludeMail = true
+	t.Cleanup(func() { readyIncludeMail = prev })
+
+	issues := []*beads.Issue{
+		{ID: "gt-work", Type: "bug"},
+		{ID: "hq-mail", Type: "task", Labels: []string{"gt:message"}},
+	}
+
+	if got := filterMailBeads(issues); len(got) != 2 {
+		t.Errorf("--include-mail must keep mail: kept %d of 2", len(got))
+	}
+}
+
+// TestFilterMailBeadsSpares keeps the exclusion from widening past mail. The
+// other gt: labels on an ordinary bead are not a reason to hide it from the
+// work queue, and a filter that matched any gt: prefix would empty the listing.
+func TestFilterMailBeadsSpares(t *testing.T) {
+	issues := []*beads.Issue{
+		{ID: "gt-esc", Type: "bug", Labels: []string{"gt:escalation"}},
+		{ID: "gt-keep", Type: "task", Labels: []string{"gt:keep"}},
+		{ID: "gt-conv", Type: "task", Labels: []string{"gt:convoy"}},
+	}
+
+	if got := filterMailBeads(issues); len(got) != 3 {
+		t.Errorf("filterMailBeads dropped a non-mail bead: kept %d of 3", len(got))
+	}
+}
+
+// TestReadyIncludeMailFlagRegistered pins the escape hatch. Excluding mail by
+// default is only defensible while the old listing is one flag away.
+func TestReadyIncludeMailFlagRegistered(t *testing.T) {
+	flag := readyCmd.Flags().Lookup("include-mail")
+	if flag == nil {
+		t.Fatal("gt ready must offer --include-mail to restore the unfiltered listing")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--include-mail default = %q, want \"false\" (mail excluded unless asked for)", flag.DefValue)
+	}
+	if !strings.Contains(readyCmd.Long, "--include-mail") {
+		t.Error("gt ready --help must say how to get mail back")
+	}
+}

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,12 +39,13 @@ var (
 	mqRejectStdin  bool // Read reason from stdin
 
 	// List command flags
-	mqListReady  bool
-	mqListStatus string
-	mqListWorker string
-	mqListEpic   string
-	mqListJSON   bool
-	mqListVerify bool
+	mqListReady      bool
+	mqListStatus     string
+	mqListWorker     string
+	mqListEpic       string
+	mqListJSON       bool
+	mqListVerify     bool
+	mqListMergeCheck bool
 
 	// Status command flags
 	mqStatusJSON bool
@@ -160,14 +162,29 @@ Output format:
   gt-mr-003   blocked      P1        polecat/Capable/gt-def    Capable 8m
               (waiting on gt-mr-001)
 
-With --verify, a GIT column reports what git says about each branch:
-  OK       Branch exists and carries at least one commit over its target
+--verify answers REACHABILITY AND NON-EMPTINESS ONLY. It is not a merge verdict.
+The GIT column reports:
+  PRESENT  Branch exists and carries at least one commit over its target
   EMPTY    Branch exists but is not ahead of its target — merging it is a no-op
   MISSING  Neither a local nor an origin ref for the branch exists
   ERR      git could not answer (unresolvable target, unreadable repo)
 
 EMPTY is a rejection, not a merge: an empty branch rehearses and tests cleanly,
 so every downstream gate reports success while zero lines change (gt-d5u).
+
+PRESENT is not clearance to merge. The good state used to be spelled OK, and in
+a column called GIT beside a STATUS column reading "ready" it was taken for a
+merge verdict — two branches so reported conflicted in 17 and 12 files, because
+their merge base was 700 commits back (gt-0w2l). Existence and mergeability are
+different questions and --verify only asks the first.
+
+To ask the second, use --merge-check. It runs a real three-way merge of each
+branch into its target with git merge-tree, in the object store only — no
+worktree, no index, nothing to unwind — and adds a MERGE column:
+  CLEAN          The merge produces a tree with no conflicts
+  CONFLICTS=<n>  The merge stops on n conflicted files
+  ERR            git could not rehearse it — UNKNOWN, not clean
+  -              Not rehearsed (branch was MISSING, EMPTY or ERR)
 
 Examples:
   gt mq list greenplace
@@ -176,7 +193,8 @@ Examples:
   gt mq list greenplace --status=closed    # merged/rejected MRs (audit)
   gt mq list greenplace --status=all       # every MR regardless of status
   gt mq list greenplace --worker=Nux
-  gt mq list greenplace --verify`,
+  gt mq list greenplace --verify           # can it be reached? is it non-empty?
+  gt mq list greenplace --merge-check      # will it actually merge?`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMQList,
 }
@@ -216,7 +234,15 @@ This command consolidates post-merge steps into a single atomic operation:
 	 1. Verify the target branch contains the submitted source head
 	 2. Close the MR bead (status: merged)
 	 3. Close the source issue
-	 4. Delete the remote polecat branch at the submitted head (unless --skip-branch-delete)
+	 4. Delete the remote polecat branch (unless --skip-branch-delete)
+
+The delete is leased against the branch's head as it stands now, not the sha
+recorded at submission: a branch refreshed to resolve a conflict has moved on,
+and that head is verified contained in the target before the branch goes.
+
+Steps 2-4 are not one transaction. When the branch delete fails, the steps that
+did land are printed and the outstanding one is named — re-running reports the
+earlier steps as already done and cannot tell you about the branch.
 
 Designed for use by the refinery formula after a successful merge to main.
 The branch name is read from the MR bead, so no manual branch argument is needed.
@@ -234,23 +260,40 @@ type mqPostMergeManager interface {
 }
 
 type mqPostMergeGit interface {
-	VerifyPushedCommitReachableFromPushTarget(remote, branch, commit string) error
-	PushRemoteBranchTip(remote, branch string) (string, error)
-	HasOpenPullRequest(ref git.PullRequestRef) bool
+	VerifyCommitLandedOnPushTarget(remote, branch, commit string) (git.MergeProof, error)
+	ResolveMergedBranchDeleteHead(remote, branch, target, recordedHead string) (string, error)
+	CheckOpenPullRequest(ref git.PullRequestRef) git.PullRequestProtection
 	Rev(ref string) (string, error)
 	DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error
 	DeleteBranch(branch string, force bool) error
 }
 
 type mqPostMergeBranchCleanup struct {
-	Branch        string
-	NoBranch      bool
-	Skipped       bool
-	Disabled      bool
-	OpenPR        bool
+	// Attempted records that the branch-cleanup step ran at all, which is what
+	// separates a cleanup failure (MR and issue already closed, branch left
+	// behind) from a failure before either was touched.
+	Attempted bool
+	Branch    string
+	NoBranch  bool
+	Skipped   bool
+	Disabled  bool
+	// OpenPR means a completed PR lookup found an open PR. PRLookupFailed means
+	// the lookup could not run, so nothing about the branch was determined.
+	// Both skip the delete; only one of them is a fact about the branch, and
+	// printing them as the same line told operators a PR was open when the
+	// lookup had 401'd (gt-wbvx).
+	OpenPR         bool
+	PRLookupFailed bool
+	// PRReason is the rendered protection, carrying the PR number when one was
+	// found and the lookup error when there was none.
+	PRReason      string
 	AlreadyGone   bool
 	RemoteDeleted bool
 	LocalDeleted  bool
+	// RefreshedHead is the branch head the delete was leased against when it
+	// differs from the MR's recorded commit_sha — the branch was refreshed
+	// after submission and that head was verified contained in the target.
+	RefreshedHead string
 }
 
 var mqStatusCmd = &cobra.Command{
@@ -388,11 +431,12 @@ func init() {
 	mqListCmd.Flags().StringVar(&mqListWorker, "worker", "", "Filter by worker name")
 	mqListCmd.Flags().StringVar(&mqListEpic, "epic", "", "Show MRs targeting integration/<epic>")
 	mqListCmd.Flags().BoolVar(&mqListJSON, "json", false, "Output as JSON")
-	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Verify branches in git (MISSING for deleted branches, EMPTY for branches with no commits over their target)")
+	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Check branch REACHABILITY and non-emptiness only — PRESENT is not a merge verdict (MISSING for deleted branches, EMPTY for branches with no commits over their target). Use --merge-check for mergeability")
+	mqListCmd.Flags().BoolVar(&mqListMergeCheck, "merge-check", false, "Rehearse each branch's merge into its target with git merge-tree and report CLEAN or CONFLICTS=<n> (implies --verify)")
 
 	// Reject flags
 	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required unless --stdin)")
-	mqRejectCmd.Flags().BoolVar(&mqRejectNotify, "notify", false, "Send mail notification to worker")
+	mqRejectCmd.Flags().BoolVar(&mqRejectNotify, "notify", false, "Tell the worker: nudge their session, falling back to durable mail if it is gone (the summary reports which, or that neither landed)")
 	mqRejectCmd.Flags().BoolVar(&mqRejectStdin, "stdin", false, "Read reason from stdin (avoids shell quoting issues)")
 
 	// Status flags
@@ -401,6 +445,9 @@ func init() {
 	// Post-merge flags
 	mqPostMergeCmd.Flags().BoolVar(&mqPostMergeSkipBranchDelete, "skip-branch-delete", false, "Skip remote branch deletion")
 
+	// Blocker-priority flags
+	mqBlockerPriorityCmd.Flags().BoolVar(&mqBlockerPriorityJSON, "json", false, "Show the derivation as JSON")
+
 	// Add subcommands
 	mqCmd.AddCommand(mqSubmitCmd)
 	mqCmd.AddCommand(mqRetryCmd)
@@ -408,6 +455,7 @@ func init() {
 	mqCmd.AddCommand(mqRejectCmd)
 	mqCmd.AddCommand(mqStatusCmd)
 	mqCmd.AddCommand(mqPostMergeCmd)
+	mqCmd.AddCommand(mqBlockerPriorityCmd)
 
 	// Integration branch subcommands
 	mqIntegrationCreateCmd.Flags().StringVar(&mqIntegrationCreateBranch, "branch", "", "Override branch name template (supports {title}, {epic}, {prefix}, {user})")
@@ -556,10 +604,7 @@ func runMQReject(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Worker: %s\n", result.MR.Worker)
 	fmt.Printf("  Reason: %s\n", mqRejectReason)
 	printRejectedIssueLine(result)
-
-	if mqRejectNotify {
-		fmt.Printf("  %s\n", style.Dim.Render("Worker notified via mail"))
-	}
+	printRejectNotifyLine(result)
 
 	return nil
 }
@@ -618,6 +663,79 @@ func printRejectedIssueLine(result *refinery.RejectResult) {
 	}
 }
 
+// rejectNotifyReport is the notification outcome of a rejection, as plain text.
+type rejectNotifyReport struct {
+	// Note is the line body; empty when --notify was not requested.
+	Note string
+	// Failed marks a notice that did NOT reach the worker, so the line is
+	// printed as a warning rather than dimmed.
+	Failed bool
+	// Action is an operator instruction, empty when nothing needs doing by hand.
+	Action string
+}
+
+// rejectNotifyReportFor describes what the notification half of a rejection
+// ACTUALLY did.
+//
+// The old line ("Worker notified via mail") was printed from the --notify flag
+// alone. It was wrong three ways at once: no mail was ever sent (the path
+// nudges), a failing nudge only reached a log line above the summary, and a
+// worker whose tmux session did not exist at all still read as notified. That
+// is the worst case to get wrong, because reject leaves the source issue HOOKED
+// to that worker — an unreachable polecat holding a hooked bead waits forever
+// for a merge that was already rejected (gt-sfcl).
+func rejectNotifyReportFor(result *refinery.RejectResult) rejectNotifyReport {
+	n := result.Notify
+	switch n.Outcome {
+	case refinery.NotifyNotRequested:
+		return rejectNotifyReport{}
+	case refinery.NotifyNudged:
+		return rejectNotifyReport{
+			Note: fmt.Sprintf("Worker notified: nudged %s", n.Target),
+		}
+	case refinery.NotifyMailed:
+		return rejectNotifyReport{
+			Note: fmt.Sprintf("Worker notified by mail (no live session: %v) - %s",
+				n.NudgeErr, n.Target),
+		}
+	case refinery.NotifySkipped:
+		return rejectNotifyReport{
+			Note:   fmt.Sprintf("Worker NOT notified: %s", n.SkipReason),
+			Failed: true,
+			Action: fmt.Sprintf("Tell them by hand: gt mail send %s -s 'MR rejected: %s' -m '...'",
+				n.Target, result.MR.IssueID),
+		}
+	default:
+		return rejectNotifyReport{
+			Note: fmt.Sprintf("Worker NOT notified: nudge: %v; mail: %v",
+				n.NudgeErr, n.MailErr),
+			Failed: true,
+			Action: fmt.Sprintf("Tell them by hand: gt mail send %s -s 'MR rejected: %s' -m '...'",
+				n.Target, result.MR.IssueID),
+		}
+	}
+}
+
+// printRejectNotifyLine reports the notification outcome.
+//
+// The rejection itself still succeeded when the notice did not land, so the
+// exit status stays 0 — a caller must not re-reject on this. The failure is
+// made unmissable in the summary block instead, where the old success line was.
+func printRejectNotifyLine(result *refinery.RejectResult) {
+	report := rejectNotifyReportFor(result)
+	if report.Note == "" {
+		return
+	}
+	if report.Failed {
+		fmt.Printf("  %s\n", style.Warning.Render("✗ "+report.Note))
+	} else {
+		fmt.Printf("  %s\n", style.Dim.Render(report.Note))
+	}
+	if report.Action != "" {
+		fmt.Printf("  %s\n", style.Warning.Render(report.Action))
+	}
+}
+
 func issueStatusLabel(status string) string {
 	if strings.TrimSpace(status) == "" {
 		return "unknown"
@@ -638,87 +756,171 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("post-merge proof: %w", err)
 	}
 
-	result, branchCleanup, err := runVerifiedMQPostMerge(mgr, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
-	if err != nil {
-		return fmt.Errorf("post-merge cleanup: %w", err)
+	result, proof, branchCleanup, err := runVerifiedMQPostMerge(mgr, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
+	return reportMQPostMerge(os.Stdout, result, proof, branchCleanup, err)
+}
+
+// reportMQPostMerge prints the per-step outcome of a post-merge run and returns
+// the error the command should exit with.
+//
+// Branch cleanup runs after the MR and the source issue are closed, and is not
+// part of that transaction: a failure there leaves cleanup half done. Returning
+// only the error hid that, because re-running reports "already closed" for the
+// finished steps and says nothing at all about the branch — the one outstanding
+// step was visible only by going and looking at the ref. So print the steps that
+// did land even on failure, and name the one that did not. (gt-yog2)
+func reportMQPostMerge(w io.Writer, result *refinery.PostMergeResult, proof git.MergeProof, branchCleanup mqPostMergeBranchCleanup, cleanupErr error) error {
+	if result == nil || result.MR == nil {
+		if cleanupErr != nil {
+			return fmt.Errorf("post-merge cleanup: %w", cleanupErr)
+		}
+		return nil
 	}
 
 	mr := result.MR
-	fmt.Printf("%s Post-merge: %s\n", style.Bold.Render("✓"), mr.ID)
-	fmt.Printf("  Branch: %s\n", mr.Branch)
-	fmt.Printf("  Worker: %s\n", mr.Worker)
+	marker := style.Bold.Render("✓")
+	if cleanupErr != nil {
+		marker = style.Warning.Render("⚠")
+	}
+	fmt.Fprintf(w, "%s Post-merge: %s\n", marker, mr.ID)
+	fmt.Fprintf(w, "  Branch: %s\n", mr.Branch)
+	fmt.Fprintf(w, "  Worker: %s\n", mr.Worker)
+	if line := describeMergeProof(proof, mr); line != "" {
+		fmt.Fprintf(w, "  %s %s\n", style.Success.Render("✓"), line)
+	}
 
 	if result.MRClosed {
-		fmt.Printf("  %s MR closed (merged)\n", style.Success.Render("✓"))
+		fmt.Fprintf(w, "  %s MR closed (merged)\n", style.Success.Render("✓"))
 	}
 	if result.SourceIssueClosed {
-		fmt.Printf("  %s Source issue closed: %s\n", style.Success.Render("✓"), result.SourceIssueID)
+		fmt.Fprintf(w, "  %s Source issue closed: %s\n", style.Success.Render("✓"), result.SourceIssueID)
 	} else if result.SourceIssueNotFound {
-		fmt.Printf("  %s Source issue: %s %s\n", style.Dim.Render("○"), result.SourceIssueID, style.Dim.Render("(already closed or not found)"))
+		fmt.Fprintf(w, "  %s Source issue: %s %s\n", style.Dim.Render("○"), result.SourceIssueID, style.Dim.Render("(already closed or not found)"))
 	}
 
-	if branchCleanup.NoBranch {
-		fmt.Printf("  %s No branch name in MR (skipping branch delete)\n", style.Dim.Render("○"))
-	} else if branchCleanup.Skipped {
-		fmt.Printf("  %s Branch delete skipped (--skip-branch-delete)\n", style.Dim.Render("○"))
-	} else if branchCleanup.Disabled {
-		fmt.Printf("  %s Branch delete disabled by config\n", style.Dim.Render("○"))
-	} else if branchCleanup.OpenPR {
-		fmt.Printf("  %s Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", style.Dim.Render("○"), mr.Branch)
-	} else if branchCleanup.AlreadyGone {
-		fmt.Printf("  %s Remote branch already absent: %s\n", style.Dim.Render("○"), mr.Branch)
-	} else if branchCleanup.RemoteDeleted {
-		fmt.Printf("  %s Deleted remote branch: %s\n", style.Success.Render("✓"), mr.Branch)
+	branch := strings.TrimSpace(branchCleanup.Branch)
+	if branch == "" {
+		branch = strings.TrimSpace(mr.Branch)
+	}
+
+	switch {
+	case cleanupErr != nil && !branchCleanup.Attempted:
+		// Failed before branch cleanup ran (a merge-proof or MR-close failure):
+		// the branch is untouched by design, so do not claim it is outstanding.
+		return fmt.Errorf("post-merge cleanup: %w", cleanupErr)
+	case cleanupErr != nil:
+		fmt.Fprintf(w, "  %s Remote branch NOT deleted: %s\n", style.Error.Render("✗"), branch)
+		fmt.Fprintf(w, "  %s\n", style.Warning.Render(fmt.Sprintf(
+			"Outstanding: %s still needs deleting (the steps above are done — re-running will not report this).", branch)))
+		return fmt.Errorf("post-merge cleanup incomplete for %s (MR and source issue closed; remote branch %s outstanding): %w", mr.ID, branch, cleanupErr)
+	case branchCleanup.NoBranch:
+		fmt.Fprintf(w, "  %s No branch name in MR (skipping branch delete)\n", style.Dim.Render("○"))
+	case branchCleanup.Skipped:
+		fmt.Fprintf(w, "  %s Branch delete skipped (--skip-branch-delete)\n", style.Dim.Render("○"))
+	case branchCleanup.Disabled:
+		fmt.Fprintf(w, "  %s Branch delete disabled by config\n", style.Dim.Render("○"))
+	case branchCleanup.OpenPR:
+		fmt.Fprintf(w, "  %s Skipping remote branch delete for %s: %s\n", style.Dim.Render("○"), branch, branchCleanup.PRReason)
+	case branchCleanup.PRLookupFailed:
+		// Warning, not a dim skip: an open PR is a settled state that needs
+		// nothing from anyone, while a failed lookup means this branch is
+		// unclassified and will stay on the remote until someone looks.
+		fmt.Fprintf(w, "  %s Skipping remote branch delete for %s: %s\n", style.Warning.Render("⚠"), branch, branchCleanup.PRReason)
+	case branchCleanup.AlreadyGone:
+		fmt.Fprintf(w, "  %s Remote branch already absent: %s\n", style.Dim.Render("○"), branch)
+	case branchCleanup.RemoteDeleted && branchCleanup.RefreshedHead != "":
+		fmt.Fprintf(w, "  %s Deleted remote branch: %s %s\n", style.Success.Render("✓"), branch,
+			style.Dim.Render(fmt.Sprintf("(refreshed to %s after submission; verified contained in %s)",
+				shortSHA(branchCleanup.RefreshedHead), strings.TrimSpace(mr.TargetBranch))))
+	case branchCleanup.RemoteDeleted:
+		fmt.Fprintf(w, "  %s Deleted remote branch: %s\n", style.Success.Render("✓"), branch)
 	}
 
 	if branchCleanup.LocalDeleted {
-		fmt.Printf("  %s Deleted local branch: %s\n", style.Success.Render("✓"), mr.Branch)
+		fmt.Fprintf(w, "  %s Deleted local branch: %s\n", style.Success.Render("✓"), branch)
 	}
 
 	return nil
 }
 
-func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPostMergeGit, mrID string, skipBranchDelete bool) (*refinery.PostMergeResult, mqPostMergeBranchCleanup, error) {
+// describeMergeProof renders how the landing was proven, so the record says
+// which evidence carried it rather than only that something did. A rebased
+// landing is proven by content under a rewritten sha, and the operator reading
+// this later needs to be able to tell that apart from plain containment.
+func describeMergeProof(proof git.MergeProof, mr *refinery.MergeRequest) string {
+	target := strings.TrimSpace(mr.TargetBranch)
+	commit := shortSHA(strings.TrimSpace(mr.CommitSHA))
+	switch proof.Method {
+	case git.MergeProofSHA:
+		return fmt.Sprintf("Merge proof: %s contains submitted head %s", target, commit)
+	case git.MergeProofContent:
+		detail := fmt.Sprintf("Merge proof: %s carries the content of submitted head %s under a rewritten sha (rebased landing)", target, commit)
+		if proof.TargetTip != "" {
+			detail += fmt.Sprintf("; target tip %s", shortSHA(proof.TargetTip))
+		}
+		if proof.Evidence != "" {
+			detail += fmt.Sprintf("; evidence %s", proof.Evidence)
+		}
+		return detail
+	default:
+		return ""
+	}
+}
+
+func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPostMergeGit, mrID string, skipBranchDelete bool) (*refinery.PostMergeResult, git.MergeProof, mqPostMergeBranchCleanup, error) {
 	mr, err := mgr.FindMRForPostMerge(mrID)
 	if err != nil {
-		return nil, mqPostMergeBranchCleanup{}, err
+		return nil, git.MergeProof{}, mqPostMergeBranchCleanup{}, err
 	}
-	if err := verifyMQPostMergeProof(rigGit, mr); err != nil {
-		return nil, mqPostMergeBranchCleanup{}, err
+	proof, err := verifyMQPostMergeProof(rigGit, mr)
+	if err != nil {
+		return nil, git.MergeProof{}, mqPostMergeBranchCleanup{}, err
 	}
 
 	result, err := mgr.PostMergeMR(mr)
 	if err != nil {
-		return result, mqPostMergeBranchCleanup{}, err
+		return result, proof, mqPostMergeBranchCleanup{}, err
 	}
 
 	branchCleanup, err := cleanupMQPostMergeBranch(rigPath, rigGit, result.MR, skipBranchDelete)
-	return result, branchCleanup, err
+	return result, proof, branchCleanup, err
 }
 
-func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {
+// verifyMQPostMergeProof proves the MR's work is on its target and returns how.
+//
+// The refusals below distinguish two things the operator has to respond to
+// differently. "did not land" is a statement about the work: it is not there, do
+// not close anything. "cannot be proven" is a statement about this check: it
+// could not read what it needed, and the MR may be perfectly fine. Naming the MR
+// as the problem in both cases reads as "this MR is bad" and is wrong in the
+// second (gt-umq0).
+func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) (git.MergeProof, error) {
 	if mr == nil {
-		return fmt.Errorf("merge proof failed: merge request is missing")
+		return git.MergeProof{}, fmt.Errorf("merge proof failed: merge request is missing")
 	}
 	target := strings.TrimSpace(mr.TargetBranch)
 	if target == "" {
-		return fmt.Errorf("merge proof failed for MR %s: missing target branch", mr.ID)
+		return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: missing target branch", mr.ID)
 	}
 	if source := strings.TrimSpace(mr.Branch); source != "" && source == target {
-		return fmt.Errorf("merge proof failed for MR %s: source branch %s matches target branch", mr.ID, source)
+		return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: source branch %s matches target branch", mr.ID, source)
 	}
 	commit := strings.TrimSpace(mr.CommitSHA)
 	if commit == "" {
-		return fmt.Errorf("merge proof failed for MR %s: missing submitted commit_sha", mr.ID)
+		return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: missing submitted commit_sha", mr.ID)
 	}
-	if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w", mr.ID, target, commit, err)
+	proof, err := rigGit.VerifyCommitLandedOnPushTarget("origin", target, commit)
+	if err == nil {
+		return proof, nil
 	}
-	return nil
+	if errors.Is(err, git.ErrMergeProofUnprovable) {
+		return git.MergeProof{}, fmt.Errorf("merge proof for MR %s could not be established (the MR itself may be fine): %w", mr.ID, err)
+	}
+	return git.MergeProof{}, fmt.Errorf("merge proof failed for MR %s: %s carries neither submitted head %s nor its content: %w", mr.ID, target, commit, err)
 }
 
 func cleanupMQPostMergeBranch(rigPath string, rigGit mqPostMergeGit, mr *refinery.MergeRequest, skipBranchDelete bool) (mqPostMergeBranchCleanup, error) {
-	cleanup := mqPostMergeBranchCleanup{}
+	cleanup := mqPostMergeBranchCleanup{Attempted: true}
 	if mr == nil {
 		return cleanup, fmt.Errorf("remote branch delete: merge request is missing")
 	}
@@ -744,23 +946,38 @@ func cleanupMQPostMergeBranch(rigPath string, rigGit mqPostMergeGit, mr *refiner
 
 	// Deleting a branch with an open PR causes GitHub to auto-close the PR as
 	// "closed" (not "merged"), destroying the PR audit trail. (gas-fk4)
-	if rigGit.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: cleanup.Branch, HeadSHA: expectedHead}) {
-		cleanup.OpenPR = true
+	leaseHead := expectedHead
+	protection := rigGit.CheckOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: cleanup.Branch, HeadSHA: expectedHead})
+	if protection.Protected() {
+		cleanup.OpenPR = protection.Open
+		cleanup.PRLookupFailed = protection.LookupFailed
+		cleanup.PRReason = protection.Reason()
 	} else {
-		remoteTip, err := rigGit.PushRemoteBranchTip("origin", cleanup.Branch)
+		// Lease against the branch's head as it stands now, not the sha recorded
+		// at submission: a branch refreshed to resolve a conflict has moved on,
+		// and leasing against the stale sha makes git reject the delete as
+		// "stale info". The resolver proves the current head is contained in the
+		// target before returning it, which is the safety property the recorded
+		// sha stood in for. (gt-yog2)
+		resolvedHead, err := rigGit.ResolveMergedBranchDeleteHead("origin", cleanup.Branch, strings.TrimSpace(mr.TargetBranch), expectedHead)
 		if err != nil {
-			return cleanup, fmt.Errorf("remote branch delete %s: read remote branch tip: %w", cleanup.Branch, err)
+			return cleanup, fmt.Errorf("remote branch delete %s: %w", cleanup.Branch, err)
 		}
-		if strings.TrimSpace(remoteTip) == "" {
+		if resolvedHead == "" {
 			cleanup.AlreadyGone = true
-		} else if err := rigGit.DeleteRemoteBranchIfAt("origin", cleanup.Branch, expectedHead); err != nil {
-			return cleanup, fmt.Errorf("remote branch delete %s at %s: %w", cleanup.Branch, expectedHead, err)
 		} else {
+			leaseHead = resolvedHead
+			if resolvedHead != expectedHead {
+				cleanup.RefreshedHead = resolvedHead
+			}
+			if err := rigGit.DeleteRemoteBranchIfAt("origin", cleanup.Branch, leaseHead); err != nil {
+				return cleanup, fmt.Errorf("remote branch delete %s at %s: %w", cleanup.Branch, leaseHead, err)
+			}
 			cleanup.RemoteDeleted = true
 		}
 	}
 
-	if deleteMQPostMergeLocalBranchIfAt(rigGit, cleanup.Branch, expectedHead) {
+	if deleteMQPostMergeLocalBranchIfAt(rigGit, cleanup.Branch, leaseHead) {
 		cleanup.LocalDeleted = true
 	}
 	return cleanup, nil

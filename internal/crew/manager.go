@@ -35,6 +35,16 @@ var (
 	ErrSessionNotFound = errors.New("session not found")
 )
 
+// crewRuntimeConfigDir resolves the account a crew session authenticates as:
+// the caller's if it resolved one, otherwise the town's. See
+// StartOptions.ClaudeConfigDir and gt-acb1 for why the caller is not trusted.
+func crewRuntimeConfigDir(townRoot, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return config.ResolveTownRuntimeConfigDir(townRoot)
+}
+
 // StartOptions configures crew session startup.
 type StartOptions struct {
 	// Account specifies the account handle to use (overrides default).
@@ -42,6 +52,13 @@ type StartOptions struct {
 
 	// ClaudeConfigDir is resolved CLAUDE_CONFIG_DIR for the account.
 	// If set, this is injected as an environment variable.
+	//
+	// Leaving it empty does NOT mean "no account": Start falls back to the
+	// town's, because an unset CLAUDE_CONFIG_DIR brings the agent up on the
+	// default ~/.claude profile and it goes logged out with nothing reporting an
+	// auth problem. Both of this option's callers happen to resolve an account
+	// today; the polecat session manager was the same shape and three of its four
+	// callers did not (gt-acb1).
 	ClaudeConfigDir string
 
 	// KillExisting kills any existing session before starting (for restart operations).
@@ -730,7 +747,7 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		Rig:              m.rig.Name,
 		AgentName:        name,
 		TownRoot:         townRoot,
-		RuntimeConfigDir: opts.ClaudeConfigDir,
+		RuntimeConfigDir: crewRuntimeConfigDir(townRoot, opts.ClaudeConfigDir),
 		Agent:            opts.AgentOverride,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)

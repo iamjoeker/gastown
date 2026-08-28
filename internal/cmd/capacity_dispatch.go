@@ -354,8 +354,9 @@ func printDispatchNoOp(report capacity.DispatchReport, snapshot polecatCapacityS
 	case "none":
 		fmt.Println("No ready beads scheduled for dispatch")
 	case "capacity":
-		fmt.Printf("\n%s No capacity: %d ready bead(s) waiting (working: %d recovery_blocked: %d reservations: %d reusable_idle: %d unverified_idle: %d pending_mr: %d)\n",
-			style.Dim.Render("○"), report.Skipped, snapshot.Working, snapshot.RecoveryBlocked, snapshot.Reservations, snapshot.ReusableIdle, snapshot.UnverifiedIdle, snapshot.PendingMR)
+		fmt.Printf("\n%s No capacity: %d ready bead(s) waiting (%s)\n",
+			style.Dim.Render("○"), report.Skipped, polecatCapacityBreakdown(snapshot))
+		printPolecatCapacityUnverifiedNote(os.Stdout, snapshot)
 	default:
 		fmt.Printf("\n%s No dispatchable beads (reason: %s, skipped: %d)\n",
 			style.Dim.Render("○"), report.Reason, report.Skipped)
@@ -371,8 +372,8 @@ func printDryRunPlan(plan capacity.DispatchPlan, snapshot polecatCapacitySnapsho
 
 	capStr := "unlimited"
 	if snapshot.Max > 0 {
-		capStr = fmt.Sprintf("%d free of %d (working: %d, recovery_blocked: %d, reservations: %d, reusable_idle: %d, unverified_idle: %d, pending_mr: %d)",
-			snapshot.Free, snapshot.Max, snapshot.Working, snapshot.RecoveryBlocked, snapshot.Reservations, snapshot.ReusableIdle, snapshot.UnverifiedIdle, snapshot.PendingMR)
+		capStr = fmt.Sprintf("%d free of %d (%s)",
+			snapshot.Free, snapshot.Max, polecatCapacityBreakdown(snapshot))
 	}
 
 	totalReady := len(plan.ToDispatch) + plan.Skipped
@@ -380,6 +381,7 @@ func printDryRunPlan(plan capacity.DispatchPlan, snapshot polecatCapacitySnapsho
 		switch plan.Reason {
 		case "capacity":
 			fmt.Printf("No capacity: %s, %d ready bead(s) waiting\n", capStr, totalReady)
+			printPolecatCapacityUnverifiedNote(os.Stdout, snapshot)
 		case "validation":
 			fmt.Printf("No dispatchable beads: validation failed for %d candidate(s)\n", totalReady)
 		default:
@@ -390,6 +392,7 @@ func printDryRunPlan(plan capacity.DispatchPlan, snapshot polecatCapacitySnapsho
 
 	fmt.Printf("%s Would dispatch %d bead(s) (capacity: %s, batch: %d, ready: %d, reason: %s)\n",
 		style.Bold.Render("📋"), len(plan.ToDispatch), capStr, batchSize, totalReady, plan.Reason)
+	printPolecatCapacityUnverifiedNote(os.Stdout, snapshot)
 	for _, b := range plan.ToDispatch {
 		fmt.Printf("  Would dispatch: %s → %s\n", b.WorkBeadID, b.TargetRig)
 	}
@@ -569,6 +572,13 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 		}
 		result[id] = beadStatusInfoFromBeadInfo(info)
 	}
+
+	// Both lookups above route by id prefix, which names the rig a bead was
+	// FILED in. For a bead moved to the rig that owns the work that is the
+	// closed source copy, and every caller here treats a closed row as a
+	// finished bead: the context gets reaped as "stale-work-bead", the bead
+	// leaves the queue, and `gt scheduler list` stops showing it (gt-ygb7).
+	adoptMovedWorkBeadRows(townRoot, requestedIDs, result)
 	return result
 }
 
@@ -816,6 +826,15 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 	rigPath := filepath.Join(townRoot, b.TargetRig)
 	rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
 	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
+		return nil
+	}
+	// The prefix cannot express a bead that moved. A bead filed in one rig and
+	// moved to the rig that owns the work keeps its id, so the guard above
+	// refuses the only rig that can run it — the same deadlock gt-ad32 fixed on
+	// the sling entry paths and left in place here (gt-ygb7). Ownership follows
+	// the live row, so a bead whose open row is in the target rig is not a
+	// cross-rig dispatch however its id reads.
+	if beadOwnedByRig(townRoot, b.TargetRig, b.WorkBeadID, nil) {
 		return nil
 	}
 	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)

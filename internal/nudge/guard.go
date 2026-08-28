@@ -61,3 +61,35 @@ func guardTestEnqueue(townRoot, session, message string) (handled bool, err erro
 	return true, fmt.Errorf("%w, or set %s to record instead of queueing",
 		testguard.Refusal("queue nudge for", session, "town root", townRoot), testguard.LogEnv)
 }
+
+// guardTestStartPoller stops a test binary from launching a poller process.
+//
+// This guard is deliberately STRICTER than guardTestEnqueue: a disposable town
+// root does not make it safe. The hazard is not where the poller would write —
+// it is what gets executed. StartPoller runs os.Executable(), which under `go
+// test` is the test binary, so spawning a poller from a test re-runs the suite
+// as a detached background process that nothing waits on. A temporary town root
+// isolates the queue and does nothing about that, which is why Disposable is not
+// consulted here and Authorized is: a test that names the town root is claiming
+// to own a real gt binary and a real town, not merely a scratch directory.
+//
+// It exists because StartPoller acquired callers on every agent spawn path
+// (gt-xmq6). Before that it was reached only from four managers that tests do
+// not drive; now it sits behind session.StartSession, which any future test of
+// the shared lifecycle will call.
+//
+// Returns handled=true when the caller must not spawn. Injection — the
+// startPoller field on deacon.Manager, the vars in session and cmd — remains the
+// way a test observes the decision; this is the backstop for the paths that do
+// not inject.
+func guardTestStartPoller(townRoot, session string) (handled bool, err error) {
+	// testing.Testing() is true only in a binary built by `go test`, so this
+	// cannot fire in production regardless of the environment.
+	if !testing.Testing() {
+		return false, nil
+	}
+	if testguard.Authorized(townRoot) {
+		return false, nil
+	}
+	return true, testguard.Refusal("start a nudge poller for", session, "town root", townRoot)
+}

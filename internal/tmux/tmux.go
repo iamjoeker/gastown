@@ -1276,8 +1276,10 @@ func (t *Tmux) SendKeys(session, keys string) error {
 // This prevents race conditions where Enter arrives before paste is processed.
 func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr error) {
 	defer func() { telemetry.RecordPromptSend(context.Background(), session, keys, debounceMs, retErr) }()
-	// Send text using literal mode (-l) to handle special chars
-	if _, err := t.run("send-keys", "-t", session, "-l", keys); err != nil {
+	// Send text using literal mode (-l) to handle special chars.
+	// "--" is required: without it tmux parses payload text beginning with a
+	// hyphen as more send-keys options. See sendLiteral.
+	if _, err := t.run(sendLiteralArgs(session, keys)...); err != nil {
 		return err
 	}
 	// Wait for paste to be processed
@@ -1473,24 +1475,63 @@ func sanitizeNudgeMessage(msg string) string {
 //
 // Detection is based on pane content analysis. Returns false on any error
 // (defensive — don't block nudge delivery on detection failure).
+//
+// A BUSY pane is never in Rewind mode, and that is checked first (gt-z8ra).
+// Rewind is a modal UI that captures all input — an agent sitting in it is not
+// generating, so "mid-turn" and "in Rewind" are mutually exclusive states. The
+// gate matters because the remedy is destructive: dismissRewindMode sends a
+// real Escape, and Escape cancels in-flight generation. It runs at nudge step
+// 0, BEFORE the shouldSendEscape guard that protects step 5, so a false
+// positive here is the one path by which a nudge still interrupts a working
+// agent — killing the turn and every child process of it, with no error, no
+// log, and no signal record anywhere, because it is a keystroke.
+//
+// The textual check alone cannot carry that weight: it scans for a bare "esc"
+// substring, which the busy footer "esc to interrupt" satisfies on every busy
+// Claude Code pane, permanently. That left only "rewind" and "enter" to be
+// found anywhere in the snapshot — which an agent's own transcript supplies
+// whenever it discusses rewinding or a word containing "enter". Because pane
+// content persists, a contaminated transcript makes EVERY nudge arriving in
+// that window fire the Escape, which is why the failures cluster.
 func (t *Tmux) isInRewindMode(target string) bool {
-	content, err := t.CapturePane(target, 15)
+	lines, err := t.CapturePaneLines(target, idleCaptureHistoryLines)
 	if err != nil {
 		return false
 	}
-	return containsRewindIndicators(content)
+	// Structural discriminator, checked before the textual one: if the agent is
+	// demonstrably mid-turn, the Rewind modal is not up and no Escape is owed.
+	if busyFromLines(lines, readyPromptPrefixForSession(t, target)) {
+		return false
+	}
+	return containsRewindIndicators(strings.Join(lines, "\n"))
 }
 
 // containsRewindIndicators checks pane content for Claude Code Rewind menu
 // patterns. The Rewind UI takes over the terminal and shows distinctive
 // action prompts (Enter to act, Esc to cancel/exit). We require multiple
 // co-occurring indicators to avoid false positives from conversation text.
+//
+// Every indicator must be an ACTION PROMPT ("enter to …", "esc to …"), never a
+// bare "enter"/"esc" substring, and status-footer lines are excluded before
+// matching (gt-z8ra). Both rules exist for the same reason: the pane holds the
+// agent's own transcript as well as its chrome, so text ABOUT rewinding, and
+// the busy footer's own "esc to interrupt", used to satisfy a search FOR the
+// Rewind menu. The caller acts on a hit by sending Escape, so a false positive
+// here interrupts a working agent.
 func containsRewindIndicators(content string) bool {
-	lower := strings.ToLower(content)
+	// Drop the agent's status footer: "esc to interrupt" is the busy indicator,
+	// not Rewind chrome, and it matches every "esc to …" pattern below.
+	kept := make([]string, 0, strings.Count(content, "\n")+1)
+	for _, line := range strings.Split(content, "\n") {
+		if !hasBusyIndicator(line) {
+			kept = append(kept, line)
+		}
+	}
+	lower := strings.ToLower(strings.Join(kept, "\n"))
 
 	// Primary: "rewind" appears alongside both Enter and Esc action prompts.
 	if strings.Contains(lower, "rewind") {
-		if strings.Contains(lower, "enter") && strings.Contains(lower, "esc") {
+		if strings.Contains(lower, "enter to ") && strings.Contains(lower, "esc to ") {
 			return true
 		}
 	}
@@ -1606,6 +1647,25 @@ func adaptiveTextDelay(messageLen int) time.Duration {
 // raw stdin (like Claude Code's TUI) are not affected.
 const sendKeysChunkSize = 512
 
+// sendLiteralArgs builds the tmux argv for sending one run of literal text.
+//
+// The "--" is load-bearing. tmux parses send-keys options with getopt, and -l
+// takes no argument, so a payload beginning with "-" is read as further option
+// flags rather than as the text to type:
+//
+//	tmux send-keys -t %3 -l "-bmh and the rest"
+//	  -> command send-keys: unknown flag -b   (exit 1, nothing sent)
+//
+// This bit chunked nudges (gt-bp18). Chunk boundaries fall at fixed 512-byte
+// offsets with no regard for content, and agent-to-agent messages are dense
+// with hyphens — bead IDs (dn-bmh, gt-bp18), "--flag", "- " list bullets. When
+// a boundary landed immediately before one, tmux rejected that chunk while the
+// preceding chunks had already been typed into the recipient's composer: the
+// message arrived truncated mid-word, cut exactly before the hyphen.
+func sendLiteralArgs(target, text string) []string {
+	return []string{"send-keys", "-t", target, "-l", "--", text}
+}
+
 func (t *Tmux) sendMessageToTarget(target, text string) error {
 	if len(text) <= sendKeysChunkSize {
 		return t.sendKeysLiteralWithRetry(target, text, constants.NudgeReadyTimeout)
@@ -1624,8 +1684,13 @@ func (t *Tmux) sendMessageToTarget(target, text string) error {
 				return err
 			}
 		} else {
-			if _, err := t.run("send-keys", "-t", target, "-l", chunk); err != nil {
-				return err
+			if _, err := t.run(sendLiteralArgs(target, chunk)...); err != nil {
+				// Everything before this chunk is already in the recipient's
+				// composer. Say so: a bare transport error reads as "nothing
+				// was sent", and the receiving end is the only place a partial
+				// payload is visible otherwise (gt-bp18).
+				return fmt.Errorf("partial delivery: %d of %d bytes already sent to %s before chunk at offset %d failed: %w",
+					i, len(text), target, i, err)
 			}
 		}
 		// Small delay between chunks to let the terminal process
@@ -1655,7 +1720,7 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 	var lastErr error
 
 	for time.Now().Before(deadline) {
-		_, err := t.run("send-keys", "-t", target, "-l", text)
+		_, err := t.run(sendLiteralArgs(target, text)...)
 		if err == nil {
 			return nil
 		}
@@ -3650,6 +3715,92 @@ func (t *Tmux) IsBusy(session string) bool {
 		return false
 	}
 	return busyFromLines(lines, readyPromptPrefixForSession(t, session))
+}
+
+// loggedOutIndicators is the single source of truth for the substrings an agent
+// TUI renders in its status region when it has no usable credentials. Same role
+// as busyIndicators, and the same fragility: it couples to upstream status text
+// and a silent rename fails closed, reporting no evidence rather than an error.
+//
+// Both markers were read off a live gastown/foundation pane one minute after a
+// `gt session restart` brought it up without CLAUDE_CONFIG_DIR (gt-acb1):
+//
+//	● Login expired · Please run /login
+//	✻ Crunched for 0s · done 8:58 PM
+//	   Not logged in · Run /login
+//
+// This state does NOT resolve on its own. It is not a transient the next poll
+// clears: the session has no credentials and will sit there until a human runs
+// /login, which is why it is worth a detector at all.
+var loggedOutIndicators = []string{"Not logged in", "Login expired"}
+
+func hasLoggedOutIndicator(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, marker := range loggedOutIndicators {
+		if strings.Contains(trimmed, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// loggedOutFromLines reports whether a pane snapshot shows an agent sitting at
+// an auth wall. It is the third reader of the anchored status region, alongside
+// busyFromLines and idleFromLines, and it is deliberately the strictest of them.
+//
+// Positive evidence only, and NO unanchored fallback — this is the one place
+// where busyFromLines' "scan the whole snapshot when no anchor is found"
+// behaviour would be wrong rather than merely conservative. Text ABOUT being
+// logged out satisfies a search FOR being logged out, and the agents most likely
+// to have "Not logged in" in their transcript are the ones investigating this
+// very defect. A whole-pane scan would report the investigator as needing a
+// human login.
+//
+// The two directions cost differently, which is what sets the bound. A false
+// negative leaves things exactly as they were before this function existed —
+// the logged-out agent goes unnoticed, which is the status quo it is trying to
+// improve on. A false positive parks a healthy polecat on a verdict whose only
+// remedy is a person at a browser. So when the pane cannot be located as an
+// agent pane, this answers no.
+//
+// One thing not established: the excerpt above is three contiguous lines lifted
+// from an incident report, not a full-height capture, so where the composer sits
+// relative to the marker is unverified. The scan therefore reuses the busy
+// scan's region — anchor, everything below, and turnBusyLookback non-empty lines
+// above — rather than assuming the marker is strictly below the composer.
+func loggedOutFromLines(lines []string, promptPrefix string) bool {
+	lines = trimTrailingBlankLines(lines)
+	anchor := statusAnchor(lines, promptPrefix)
+	if anchor < 0 {
+		return false
+	}
+	return indicatorNearAnchor(lines, anchor, hasLoggedOutIndicator)
+}
+
+// IsLoggedOut reports whether a session's pane shows positive evidence that the
+// agent has no usable credentials and is waiting on a human to run /login.
+//
+// It exists because that state was invisible to every health surface. On
+// 2026-08-25 `gt rig status` reported gastown/foundation as "working" and
+// `gt polecat check-recovery` returned WORKING for eighteen minutes while its
+// pane read "Not logged in · Run /login" — hooked-ness was being read as
+// liveness. The same variable left the Deacon logged out for 3.27 days without
+// anything noticing (hq-nms9g). Both are the same gap: no surface in this repo
+// looked at the pane for an auth wall, and a grep for these markers across every
+// .go file in the tree returned zero.
+//
+// Same one-way contract as IsBusy: true means the pane demonstrably showed the
+// auth wall at capture time; false means only that nothing proved it did. An
+// unreadable pane, a dead session, or a non-agent session all return false.
+func (t *Tmux) IsLoggedOut(session string) bool {
+	lines, err := t.CapturePaneLines(session, idleCaptureHistoryLines)
+	if err != nil {
+		return false
+	}
+	return loggedOutFromLines(lines, readyPromptPrefixForSession(t, session))
 }
 
 // GetSessionInfo returns detailed information about a session.

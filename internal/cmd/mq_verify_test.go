@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -78,7 +80,7 @@ func TestVerifyBranch(t *testing.T) {
 				ahead:         map[string]int{"main..polecat/Nux/gt-abc": 3},
 			},
 			fields:    &beads.MRFields{Branch: "polecat/Nux/gt-abc", Target: "main"},
-			wantState: mrBranchStateOK,
+			wantState: mrBranchStatePresent,
 			wantAhead: 3,
 		},
 		{
@@ -93,7 +95,7 @@ func TestVerifyBranch(t *testing.T) {
 				ahead: map[string]int{"origin/main..origin/polecat/Nux/gt-abc": 1},
 			},
 			fields:    &beads.MRFields{Branch: "polecat/Nux/gt-abc", Target: "main"},
-			wantState: mrBranchStateOK,
+			wantState: mrBranchStatePresent,
 			wantAhead: 1,
 		},
 		{
@@ -145,7 +147,7 @@ func TestVerifyBranch(t *testing.T) {
 				ahead: map[string]int{"integration/auth-epic..polecat/Nux/gt-abc": 2},
 			},
 			fields:    &beads.MRFields{Branch: "polecat/Nux/gt-abc", Target: "integration/auth-epic"},
-			wantState: mrBranchStateOK,
+			wantState: mrBranchStatePresent,
 			wantAhead: 2,
 		},
 		{
@@ -259,8 +261,8 @@ func TestVerifyBranchAgainstRealGit(t *testing.T) {
 	}
 
 	state, ahead = verifyBranch(true, g, &beads.MRFields{Branch: "polecat/Nux/gt-abc", Target: "main"})
-	if state != mrBranchStateOK {
-		t.Errorf("branch with work: state = %q, want %q", state, mrBranchStateOK)
+	if state != mrBranchStatePresent {
+		t.Errorf("branch with work: state = %q, want %q", state, mrBranchStatePresent)
 	}
 	if ahead != 1 {
 		t.Errorf("branch with work: commitsAhead = %d, want 1", ahead)
@@ -269,5 +271,275 @@ func TestVerifyBranchAgainstRealGit(t *testing.T) {
 	state, _ = verifyBranch(true, g, &beads.MRFields{Branch: "polecat/gone/gt-xyz", Target: "main"})
 	if state != mrBranchStateMissing {
 		t.Errorf("deleted branch: state = %q, want %q", state, mrBranchStateMissing)
+	}
+}
+
+// mockMergeRehearser implements mergeRehearser for testing.
+type mockMergeRehearser struct {
+	conflicts map[string][]string // "base..branch" -> conflicted paths
+	err       error
+	calls     int
+}
+
+func (m *mockMergeRehearser) MergeConflicts(base, branch string) ([]string, error) {
+	m.calls++
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.conflicts[base+".."+branch], nil
+}
+
+func TestRehearseMerge(t *testing.T) {
+	present := mrVerification{
+		state:        mrBranchStatePresent,
+		commitsAhead: 700,
+		branchRef:    "origin/polecat/deathclaw/gt-x",
+		targetRef:    "origin/main",
+	}
+
+	tests := []struct {
+		name          string
+		check         bool
+		client        mergeRehearser
+		verification  mrVerification
+		wantState     mrMergeState
+		wantConflicts int
+		wantCalls     int
+	}{
+		{
+			name:         "merge check disabled",
+			check:        false,
+			client:       &mockMergeRehearser{},
+			verification: present,
+			wantState:    mrMergeStateSkipped,
+		},
+		{
+			name:         "nil client",
+			check:        true,
+			client:       nil,
+			verification: present,
+			wantState:    mrMergeStateSkipped,
+		},
+		{
+			name:          "clean merge",
+			check:         true,
+			client:        &mockMergeRehearser{},
+			verification:  present,
+			wantState:     mrMergeStateClean,
+			wantConflicts: 0,
+			wantCalls:     1,
+		},
+		{
+			// The measured case from gt-0w2l: PRESENT, 700 commits ahead, and
+			// unmergeable. Existence and mergeability disagreeing is the whole
+			// point of this check, so the fixture must exhibit it.
+			name:  "present branch that conflicts",
+			check: true,
+			client: &mockMergeRehearser{conflicts: map[string][]string{
+				"origin/main..origin/polecat/deathclaw/gt-x": conflictedPathsFixture(17),
+			}},
+			verification:  present,
+			wantState:     mrMergeStateConflicts,
+			wantConflicts: 17,
+			wantCalls:     1,
+		},
+		{
+			name:          "git failure is ERR, never CLEAN",
+			check:         true,
+			client:        &mockMergeRehearser{err: errors.New("bad object")},
+			verification:  present,
+			wantState:     mrMergeStateErr,
+			wantConflicts: 0,
+			wantCalls:     1,
+		},
+		{
+			name:         "empty branch is not rehearsed",
+			check:        true,
+			client:       &mockMergeRehearser{},
+			verification: mrVerification{state: mrBranchStateEmpty, branchRef: "origin/b", targetRef: "origin/main"},
+			wantState:    mrMergeStateSkipped,
+		},
+		{
+			name:         "missing branch is not rehearsed",
+			check:        true,
+			client:       &mockMergeRehearser{},
+			verification: mrVerification{state: mrBranchStateMissing},
+			wantState:    mrMergeStateSkipped,
+		},
+		{
+			name:         "unresolved refs are not rehearsed",
+			check:        true,
+			client:       &mockMergeRehearser{},
+			verification: mrVerification{state: mrBranchStatePresent, commitsAhead: 2},
+			wantState:    mrMergeStateSkipped,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotState, gotConflicts := rehearseMerge(tt.check, tt.client, tt.verification)
+			if gotState != tt.wantState {
+				t.Errorf("rehearseMerge() state = %q, want %q", gotState, tt.wantState)
+			}
+			if gotConflicts != tt.wantConflicts {
+				t.Errorf("rehearseMerge() conflicts = %d, want %d", gotConflicts, tt.wantConflicts)
+			}
+			if m, ok := tt.client.(*mockMergeRehearser); ok && m.calls != tt.wantCalls {
+				t.Errorf("rehearseMerge() called git %d time(s), want %d", m.calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func conflictedPathsFixture(n int) []string {
+	paths := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		paths = append(paths, fmt.Sprintf("internal/pkg/file%d.go", i))
+	}
+	return paths
+}
+
+// TestRehearseMergeAgainstRealGit is the control this whole change exists for:
+// a branch that --verify calls PRESENT, with commits over its target, that
+// still cannot merge. If the rehearsal ever agrees with --verify on this
+// fixture, it has stopped measuring anything (gt-0w2l).
+func TestRehearseMergeAgainstRealGit(t *testing.T) {
+	repo := t.TempDir()
+	runGitForMQSubmitTest(t, repo, "init")
+	runGitForMQSubmitTest(t, repo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, repo, "config", "user.name", "Test User")
+
+	writeMQSubmitTestFile(t, repo, "a.txt", "base\n")
+	writeMQSubmitTestFile(t, repo, "b.txt", "base\n")
+	runGitForMQSubmitTest(t, repo, "add", ".")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "base")
+	runGitForMQSubmitTest(t, repo, "branch", "-M", "main")
+
+	// A branch that edits two files one way...
+	runGitForMQSubmitTest(t, repo, "checkout", "-b", "polecat/deathclaw/gt-x")
+	writeMQSubmitTestFile(t, repo, "a.txt", "deathclaw\n")
+	writeMQSubmitTestFile(t, repo, "b.txt", "deathclaw\n")
+	runGitForMQSubmitTest(t, repo, "commit", "-am", "deathclaw")
+
+	// ...and a branch that touches a file main never moved.
+	runGitForMQSubmitTest(t, repo, "checkout", "-b", "polecat/nux/gt-y", "main")
+	writeMQSubmitTestFile(t, repo, "c.txt", "nux\n")
+	runGitForMQSubmitTest(t, repo, "add", ".")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "nux")
+
+	// main moves the same two lines the other way, so the merge base is behind
+	// both tips — exactly the shape that produced 17 conflicted files in the
+	// live case.
+	runGitForMQSubmitTest(t, repo, "checkout", "main")
+	writeMQSubmitTestFile(t, repo, "a.txt", "main\n")
+	writeMQSubmitTestFile(t, repo, "b.txt", "main\n")
+	runGitForMQSubmitTest(t, repo, "commit", "-am", "main moved on")
+
+	g := gitpkg.NewGit(repo)
+
+	conflicting := &beads.MRFields{Branch: "polecat/deathclaw/gt-x", Target: "main"}
+	v := verifyBranchRefs(true, g, conflicting)
+	if v.state != mrBranchStatePresent {
+		t.Fatalf("conflicting branch: verify state = %q, want %q", v.state, mrBranchStatePresent)
+	}
+	state, files := rehearseMerge(true, g, v)
+	if state != mrMergeStateConflicts {
+		t.Errorf("conflicting branch: merge state = %q, want %q", state, mrMergeStateConflicts)
+	}
+	if files != 2 {
+		t.Errorf("conflicting branch: conflicted files = %d, want 2", files)
+	}
+
+	clean := &beads.MRFields{Branch: "polecat/nux/gt-y", Target: "main"}
+	v = verifyBranchRefs(true, g, clean)
+	if v.state != mrBranchStatePresent {
+		t.Fatalf("clean branch: verify state = %q, want %q", v.state, mrBranchStatePresent)
+	}
+	state, files = rehearseMerge(true, g, v)
+	if state != mrMergeStateClean {
+		t.Errorf("clean branch: merge state = %q, want %q", state, mrMergeStateClean)
+	}
+	if files != 0 {
+		t.Errorf("clean branch: conflicted files = %d, want 0", files)
+	}
+}
+
+// TestVerifyBranchRefsResolvesRefsForRehearsal pins the refs the rehearsal runs
+// against. Rehearsing "polecat/x" when the queue will merge "origin/polecat/x"
+// answers about a different commit, and a stale local ref is the routine way
+// those two come apart.
+func TestVerifyBranchRefsResolvesRefsForRehearsal(t *testing.T) {
+	client := &mockBranchVerifier{
+		localBranches: map[string]bool{"polecat/Nux/gt-abc": true, "main": true},
+		remoteBranches: map[string]bool{
+			"origin/polecat/Nux/gt-abc": true,
+			"origin/main":               true,
+		},
+		ahead: map[string]int{"origin/main..origin/polecat/Nux/gt-abc": 5},
+	}
+	v := verifyBranchRefs(true, client, &beads.MRFields{Branch: "polecat/Nux/gt-abc", Target: "main"})
+	if v.branchRef != "origin/polecat/Nux/gt-abc" {
+		t.Errorf("branchRef = %q, want %q", v.branchRef, "origin/polecat/Nux/gt-abc")
+	}
+	if v.targetRef != "origin/main" {
+		t.Errorf("targetRef = %q, want %q", v.targetRef, "origin/main")
+	}
+}
+
+// TestVerifyStatesDoNotReadAsMergeClearance guards the rename, and it is a
+// behaviour test rather than a spelling one: the failure it prevents is a
+// reader taking a reachability answer for a merge verdict.
+//
+// "OK" is banned outright. It is the string that misled — in a GIT column
+// beside a "ready" status it read as clearance for two branches that conflicted
+// in 17 and 12 files (gt-0w2l) — and reintroducing it anywhere in these states
+// reintroduces the defect whatever else changes around it.
+func TestVerifyStatesDoNotReadAsMergeClearance(t *testing.T) {
+	for _, state := range []mrBranchState{
+		mrBranchStatePresent, mrBranchStateMissing, mrBranchStateEmpty, mrBranchStateErr,
+	} {
+		if strings.EqualFold(string(state), "OK") {
+			t.Errorf("branch state %q reads as merge clearance; --verify answers reachability only", state)
+		}
+	}
+	if mrBranchStatePresent != "PRESENT" {
+		t.Errorf("the reachable-and-non-empty state is %q, want PRESENT", mrBranchStatePresent)
+	}
+
+	// The help an operator reads before believing the column has to carry the
+	// limit AND point at the check that does answer mergeability. Matching
+	// distinctive content phrases, not headings — headings get restyled.
+	help := mqListCmd.Long
+	for _, want := range []string{
+		"not a merge verdict",
+		"PRESENT",
+		"--merge-check",
+		"CONFLICTS=<n>",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("gt mq list --help does not mention %q:\n%s", want, help)
+		}
+	}
+	if strings.Contains(mqListCmd.Long, "\n  OK  ") {
+		t.Error("gt mq list --help still documents an OK state")
+	}
+}
+
+// TestMergeCheckFlagIsRegistered keeps the fix reachable. A verdict that only
+// exists as a function is a verdict nobody can ask for.
+func TestMergeCheckFlagIsRegistered(t *testing.T) {
+	f := mqListCmd.Flags().Lookup("merge-check")
+	if f == nil {
+		t.Fatal("gt mq list has no --merge-check flag")
+	}
+	if !strings.Contains(f.Usage, "merge-tree") {
+		t.Errorf("--merge-check usage does not say how it decides: %q", f.Usage)
+	}
+	v := mqListCmd.Flags().Lookup("verify")
+	if v == nil {
+		t.Fatal("gt mq list has no --verify flag")
+	}
+	if !strings.Contains(v.Usage, "not a merge verdict") {
+		t.Errorf("--verify usage does not disclaim a merge verdict: %q", v.Usage)
 	}
 }

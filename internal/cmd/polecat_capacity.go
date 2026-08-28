@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -25,16 +27,23 @@ var acquirePolecatAdmissionFn = acquirePolecatAdmission
 // (max > 0). See MarshalJSON for how that is reflected on the wire; the field
 // tags below are not what callers see.
 type polecatCapacitySnapshot struct {
-	Max             int `json:"max"`
-	Working         int `json:"working"`
-	RecoveryBlocked int `json:"recovery_blocked"`
-	ReusableIdle    int `json:"reusable_idle"`
-	UnverifiedIdle  int `json:"unverified_idle"`
-	PendingMR       int `json:"pending_mr"`
-	Reservations    int `json:"reservations"`
-	Free            int `json:"free"`
-	ActiveSessions  int `json:"active_sessions"`
-	capacityUsed    int
+	Max int `json:"max"`
+	// VerifiedReusableIdle counts idle polecats a git check cleared for reuse.
+	// It is deliberately not called "reusable idle": nothing in ordinary
+	// operation runs that check, so it is a floor on what is available, never
+	// the total. See polecatCapacityUnverifiedNote (gt-rjhr).
+	VerifiedReusableIdle int `json:"verified_reusable_idle"`
+	Working              int `json:"working"`
+	RecoveryBlocked      int `json:"recovery_blocked"`
+	UnverifiedIdle       int `json:"unverified_idle"`
+	PendingMR            int `json:"pending_mr"`
+	Reservations         int `json:"reservations"`
+	Free                 int `json:"free"`
+	ActiveSessions       int `json:"active_sessions"`
+	capacityUsed         int
+	// unverifiedExample names one polecat counted in UnverifiedIdle, so the
+	// note can hand the reader a command to run rather than a placeholder.
+	unverifiedExample string
 }
 
 func (s polecatCapacitySnapshot) occupied() int {
@@ -44,17 +53,21 @@ func (s polecatCapacitySnapshot) occupied() int {
 // measuredPolecatCapacityJSON is the wire form of a snapshot taken while
 // admission control is enabled (max > 0): every field was counted.
 type measuredPolecatCapacityJSON struct {
-	Max             int    `json:"max"`
-	Admission       string `json:"admission"`
-	Measured        bool   `json:"measured"`
-	Working         int    `json:"working"`
-	RecoveryBlocked int    `json:"recovery_blocked"`
-	ReusableIdle    int    `json:"reusable_idle"`
-	UnverifiedIdle  int    `json:"unverified_idle"`
-	PendingMR       int    `json:"pending_mr"`
-	Reservations    int    `json:"reservations"`
-	Free            int    `json:"free"`
-	ActiveSessions  int    `json:"active_sessions"`
+	Max                  int    `json:"max"`
+	Admission            string `json:"admission"`
+	Measured             bool   `json:"measured"`
+	Working              int    `json:"working"`
+	RecoveryBlocked      int    `json:"recovery_blocked"`
+	VerifiedReusableIdle int    `json:"verified_reusable_idle"`
+	UnverifiedIdle       int    `json:"unverified_idle"`
+	// UnverifiedIdleNote is absent exactly when unverified_idle is 0, which is
+	// emitted unconditionally beside it — so its absence is readable, not a
+	// silently dropped measurement.
+	UnverifiedIdleNote string `json:"unverified_idle_note,omitempty"`
+	PendingMR          int    `json:"pending_mr"`
+	Reservations       int    `json:"reservations"`
+	Free               int    `json:"free"`
+	ActiveSessions     int    `json:"active_sessions"`
 }
 
 // unmeasuredPolecatCapacityJSON is the wire form of a snapshot taken while
@@ -74,7 +87,7 @@ type unmeasuredPolecatCapacityJSON struct {
 //
 // polecatCapacitySnapshotForTownNoCleanup short-circuits at max <= 0 before it
 // reads rigs.json, lists sessions, or applies any workstate disposition, so
-// Working/RecoveryBlocked/ReusableIdle/PendingMR/Reservations/Free are struct
+// Working/RecoveryBlocked/VerifiedReusableIdle/PendingMR/Reservations/Free are struct
 // zero values in that mode — not counts of zero. Marshaling them unconditionally
 // told readers "free: 0" (capacity exhausted) when admission was in fact
 // disabled and nothing was being gated, and "recovery_blocked: 0" while
@@ -93,18 +106,70 @@ func (s polecatCapacitySnapshot) MarshalJSON() ([]byte, error) {
 		})
 	}
 	return json.Marshal(measuredPolecatCapacityJSON{
-		Max:             s.Max,
-		Admission:       "enabled",
-		Measured:        true,
-		Working:         s.Working,
-		RecoveryBlocked: s.RecoveryBlocked,
-		ReusableIdle:    s.ReusableIdle,
-		UnverifiedIdle:  s.UnverifiedIdle,
-		PendingMR:       s.PendingMR,
-		Reservations:    s.Reservations,
-		Free:            s.Free,
-		ActiveSessions:  s.ActiveSessions,
+		Max:                  s.Max,
+		Admission:            "enabled",
+		Measured:             true,
+		Working:              s.Working,
+		RecoveryBlocked:      s.RecoveryBlocked,
+		VerifiedReusableIdle: s.VerifiedReusableIdle,
+		UnverifiedIdle:       s.UnverifiedIdle,
+		UnverifiedIdleNote:   polecatCapacityUnverifiedNote(s),
+		PendingMR:            s.PendingMR,
+		Reservations:         s.Reservations,
+		Free:                 s.Free,
+		ActiveSessions:       s.ActiveSessions,
 	})
+}
+
+// polecatCapacityBreakdown renders the per-disposition counters. Four surfaces
+// print this breakdown; rendering it in one place is what keeps the field name
+// and its caveat from drifting apart between them (gt-rjhr).
+func polecatCapacityBreakdown(s polecatCapacitySnapshot) string {
+	return fmt.Sprintf(
+		"working: %d, recovery_blocked: %d, reservations: %d, verified_reusable_idle: %d, unverified_idle: %d, pending_mr: %d",
+		s.Working, s.RecoveryBlocked, s.Reservations, s.VerifiedReusableIdle, s.UnverifiedIdle, s.PendingMR)
+}
+
+// polecatCapacityUnverifiedNote states, wherever the breakdown is printed, what
+// verified_reusable_idle does not count. It returns "" when there is nothing
+// unverified to disclaim.
+//
+// Nothing promotes a polecat out of unverified_idle during ordinary operation:
+// the inventory surface that feeds this snapshot runs no git and says so about
+// itself, and `gt polecat check-recovery` is operator-invoked. The count is
+// therefore pinned near zero by construction — it cannot rise on its own.
+//
+// Read bare, a structural zero reads as scarcity, and scarcity is pressure
+// toward destructive reclamation: the figure was cited three times in one
+// night as evidence that stuck polecats had to be nuked to reclaim slots, while
+// 21 of 25 were in fact eligible for reuse. The load-bearing correction is that
+// unverified idle polecats consume no capacity — `free` never counted them as
+// occupied, so a low reusable count is not a full town. (gt-rjhr)
+func polecatCapacityUnverifiedNote(s polecatCapacitySnapshot) string {
+	if s.Max <= 0 || s.UnverifiedIdle <= 0 {
+		return ""
+	}
+	noun := "polecats"
+	if s.UnverifiedIdle == 1 {
+		noun = "polecat"
+	}
+	example := s.unverifiedExample
+	if example == "" {
+		example = "<rig>/<name>"
+	}
+	return fmt.Sprintf(
+		"%d idle %s were classified WITHOUT a git check and nothing verifies proactively, so verified_reusable_idle=%d is a floor, not the number available for reuse. None of them counts against free. For a measured verdict: gt polecat check-recovery %s",
+		s.UnverifiedIdle, noun, s.VerifiedReusableIdle, example)
+}
+
+// printPolecatCapacityUnverifiedNote writes the note as its own dimmed line
+// beneath a capacity breakdown, or nothing when there is none.
+func printPolecatCapacityUnverifiedNote(w io.Writer, s polecatCapacitySnapshot) {
+	note := polecatCapacityUnverifiedNote(s)
+	if note == "" {
+		return
+	}
+	fmt.Fprintf(w, "%s\n", style.Dim.Render("  "+note))
 }
 
 func (s *polecatCapacitySnapshot) addWorking() {
@@ -119,8 +184,8 @@ func (s *polecatCapacitySnapshot) addRecoveryBlocked(countsTowardCapacity bool) 
 	}
 }
 
-func (s *polecatCapacitySnapshot) addReusableIdle() {
-	s.ReusableIdle++
+func (s *polecatCapacitySnapshot) addVerifiedReusableIdle() {
+	s.VerifiedReusableIdle++
 }
 
 // addUnverifiedIdle counts a polecat that nothing blocked and nothing checked.
@@ -129,9 +194,14 @@ func (s *polecatCapacitySnapshot) addReusableIdle() {
 // git and no merge-queue lookup, so these polecats were previously counted as
 // reusable_idle on the strength of facts nobody gathered — and `gt sling` then
 // refused them one by one at the measured gate (gt-49dp). They are counted
-// separately rather than dropped: like reusable_idle they hold no capacity, but
-// a reader comparing this projection against dispatch reality needs to see that
-// the pool's apparent depth is unconfirmed.
+// separately rather than dropped: like verified_reusable_idle they hold no
+// capacity, but a reader comparing this projection against dispatch reality
+// needs to see that the pool's apparent depth is unconfirmed.
+//
+// This is the bucket almost every idle polecat lands in, because nothing
+// proactively runs the check that would move one out of it — which is why the
+// verified count beside it must never be read as "how many are available"
+// (gt-rjhr).
 func (s *polecatCapacitySnapshot) addUnverifiedIdle() {
 	s.UnverifiedIdle++
 }
@@ -177,18 +247,18 @@ func (e *polecatCapacityAdmissionError) Error() string {
 	if e.Snapshot.Max <= 0 {
 		return fmt.Sprintf("polecat admission denied: %s", e.Reason)
 	}
+	note := polecatCapacityUnverifiedNote(e.Snapshot)
+	if note != "" {
+		note = " Note: " + note + "."
+	}
 	return fmt.Sprintf(
-		"polecat admission denied: %s (max=%d occupied=%d working=%d recovery_blocked=%d reservations=%d reusable_idle=%d unverified_idle=%d pending_mr=%d free=%d). Resolve recovery-needed polecats or raise scheduler.max_polecats; inspect with `gt scheduler status --json` or `gt polecat list --all --json`",
+		"polecat admission denied: %s (max: %d, occupied: %d, %s, free: %d). Resolve recovery-needed polecats or raise scheduler.max_polecats; inspect with `gt scheduler status --json` or `gt polecat list --all --json`.%s",
 		e.Reason,
 		e.Snapshot.Max,
 		e.Snapshot.occupied(),
-		e.Snapshot.Working,
-		e.Snapshot.RecoveryBlocked,
-		e.Snapshot.Reservations,
-		e.Snapshot.ReusableIdle,
-		e.Snapshot.UnverifiedIdle,
-		e.Snapshot.PendingMR,
+		polecatCapacityBreakdown(e.Snapshot),
 		e.Snapshot.Free,
+		note,
 	)
 }
 
@@ -357,7 +427,11 @@ func listPolecatDirectoryNames(rigPath string) ([]string, error) {
 
 func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet, mrIndex *polecatBranchMRIndex) {
 	item := buildPolecatInventoryItem(rigName, polecatName, fields, activeWork, sessions, mrIndex)
+	unverifiedBefore := snapshot.UnverifiedIdle
 	applyWorkstateDispositionToCapacitySnapshot(snapshot, item.State, item.Disposition)
+	if snapshot.UnverifiedIdle > unverifiedBefore && snapshot.unverifiedExample == "" {
+		snapshot.unverifiedExample = rigName + "/" + polecatName
+	}
 }
 
 func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapshot, state polecat.State, disposition polecat.WorkstateDisposition) {
@@ -366,7 +440,7 @@ func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapsh
 		return
 	}
 	if disposition.Reusable {
-		snapshot.addReusableIdle()
+		snapshot.addVerifiedReusableIdle()
 		return
 	}
 	if disposition.Verdict == polecat.WorkstateVerdictUnverified {

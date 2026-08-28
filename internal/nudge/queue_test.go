@@ -1,6 +1,8 @@
 package nudge
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -789,5 +791,266 @@ func TestConcurrentDrainNoDoubleDeli(t *testing.T) {
 	// Verify no double-delivery: total must be exactly count, not more.
 	if total > count {
 		t.Errorf("double delivery detected: got %d total nudges, want exactly %d", total, count)
+	}
+}
+
+func TestPurgeExpiredRemovesOnlyDeadEntries(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-purge-expired"
+
+	live := QueuedNudge{Sender: "mayor", Message: "live", ExpiresAt: time.Now().Add(time.Hour)}
+	dead := QueuedNudge{Sender: "mayor", Message: "dead", ExpiresAt: time.Now().Add(-time.Hour)}
+	forever := QueuedNudge{Sender: "mayor", Message: "no ttl", ExpiresAt: time.Time{}}
+
+	for _, n := range []QueuedNudge{live, dead, forever} {
+		// Enqueue would stamp a default TTL over the zero ExpiresAt, so write
+		// the file directly to keep "no TTL" actually meaning no TTL.
+		writeNudgeFile(t, townRoot, session, n)
+	}
+
+	removed, err := PurgeExpired(townRoot, session)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d, want 1", removed)
+	}
+
+	remaining, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("remaining %d, want 2: %+v", len(remaining), remaining)
+	}
+}
+
+// The depth cap used to be enforced by age alone: a queue full of nudges that
+// the next Drain would discard unread still refused the live message arriving
+// now, so a dead entry outlived the one superseding it (gt-loz6).
+func TestEnqueueSweepsExpiredBeforeRejecting(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-cap-sweep"
+
+	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
+	for i := 0; i < maxDepth; i++ {
+		writeNudgeFile(t, townRoot, session, QueuedNudge{
+			Sender:    "mayor",
+			Message:   "dead order",
+			Timestamp: time.Now().Add(-3 * time.Hour),
+			ExpiresAt: time.Now().Add(-time.Hour),
+		})
+	}
+	if n, _ := Pending(townRoot, session); n != maxDepth {
+		t.Fatalf("setup: pending = %d, want %d", n, maxDepth)
+	}
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "the correction"}); err != nil {
+		t.Fatalf("Enqueue into a queue full of expired entries: %v", err)
+	}
+
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 1 || drained[0].Message != "the correction" {
+		t.Fatalf("drained %+v, want only the correction", drained)
+	}
+}
+
+// A live queue is still full: the sweep must not turn the cap into a no-op.
+func TestEnqueueStillRejectsWhenFullOfLiveEntries(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-cap-live"
+
+	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
+	for i := 0; i < maxDepth; i++ {
+		if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "live"}); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+
+	err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "overflow"})
+	if err == nil {
+		t.Fatal("Enqueue into a full queue of live entries should fail")
+	}
+	if !strings.Contains(err.Error(), "full") {
+		t.Errorf("error = %v, want it to mention the queue being full", err)
+	}
+}
+
+func TestRemoveByMessage(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-remove-by-message"
+
+	entries := []QueuedNudge{
+		{Sender: "mayor", Message: "read it", Kind: KindMail, MessageID: "gt-a", ThreadID: "thread-1"},
+		{Sender: "system", Message: "reply to it", Kind: KindReplyReminder, MessageID: "gt-a", ThreadID: "thread-1"},
+		{Sender: "mayor", Message: "other message, same thread", Kind: KindMail, MessageID: "gt-b", ThreadID: "thread-1"},
+		{Sender: "mayor", Message: "pre-MessageID entry", Kind: KindMail, ThreadID: "thread-1"},
+		{Sender: "witness", Message: "plain nudge"},
+	}
+	for _, n := range entries {
+		if err := Enqueue(townRoot, session, n); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	removed, err := RemoveByMessage(townRoot, session, "gt-a", "thread-1")
+	if err != nil {
+		t.Fatalf("RemoveByMessage: %v", err)
+	}
+	// Both entries for gt-a, plus the pre-MessageID entry matched on thread.
+	if removed != 3 {
+		t.Fatalf("removed %d, want 3", removed)
+	}
+
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 2 {
+		t.Fatalf("remaining %d, want 2: %+v", len(drained), drained)
+	}
+	for _, n := range drained {
+		if n.MessageID == "gt-a" {
+			t.Errorf("nudge for gt-a survived: %+v", n)
+		}
+	}
+}
+
+// A reply reminder used to record only what it was about, so nothing but a mail
+// reply on the same thread could retire it (gt-w4ba).
+func TestRemoveReplyReminders(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-remove-reply-reminders"
+
+	entries := []QueuedNudge{
+		{Sender: "system", Message: "owed to witness, thread-1", Kind: KindReplyReminder, ReplyTo: "gastown/witness", ThreadID: "thread-1"},
+		{Sender: "system", Message: "owed to witness, thread-2", Kind: KindReplyReminder, ReplyTo: "gastown/witness", ThreadID: "thread-2"},
+		{Sender: "system", Message: "owed to mayor", Kind: KindReplyReminder, ReplyTo: "mayor/", ThreadID: "thread-1"},
+		{Sender: "system", Message: "pre-ReplyTo reminder", Kind: KindReplyReminder, ThreadID: "thread-1"},
+		{Sender: "gastown/witness", Message: "mail announcement", Kind: KindMail, ThreadID: "thread-1"},
+		{Sender: "gastown/witness", Message: "plain nudge"},
+	}
+	for _, n := range entries {
+		if err := Enqueue(townRoot, session, n); err != nil {
+			t.Fatalf("Enqueue(%q): %v", n.Message, err)
+		}
+	}
+
+	removed, err := RemoveReplyReminders(townRoot, session, func(replyTo string) bool {
+		return replyTo == "gastown/witness"
+	})
+	if err != nil {
+		t.Fatalf("RemoveReplyReminders: %v", err)
+	}
+	// Both threads owed to the witness go; nothing else does. In particular the
+	// mail announcement stays: answering is not reading.
+	if removed != 2 {
+		t.Fatalf("removed %d, want 2", removed)
+	}
+
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 4 {
+		t.Fatalf("remaining %d, want 4: %+v", len(drained), drained)
+	}
+	for _, n := range drained {
+		if n.ReplyTo == "gastown/witness" {
+			t.Errorf("reminder owed to the nudged agent survived: %+v", n)
+		}
+	}
+}
+
+// A reminder written before ReplyTo existed names nobody. Matching it would
+// retire every agent's reminder on the first nudge to anyone.
+func TestRemoveReplyRemindersSkipsUnaddressedReminders(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-reply-reminders-legacy"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{
+		Sender: "system", Message: "pre-ReplyTo reminder", Kind: KindReplyReminder, ThreadID: "thread-1",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	called := false
+	removed, err := RemoveReplyReminders(townRoot, session, func(string) bool {
+		called = true
+		return true
+	})
+	if err != nil {
+		t.Fatalf("RemoveReplyReminders: %v", err)
+	}
+	if called {
+		t.Error("matcher was consulted for a reminder carrying no address")
+	}
+	if removed != 0 {
+		t.Fatalf("removed %d, want 0", removed)
+	}
+}
+
+// The banner used to carry sender and subject only, so an agent holding ten
+// queued orders could not tell which was current (gt-loz6).
+func TestFormatForInjectionCarriesTimestamps(t *testing.T) {
+	sent := time.Now().Add(-2*time.Hour - 14*time.Minute)
+	output := FormatForInjection([]QueuedNudge{
+		{Sender: "mayor/", Message: "STANDING ORDER", Priority: PriorityUrgent, Timestamp: sent},
+	})
+
+	if !strings.Contains(output, "2h14m ago") {
+		t.Errorf("banner should carry the nudge's age:\n%s", output)
+	}
+	if !strings.Contains(output, sent.Local().Format("15:04 MST")) {
+		t.Errorf("banner should carry the send time:\n%s", output)
+	}
+}
+
+func TestFormatForInjectionOmitsStampWithoutTimestamp(t *testing.T) {
+	output := FormatForInjection([]QueuedNudge{{Sender: "mayor/", Message: "hi"}})
+	if !strings.Contains(output, "[from mayor/] hi") {
+		t.Errorf("a nudge with no timestamp should render unchanged:\n%s", output)
+	}
+}
+
+func TestHumanAge(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{90 * time.Second, "1m"},
+		{59 * time.Minute, "59m"},
+		{2*time.Hour + 14*time.Minute, "2h14m"},
+		{3 * time.Hour, "3h00m"},
+		{50 * time.Hour, "2d2h"},
+	}
+	for _, tt := range tests {
+		if got := humanAge(tt.d); got != tt.want {
+			t.Errorf("humanAge(%v) = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
+// writeNudgeFile puts a nudge in the queue exactly as given, bypassing the
+// defaults Enqueue would stamp on.
+func writeNudgeFile(t *testing.T, townRoot, session string, n QueuedNudge) {
+	t.Helper()
+	dir := queueDir(townRoot, session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if n.Timestamp.IsZero() {
+		n.Timestamp = time.Now()
+	}
+	data, err := json.MarshalIndent(n, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s.json", n.Timestamp.UnixNano(), randomSuffix()))
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
 }

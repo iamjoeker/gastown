@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,6 +44,7 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 		wantReusable bool
 		wantRecovery bool
 		wantCapacity bool
+		wantBlocker  string // substring that must appear in some blocker
 	}{
 		{
 			// Nothing blocks and nothing was checked. This constructor reads
@@ -97,12 +99,20 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			wantRecovery: true,
 		},
 		{
-			name:         "paused agent state protects without capacity",
-			polecatName:  "paused",
-			fields:       &beads.AgentFields{AgentState: string(beads.AgentStatePaused), CleanupStatus: string(polecat.CleanupClean)},
-			wantState:    polecat.StateIdle,
-			wantVerdict:  polecat.WorkstateVerdictNeedsRecovery,
-			wantRecovery: true,
+			// A pause blocks reuse but is NOT a recovery condition, and this
+			// surface runs no git — so it reports UNVERIFIED rather than the
+			// NEEDS_RECOVERY it used to assert without measuring. The blocker
+			// assertion is the load-bearing half: the whole defect in gt-fbgq was
+			// agent_state going unreported by the surfaces that classify, and a
+			// build that dropped the field entirely would also answer UNVERIFIED
+			// here. Only check-recovery, which measures, upgrades this to
+			// NEEDS_STATE_CLEAR.
+			name:        "paused agent state blocks reuse and stays named",
+			polecatName: "paused",
+			fields:      &beads.AgentFields{AgentState: string(beads.AgentStatePaused), CleanupStatus: string(polecat.CleanupClean)},
+			wantState:   polecat.StateIdle,
+			wantVerdict: polecat.WorkstateVerdictUnverified,
+			wantBlocker: "agent_state=paused",
 		},
 		{
 			name:        "active mr is pending non capacity",
@@ -142,6 +152,11 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			item := buildPolecatInventoryItem("gastown", tt.polecatName, tt.fields, tt.activeWork, sessions, nil)
 			if item.State != tt.wantState || item.Issue != tt.wantIssue || item.Disposition.Verdict != tt.wantVerdict || item.Disposition.Reusable != tt.wantReusable || item.Disposition.NeedsRecovery != tt.wantRecovery || item.Disposition.CountsTowardCapacity != tt.wantCapacity {
 				t.Fatalf("item = %+v disposition=%+v", item, item.Disposition)
+			}
+			if tt.wantBlocker != "" && !slices.ContainsFunc(item.Disposition.Blockers, func(b string) bool {
+				return strings.Contains(b, tt.wantBlocker)
+			}) {
+				t.Fatalf("blockers %q do not name %q", item.Disposition.Blockers, tt.wantBlocker)
 			}
 		})
 	}
@@ -195,8 +210,15 @@ func TestBuildPolecatInventoryItemSurfacesRefusedMR(t *testing.T) {
 	if !item.Disposition.NeedsMQSubmit || item.Disposition.SafeToNuke || item.Disposition.Reusable {
 		t.Fatalf("refused polecat must not read safe/reusable: %+v", item.Disposition)
 	}
-	if item.Disposition.MQStatus != "refused_closed_source" {
-		t.Fatalf("mq_status = %q, want refused_closed_source", item.Disposition.MQStatus)
+	// gt-mkpm: this surface consults no merge queue, so it says so. The verdict
+	// and every flag above are unchanged — only the words admit that the question
+	// "does the branch still hold unsubmitted work?" was never asked here.
+	if item.Disposition.MQStatus != "refused_closed_source_unchecked" {
+		t.Fatalf("mq_status = %q, want refused_closed_source_unchecked", item.Disposition.MQStatus)
+	}
+	if item.Disposition.ReuseStatus != polecat.ReuseStatusMQUnchecked {
+		t.Fatalf("reuse_status = %q, want %q — the did-not-look road must not wear the measured string",
+			item.Disposition.ReuseStatus, polecat.ReuseStatusMQUnchecked)
 	}
 
 	// Control: the same polecat without the refusal record is the ordinary
@@ -270,6 +292,259 @@ func TestBuildPolecatInventoryItemRescueMRClearsRefusal(t *testing.T) {
 	}
 	if merged.Disposition.SafeToNuke || merged.Disposition.Reusable {
 		t.Fatalf("a surface that ran no git check must not authorize anything: %+v", merged.Disposition)
+	}
+}
+
+// TestBuildPolecatInventoryItemHandedOff is the gt-mkpm regression.
+//
+// gastown/chrome: session gone, work bead still hooked, MR gt-wisp-1cmci OPEN in
+// the refinery queue, refinery up. `gt polecat list` said "stalled" — the word
+// for a session that died mid-work. beads/ace read the same way on a different
+// rig, observed by a different witness, and BOTH flipped to "done" on the merge
+// of their own MR with nothing else changed. So the divergence window is exactly
+// the in-flight-MR window: it opens when the polecat hands off and closes when
+// the refinery lands the work, which is precisely when a witness is most likely
+// to be looking. A third observer took a reading inside the window and filed it
+// as evidence for an unrelated pool-leak bead.
+func TestBuildPolecatInventoryItemHandedOff(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	fields := &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupClean),
+		Branch:        "polecat/chrome/gt-0g5r",
+	}
+	hooked := &beads.Issue{ID: "gt-0g5r", Status: string(beads.IssueStatusHooked), Assignee: "gastown/polecats/chrome"}
+	openIndex := &polecatBranchMRIndex{
+		openMR:    map[string]string{"polecat/chrome/gt-0g5r": "gt-wisp-1cmci"},
+		submitted: map[string]bool{"polecat/chrome/gt-0g5r": true},
+	}
+
+	// Sessions is empty: the session is gone. That plus a hooked bead is what
+	// used to be enough to print "stalled".
+	item := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, openIndex)
+
+	if item.State != polecat.StateHandedOff {
+		t.Fatalf("state = %q, want %q — its work is sitting in the queue", item.State, polecat.StateHandedOff)
+	}
+	// The MR must be NAMED, not merely implied by the state word. This is what a
+	// reader quotes, and "stalled" carried no pointer to the thing in flight.
+	if !slices.ContainsFunc(item.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "gt-wisp-1cmci")
+	}) {
+		t.Fatalf("blockers %v must name the in-flight MR", item.Disposition.Blockers)
+	}
+	// Not a waiver: the hook is still set and still reported. Handed-off changes
+	// the WORD, not what blocks.
+	if !slices.ContainsFunc(item.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "gt-0g5r")
+	}) {
+		t.Fatalf("blockers %v must still name the hooked bead", item.Disposition.Blockers)
+	}
+	if item.Disposition.SafeToNuke || item.Disposition.Reusable {
+		t.Fatalf("handed-off must never read safe or reusable: %+v", item.Disposition)
+	}
+
+	// THE CONTROL, and it is the arm that matters: a polecat whose session died
+	// with NO merge request for its branch is genuinely stalled and must keep
+	// saying so. Promoting on absence of evidence would be the same defect
+	// pointing the other way — and this direction talks a witness out of looking
+	// at a polecat that really did die.
+	noMRIndex := &polecatBranchMRIndex{openMR: map[string]string{}, submitted: map[string]bool{}}
+	stalled := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, noMRIndex)
+	if stalled.State != polecat.StateStalled {
+		t.Fatalf("state = %q, want stalled — no MR was found for this branch", stalled.State)
+	}
+	if stalled.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("a truly stalled polecat must still need recovery: %+v", stalled.Disposition)
+	}
+
+	// Second control: an UNCONSULTED queue (nil index) is not proof of anything
+	// either. This is the reading every surface gets when the merge-queue listing
+	// fails, and it must fall back to stalled rather than to the success word.
+	unconsulted := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, nil)
+	if unconsulted.State != polecat.StateStalled {
+		t.Fatalf("state = %q, want stalled — the queue was never consulted", unconsulted.State)
+	}
+}
+
+// TestBuildPolecatInventoryItemDeadSessionUnderOpenMR is the gt-9f67
+// regression, and it runs on the SAME fixture as the gt-mkpm test above.
+//
+// That is the point of it. gt-mkpm established that a polecat whose session is
+// gone with its work in the queue must be called "handed-off" and not "stalled",
+// and that is still right — nothing here changes the word. What gt-mkpm did not
+// separate is the two ways a polecat arrives in that shape, because in every
+// bead fact they are identical:
+//
+//	ran gt done   -> hook CLEARED on the way out, open MR is the trace of success
+//	died mid-work -> hook STILL SET, open MR was submitted on its behalf
+//
+// The second is the one gastown/chrome was in, and PENDING_MR / leave-alone told
+// a witness to leave a dead agent alone for as long as its MR was in flight. The
+// submission that produced that MR is itself the standing remedy for a convoy
+// deadlock, so the remedy for one defect was arming the other.
+//
+// The word stays handed-off. The VERDICT stops being leave-alone.
+func TestBuildPolecatInventoryItemDeadSessionUnderOpenMR(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	fields := &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupClean),
+		Branch:        "polecat/chrome/gt-0g5r",
+	}
+	hooked := &beads.Issue{ID: "gt-0g5r", Status: string(beads.IssueStatusHooked), Assignee: "gastown/polecats/chrome"}
+	openIndex := func() *polecatBranchMRIndex {
+		return &polecatBranchMRIndex{
+			openMR:    map[string]string{"polecat/chrome/gt-0g5r": "gt-wisp-1cmci"},
+			submitted: map[string]bool{"polecat/chrome/gt-0g5r": true},
+		}
+	}
+
+	// An enumerated session listing that does not contain this polecat. Both
+	// production callers abort outright when `tmux list-sessions` fails, so a
+	// non-nil set is a real enumeration and this absence is a real absence.
+	dead := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, polecatSessionSet{}, openIndex())
+
+	if dead.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — the session is gone and the hook is still set: %+v",
+			dead.Disposition.Verdict, dead.Disposition)
+	}
+	if dead.Disposition.Reason != polecat.WorkstateReasonStalledPendingMR {
+		t.Fatalf("reason = %q, want %q", dead.Disposition.Reason, polecat.WorkstateReasonStalledPendingMR)
+	}
+	// The dead session must be NAMED. A verdict that escalates for the right
+	// reason but reports only the hook sends the reader looking for a stuck bead
+	// instead of a dead agent, and every one of the three readings in gt-9f67
+	// omitted the session entirely.
+	if !slices.ContainsFunc(dead.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "session_presence=absent")
+	}) {
+		t.Fatalf("blockers %v must name the dead session", dead.Disposition.Blockers)
+	}
+	// gt-mkpm's requirements are unchanged: the word, and both other blockers.
+	if dead.State != polecat.StateHandedOff {
+		t.Fatalf("state = %q, want %q — its work really is sitting in the queue", dead.State, polecat.StateHandedOff)
+	}
+	for _, want := range []string{"gt-wisp-1cmci", "gt-0g5r"} {
+		if !slices.ContainsFunc(dead.Disposition.Blockers, func(b string) bool {
+			return strings.Contains(b, want)
+		}) {
+			t.Fatalf("blockers %v must still name %s", dead.Disposition.Blockers, want)
+		}
+	}
+
+	// THE CONTROL, and it isolates exactly one field. A nil session set is the
+	// UNMEASURED road — nobody enumerated, so nothing has been shown about
+	// whether this agent is alive. Every other input is byte-identical to the
+	// case above, and the verdict must go back to leave-alone.
+	//
+	// Without this arm the test above would pass just as well if the guard fired
+	// on the hook alone, which would revert gt-mkpm.
+	unmeasured := buildPolecatInventoryItem("gastown", "chrome", fields, hooked, nil, openIndex())
+	if unmeasured.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR — liveness was never measured, so nothing was ruled out: %+v",
+			unmeasured.Disposition.Verdict, unmeasured.Disposition)
+	}
+
+	// Second control: a polecat that DID complete. Same dead session, same open
+	// MR, no hook — which is what `gt done` leaves behind, and what the whole
+	// reuse pool looks like in its steady state. It must stay leave-alone, or
+	// every finished polecat escalates.
+	completed := buildPolecatInventoryItem("gastown", "chrome", fields, nil, polecatSessionSet{}, openIndex())
+	if completed.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR — a cleared hook is what completion looks like: %+v",
+			completed.Disposition.Verdict, completed.Disposition)
+	}
+}
+
+// TestBuildPolecatInventoryItemCompletionRecordCoversHookedWork is the gt-n3jq
+// regression, and it corrects the premise of the test directly above.
+//
+// That test's second control passes `nil` for the hooked bead and calls it "what
+// `gt done` leaves behind". It is not. `gt done` clears the AGENT BEAD's
+// hook_bead; the issue store's hooked bead it leaves open ON PURPOSE, because
+// the refinery closes the source on merge (gt-429i). So the real steady state of
+// a polecat that just succeeded is the FIRST fixture — session gone, bead still
+// hooked, MR open — and gt-9f67 escalates every one of them for as long as its
+// MR is in flight.
+//
+// Measured on gastown/deathclaw, which had run `gt done --pre-verified` and
+// authored the commit that landed as 4392fa4db:
+//
+//	Cleanup Status:  clean          Verdict:        NEEDS_RECOVERY
+//	Active MR:       gt-wisp-ep0m   Witness action: escalate
+//
+// What separates it from the polecat that DIED holding work is not any bead
+// state — those are identical — but the completion record the survivor wrote and
+// the casualty did not.
+func TestBuildPolecatInventoryItemCompletionRecordCoversHookedWork(t *testing.T) {
+	setupPolecatTestRegistry(t)
+	hooked := &beads.Issue{ID: "gt-0g5r", Status: string(beads.IssueStatusHooked), Assignee: "gastown/polecats/chrome"}
+	openIndex := func() *polecatBranchMRIndex {
+		return &polecatBranchMRIndex{
+			openMR:    map[string]string{"polecat/chrome/gt-0g5r": "gt-wisp-1cmci"},
+			submitted: map[string]bool{"polecat/chrome/gt-0g5r": true},
+		}
+	}
+	completedFields := func() *beads.AgentFields {
+		return &beads.AgentFields{
+			AgentState:    string(beads.AgentStateIdle),
+			CleanupStatus: string(polecat.CleanupClean),
+			Branch:        "polecat/chrome/gt-0g5r",
+			// The completion metadata gt done writes on its way out (gt-x7t9).
+			ExitType:        "COMPLETED",
+			MRID:            "gt-wisp-1cmci",
+			LastSourceIssue: "gt-0g5r",
+			CompletionTime:  "2026-08-26T14:03:30Z",
+		}
+	}
+
+	survived := buildPolecatInventoryItem("gastown", "chrome", completedFields(), hooked, polecatSessionSet{}, openIndex())
+	if survived.Disposition.Verdict != polecat.WorkstateVerdictPendingMR {
+		t.Fatalf("verdict = %q, want PENDING_MR — this polecat wrote its own completion record for this bead and this MR: %+v",
+			survived.Disposition.Verdict, survived.Disposition)
+	}
+	// The dead session is still NAMED, with the reason it is not being read as a
+	// stall. A waived precondition that leaves no trace is the same reading
+	// problem gt-9f67 was filed about, pointed the other way.
+	if !slices.ContainsFunc(survived.Disposition.Blockers, func(b string) bool {
+		return strings.Contains(b, "session_presence=absent") && strings.Contains(b, "completion_record=")
+	}) {
+		t.Fatalf("blockers %v must name the dead session and the record that waives it", survived.Disposition.Blockers)
+	}
+
+	// CONTROL 1 — the casualty. Byte-identical except that no completion record
+	// was ever written, which is precisely what "died mid-work" leaves behind.
+	// It must still escalate, or this reverts gt-9f67.
+	casualty := buildPolecatInventoryItem("gastown", "chrome", &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: string(polecat.CleanupClean),
+		Branch:        "polecat/chrome/gt-0g5r",
+	}, hooked, polecatSessionSet{}, openIndex())
+	if casualty.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — no completion record covers this hook: %+v",
+			casualty.Disposition.Verdict, casualty.Disposition)
+	}
+
+	// CONTROL 2 — a record from an EARLIER episode. The slot was reused and the
+	// new occupant died; the old record names the old episode's MR, which no
+	// branch lookup on the current branch can return. Escalate.
+	stale := completedFields()
+	stale.MRID = "gt-wisp-previous"
+	inherited := buildPolecatInventoryItem("gastown", "chrome", stale, hooked, polecatSessionSet{}, openIndex())
+	if inherited.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — the record names a different MR: %+v",
+			inherited.Disposition.Verdict, inherited.Disposition)
+	}
+
+	// CONTROL 3 — a record that completed a DIFFERENT bead than the one still
+	// attached. Completing something is not completing this.
+	otherBead := completedFields()
+	otherBead.LastSourceIssue = "gt-9tpw"
+	mismatched := buildPolecatInventoryItem("gastown", "chrome", otherBead, hooked, polecatSessionSet{}, openIndex())
+	if mismatched.Disposition.Verdict != polecat.WorkstateVerdictNeedsRecovery {
+		t.Fatalf("verdict = %q, want NEEDS_RECOVERY — the record covers gt-9tpw, not the hooked gt-0g5r: %+v",
+			mismatched.Disposition.Verdict, mismatched.Disposition)
 	}
 }
 

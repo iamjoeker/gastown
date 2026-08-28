@@ -25,6 +25,8 @@ var (
 	awaitSignalBackoffMax  string
 	awaitSignalQuiet       bool
 	awaitSignalAgentBead   string
+	awaitSignalRig         string
+	awaitSignalAllRigs     bool
 )
 
 var moleculeAwaitSignalCmd = &cobra.Command{
@@ -52,6 +54,20 @@ is incremented; when a signal is received it is reset to 0 by this command,
 so the backoff collapses back to the base interval on real activity. Callers
 do not need to reset it themselves.
 
+RIG SCOPING:
+The events feed is town-wide, so without a filter an idle rig's patrol agent
+wakes on every event any rig produces and the backoff above never gets to grow.
+By default the wait is scoped to the caller's own rig, taken from --rig, else
+GT_RIG, else the current directory. Agents that are not inside a rig (Deacon,
+Mayor) resolve to no rig and wait town-wide; --all-rigs asks for that
+explicitly.
+
+Scoping suppresses only events confined to OTHER rigs. An event addressed to
+you still wakes you whichever rig sent it — cross-rig mail keeps working — and
+town-scoped events (mayor/Deacon traffic, boot sessions, escalation closes)
+wake every rig. The count of suppressed events is reported so the saving is
+measurable rather than assumed.
+
 EXIT CODES:
   0 - Signal received or timeout (check output for which)
   1 - Error opening events file
@@ -71,7 +87,13 @@ EXAMPLES:
   # On signal, the idle:N label is automatically reset to idle:0
 
   # Quiet mode (no output, for scripting)
-  gt mol await-signal --timeout 30s --quiet`,
+  gt mol await-signal --timeout 30s --quiet
+
+  # Wait on another rig's events instead of your own
+  gt mol await-signal --rig beads --timeout 60s
+
+  # Town-wide wait (Deacon and Mayor want every rig's events)
+  gt mol await-signal --all-rigs --timeout 60s`,
 	RunE: runMoleculeAwaitSignal,
 }
 
@@ -98,6 +120,12 @@ type AwaitSignalResult struct {
 	// Without this, a maximally-backed-off agent is indistinguishable from a
 	// healthy briefly-idle one in both output and logs (gt-609).
 	BackoffAtCap bool `json:"backoff_at_cap,omitempty"`
+	// WatchedRig is the rig this wait was scoped to; empty means town-wide.
+	WatchedRig string `json:"watched_rig,omitempty"`
+	// Suppressed counts events that arrived during this wait and were confined
+	// to other rigs, so the saving from rig scoping is a measurement rather
+	// than an assumption. It is the wake count that did NOT happen (gt-p54t).
+	Suppressed int `json:"suppressed"`
 }
 
 // backoffAtCap reports whether the effective timeout has reached the configured
@@ -125,6 +153,10 @@ func init() {
 		"Maximum interval cap for backoff (e.g., 10m)")
 	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
+	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalRig, "rig", "",
+		"Only wake on events concerning this rig (default: GT_RIG, else inferred from cwd)")
+	moleculeAwaitSignalCmd.Flags().BoolVar(&awaitSignalAllRigs, "all-rigs", false,
+		"Wake on every rig's events (town-wide; for Deacon and Mayor)")
 	moleculeAwaitSignalCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
 		"Suppress output (for scripting)")
 	moleculeAwaitSignalCmd.Flags().BoolVar(&moleculeJSON, "json", false,
@@ -143,6 +175,10 @@ func init() {
 		"Maximum interval cap for backoff (e.g., 10m)")
 	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalRig, "rig", "",
+		"Only wake on events concerning this rig (default: GT_RIG, else inferred from cwd)")
+	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&awaitSignalAllRigs, "all-rigs", false,
+		"Wake on every rig's events (town-wide; for Deacon and Mayor)")
 	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
 		"Suppress output (for scripting)")
 	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&moleculeJSON, "json", false,
@@ -164,6 +200,12 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Scope the wait to one rig's events unless the caller is town-scoped.
+	watchRig, err := resolveAwaitSignalRig(townRoot)
+	if err != nil {
+		return err
 	}
 
 	// Read current idle cycles and backoff window from agent bead (if specified)
@@ -226,15 +268,19 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	}
 
 	if !awaitSignalQuiet && !moleculeJSON {
+		scope := "town-wide"
+		if watchRig != "" {
+			scope = "rig: " + watchRig
+		}
 		if resumed {
-			fmt.Printf("%s Resuming backoff (remaining: %v, idle: %d)...\n",
-				style.Dim.Render("⏳"), timeout.Round(time.Second), idleCycles)
+			fmt.Printf("%s Resuming backoff (remaining: %v, idle: %d, %s)...\n",
+				style.Dim.Render("⏳"), timeout.Round(time.Second), idleCycles, scope)
 		} else if awaitSignalAgentBead != "" {
-			fmt.Printf("%s Awaiting signal (timeout: %v, idle: %d)...\n",
-				style.Dim.Render("⏳"), timeout, idleCycles)
+			fmt.Printf("%s Awaiting signal (timeout: %v, idle: %d, %s)...\n",
+				style.Dim.Render("⏳"), timeout, idleCycles, scope)
 		} else {
-			fmt.Printf("%s Awaiting signal (timeout: %v)...\n",
-				style.Dim.Render("⏳"), timeout)
+			fmt.Printf("%s Awaiting signal (timeout: %v, %s)...\n",
+				style.Dim.Render("⏳"), timeout, scope)
 		}
 	}
 
@@ -244,12 +290,13 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForActivitySignal(ctx, townRoot)
+	result, err := waitForActivitySignal(ctx, townRoot, watchRig)
 	if err != nil {
 		return fmt.Errorf("feed subscription failed: %w", err)
 	}
 
 	result.Elapsed = time.Since(startTime)
+	result.WatchedRig = watchRig
 
 	// Surface "parked at the backoff cap" so a maximally-backed-off agent is
 	// distinguishable from a healthy briefly-idle one. Only meaningful on
@@ -351,6 +398,15 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		// Report the wakes that rig scoping prevented. Without a number here
+		// the filter's benefit is an assumption; with it, an operator can
+		// compare the same event volume with and without --all-rigs.
+		if result.Suppressed > 0 {
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf(
+				"%d event(s) confined to other rigs did not wake this agent (scope: %s)",
+				result.Suppressed, watchRig)))
+		}
+
 		// Output effort recommendation for the next patrol cycle.
 		if result.EffortLevel == "abbreviated" {
 			fmt.Printf("\n%s Run ABBREVIATED patrol: quick checks only, skip optional steps.\n",
@@ -362,6 +418,43 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// resolveAwaitSignalRig determines which rig's events this wait listens for,
+// in order of decreasing explicitness:
+//
+//  1. --all-rigs, which asks for a town-wide wait
+//  2. an explicit --rig
+//  3. the GT_RIG environment variable, which the session harness sets
+//  4. inference from the current working directory
+//
+// An empty result is not an error: it means the caller is not inside a rig —
+// the Deacon, the Mayor, a bare shell in the town root — and those callers are
+// town-scoped, so they wait town-wide.
+//
+// The cwd inference deliberately uses detectRigFromPath rather than the looser
+// inferRigFromCwd: the latter returns the first path segment unconditionally,
+// which would hand the Deacon a "rig" of "deacon" and suppress every real event
+// it exists to react to.
+func resolveAwaitSignalRig(townRoot string) (string, error) {
+	if awaitSignalAllRigs {
+		if awaitSignalRig != "" {
+			return "", fmt.Errorf("--rig and --all-rigs are mutually exclusive")
+		}
+		return "", nil
+	}
+	if awaitSignalRig != "" {
+		return awaitSignalRig, nil
+	}
+	if envRig := os.Getenv("GT_RIG"); envRig != "" {
+		return envRig, nil
+	}
+	if townRoot != "" {
+		if cwd, err := filepath.Abs("."); err == nil {
+			return detectRigFromPath(townRoot, cwd), nil
+		}
+	}
+	return "", nil
 }
 
 // calculateEffectiveTimeout determines the timeout based on flags.
@@ -410,15 +503,20 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 
 // waitForActivitySignal tails the events file for new activity.
 // townRoot is the Gas Town workspace root; the events file is at
-// <townRoot>/.events.jsonl. Returns immediately when a new event line is
-// appended, or when context is canceled.
-func waitForActivitySignal(ctx context.Context, townRoot string) (*AwaitSignalResult, error) {
-	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile))
+// <townRoot>/.events.jsonl. Returns immediately when a new event line
+// concerning watchRig is appended, or when context is canceled. An empty
+// watchRig waits town-wide.
+func waitForActivitySignal(ctx context.Context, townRoot, watchRig string) (*AwaitSignalResult, error) {
+	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile), watchRig)
 }
 
 // waitForEventsFile tails the events file for new lines.
 // This replaces the former bd activity --follow subprocess approach.
-func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResult, error) {
+//
+// Lines for events confined to other rigs are counted and skipped rather than
+// returned; see internal/events/scope.go for what "confined" means and for the
+// fail-open rules that keep cross-rig mail and town-scoped events waking.
+func waitForEventsFile(ctx context.Context, eventsPath, watchRig string) (*AwaitSignalResult, error) {
 
 	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -438,23 +536,49 @@ func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResu
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
+	// A tick drains every complete line that has landed, not just one. With
+	// filtering that matters: a burst of foreign events must not push a
+	// matching event one 200ms tick further away per foreign line.
+	//
+	// partial holds a line that arrived without its terminating newline. Only
+	// complete lines are evaluated — a fragment would fail to parse as JSON and
+	// so would fail open into a spurious wake, which is exactly the wake the
+	// filter exists to prevent.
+	var partial strings.Builder
+	suppressed := 0
+
 	for {
 		select {
 		case <-ctx.Done():
 			return &AwaitSignalResult{
-				Reason: "timeout",
+				Reason:     "timeout",
+				Suppressed: suppressed,
 			}, nil
 		case <-ticker.C:
-			line, err := reader.ReadString('\n')
-			if err == nil && line != "" {
+			for {
+				chunk, err := reader.ReadString('\n')
+				if chunk != "" {
+					partial.WriteString(chunk)
+				}
+				if err == io.EOF {
+					// No complete line yet — keep whatever fragment we hold.
+					break
+				}
+				if err != nil {
+					return nil, fmt.Errorf("reading events file: %w", err)
+				}
+
+				line := partial.String()
+				partial.Reset()
+				if !events.LineWakesRig(line, watchRig) {
+					suppressed++
+					continue
+				}
 				return &AwaitSignalResult{
-					Reason: "signal",
-					Signal: strings.TrimRight(line, "\n"),
+					Reason:     "signal",
+					Signal:     strings.TrimRight(line, "\n"),
+					Suppressed: suppressed,
 				}, nil
-			}
-			// io.EOF means no new data yet — keep polling
-			if err != nil && err != io.EOF {
-				return nil, fmt.Errorf("reading events file: %w", err)
 			}
 		}
 	}

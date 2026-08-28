@@ -45,8 +45,45 @@ func poolReuseRejections(candidates []polecat.PoolReuseCandidate) []string {
 	return rejections
 }
 
-// logPoolReuseRefusals records which idle polecats the reuse gate turned down
-// and why, before the caller falls through to allocating a fresh worktree.
+// poolReuseEventType picks the event type from the SETTLED outcome.
+//
+// This one branch is the whole of gt-ibtb. The emit used to run before the
+// check that distinguishes success from refusal, so TypePoolReuseRefused fired
+// whenever any candidate had been passed over — and because the gate
+// short-circuits on the first reusable polecat, "passed over" is the normal
+// shape of a SUCCESS: the list ends at the accepted candidate. All 21 events on
+// record were successes and a genuine total refusal had never been emitted,
+// which is how two witnesses and a deacon each arrived at the feed line, read
+// "refused", and jointly scoped a P1 on it (gt-uapr). None of them arrived via
+// the bead — the feed line is the rendered surface, so the outcome has to live
+// there.
+func poolReuseEventType(o events.PoolReuseOutcome) string {
+	if o.ReusedPolecat == "" {
+		return events.TypePoolReuseRefused
+	}
+	return events.TypePoolReuseSkipped
+}
+
+// emitPoolReuseOutcome writes the outcome to the feed under the type its own
+// result picks.
+//
+// Callers must only reach here once the reuse ATTEMPT has settled, not merely
+// once the gate has picked a candidate: ReuseIdlePolecat can still fail on a
+// polecat the gate cleared, and an event claiming a reuse that then did not
+// happen would rebuild gt-ibtb one step further along the path.
+//
+// Emitted as one aggregate event rather than one per candidate: a rig can hold
+// thirty polecats, and thirty feed lines per sling would bury the fact they are
+// meant to surface. LogFeed rather than fmt.Printf because scheduler-driven
+// dispatch discards this process's stdout, which is exactly when nobody is
+// watching.
+func emitPoolReuseOutcome(o events.PoolReuseOutcome) {
+	_ = events.LogFeed(poolReuseEventType(o), "gt", events.PoolReuseOutcomePayload(o))
+}
+
+// logPoolReuseOutcome records which idle polecats the reuse gate turned down
+// and why, and — crucially — whether one was reused in the end, then tells the
+// operator when nothing was.
 //
 // There used to be no else on the `findErr == nil && idlePolecat != nil` branch
 // below. When the gate rejected every candidate, control fell straight through
@@ -55,31 +92,38 @@ func poolReuseRejections(candidates []polecat.PoolReuseCandidate) []string {
 // logged TypeSpawn all along. That asymmetry is why the pool's growth could be
 // measured while the condition causing it could not be named: the reuse gate
 // runs eleven predicates and every one of its refusals was unrecorded (gt-49dp).
-//
-// Emitted as one aggregate event rather than one per candidate: a rig can hold
-// thirty polecats, and thirty feed lines per sling would bury the fact they are
-// meant to surface. LogFeed rather than fmt.Printf because scheduler-driven
-// dispatch discards this process's stdout, which is exactly when nobody is
-// watching.
-func logPoolReuseRefusals(rigName string, reused *polecat.Polecat, candidates []polecat.PoolReuseCandidate, findErr error) {
-	lookupErr := ""
-	if findErr != nil {
-		lookupErr = findErr.Error()
-		style.PrintWarning("could not evaluate idle polecats for reuse: %v; allocating fresh...", findErr)
-	}
-	rejections := poolReuseRejections(candidates)
-	if len(rejections) == 0 && lookupErr == "" {
-		// Either the pool was empty or the first candidate was reusable. Neither
-		// is a refusal, and the reuse itself is already logged as TypeSpawn.
+func logPoolReuseOutcome(o events.PoolReuseOutcome) {
+	if len(o.Rejections) == 0 && o.LookupError == "" {
+		// Either the pool was empty or the first candidate was reusable and the
+		// reuse worked. Neither is a refusal, and a reuse is already logged as
+		// TypeSpawn.
 		return
 	}
-	_ = events.LogFeed(events.TypePoolReuseRefused, "gt", events.PoolReuseRefusedPayload(rigName, len(candidates), rejections, lookupErr))
-	if reused != nil || len(rejections) == 0 {
+	emitPoolReuseOutcome(o)
+	if o.ReusedPolecat != "" || len(o.Rejections) == 0 {
 		// Reuse still succeeded (or only the lookup failed): the rejections are
 		// recorded for the feed but are not what the operator is waiting on.
 		return
 	}
-	fmt.Printf("  No idle polecat reusable (%d considered): %s\n", len(candidates), strings.Join(rejections, "; "))
+	fmt.Printf("  No idle polecat reusable (%d considered): %s\n", o.Considered, strings.Join(o.Rejections, "; "))
+}
+
+// poolReuseGateOutcome records what the gate alone decided, before any reuse is
+// attempted. GateAccepted is set from idlePolecat rather than from the reuse,
+// because the two come apart: a cleared candidate whose reuse then fails is a
+// refusal reported over a PREFIX, since the candidates after it were never
+// evaluated.
+func poolReuseGateOutcome(rigName string, idlePolecat *polecat.Polecat, candidates []polecat.PoolReuseCandidate, findErr error) events.PoolReuseOutcome {
+	o := events.PoolReuseOutcome{
+		Rig:          rigName,
+		Considered:   len(candidates),
+		Rejections:   poolReuseRejections(candidates),
+		GateAccepted: idlePolecat != nil,
+	}
+	if findErr != nil {
+		o.LookupError = findErr.Error()
+	}
+	return o
 }
 
 // SpawnedPolecatInfo contains info about a spawned polecat session.
@@ -249,7 +293,15 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
 	idlePolecat, reuseCandidates, findErr := polecatMgr.FindIdlePolecatWithCandidates()
-	logPoolReuseRefusals(rigName, idlePolecat, reuseCandidates, findErr)
+	if findErr != nil {
+		style.PrintWarning("could not evaluate idle polecats for reuse: %v; allocating fresh...", findErr)
+	}
+	reuseOutcome := poolReuseGateOutcome(rigName, idlePolecat, reuseCandidates, findErr)
+	if findErr != nil || idlePolecat == nil {
+		// The gate's verdict IS the outcome here: there is nothing left to
+		// attempt, so it can be logged now.
+		logPoolReuseOutcome(reuseOutcome)
+	}
 	if findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
 		fmt.Printf("Reusing idle polecat: %s\n", polecatName)
@@ -302,13 +354,31 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 			// above for a human at a terminal, and logged here for everyone
 			// else: under scheduler-driven dispatch that stdout goes nowhere,
 			// which made this refusal unrecoverable after the fact (gt-49dp).
-			_ = events.LogFeed(events.TypePoolReuseRefused, "gt", events.PoolReuseRefusedPayload(
-				rigName, 1, []string{fmt.Sprintf("%s=reuse-failed state=%s", polecatName, idlePolecat.State)}, err.Error()))
+			//
+			// This is a genuine refusal — control falls through to a fresh
+			// worktree — so ReusedPolecat stays empty and the type stays
+			// pool_reuse_refused. The reuse failure joins the rejections the
+			// gate had already collected rather than replacing them: it is the
+			// last entry in the same prefix, and reporting considered=1 here
+			// used to erase every candidate passed over before it.
+			refused := reuseOutcome
+			// Cloned, not appended in place: the struct copy shares this
+			// backing array with reuseOutcome, which has spare capacity
+			// whenever the gate accepted a candidate.
+			refused.Rejections = append(append([]string(nil), reuseOutcome.Rejections...),
+				fmt.Sprintf("%s=reuse-failed state=%s err=%v", polecatName, idlePolecat.State, err))
+			emitPoolReuseOutcome(refused)
 		} else {
 			reuseOK = true
 		}
 
 		if reuseOK {
+			// Settled: the reuse actually happened, so the candidates the gate
+			// passed over on the way to it were skipped, not refused (gt-ibtb).
+			reused := reuseOutcome
+			reused.ReusedPolecat = polecatName
+			logPoolReuseOutcome(reused)
+
 			polecatObj, err := polecatMgr.Get(polecatName)
 			if err != nil {
 				return nil, fmt.Errorf("getting idle polecat after reuse: %w", err)

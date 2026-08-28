@@ -159,8 +159,20 @@ func findComposerLine(lines []string, promptPrefix string) int {
 // detection falls back to the mode-status line, which sits in the same footer
 // region, when the composer is not on screen.
 func busyIndicatorNearAnchor(lines []string, anchor int) bool {
+	return indicatorNearAnchor(lines, anchor, hasBusyIndicator)
+}
+
+// indicatorNearAnchor is the bounded status-region scan busyIndicatorNearAnchor
+// documents, with the marker test supplied by the caller.
+//
+// It is shared rather than copied because the BOUND, not the marker, is the part
+// that is hard to get right, and every status-bar marker this package scrapes
+// needs the same one. A second scan that reimplemented the window would be a
+// second chance to reach up into the transcript, which is where text that merely
+// looks like a status marker lives.
+func indicatorNearAnchor(lines []string, anchor int, match func(string) bool) bool {
 	for i := anchor; i < len(lines); i++ {
-		if hasBusyIndicator(lines[i]) {
+		if match(lines[i]) {
 			return true
 		}
 	}
@@ -171,7 +183,7 @@ func busyIndicatorNearAnchor(lines []string, anchor int) bool {
 			continue
 		}
 		checked++
-		if hasBusyIndicator(line) {
+		if match(line) {
 			return true
 		}
 	}

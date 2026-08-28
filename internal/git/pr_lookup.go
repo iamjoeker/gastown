@@ -93,14 +93,73 @@ func (g *Git) LookupPullRequest(ref PullRequestRef) (*PullRequestInfo, error) {
 	return g.lookupPullRequestByHead(targetRepo, branch, strings.TrimSpace(ref.HeadSHA))
 }
 
-// HasOpenPullRequest checks whether the ref resolves to an open PR. Errors and
-// ambiguity are treated as protected so callers do not delete a branch blindly.
-func (g *Git) HasOpenPullRequest(ref PullRequestRef) bool {
+// PullRequestProtection is the outcome of the PR check that guards a branch
+// delete. It separates the two answers a single bool used to conflate: a lookup
+// that COMPLETED and found an open PR, and a lookup that could not be performed
+// at all.
+//
+// Both protect the branch, and that part was never the defect — never delete a
+// branch you could not verify. The defect was the report. An operator told
+// "open PR exists" when the truth was "the lookup returned HTTP 401" concludes
+// a PR is open and leaves the branch alone, when in fact nothing was measured.
+// Two different facts about the world cannot share one line (gt-wbvx).
+type PullRequestProtection struct {
+	// Open reports that an authoritative lookup found an open PR.
+	Open bool
+	// LookupFailed reports that the lookup did not complete: an auth failure, a
+	// network error, or a branch that matched more than one PR. Nothing about
+	// the branch was determined.
+	LookupFailed bool
+	// Err is why the lookup failed. Non-nil exactly when LookupFailed is set.
+	Err error
+	// PR is the resolved pull request when the lookup completed, open or not.
+	PR *PullRequestInfo
+}
+
+// Protected reports whether the branch delete must be skipped. It is the whole
+// of the old bool, so callers that only need the fail-closed decision keep the
+// behaviour they had.
+func (p PullRequestProtection) Protected() bool {
+	return p.Open || p.LookupFailed
+}
+
+// Reason renders the protection the way an operator has to read it: what was
+// found, or that nothing was. Empty when the branch is not protected.
+func (p PullRequestProtection) Reason() string {
+	switch {
+	case p.LookupFailed:
+		return fmt.Sprintf("PR lookup FAILED (%v) — branch protected, nothing was verified", p.Err)
+	case p.Open && p.PR != nil && p.PR.Number > 0:
+		return fmt.Sprintf("open PR #%d found", p.PR.Number)
+	case p.Open:
+		return "open PR found"
+	default:
+		return ""
+	}
+}
+
+// CheckOpenPullRequest resolves the ref and reports whether a branch delete is
+// protected, and by which of the two reasons.
+func (g *Git) CheckOpenPullRequest(ref PullRequestRef) PullRequestProtection {
 	pr, err := g.LookupPullRequest(ref)
 	if err != nil {
-		return !errors.Is(err, ErrPullRequestNotFound)
+		// "Looked, found nothing" is an answer. Everything else is a non-answer.
+		if errors.Is(err, ErrPullRequestNotFound) {
+			return PullRequestProtection{}
+		}
+		return PullRequestProtection{LookupFailed: true, Err: err}
 	}
-	return pr.Open()
+	return PullRequestProtection{Open: pr.Open(), PR: pr}
+}
+
+// HasOpenPullRequest checks whether the ref resolves to an open PR. Errors and
+// ambiguity are treated as protected so callers do not delete a branch blindly.
+//
+// This collapses CheckOpenPullRequest back to one bool and therefore cannot say
+// which reason protected the branch. Callers that report to a human want
+// CheckOpenPullRequest instead.
+func (g *Git) HasOpenPullRequest(ref PullRequestRef) bool {
+	return g.CheckOpenPullRequest(ref).Protected()
 }
 
 func (g *Git) pullRequestTargetRepo(explicit string) (string, error) {

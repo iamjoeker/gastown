@@ -4,7 +4,6 @@
 package boot
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -179,6 +179,11 @@ func (b *Boot) spawnTmux(agentOverride string) error {
 	}
 
 	// Use unified session lifecycle for config → settings → command → create → env.
+	//
+	// Boot is spawned by the daemon, which usually has no CLAUDE_CONFIG_DIR of its
+	// own, so this must be resolved from accounts.json rather than inherited
+	// (gt-gllf). Without it Boot comes up on the default account and goes silently
+	// logged out when that account's session expires.
 	_, err := session.StartSession(b.tmux, session.SessionConfig{
 		SessionID: session.BootSessionName(),
 		WorkDir:   b.bootDir,
@@ -189,8 +194,9 @@ func (b *Boot) spawnTmux(agentOverride string) error {
 			Sender:    "daemon",
 			Topic:     "triage",
 		},
-		Instructions:  "Run `" + cli.Name() + " boot triage` now.",
-		AgentOverride: agentOverride,
+		Instructions:     "Run `" + cli.Name() + " boot triage` now.",
+		AgentOverride:    agentOverride,
+		RuntimeConfigDir: config.ResolveTownRuntimeConfigDir(b.townRoot),
 	})
 	return err
 }
@@ -212,8 +218,15 @@ func (b *Boot) spawnDegraded() error {
 	cmd.Env = config.EnvForExecCommand(envVars)
 	cmd.Env = append(cmd.Env, "GT_DEGRADED=true")
 
-	// Run async - don't wait for completion
-	return cmd.Start()
+	// Run async - don't wait for completion. The wait still has to happen, just
+	// not on this goroutine: the caller here is the daemon, so an uncollected
+	// exit status would sit in the process table as a `gt <defunct>` child for
+	// the daemon's whole lifetime.
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	util.ReapDetached(cmd)
+	return nil
 }
 
 // IsDegraded returns whether Boot is in degraded mode.

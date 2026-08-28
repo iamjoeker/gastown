@@ -1,6 +1,7 @@
 package reaper
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -109,6 +110,16 @@ func TestPurgeArchivesProtectedWispsThenReleasesThem(t *testing.T) {
 	)
 	f.insertWispComment(t, "w-mr", "witness: gates red on rebase, see run 4412")
 	f.insertWispDependency(t, "wd-mr", "w-mr", "", "gt-6xwt", "parent-child")
+	// Inserted out of chronological order, so an events list that came back in
+	// insertion order rather than by created_at fails here. The SEQUENCE is the
+	// value of the field: the closed row says only "rejected", and only these
+	// say it was submitted, rejected, and never resubmitted.
+	f.insertWispEvent(t, "w-mr", "status_changed", "gastown/refinery", "submitted", "rejected", oldClose.Add(-1*time.Hour))
+	f.insertWispEvent(t, "w-mr", "created", "gastown/polecats/guzzle", "", "submitted", oldClose.Add(-3*time.Hour))
+	// NEGATIVE CONTROL on the join: a neighbour's events must not land in
+	// w-mr's record. Without it, an attach that ignored issue_id would pass
+	// every assertion below.
+	f.insertWispEvent(t, "w-ordinary", "created", "someone-else", "", "open", oldClose.Add(-2*time.Hour))
 
 	scan, err := Scan(f.db, f.dbName, purgeAge, purgeAge, purgeAge, staleAge)
 	if err != nil {
@@ -168,7 +179,10 @@ func TestPurgeArchivesProtectedWispsThenReleasesThem(t *testing.T) {
 	}
 	// ...and so are its auxiliary rows: releasing the wisp while its labels and
 	// comments stay behind would trade unbounded wisps for unbounded orphans.
-	for _, table := range []string{"wisp_labels", "wisp_comments", "wisp_dependencies"} {
+	// wisp_events is in this list because it is in wispArchiveAuxTables. It was
+	// left out of it for as long as nothing archived events, and the omission
+	// is why the loop agreed with a release that destroyed them (gt-wv8h).
+	for _, table := range wispArchiveAuxTables {
 		for _, id := range f.issueIDs(t, table) {
 			if id == "w-mr" {
 				t.Errorf("%s still holds w-mr rows after release", table)
@@ -222,6 +236,114 @@ func TestPurgeArchivesProtectedWispsThenReleasesThem(t *testing.T) {
 	}
 	if len(rec.Dependencies) != 1 || rec.Dependencies[0].DependsOnExternal != "gt-6xwt" {
 		t.Errorf("record Dependencies = %+v, want the parent-child edge to gt-6xwt", rec.Dependencies)
+	}
+
+	// The event history, in chronological order and with the actors intact.
+	// This is the half the release destroyed unrecorded until gt-wv8h: the row
+	// above says "closed / rejected" and cannot say it was ever submitted, so
+	// asserting only on the row would pass against an archive that lost this.
+	wantEvents := []ArchivedEvent{
+		{EventType: "created", Actor: "gastown/polecats/guzzle", NewValue: "submitted"},
+		{EventType: "status_changed", Actor: "gastown/refinery", OldValue: "submitted", NewValue: "rejected"},
+	}
+	if len(rec.Events) != len(wantEvents) {
+		t.Fatalf("record Events = %+v, want %d — the wisps row keeps only the FINAL status, so "+
+			"an archive without these cannot say how the MR reached it", rec.Events, len(wantEvents))
+	}
+	for i, want := range wantEvents {
+		got := rec.Events[i]
+		if got.EventType != want.EventType || got.Actor != want.Actor ||
+			got.OldValue != want.OldValue || got.NewValue != want.NewValue {
+			t.Errorf("record Events[%d] = %+v, want %+v (chronological, oldest first)", i, got, want)
+		}
+		if got.CreatedAt == nil {
+			t.Errorf("record Events[%d] has no CreatedAt — an event with no time cannot be "+
+				"placed in a sequence, which is the only thing the list is for", i)
+		}
+	}
+}
+
+// TestArchiveRecordsEveryTableTheReleaseDeletes is the guard the comment on
+// wispArchiveAuxTables could not be (gt-wv8h).
+//
+// The release deletes the tables in that list and archives whatever
+// collectArchivableWisps happens to read. For wisp_events those two disagreed
+// from the day the list was written: the table was named as deleted, read by
+// nothing, and the comment above it said the rows "were written out first".
+// 98 records on the reporting host carried no events at all.
+//
+// A per-table assertion is what fails when a FIFTH table is added to the delete
+// list and not to the collector — the case a reviewer reading either list alone
+// cannot catch, because each is correct on its own.
+func TestArchiveRecordsEveryTableTheReleaseDeletes(t *testing.T) {
+	f := newFixture(t, "archive_covers_delete_list")
+	oldClose := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	f.insertWisps(t, wispRow{id: "w-mr", title: "MR: coverage", status: "closed",
+		createdAt: oldClose, closedAt: &oldClose, labels: []string{"gt:merge-request"}})
+	f.insertWispComment(t, "w-mr", "a rationale")
+	f.insertWispDependency(t, "wd-mr", "w-mr", "", "gt-cover", "parent-child")
+	f.insertWispEvent(t, "w-mr", "created", "someone", "", "submitted", oldClose)
+
+	archive := &recordingArchive{dir: "test://archive"}
+	if _, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false, WithArchive(archive)); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	records := archive.all()
+	if len(records) != 1 {
+		t.Fatalf("archived %d records, want 1", len(records))
+	}
+	rec := records[0]
+
+	// carried[table] answers "did the record keep what deleting this table
+	// removed?" — one entry per table the release deletes, so the map cannot
+	// silently stop covering one of them.
+	carried := map[string]int{
+		"wisp_labels":       len(rec.Labels),
+		"wisp_comments":     len(rec.Comments),
+		"wisp_events":       len(rec.Events),
+		"wisp_dependencies": len(rec.Dependencies),
+	}
+	for _, table := range wispArchiveAuxTables {
+		count, known := carried[table]
+		if !known {
+			t.Errorf("the release deletes %s and no field of ArchivedWisp is known to carry it — "+
+				"add the attach call to collectArchivableWisps and the field here, or the rows "+
+				"go the way wisp_events did", table)
+			continue
+		}
+		if count == 0 {
+			t.Errorf("%s had a row for w-mr and the record carries none of it: deleted with no "+
+				"record, which is the failure the archive exists to prevent", table)
+		}
+	}
+}
+
+// TestArchivedRecordAlwaysCarriesEventsKey pins the one field that is not
+// omitempty, and why (gt-wv8h).
+//
+// The bug was reported as an unreadable absence: nothing in an archived record
+// distinguished "this wisp had no events" from "this writer never read the
+// events table", so 98 records looked the same as complete ones. Emitting the
+// key even when the list is empty is what makes the two tellable apart forever
+// after — an archived record with no `events` key is one written before the fix
+// and its history is gone.
+func TestArchivedRecordAlwaysCarriesEventsKey(t *testing.T) {
+	blob, err := json.Marshal(ArchivedWisp{ID: "w-none", Title: "no events"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(blob), `"events":null`) {
+		t.Errorf("record with no events = %s, want an explicit \"events\":null — with omitempty, "+
+			"a record that lost its history is byte-identical to one that never had any", blob)
+	}
+
+	// The control: the fields that stay omitempty must stay omitempty, or every
+	// record on disk grows three null keys that mean nothing.
+	for _, key := range []string{`"labels"`, `"comments"`, `"dependencies"`} {
+		if strings.Contains(string(blob), key) {
+			t.Errorf("record emitted %s for an empty slice; only events carries the empty-key "+
+				"discriminator, because it alone dates the writer", key)
+		}
 	}
 }
 

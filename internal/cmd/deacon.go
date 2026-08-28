@@ -326,13 +326,18 @@ var deaconFeedStrandedCmd = &cobra.Command{
 A convoy is "stranded" when it is open AND either:
 - Has ready issues (open, unblocked, no assignee) but no workers
 - Has 0 tracked issues (empty — needs auto-close)
-- Has tracked issues but none are ready (needs agent review)
+- Has all tracked issues closed (complete — needs auto-close)
+- Has tracked issues that are blocked or unroutable (needs agent review)
+
+Convoys that are merely WAITING are not stranded and never reach this command:
+deferred beads, beads already scheduled, beads being worked by a live session,
+and beads whose work is sitting in the merge queue.
 
 This command:
 1. Runs 'gt convoy stranded --json' to find stranded convoys
 2. For feedable convoys (ready_count > 0): dispatches a dog via gt sling
-3. For empty convoys (tracked_count == 0): auto-closes via gt convoy check
-4. For tracked-but-not-ready convoys: surfaces raw data for deacon review
+3. For empty or complete convoys: auto-closes via gt convoy check
+4. For tracked-but-not-ready convoys: surfaces the evidence for deacon review
 5. Rate limits to avoid spawning too many dogs at once
 
 Rate limiting:
@@ -510,13 +515,7 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 		return fmt.Errorf("creating deacon directory: %w", err)
 	}
 
-	// Resolve CLAUDE_CONFIG_DIR from accounts.json so deacon sessions
-	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
-	accountsPath := constants.MayorAccountsPath(townRoot)
-	runtimeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
-	if runtimeConfigDir == "" {
-		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
-	}
+	runtimeConfigDir := config.ResolveTownRuntimeConfigDir(townRoot)
 
 	// Ensure runtime settings exist (autonomous role needs mail in SessionStart)
 	runtimeConfig := config.ResolveRoleAgentConfig("deacon", townRoot, deaconDir)
@@ -729,7 +728,10 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 			// only visible by comparing successive observations, and whoever
 			// polls has to be the one to persist them.
 			now := time.Now()
-			th := deacon.DefaultHealthThresholds()
+			// Judge against the operator's configured thresholds, not the
+			// compiled-in ones — this surface is the one agents read before
+			// deciding a Deacon is wedged, so it has to agree with the daemon.
+			th := deacon.HealthThresholdsFrom(config.LoadOperationalConfig(townRoot).GetDeaconConfig())
 			obs := deacon.ObserveCycle(townRoot, hb, now)
 
 			// The two signals that separate a stopped Deacon from a sleeping or
@@ -750,9 +752,9 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 				AgeSec:     hb.Age().Seconds(),
 				Cycle:      hb.Cycle,
 				LastAction: hb.LastAction,
-				Fresh:      hb.IsFresh(),
-				Stale:      hb.IsStale(),
-				VeryStale:  hb.IsVeryStale(),
+				Fresh:      hb.IsFreshFor(th.Stale),
+				Stale:      hb.IsStaleFor(th.Stale, th.VeryStale),
+				VeryStale:  hb.IsVeryStaleFor(th.VeryStale),
 				Verdict:    string(verdict),
 				Healthy:    verdict.Healthy(),
 				Await:      sig.Await.String(),

@@ -175,18 +175,31 @@ func IsFlagLikeTitle(title string) bool {
 
 // Issue represents a beads issue.
 type Issue struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Design      string   `json:"design,omitempty"`
-	Notes       string   `json:"notes,omitempty"`
-	Status      string   `json:"status"`
-	Priority    int      `json:"priority"`
-	Type        string   `json:"issue_type"`
-	CreatedAt   string   `json:"created_at"`
-	CreatedBy   string   `json:"created_by,omitempty"`
-	UpdatedAt   string   `json:"updated_at"`
-	ClosedAt    string   `json:"closed_at,omitempty"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Design      string `json:"design,omitempty"`
+	Notes       string `json:"notes,omitempty"`
+	Status      string `json:"status"`
+	Priority    int    `json:"priority"`
+	Type        string `json:"issue_type"`
+	CreatedAt   string `json:"created_at"`
+	CreatedBy   string `json:"created_by,omitempty"`
+	UpdatedAt   string `json:"updated_at"`
+	ClosedAt    string `json:"closed_at,omitempty"`
+	// CloseReason is the bead's own close_reason COLUMN, as bd reports it.
+	//
+	// It is not the same carrier as the `close_reason:` line an MR description
+	// holds (beads.MRFields.CloseReason), and the two disagree: the refinery
+	// writes the description line, `bd close --reason` and ForceCloseWithReason
+	// write this field. An MR superseded out from under a merge has
+	// "superseded by X" here and nothing at all there (gt-fe1e).
+	//
+	// bd emits it from `bd list --json`, `bd show --json` and the wisps table
+	// alike; every one of those was being unmarshalled into a struct with no
+	// field to hold it, so the audit instrument could not see the field the
+	// audit turned on.
+	CloseReason string   `json:"close_reason,omitempty"`
 	Parent      string   `json:"parent,omitempty"`
 	ExternalRef string   `json:"external_ref,omitempty"`
 	Assignee    string   `json:"assignee,omitempty"`
@@ -1444,13 +1457,13 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 
 	query := fmt.Sprintf(
 		"SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, "+
-			"w.created_at, w.updated_at, w.created_by, "+
+			"w.created_at, w.updated_at, w.created_by, w.close_reason, "+
 			"GROUP_CONCAT(al.label) as labels_csv "+
 			"FROM wisps w "+
 			"JOIN wisp_labels l ON w.id = l.issue_id "+
 			"LEFT JOIN wisp_labels al ON w.id = al.issue_id "+
 			"WHERE %s AND %s "+
-			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by",
+			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by, w.close_reason",
 		labelFilter, statusFilter)
 
 	// The wisps table is the ONLY source of MR beads: the bd list half above
@@ -1473,6 +1486,7 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 			CreatedAt   string `json:"created_at"`
 			UpdatedAt   string `json:"updated_at"`
 			CreatedBy   string `json:"created_by"`
+			CloseReason string `json:"close_reason"`
 			LabelsCSV   string `json:"labels_csv"`
 		}
 		if jsonErr := json.Unmarshal(sqlOut, &rows); jsonErr == nil {
@@ -1490,6 +1504,7 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 					CreatedAt:   row.CreatedAt,
 					UpdatedAt:   row.UpdatedAt,
 					CreatedBy:   row.CreatedBy,
+					CloseReason: row.CloseReason,
 					Ephemeral:   true,
 				}
 				if row.LabelsCSV != "" {
@@ -1597,6 +1612,13 @@ func mergeListIssueFields(detail, listed *Issue) {
 	if detail.CreatedBy == "" {
 		detail.CreatedBy = listed.CreatedBy
 	}
+	// hydrate REPLACES the listed row with the detail row, so a close_reason
+	// the wisps query resolved would be discarded whenever `bd show` did not
+	// also carry one. Both halves populate it today; carrying it over is what
+	// keeps that true if either stops.
+	if detail.CloseReason == "" {
+		detail.CloseReason = listed.CloseReason
+	}
 	if len(detail.Labels) == 0 {
 		detail.Labels = listed.Labels
 	}
@@ -1648,6 +1670,44 @@ func (b *Beads) Ready() ([]*Issue, error) {
 	}
 
 	out, err := b.run("ready", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd ready output: %w", err)
+	}
+
+	return issues, nil
+}
+
+// ReadyExcludingLabels returns ready work with any bead carrying one of labels
+// dropped by the query itself rather than by the caller.
+//
+// Excluding server-side is what makes the exclusion worth anything: the CLI
+// path takes bd's default row limit, so a store whose ready set is mostly mail
+// spends that whole window on mail and the work underneath it is never
+// returned at all. Filtering the returned rows shrinks the list without
+// revealing anything the limit already cut off — and it cannot even do that
+// reliably, because `bd ready --json` omits the labels field (gt-cw1u).
+//
+// An empty labels list is exactly Ready().
+func (b *Beads) ReadyExcludingLabels(labels ...string) ([]*Issue, error) {
+	if len(labels) == 0 {
+		return b.Ready()
+	}
+
+	if b.store != nil {
+		return b.storeReadyWithFilter(beadsdk.WorkFilter{ExcludeLabels: labels})
+	}
+
+	args := []string{"ready", "--json"}
+	for _, label := range labels {
+		args = append(args, "--exclude-label", label)
+	}
+
+	out, err := b.run(args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1740,15 +1800,28 @@ func (b *Beads) Show(id string) (*Issue, error) {
 }
 
 // FindLatestIssueByTitleAndAssignee finds the newest issue matching the given title and assignee.
+//
+// The assignee is queried in every form AgentAddressForms lists and matched with
+// SameAgentAddress, because the bead being looked up here was written by a
+// different command than the one looking it up — an exact-string match returned
+// ErrNotFound for a bead sitting right there under the other convention.
 func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issue, error) {
-	out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", assignee)
-	if err != nil {
-		return nil, fmt.Errorf("bd list: %w", err)
+	forms := AgentAddressForms(assignee)
+	if len(forms) == 0 {
+		forms = []string{assignee}
 	}
 
 	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	for _, form := range forms {
+		out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", form)
+		if err != nil {
+			return nil, fmt.Errorf("bd list: %w", err)
+		}
+		var found []*Issue
+		if err := json.Unmarshal(out, &found); err != nil {
+			return nil, fmt.Errorf("parsing bd list output: %w", err)
+		}
+		issues = append(issues, found...)
 	}
 	if len(issues) == 0 {
 		return nil, ErrNotFound
@@ -1756,7 +1829,7 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 
 	var newest *Issue
 	for _, issue := range issues {
-		if issue.Title != title || issue.Assignee != assignee {
+		if issue.Title != title || !SameAgentAddress(issue.Assignee, assignee) {
 			continue
 		}
 		if newest == nil || issue.CreatedAt > newest.CreatedAt {

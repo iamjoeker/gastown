@@ -93,7 +93,7 @@ func runMoleculeDag(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(children) == 0 {
-		return fmt.Errorf("no steps found for %s (not a molecule root?)", rootID)
+		return noStepsError(rootID, root)
 	}
 
 	// Build the DAG

@@ -93,6 +93,23 @@ func TestHeartbeat_Age(t *testing.T) {
 	}
 }
 
+// aged returns a heartbeat stamped the given duration ago.
+func aged(age time.Duration) *Heartbeat {
+	return &Heartbeat{Timestamp: time.Now().Add(-age)}
+}
+
+// bandAges names one age in each band, expressed relative to the thresholds
+// rather than as literal minutes. Pinning the ages to numbers is what let the
+// old 5m calibration sit under a fully green suite: every case had been chosen
+// to sit either side of 5m, so the tests agreed with the threshold no matter
+// what the threshold was worth (gt-cbd).
+var (
+	ageFresh     = HeartbeatStaleThreshold / 2
+	ageStale     = HeartbeatStaleThreshold + time.Minute
+	ageLateStale = HeartbeatVeryStaleThreshold - time.Minute
+	ageVeryStale = HeartbeatVeryStaleThreshold + time.Minute
+)
+
 func TestHeartbeat_IsFresh(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -105,25 +122,19 @@ func TestHeartbeat_IsFresh(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "just now",
-			hb: &Heartbeat{
-				Timestamp: time.Now(),
-			},
+			name:     "just now",
+			hb:       aged(0),
 			expected: true,
 		},
 		{
-			name: "3 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-3 * time.Minute),
-			},
-			expected: true, // Fresh is <5 minutes
+			name:     "inside the fresh window",
+			hb:       aged(ageFresh),
+			expected: true,
 		},
 		{
-			name: "6 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-6 * time.Minute),
-			},
-			expected: false, // Not fresh (>=5 minutes)
+			name:     "past the stale threshold",
+			hb:       aged(ageStale),
+			expected: false,
 		},
 	}
 
@@ -149,32 +160,24 @@ func TestHeartbeat_IsStale(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "3 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-3 * time.Minute),
-			},
-			expected: false, // Fresh (<5 minutes)
+			name:     "inside the fresh window",
+			hb:       aged(ageFresh),
+			expected: false,
 		},
 		{
-			name: "7 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-7 * time.Minute),
-			},
-			expected: true, // Stale (5-20 minutes)
+			name:     "just into the stale band",
+			hb:       aged(ageStale),
+			expected: true,
 		},
 		{
-			name: "16 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-16 * time.Minute),
-			},
-			expected: true, // Stale (5-20 minutes)
+			name:     "late in the stale band",
+			hb:       aged(ageLateStale),
+			expected: true,
 		},
 		{
-			name: "21 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-21 * time.Minute),
-			},
-			expected: false, // Very stale, not stale (>20 minutes)
+			name:     "past very-stale is no longer merely stale",
+			hb:       aged(ageVeryStale),
+			expected: false,
 		},
 	}
 
@@ -200,32 +203,24 @@ func TestHeartbeat_IsVeryStale(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "3 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-3 * time.Minute),
-			},
-			expected: false, // Fresh
+			name:     "inside the fresh window",
+			hb:       aged(ageFresh),
+			expected: false,
 		},
 		{
-			name: "10 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-10 * time.Minute),
-			},
-			expected: false, // Stale but not very stale
+			name:     "just into the stale band",
+			hb:       aged(ageStale),
+			expected: false,
 		},
 		{
-			name: "16 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-16 * time.Minute),
-			},
-			expected: false, // Stale but not very stale (threshold is 20m)
+			name:     "late in the stale band",
+			hb:       aged(ageLateStale),
+			expected: false,
 		},
 		{
-			name: "21 minutes old",
-			hb: &Heartbeat{
-				Timestamp: time.Now().Add(-21 * time.Minute),
-			},
-			expected: true, // Very stale (>20 minutes)
+			name:     "past the very-stale threshold",
+			hb:       aged(ageVeryStale),
+			expected: true,
 		},
 	}
 

@@ -469,6 +469,37 @@ func TestShouldNotifyMayorSlotOpenRequiresSafeRecovery(t *testing.T) {
 			err:     errors.New("boom"),
 			wantMsg: "check-recovery failed",
 		},
+		{
+			// --reconcile-cleanup exits non-zero when a repair it was asked for
+			// did not happen (gt-hm0v), and that is routine on this road — the
+			// witness runs it seconds after every polecat exits. The verdict is
+			// still on stdout, so the verdict is what decides. Reporting "exit
+			// status 1" here would replace an actionable blocker list with
+			// nothing on the exact road the exit status was added to clarify.
+			name:    "non-zero exit still reports the verdict it carried",
+			output:  `{"verdict":"NEEDS_RECOVERY","blockers":["cleanup_status=<missing>"]}`,
+			err:     errors.New("exit status 1"),
+			wantMsg: "cleanup_status=<missing>",
+		},
+		{
+			// The safe side of the same road: a repair was refused, the polecat
+			// is nonetheless safe, and the slot must still open. Suppressing on
+			// the exit code alone would hold a reusable polecat out of the pool
+			// — which is the outcome gt-hm0v is about.
+			name:   "non-zero exit over a safe verdict still notifies",
+			output: `{"verdict":"SAFE_TO_NUKE"}`,
+			err:    errors.New("exit status 1"),
+			wantOK: true,
+		},
+		{
+			// An exit with no JSON at all is the one this handler cannot see
+			// past, and it must stay a failure rather than parsing into a blank
+			// verdict.
+			name:    "non-zero exit with no output is still a failure",
+			output:  "   ",
+			err:     errors.New("exit status 1"),
+			wantMsg: "check-recovery failed",
+		},
 	}
 
 	for _, tt := range tests {
@@ -2399,7 +2430,7 @@ func TestProcessDiscoveredCompletion_PhaseComplete(t *testing.T) {
 		Exit:        "PHASE_COMPLETE",
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, scanEffects{})
 	if discovery.Action != "phase-complete" {
 		t.Errorf("Action = %q, want %q", discovery.Action, "phase-complete")
 	}
@@ -2413,7 +2444,7 @@ func TestProcessDiscoveredCompletion_NoMR(t *testing.T) {
 		MRFailed:    true, // Prevents fallback MR lookup
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, scanEffects{})
 	if !strings.Contains(discovery.Action, "acknowledged-idle") {
 		t.Errorf("Action = %q, want to contain %q", discovery.Action, "acknowledged-idle")
 	}
@@ -2426,7 +2457,7 @@ func TestProcessDiscoveredCompletion_EscalatedNoMR(t *testing.T) {
 		Exit:        "ESCALATED",
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, scanEffects{})
 	if !strings.Contains(discovery.Action, "acknowledged-idle") {
 		t.Errorf("Action = %q, want to contain %q for ESCALATED exit", discovery.Action, "acknowledged-idle")
 	}
@@ -2816,7 +2847,7 @@ func TestHandleZombieRestart_SkipsWhenBranchAlreadyMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z, scanEffects{})
 
 	// Action must reflect the archive decision; must NOT be a "restarted*" action.
 	if !strings.Contains(z.Action, "work-already-merged") {
@@ -2845,7 +2876,7 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z, scanEffects{})
 
 	// Should NOT take the archive path.
 	if strings.Contains(z.Action, "work-already-merged") {

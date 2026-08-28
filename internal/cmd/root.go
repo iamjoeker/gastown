@@ -306,6 +306,10 @@ func checkStaleBinaryWarning() {
 		return
 	}
 
+	// Deliberately the local-only check: this runs before EVERY gt command, so
+	// it cannot afford a fetch. It can therefore only under-report staleness —
+	// the warning firing is evidence, the warning staying silent is not. The
+	// surfaces that must be trustworthy (gt stale, gt doctor) read the remote.
 	info := version.CheckStaleBinary(repoRoot)
 	if info.Error != nil {
 		// Check failed - silently skip

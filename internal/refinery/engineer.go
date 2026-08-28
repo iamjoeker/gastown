@@ -222,10 +222,14 @@ type MRInfo struct {
 	BlockedBy       string     // Task ID blocking this MR
 
 	// Pre-verification fields (Phase 3: polecat-owned rebasing)
-	// When set, the refinery can skip gates if VerifiedBase matches target HEAD.
-	PreVerified     bool      // Polecat ran full gates after rebasing onto target
-	PreVerifiedAt   time.Time // When verification completed
-	PreVerifiedBase string    // Target branch SHA at verification time
+	// When set, the refinery may skip gates — but the branch's real merge-base
+	// with the target decides that, not these fields; see
+	// decidePreVerifiedFastPath (gt-eygw).
+	PreVerified   bool      // Polecat ran full gates after rebasing onto target
+	PreVerifiedAt time.Time // When verification completed
+	// PreVerifiedBase is the polecat's account of the commit its gates ran
+	// against: the branch's merge-base with the target.
+	PreVerifiedBase string
 
 	// Raw data for agent-side queue health analysis (ZFC: agent decides, Go transports)
 	UpdatedAt          time.Time // When the MR was last updated
@@ -1405,23 +1409,24 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	_, _ = fmt.Fprintf(e.output, "  Source: %s\n", mr.SourceIssue)
 
 	// Phase 3: Check pre-verification fast-path.
-	// If the polecat already rebased onto the target and ran gates, and the target
-	// hasn't moved since, we can skip running gates entirely (~5s merge).
-	skipGates := false
-	if mr.PreVerified && mr.PreVerifiedBase != "" {
-		_, _ = fmt.Fprintf(e.output, "  Pre-verified: yes (base=%s)\n", mr.PreVerifiedBase[:min(8, len(mr.PreVerifiedBase))])
-		// Check if target HEAD still matches the verified base
-		targetHead, err := e.git.Rev("origin/" + mr.Target)
-		if err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not resolve origin/%s HEAD: %v (falling through to normal gates)\n", mr.Target, err)
-		} else if targetHead == mr.PreVerifiedBase {
-			_, _ = fmt.Fprintln(e.output, "[Engineer] Pre-verification valid — target unchanged, skipping gates (fast-path)")
-			skipGates = true
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Pre-verification stale — target moved (%s → %s), running gates normally\n",
-				mr.PreVerifiedBase[:min(8, len(mr.PreVerifiedBase))], targetHead[:min(8, len(targetHead))])
-		}
+	// If the polecat already rebased onto the target and ran gates, and the branch
+	// is still built on the target's head, we can skip running gates (~5s merge).
+	// The MR's own account of its base is required but does not decide — see
+	// decidePreVerifiedFastPath (gt-eygw).
+	if mr.PreVerified && strings.TrimSpace(mr.PreVerifiedBase) != "" {
+		_, _ = fmt.Fprintf(e.output, "  Pre-verified: claimed base=%s\n", shortSHA(strings.TrimSpace(mr.PreVerifiedBase)))
 	}
+	// Kept out of the interface value so a nil *git.Git reaches the decision as
+	// a nil interface rather than as a typed nil that panics on first use.
+	var pvGit preVerifyGit
+	if e.git != nil {
+		pvGit = e.git
+	}
+	decision := decidePreVerifiedFastPath(pvGit, mr)
+	if decision.Log != "" {
+		_, _ = fmt.Fprint(e.output, decision.Log)
+	}
+	skipGates := decision.SkipGates
 
 	// Use the shared merge logic
 	return e.doMerge(ctx, mr, skipGates)
@@ -1446,14 +1451,21 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) bool {
 	} else {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Released merge slot\n")
 	}
-	if err := e.verifyMRInfoPostMergeProof(mr); err != nil {
+	proof, err := e.verifyMRInfoPostMergeProof(mr)
+	if err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Post-merge proof failed for %s: %v\n", mr.ID, err)
 		return false
+	}
+	if proof.Method == git.MergeProofContent {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Post-merge proof for %s: %s carries the content of %s under a rewritten sha (rebased landing, evidence %s)\n",
+			mr.ID, strings.TrimSpace(mr.Target), shortSHA(strings.TrimSpace(mr.CommitSHA)), proof.Evidence)
 	}
 
 	// Update and close the MR bead
 	if mr.ID != "" && !e.isSyntheticMergeMechanicsMR(mr) {
-		if err := e.closeMRWithReason(mr, string(CloseReasonMerged), result.MergeCommit); err != nil {
+		// verifyMRInfoPostMergeProof passed just above, so this is the one
+		// close in the codebase that knows from git that the branch landed.
+		if err := e.closeMergedMRWithProof(mr, result.MergeCommit); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Post-merge cleanup failed for %s: %v\n", mr.ID, err)
 			return false
 		}
@@ -1487,19 +1499,36 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) bool {
 		// be closed via gh pr merge (showing "merged"), not via branch deletion
 		// (which shows "closed" and destroys the PR audit trail).
 		expectedHead := strings.TrimSpace(mr.CommitSHA)
+		// Lease the delete against the branch's head as it stands now. A branch
+		// refreshed to resolve a conflict has moved past the sha recorded at
+		// submission, and leasing against that stale sha makes git reject the
+		// delete as "stale info", stranding the branch. The resolver proves the
+		// current head is contained in the target first. (gt-yog2)
+		leaseHead := expectedHead
 		remoteDeleteSafe := true
 		if isPolecat {
-			if e.git.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: expectedHead}) {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", mr.Branch)
-			} else if err := e.git.DeleteRemoteBranchIfAt("origin", mr.Branch, expectedHead); err != nil {
+			// The protection is one decision with two reasons, and the reasons
+			// have to reach the log separately: "found an open PR" is settled,
+			// "could not look" leaves the branch unclassified on the remote and
+			// is the operator's cue to go and check (gt-wbvx).
+			protection := e.git.CheckOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: expectedHead})
+			if protection.Protected() {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: %s\n", mr.Branch, protection.Reason())
+			} else if resolvedHead, err := e.git.ResolveMergedBranchDeleteHead("origin", mr.Branch, strings.TrimSpace(mr.Target), expectedHead); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
+				remoteDeleteSafe = false
+			} else if resolvedHead == "" {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Remote branch already absent: %s\n", mr.Branch)
+			} else if err := e.git.DeleteRemoteBranchIfAt("origin", mr.Branch, resolvedHead); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
 				remoteDeleteSafe = false
 			} else {
+				leaseHead = resolvedHead
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
 			}
 		}
 		if remoteDeleteSafe {
-			if err := e.deleteLocalBranchIfAt(mr.Branch, expectedHead); err != nil {
+			if err := e.deleteLocalBranchIfAt(mr.Branch, leaseHead); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete local branch %s: %v\n", mr.Branch, err)
 			} else {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted local branch: %s\n", mr.Branch)
@@ -1613,28 +1642,36 @@ func requirePullRequestHead(pr *git.PullRequestInfo, expectedHead string) error 
 	return nil
 }
 
-func (e *Engineer) verifyMRInfoPostMergeProof(mr *MRInfo) error {
+// verifyMRInfoPostMergeProof proves the MR's work reached its target, by sha
+// containment or — for the sequential-rebase landings this engineer performs
+// itself, which rewrite the sha by construction — by content. See
+// git.VerifyCommitLandedOnPushTarget (gt-umq0).
+func (e *Engineer) verifyMRInfoPostMergeProof(mr *MRInfo) (git.MergeProof, error) {
 	if mr == nil {
-		return fmt.Errorf("merge request is missing")
+		return git.MergeProof{}, fmt.Errorf("merge request is missing")
 	}
 	if e.git == nil {
-		return fmt.Errorf("git client is missing")
+		return git.MergeProof{}, fmt.Errorf("git client is missing")
 	}
 	target := strings.TrimSpace(mr.Target)
 	if target == "" {
-		return fmt.Errorf("missing target branch")
+		return git.MergeProof{}, fmt.Errorf("missing target branch")
 	}
 	if source := strings.TrimSpace(mr.Branch); source != "" && source == target {
-		return fmt.Errorf("source branch %s matches target branch", source)
+		return git.MergeProof{}, fmt.Errorf("source branch %s matches target branch", source)
 	}
 	commit := strings.TrimSpace(mr.CommitSHA)
 	if commit == "" {
-		return fmt.Errorf("missing submitted commit_sha")
+		return git.MergeProof{}, fmt.Errorf("missing submitted commit_sha")
 	}
-	if err := e.git.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("target %s does not contain submitted head %s: %w", target, commit, err)
+	proof, err := e.git.VerifyCommitLandedOnPushTarget("origin", target, commit)
+	if err == nil {
+		return proof, nil
 	}
-	return nil
+	if errors.Is(err, git.ErrMergeProofUnprovable) {
+		return git.MergeProof{}, fmt.Errorf("could not establish whether %s carries submitted head %s (the MR itself may be fine): %w", target, commit, err)
+	}
+	return git.MergeProof{}, fmt.Errorf("target %s carries neither submitted head %s nor its content: %w", target, commit, err)
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
@@ -1765,12 +1802,28 @@ func (e *Engineer) closeIneligibleMR(mr *MRInfo, reason string) error {
 }
 
 func (e *Engineer) closeMRWithReason(mr *MRInfo, closeReason string, mergeCommit ...string) error {
-	if mr == nil || strings.TrimSpace(mr.ID) == "" {
-		return nil
-	}
 	var commit string
 	if len(mergeCommit) > 0 {
 		commit = mergeCommit[0]
+	}
+	return e.closeMR(mr, closeReason, commit, false)
+}
+
+// closeMergedMRWithProof closes an MR the engineer has just merged AND proved
+// landed, via verifyMRInfoPostMergeProof against git.
+//
+// It is the only caller allowed to rewrite a record that was already closed —
+// the four beads/main merges with no merged-record were all superseded out from
+// under this exact path (gt-fe1e). Every other close, including the hand-run
+// `gt mq post-merge`, goes through closeMRWithReason and cannot repair
+// anything, because none of them has evidence a merge happened.
+func (e *Engineer) closeMergedMRWithProof(mr *MRInfo, mergeCommit string) error {
+	return e.closeMR(mr, string(CloseReasonMerged), mergeCommit, true)
+}
+
+func (e *Engineer) closeMR(mr *MRInfo, closeReason, commit string, mergeProven bool) error {
+	if mr == nil || strings.TrimSpace(mr.ID) == "" {
+		return nil
 	}
 	var expected *MergeRequest
 	if normalizedMRCloseReason(closeReason) == string(CloseReasonMerged) {
@@ -1782,12 +1835,20 @@ func (e *Engineer) closeMRWithReason(mr *MRInfo, closeReason string, mergeCommit
 		AgentBeadHint: mr.AgentBead,
 		MissingOK:     true,
 		ExpectedMR:    expected,
+		MergeProven:   mergeProven,
 	})
 	if err != nil {
 		return err
 	}
 	if result.Closed {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR bead: %s (%s)\n", mr.ID, closeReason)
+	}
+	if result.OutcomeCorrected {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Recorded merge on already-closed MR %s (record said %q) — gt-fe1e\n",
+			mr.ID, result.RecordedCloseReason)
+	}
+	if result.OutcomeCorrectErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: %v\n", result.OutcomeCorrectErr)
 	}
 	if result.AgentActiveMRClearErr != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", result.AgentBead, result.AgentActiveMRClearErr)
@@ -1827,6 +1888,28 @@ func normalizedMRCloseReason(closeReason string) string {
 	return closeReason
 }
 
+// conflictTaskCreateOptions assembles the bead the refinery files when an MR
+// hits a merge conflict.
+//
+// Split out of createConflictResolutionTaskForMR to give the priority
+// derivation a test seam that does not need a live town layout. gt-ofb0 was a
+// wiring defect — a literal priority where a derivation belonged — so a rule
+// that is correct in isolation but never reaches CreateOptions is precisely the
+// failure being fixed, and it has to be checked at this boundary.
+func conflictTaskCreateOptions(mr *MRInfo, rigName, title, description string) beads.CreateOptions {
+	return beads.CreateOptions{
+		Title:  title,
+		Labels: []string{"gt:task"},
+		// This task BLOCKS the MR, so it has to outrank it. Inheriting the MR's
+		// own priority — or worse, a fixed P1 — leaves the blocker queued behind
+		// the very item it is holding up, and the queue deadlocks (gt-ofb0).
+		Priority:    BlockerPriority(mr.Priority),
+		Description: description,
+		Actor:       rigName + "/refinery",
+		Rig:         rigName, // Ensure task lands in the rig's database (gt-7y7)
+	}
+}
+
 // createConflictResolutionTaskForMR creates a dispatchable task for resolving merge conflicts.
 // This task will be picked up by bd ready and can be slung to a fresh polecat (spawned on demand).
 // Returns the created task's ID for blocking the MR until resolution.
@@ -1835,7 +1918,7 @@ func normalizedMRCloseReason(closeReason string) string {
 //
 //	Title: Resolve merge conflicts: <original-issue-title>
 //	Type: task
-//	Priority: inherit from original (ZFC: agent decides boost strategy)
+//	Priority: BlockerPriority(MR priority) — must outrank the MR it blocks (gt-ofb0)
 //	Parent: original MR bead
 //	Description: metadata including branch, conflict SHA, etc.
 //
@@ -1894,8 +1977,6 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 		}
 	}
 
-	// ZFC: pass raw priority. Agent decides boost strategy.
-
 	// Increment retry count for tracking
 	retryCount := mr.RetryCount + 1
 
@@ -1931,14 +2012,7 @@ The Refinery will automatically retry the merge after you push.`,
 
 	// Create the conflict resolution task
 	taskTitle := fmt.Sprintf("Resolve merge conflicts: %s", originalTitle)
-	task, err := e.beads.Create(beads.CreateOptions{
-		Title:       taskTitle,
-		Labels:      []string{"gt:task"},
-		Priority:    mr.Priority,
-		Description: description,
-		Actor:       e.rig.Name + "/refinery",
-		Rig:         e.rig.Name, // Ensure task lands in the rig's database (gt-7y7)
-	})
+	task, err := e.beads.Create(conflictTaskCreateOptions(mr, e.rig.Name, taskTitle, description))
 	if err != nil {
 		releaseSlotOnError()
 		return "", fmt.Errorf("creating conflict resolution task: %w", err)
@@ -1953,7 +2027,11 @@ The Refinery will automatically retry the merge after you push.`,
 	// The conflict task's ID is returned so the MR can be blocked on it.
 	// When the task closes, the MR unblocks and re-enters the ready queue.
 
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d)\n", task.ID, task.Priority)
+	// Print both sides of the relation: a blocker's priority only means anything
+	// relative to what it blocks, and that is the pair that has to be checked
+	// when this deadlocks again.
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d, blocking MR %s at P%d)\n",
+		task.ID, task.Priority, mr.ID, mr.Priority)
 
 	return task.ID, nil
 }

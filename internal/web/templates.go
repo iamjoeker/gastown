@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/activity"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 )
 
 //go:embed templates/*.html
@@ -53,7 +54,13 @@ type ConvoyData struct {
 	// MailUnavailable holds the reason the mail query failed, or "" when it
 	// succeeded. A town whose bd cannot be reached has not gone quiet.
 	MailUnavailable string
-	Rigs            []RigRow
+	// MailTruncated is true when the mail query filled its whole row allowance
+	// and so may have had more to give. Unlike the other panels this cap is
+	// deliberate — the panel is "recent mail", and the town root holds hundreds
+	// of message beads — but a deliberate cap still produces a number that is a
+	// floor, and the panel used to print it as a total.
+	MailTruncated bool
+	Rigs          []RigRow
 	// RigsUnavailable holds the reason the rig list could not be read, or ""
 	// when it was read — including when the town genuinely has no rigs
 	// registered, which is a real zero rather than an unknown one.
@@ -99,7 +106,14 @@ type ConvoyData struct {
 	// reason turns that into a stated one, so the banner never claims "Detached"
 	// on the strength of a tmux it could not reach.
 	MayorUnavailable string
-	Issues           []IssueRow
+	// Issues is the part of the backlog this page renders, highest priority
+	// first — up to issuesDisplayLimit rows.
+	Issues []IssueRow
+	// IssueCount is how large the backlog actually is, which is what the panel
+	// displays as its number. len(Issues) is a page size and cannot be used for
+	// it: pinned to a cap, the number stops falling when work is closed, and
+	// that is the whole of gt-eolg. It is a floor when IssuesWarning is set.
+	IssueCount int
 	// IssuesWarning is the same caveat for the backlog union.
 	IssuesWarning string
 	// IssuesUnavailable is the same "no source answered" reason for the backlog
@@ -244,6 +258,30 @@ type DashboardSummary struct {
 	HooksUnavailable  bool
 	IssuesUnavailable bool
 
+	// HooksPartial and IssuesPartial are the *other* half of the same fact, and
+	// the one the codebase had not reached: the union answered, but not fully.
+	// A store errored, or filled its whole row allowance, or was never asked —
+	// so the stat beside them is a floor and the banner renders it "N+".
+	//
+	// A failed read was already distinguishable from a real zero; a TRUNCATED
+	// read was not. It arrives as an ordinary number in the same visual language
+	// as a measured one, which is the more dangerous of the two: an operator who
+	// sees "?" knows to go look, and an operator who sees "50" does not.
+	//
+	// They are set only when the panel is otherwise readable. A stat with no
+	// source at all already renders "?", and "0+" would be a floor drawn from
+	// nothing read — the two markers must not stack.
+	HooksPartial  bool
+	IssuesPartial bool
+
+	// MergeQueuePartial says some rigs answered the merge-queue query and some
+	// did not. The banner prints no merge-queue number, so this is alert-only —
+	// and that is precisely why it is here. The panel already renders its own
+	// "+", but an operator whose banner says "✓ All clear" never scrolls down to
+	// read it, and "merge queue empty" is the most consequential thing this
+	// dashboard can wrongly imply.
+	MergeQueuePartial bool
+
 	// These four panels print no stat in the banner, so they are alert-only.
 	// They are here because HasAlerts is what decides between "✓ All clear" and
 	// a warning, and a panel the dashboard could not read is precisely the case
@@ -320,19 +358,33 @@ type MergeQueueRow struct {
 
 // ConvoyRow represents a single convoy in the dashboard.
 type ConvoyRow struct {
-	ID            string
-	Title         string
-	Status        string // "open" or "closed" (raw beads status)
-	WorkStatus    string // Computed: "complete", "active", "stale", "stuck", "waiting"
+	ID     string
+	Title  string
+	Status string // "open" or "closed" (raw beads status)
+	// WorkStatus is the shared convoy verdict — one of convoy.WorkStatus*:
+	// "complete", "working", "in-queue", "ready", "waiting", "stuck", "empty".
+	// It is decided from EXECUTION state (live sessions, queued MRs, blockers),
+	// never from how long ago something was logged (gt-skzk.1).
+	WorkStatus string
+	// Evidence tallies the tracked beads by disposition, so the panel can say
+	// what it observed alongside what it concluded.
+	Evidence      map[string]int
 	Progress      string // e.g., "2/5"
 	Completed     int
 	Total         int
 	ProgressPct   int      // 0-100, computed from Completed/Total
-	ReadyBeads    int      // open beads with no assignee (available to pick up)
-	InProgress    int      // beads currently being worked on
+	ReadyBeads    int      // beads dispatchable right now
+	InProgress    int      // beads whose assignee's session is live
+	InQueue       int      // beads whose work is an open merge request
 	Assignees     []string // unique assignees across tracked issues
 	LastActivity  activity.Info
 	TrackedIssues []TrackedIssue
+}
+
+// EvidenceSummary renders the disposition tally the way `gt convoy stranded`
+// renders it, e.g. "1 working, 2 closed".
+func (r ConvoyRow) EvidenceSummary() string {
+	return convoyops.FormatEvidence(r.Evidence)
 }
 
 // TrackedIssue represents an issue tracked by a convoy.
@@ -402,19 +454,23 @@ func statusClass(status string) string {
 	}
 }
 
-// workStatusClass returns the CSS class for a computed work status.
+// workStatusClass returns the CSS class for a convoy's work status.
 func workStatusClass(workStatus string) string {
 	switch workStatus {
-	case "complete":
+	case convoyops.WorkStatusComplete:
 		return "work-complete"
-	case "active":
-		return "work-active"
-	case "stale":
-		return "work-stale"
-	case "stuck":
+	case convoyops.WorkStatusWorking:
+		return "work-working"
+	case convoyops.WorkStatusInQueue:
+		return "work-in-queue"
+	case convoyops.WorkStatusReady:
+		return "work-ready"
+	case convoyops.WorkStatusStuck:
 		return "work-stuck"
-	case "waiting":
+	case convoyops.WorkStatusWaiting:
 		return "work-waiting"
+	case convoyops.WorkStatusEmpty:
+		return "work-empty"
 	default:
 		return "work-unknown"
 	}

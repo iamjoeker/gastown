@@ -182,12 +182,39 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// fetchAndRender runs all 14 fetchers in parallel and renders the template.
+// issuesDisplayLimit caps how many backlog rows the Work panel renders. It is
+// a page-size, and it is deliberately not the count shown beside the panel:
+// conflating the two is what made the old Work count unable to fall when work
+// was closed (gt-eolg). Rows are sorted highest priority first before the trim,
+// so what a shortened list drops is the least urgent end of the backlog, and
+// the page says how many it dropped.
+const issuesDisplayLimit = 200
+
+// fetchAndRender collects the dashboard's data and renders the template.
 // Returns the rendered HTML bytes, or nil on template error.
 func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []byte {
 	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
 	defer cancel()
 
+	data := h.collectDashboard(ctx, expandPanel)
+
+	var buf bytes.Buffer
+	if err := h.template.ExecuteTemplate(&buf, "convoy.html", data); err != nil {
+		log.Printf("dashboard: template execution failed: %v", err)
+		return nil
+	}
+
+	return buf.Bytes()
+}
+
+// collectDashboard runs all 14 fetchers in parallel and assembles the page's
+// data, including the banner summary.
+//
+// It is split from the render so the assembled state can be examined as values
+// rather than as HTML. Whether a panel is reporting a problem is decided here,
+// in fields; a test that greps the rendered page for a word can only find the
+// alarms that fired, never establish that a healthy town raised none (gt-skzk.3).
+func (h *ConvoyHandler) collectDashboard(ctx context.Context, expandPanel string) ConvoyData {
 	// Each panel's error is kept, not just logged. A log line is a record for
 	// whoever reads the server's output later; the operator reading the page
 	// sees only the rows, and rows alone cannot say "I could not look"
@@ -380,9 +407,15 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		// The union panels have no error to carry — every store failing
 		// separately still returns a result — so the banner is told whether the
 		// rows it is counting came from any store at all.
-		hooksUnreadable:  hooks.Unreadable() || hooksErr != nil,
+		hooksUnreadable: hooks.Unreadable() || hooksErr != nil,
+		// Partial is the truncated/short read the *Unavailable flags do not
+		// cover: the stores answered, some of them incompletely, so the count is
+		// a floor. Without it the banner prints a capped number in the same
+		// typeface as a measured one (gt-skzk.2).
+		hooksPartial:     hooks.Partial(),
 		issues:           issues.Rows,
 		issuesUnreadable: issues.Unreadable() || issuesErr != nil,
+		issuesPartial:    issues.Partial(),
 		convoys:          convoys,
 		convoysErr:       convoysErr,
 		escalations:      escalations,
@@ -392,21 +425,38 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		rigsErr:          rigsErr,
 		healthErr:        healthErr,
 		mergeQueueErr:    mergeQueueErr,
+		// One rig short is not the same failure as no rig list at all, and the
+		// banner had a render for the second and none for the first.
+		mergeQueuePartial: len(mergeQueue.FailedRigs) > 0,
 	})
+
+	// The backlog is counted whole and rendered in part. They are separate
+	// numbers on purpose: the panel's count is what an operator judges progress
+	// by, and it has to be able to fall when work is closed, which a count of
+	// the rows that fit on a page cannot do (gt-eolg).
+	allIssues := enrichIssuesWithAssignees(issues.Rows, hooks.Rows)
+	shownIssues := allIssues
+	if len(shownIssues) > issuesDisplayLimit {
+		shownIssues = shownIssues[:issuesDisplayLimit]
+	}
 
 	data := ConvoyData{
 		Convoys: convoys,
 		// A failed query is reported, never rendered as an empty panel: zero
 		// must mean zero, and unknown must look different.
-		ConvoysUnavailable:     unavailableMessage(convoysErr),
-		MergeQueue:             mergeQueue.Rows,
-		MergeQueueFailedRigs:   mergeQueue.FailedRigs,
-		MergeQueueUnavailable:  unavailableMessage(mergeQueueErr),
-		Workers:                workers.Rows,
-		WorkersUnavailable:     unavailableMessage(workersErr),
-		WorkersWarning:         workers.Warning(),
-		Mail:                   mail,
-		MailUnavailable:        unavailableMessage(mailErr),
+		ConvoysUnavailable:    unavailableMessage(convoysErr),
+		MergeQueue:            mergeQueue.Rows,
+		MergeQueueFailedRigs:  mergeQueue.FailedRigs,
+		MergeQueueUnavailable: unavailableMessage(mergeQueueErr),
+		Workers:               workers.Rows,
+		WorkersUnavailable:    unavailableMessage(workersErr),
+		WorkersWarning:        workers.Warning(),
+		Mail:                  mail,
+		MailUnavailable:       unavailableMessage(mailErr),
+		// Same rule forEachStoreLimited applies to the union panels: a query
+		// that came back exactly full may have had more. The false positive on a
+		// town holding precisely mailFetchLimit messages is the safe direction.
+		MailTruncated:          len(mail) >= mailFetchLimit,
 		Rigs:                   rigs,
 		RigsUnavailable:        unavailableMessage(rigsErr),
 		Dogs:                   dogs,
@@ -424,7 +474,8 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		HooksUnavailable:       unionUnavailable(hooksErr, hooks.UnavailableReason()),
 		Mayor:                  mayor,
 		MayorUnavailable:       unavailableMessage(mayorErr),
-		Issues:                 enrichIssuesWithAssignees(issues.Rows, hooks.Rows),
+		Issues:                 shownIssues,
+		IssueCount:             len(allIssues),
 		IssuesWarning:          issues.Warning(),
 		IssuesUnavailable:      unionUnavailable(issuesErr, issues.UnavailableReason()),
 		Activity:               activity,
@@ -434,13 +485,7 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 		CSRFToken:              h.csrfToken,
 	}
 
-	var buf bytes.Buffer
-	if err := h.template.ExecuteTemplate(&buf, "convoy.html", data); err != nil {
-		log.Printf("dashboard: template execution failed: %v", err)
-		return nil
-	}
-
-	return buf.Bytes()
+	return data
 }
 
 // summaryInput is what the banner is computed from: each panel's rows AND
@@ -454,9 +499,15 @@ type summaryInput struct {
 	hooks      []HookRow
 	// hooksUnreadable and issuesUnreadable are the union panels' version of an
 	// error: no store answered, so the count below them is of nothing read.
-	hooksUnreadable  bool
+	hooksUnreadable bool
+	// hooksPartial and issuesPartial are the degree below that: the stores
+	// answered, but at least one of them short. The rows are real and the count
+	// is a floor, which is a third state the banner needs a render for — it is
+	// neither "?" nor a bare number.
+	hooksPartial     bool
 	issues           []IssueRow
 	issuesUnreadable bool
+	issuesPartial    bool
 	convoys          []ConvoyRow
 	convoysErr       error
 	escalations      []EscalationRow
@@ -469,6 +520,10 @@ type summaryInput struct {
 	rigsErr       error
 	healthErr     error
 	mergeQueueErr error
+	// mergeQueuePartial is the merge queue's own "some rigs answered" state.
+	// It has no count in the banner either, so like the four above it reaches
+	// the operator as an alert or not at all.
+	mergeQueuePartial bool
 }
 
 // computeSummary calculates dashboard stats and alerts from fetched data.
@@ -488,7 +543,15 @@ func computeSummary(in summaryInput) *DashboardSummary {
 		RigsUnavailable:        in.rigsErr != nil,
 		HealthUnavailable:      in.healthErr != nil,
 		MergeQueueUnavailable:  in.mergeQueueErr != nil,
+		MergeQueuePartial:      in.mergeQueuePartial && in.mergeQueueErr == nil,
 	}
+
+	// A panel with no source at all already renders "?", which says strictly
+	// more than "N+" does. Letting both fire would put a floor marker on a
+	// count of nothing read — "0+" — and hand the operator two contradictory
+	// claims about the same stat.
+	summary.HooksPartial = in.hooksPartial && !summary.HooksUnavailable
+	summary.IssuesPartial = in.issuesPartial && !summary.IssuesUnavailable
 
 	workers, hooks, issues, escalations, activity :=
 		in.workers, in.hooks, in.issues, in.escalations, in.activity
@@ -531,7 +594,15 @@ func computeSummary(in summaryInput) *DashboardSummary {
 	// Set HasAlerts flag. Not being able to read a panel is itself an alert —
 	// otherwise the banner reads "All clear" precisely when the dashboard has
 	// lost sight of the panels that report trouble.
-	summary.HasAlerts = summary.EscalationsUnavailable ||
+	//
+	// A partial read is the same alert one degree down. "All clear" over a
+	// count that is only a floor is the identical false assurance, and it is
+	// harder to catch: the failed read at least prints a "?" beside itself,
+	// where the short one prints a number that looks measured (gt-skzk.2).
+	summary.HasAlerts = summary.HooksPartial ||
+		summary.IssuesPartial ||
+		summary.MergeQueuePartial ||
+		summary.EscalationsUnavailable ||
 		summary.PolecatsUnavailable ||
 		summary.ConvoysUnavailable ||
 		summary.HooksUnavailable ||

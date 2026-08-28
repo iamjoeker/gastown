@@ -171,7 +171,7 @@ if [ "$1" = "list" ]; then
       printf '%s\n' '[{"id":"issue-mine","title":"Mine","description":"","status":"open","priority":2,"assignee":"gastown/witness","created_at":"2026-08-18T01:00:00Z","labels":["gt:message","from:mayor/","cc-cleared:gastown/witness"]}]'
       exit 0
       ;;
-    *"--label cc:gastown/witness"*)
+    *"--label-any cc:gastown/witness"*)
       printf '%s\n' '[{"id":"issue-cc-live","title":"CC live","description":"","status":"open","priority":2,"assignee":"beads/refinery","created_at":"2026-08-18T00:59:00Z","labels":["gt:message","from:mayor/","cc:gastown/witness"]},{"id":"issue-cc-cleared","title":"CC cleared","description":"","status":"open","priority":2,"assignee":"beads/refinery","created_at":"2026-08-18T00:58:00Z","labels":["gt:message","from:mayor/","cc:gastown/witness","cc-cleared:gastown/witness"]}]'
       exit 0
       ;;
@@ -258,10 +258,12 @@ func TestDeleteAddressedMessageStillCloses(t *testing.T) {
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$BD_LOG"
 if [ "$1" = "show" ]; then
-  printf '%s\n' '[{"id":"hq-wisp-mine","title":"Mine","description":"","status":"open","priority":2,"assignee":"gastown/witness","created_at":"2026-08-18T01:31:00Z","labels":["gt:message","from:mayor/"]}]'
+  if [ -f "$BD_LOG.closed" ]; then st=closed; else st=open; fi
+  printf '[{"id":"hq-wisp-mine","title":"Mine","description":"","status":"%s","priority":2,"assignee":"gastown/witness","created_at":"2026-08-18T01:31:00Z","labels":["gt:message","from:mayor/"]}]\n' "$st"
   exit 0
 fi
 if [ "$1" = "close" ]; then
+  : > "$BD_LOG.closed"
   exit 0
 fi
 if [ "$1" = "label" ]; then
@@ -296,10 +298,15 @@ func TestDeleteCCCopyWithForceStillCloses(t *testing.T) {
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$BD_LOG"
 if [ "$1" = "show" ]; then
-  printf '%s\n' '[{"id":"hq-wisp-cc","title":"Clearance","description":"","status":"open","priority":2,"assignee":"beads/refinery","created_at":"2026-08-18T01:31:00Z","labels":["gt:message","from:mayor/","cc:gastown/witness"]}]'
+  if [ -f "$BD_LOG.closed" ]; then st=closed; else st=open; fi
+  printf '[{"id":"hq-wisp-cc","title":"Clearance","description":"","status":"%s","priority":2,"assignee":"beads/refinery","created_at":"2026-08-18T01:31:00Z","labels":["gt:message","from:mayor/","cc:gastown/witness"]}]\n' "$st"
   exit 0
 fi
-if [ "$1" = "close" ] || [ "$1" = "label" ]; then
+if [ "$1" = "close" ]; then
+  : > "$BD_LOG.closed"
+  exit 0
+fi
+if [ "$1" = "label" ]; then
   exit 0
 fi
 printf 'unexpected bd args: %s\n' "$*" >&2

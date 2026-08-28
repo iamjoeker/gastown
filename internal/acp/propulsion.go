@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/townlog"
@@ -195,7 +196,10 @@ func (p *Propeller) eventLoop() {
 
 // deliverNudges drains queued nudges and injects them into the ACP session.
 func (p *Propeller) deliverNudges() {
-	nudges, err := nudge.Drain(p.townRoot, p.session)
+	// DrainLive discards notifications for mail this agent has already read or
+	// archived; without that filter they are requeued on every delivery failure
+	// and replayed until TTL alone retires them (gt-loz6).
+	nudges, err := mail.DrainLive(p.townRoot, p.session)
 	if err != nil {
 		debugLog(p.townRoot, "[Propeller] deliverNudges: Drain error: %v", err)
 		return

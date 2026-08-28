@@ -6,41 +6,48 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/witness"
 )
 
 func sweepFixture() *witness.BranchSweepResult {
 	return &witness.BranchSweepResult{
-		Remote:      "origin",
-		Target:      "origin/main",
-		Scanned:     4,
-		MRsMeasured: true,
+		Remote:           "origin",
+		Target:           "origin/main",
+		Scanned:          4,
+		MRsMeasured:      true,
+		SessionsMeasured: true,
 		Findings: []witness.BranchSweepFinding{
 			{
 				Branch: "polecat/dust/gt-k3v+aaa", CommitSHA: "sha1",
 				IssueID: "gt-k3v", IssueStatus: "closed",
-				Class: witness.BranchSweepCheck,
-				Note:  "bead gt-k3v is closed, no MR was ever created — check whether this was superseded or stranded",
+				SessionPresence: "unknown",
+				Class:           witness.BranchSweepCheck,
+				Note:            "bead gt-k3v is closed, no MR was ever created — check whether this was superseded or stranded",
 			},
 			{
 				Branch: "polecat/foundation/gt-q+bbb", CommitSHA: "sha2",
 				IssueID: "gt-q", IssueStatus: "closed",
 				MRID: "gt-wisp-mr2", MRStatus: "open",
-				Class: witness.BranchSweepQueued,
-				Note:  "open MR gt-wisp-mr2 — queued, not stranded",
+				SessionPresence: "unknown",
+				Class:           witness.BranchSweepQueued,
+				Note:            "open MR gt-wisp-mr2 — queued, not stranded",
 			},
 			{
 				Branch: "polecat/mirelurk/gt-live+ccc", CommitSHA: "sha3",
+				Polecat: "mirelurk",
 				IssueID: "gt-live", IssueStatus: "hooked",
-				Class: witness.BranchSweepActive,
-				Note:  "bead is hooked — still re-slingable",
+				SessionPresence: "present",
+				Class:           witness.BranchSweepActive,
+				Note:            "bead is hooked — still re-slingable; session for mirelurk is alive",
 			},
 			{
 				Branch: "polecat/refinery/gt-aqk+ddd", CommitSHA: "sha4",
 				IssueID: "gt-aqk", IssueStatus: "closed",
-				Class: witness.BranchSweepLanded, Evidence: "cherry",
+				SessionPresence: "unknown",
+				Class:           witness.BranchSweepLanded, Evidence: "merge_tree_noop",
 				ContainedIn: "origin/main", HygieneUnreachable: true,
-				Note: "content is in origin/main (same patches, squashed or cherry-picked); NOT an ancestor of origin/main — branch hygiene cannot delete it",
+				Note: "content is in origin/main (merges to nothing); contained in origin/main by neither ancestry nor patch identity — branch hygiene cannot delete it",
 			},
 		},
 	}
@@ -146,8 +153,8 @@ func TestPatrolBranchesHumanSeparatesUnknownFromCheck(t *testing.T) {
 	result.Findings = append(result.Findings, witness.BranchSweepFinding{
 		Branch: "polecat/refuge/gt-wz3y+eee",
 		Class:  witness.BranchSweepUnknown,
-		Err:    "candidate refs/heads/polecat/refuge/gt-wz3y+eee changed while pruning",
-		Note:   "could not compare against origin/main or upstream/main",
+		Err:    "remote tip for refs/heads/polecat/refuge/gt-wz3y+eee moved between listing and fetch: listed 89db0051, fetched dd7e98ec (re-run to classify it)",
+		Note:   "could not compare against origin/main or upstream/main: remote tip moved between listing and fetch",
 	})
 	result.Scanned = 5
 
@@ -164,6 +171,12 @@ func TestPatrolBranchesHumanSeparatesUnknownFromCheck(t *testing.T) {
 	}
 	if !strings.Contains(out, "not an all-clear") {
 		t.Errorf("output does not say what an unclassified branch means:\n%s", out)
+	}
+	// The reason must survive into the table. Without it every unknown reads as a
+	// property of the branch, which is how a clobbered FETCH_HEAD got reported as
+	// an unclassifiable branch for as long as it did (gt-880s).
+	if !strings.Contains(out, "moved between listing and fetch") {
+		t.Errorf("the note's reason did not reach the table:\n%s", out)
 	}
 }
 
@@ -474,8 +487,14 @@ func TestPatrolBranchesHumanRaisesHygieneUnreachableInTheDefaultView(t *testing.
 	}
 	// The routing claim is the finding. Saying only "landed" is what left these
 	// rows in every future sweep.
-	if !strings.Contains(out, "branch hygiene deletes by ancestry") {
+	if !strings.Contains(out, "post-merge delete that should have collected each one has already run") {
 		t.Errorf("default view does not say why nothing collects them:\n%s", out)
+	}
+	// And it must name the sweeper that can. "Nothing will ever collect them"
+	// was false — gt polecat prune --remote keys on patch identity — and the
+	// claim sent an operator to delete 35 branches by hand (gt-wbvx).
+	if !strings.Contains(out, "gt polecat prune gastown --remote") {
+		t.Errorf("default view does not name the sweeper that can collect them:\n%s", out)
 	}
 }
 
@@ -701,5 +720,434 @@ func TestPatrolBranchesDeletableFlagIsRegistered(t *testing.T) {
 	}
 	if !strings.Contains(patrolBranchesCmd.Long, "--deletable") {
 		t.Errorf("help text does not document --deletable:\n%s", patrolBranchesCmd.Long)
+	}
+}
+
+// --- superseded markers (gt-8xcg) ---------------------------------------
+
+// supersededSweepFixture is the shape the marker was built for: a settled check
+// row and a settled landed-but-not-an-ancestor row alongside one of each that
+// nobody has settled.
+func supersededSweepFixture() *witness.BranchSweepResult {
+	result := sweepFixture()
+	result.MarksMeasured = true
+	result.Scanned = 6
+	result.Findings = append(result.Findings,
+		witness.BranchSweepFinding{
+			Branch: "polecat/settled/gt-fbgq+eee", CommitSHA: "sha5",
+			IssueID: "gt-fbgq", IssueStatus: "closed",
+			Class: witness.BranchSweepSuperseded, UnderlyingClass: witness.BranchSweepCheck,
+			Superseded: &git.SupersededMark{
+				Branch: "polecat/settled/gt-fbgq+eee", Commit: "sha5",
+				Reason: "landed out of band as 7a108237", MarkedBy: "gastown/witness", MarkedAt: "2026-08-26T06:00:00Z",
+			},
+			Note: "settled: landed out of band as 7a108237 [by gastown/witness on 2026-08-26T06:00:00Z]; would otherwise be check",
+		},
+		witness.BranchSweepFinding{
+			Branch: "polecat/settled/gt-egq9+fff", CommitSHA: "sha6",
+			IssueID: "gt-egq9", IssueStatus: "closed",
+			Class: witness.BranchSweepSuperseded, UnderlyingClass: witness.BranchSweepLanded,
+			Evidence: "merge_tree_noop", ContainedIn: "origin/main", HygieneUnreachable: true,
+			Superseded: &git.SupersededMark{
+				Branch: "polecat/settled/gt-egq9+fff", Commit: "sha6",
+				Reason: "keep the branch: only surviving copy as originally authored", MarkedBy: "mayor",
+			},
+			Note: "settled: keep the branch: only surviving copy as originally authored [by mayor]; would otherwise be landed",
+		},
+	)
+	return result
+}
+
+func TestPatrolBranchesHidesSettledBranchesButAccountsForThem(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", supersededSweepFixture(), false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	for _, settled := range []string{"polecat/settled/gt-fbgq+eee", "polecat/settled/gt-egq9+fff"} {
+		if strings.Contains(out, settled) {
+			t.Errorf("default output still lists the settled branch %s:\n%s", settled, out)
+		}
+	}
+	// Hidden, not vanished. A sweep that quietly drops rows is the same defect
+	// as one that cannot tell settled from stranded, arriving from the other
+	// side — the reader must be able to see that suppression happened.
+	if !strings.Contains(out, "2 superseded") {
+		t.Errorf("summary does not tally the settled branches:\n%s", out)
+	}
+	if !strings.Contains(out, "6 scanned") {
+		t.Errorf("settled branches were dropped from the scan count:\n%s", out)
+	}
+	if !strings.Contains(out, "--superseded") {
+		t.Errorf("output does not say how to review what was settled:\n%s", out)
+	}
+	// The still-unsettled check row is untouched.
+	if !strings.Contains(out, "polecat/dust/gt-k3v+aaa") {
+		t.Errorf("an unsettled check row went missing:\n%s", out)
+	}
+}
+
+// The one deletion the marker must call off: a settled landed branch stops
+// asking to be deleted, because on the rig this was built for the ruling was
+// explicitly to KEEP the branch.
+func TestPatrolBranchesDeletableExcludesSettledBranches(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesDeletable(&buf, "gastown", supersededSweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if strings.Contains(out, "polecat/settled/gt-egq9+fff") {
+		t.Errorf("--deletable still asks for the deletion of a settled branch:\n%s", out)
+	}
+	if strings.Contains(out, "git push origin --delete polecat/settled/gt-egq9+fff") {
+		t.Errorf("--deletable printed a delete command for a branch marked keep:\n%s", out)
+	}
+	// The unsettled one is still there — the filter is per-row, not a mode.
+	if !strings.Contains(out, "polecat/refinery/gt-aqk+ddd") {
+		t.Errorf("--deletable dropped the branch that IS deletable:\n%s", out)
+	}
+}
+
+func TestPatrolBranchesSupersededViewShowsTheDerivation(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesSuperseded(&buf, "gastown", supersededSweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"polecat/settled/gt-fbgq+eee",
+		"landed out of band as 7a108237",
+		"gastown/witness",
+		"2026-08-26T06:00:00Z",
+		// The class the marker replaced, so an audit can tell a settled check
+		// from a settled landed one.
+		"check",
+		"unmark",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--superseded output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// A zero here is a measurement and must say what it measured, or it is
+// indistinguishable from a build that never looked.
+func TestPatrolBranchesSupersededViewSaysWhenNothingIsSettled(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesSuperseded(&buf, "gastown", sweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "none has been settled") {
+		t.Errorf("empty --superseded output does not say what was measured:\n%s", out)
+	}
+	if !strings.Contains(out, "4 scanned") {
+		t.Errorf("empty --superseded output does not say how many branches it looked at:\n%s", out)
+	}
+	if !strings.Contains(out, "mark") {
+		t.Errorf("empty --superseded output does not say how to record one:\n%s", out)
+	}
+}
+
+// A marked branch that is STILL being reported reads as the marker failing,
+// unless the output says the tip moved under it.
+func TestPatrolBranchesSaysWhyAStaleMarkerDidNotApply(t *testing.T) {
+	result := sweepFixture()
+	result.MarksMeasured = true
+	result.Findings[0].SupersededStale = true
+	result.Findings[0].Note += " — NOTE: a superseded marker exists but names sha-OLD, and the tip is now sha-NEW, so the branch was pushed to after it was settled and the marker does NOT apply"
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "NO LONGER APPLIES") {
+		t.Errorf("output does not raise the stale marker:\n%s", out)
+	}
+	if !strings.Contains(out, "1 marker(s) STALE") {
+		t.Errorf("summary does not tally stale markers:\n%s", out)
+	}
+}
+
+// A sweep that lost its markers looks exactly like a rig that has none, and the
+// two differ by every settled branch on it.
+func TestPatrolBranchesSaysWhenMarkersCouldNotBeRead(t *testing.T) {
+	result := sweepFixture()
+	result.MarksMeasured = false
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "superseded markers UNMEASURED") {
+		t.Errorf("summary presents an unread marker store as an empty one:\n%s", out)
+	}
+}
+
+func TestPatrolBranchesJSONCarriesTheMarkerTotals(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesJSON(&buf, "gastown", supersededSweepFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var out PatrolBranchesOutput
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v\n%s", err, buf.String())
+	}
+	if out.Superseded != 2 {
+		t.Errorf("superseded = %d, want 2", out.Superseded)
+	}
+	if out.HygieneUnreachable != 1 {
+		t.Errorf("hygiene_unreachable = %d, want 1 — a settled branch is still being counted as awaiting deletion", out.HygieneUnreachable)
+	}
+	// Every branch is in the JSON whatever its class: a consumer selects for
+	// itself rather than re-running the sweep with a different flag.
+	if len(out.Findings) != 6 {
+		t.Errorf("JSON carries %d findings, want 6", len(out.Findings))
+	}
+}
+
+func TestPatrolBranchesMarkerSubcommandsAreRegistered(t *testing.T) {
+	subs := map[string]bool{}
+	for _, sub := range patrolBranchesCmd.Commands() {
+		subs[sub.Name()] = true
+	}
+	for _, want := range []string{"mark", "unmark", "marks"} {
+		if !subs[want] {
+			t.Errorf("gt patrol branches %s is not registered; registered: %v", want, subs)
+		}
+	}
+	if patrolBranchesCmd.Flags().Lookup("superseded") == nil {
+		t.Error("flag --superseded is missing")
+	}
+	// A marker with no derivation is one the next reader has to redo, so the
+	// reason has to be reachable from the command line at all.
+	if patrolBranchesMarkCmd.Flags().Lookup("reason") == nil {
+		t.Error("gt patrol branches mark has no --reason flag")
+	}
+	if patrolBranchesMarkCmd.Flags().ShorthandLookup("m") == nil {
+		t.Error("gt patrol branches mark has no -m shorthand for --reason")
+	}
+	if patrolBranchesMarkCmd.Flags().Lookup("force") == nil {
+		t.Error("gt patrol branches mark has no --force, so an existing derivation could only be replaced by deleting it first")
+	}
+}
+
+// The reason is refused before anything is resolved, so the error is about the
+// missing derivation rather than about a rig or a remote.
+func TestPatrolBranchesMarkRefusesWithoutAReason(t *testing.T) {
+	saved := patrolBranchesMarkReason
+	t.Cleanup(func() { patrolBranchesMarkReason = saved })
+	patrolBranchesMarkReason = "   "
+
+	err := runPatrolBranchesMark(patrolBranchesMarkCmd, []string{"polecat/dust/gt-k3v+aaa"})
+	if err == nil {
+		t.Fatal("mark accepted a settlement with no reason")
+	}
+	if !strings.Contains(err.Error(), "reason") {
+		t.Errorf("error does not name what is missing: %v", err)
+	}
+}
+
+// stalledFixture is the gt-6i5d shape: hooked bead, dead polecat, pushed tip,
+// no MR. Before the split it rendered as an "active" row nobody was shown.
+func stalledFixture() *witness.BranchSweepResult {
+	return &witness.BranchSweepResult{
+		Remote:           "origin",
+		Target:           "origin/main",
+		Scanned:          2,
+		MRsMeasured:      true,
+		SessionsMeasured: true,
+		Findings: []witness.BranchSweepFinding{
+			{
+				Branch: "polecat/ace/bd-uzt+mt7w4a5q", CommitSHA: "83d8994f2",
+				Polecat: "ace",
+				IssueID: "bd-uzt", IssueStatus: "hooked",
+				SessionPresence: "absent",
+				Class:           witness.BranchSweepStalled,
+				Note:            "bead bd-uzt is hooked but ace's session is GONE, no MR was ever created — pushed work with nobody to submit it, and the hook stops it being re-dispatched",
+			},
+			{
+				Branch: "polecat/mirelurk/gt-live+ccc", CommitSHA: "sha3",
+				Polecat: "mirelurk",
+				IssueID: "gt-live", IssueStatus: "hooked",
+				SessionPresence: "present",
+				Class:           witness.BranchSweepActive,
+				Note:            "bead is hooked — still re-slingable; session for mirelurk is alive",
+			},
+		},
+	}
+}
+
+// The acceptance condition of gt-6i5d: a hooked bead over a dead session must
+// appear in the DEFAULT view, not only under --all.
+func TestPatrolBranchesHumanRaisesAStalledBranchByDefault(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", stalledFixture(), false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "polecat/ace/bd-uzt+mt7w4a5q") {
+		t.Fatalf("the stalled branch is not on the short list:\n%s", out)
+	}
+	if !strings.Contains(out, "stalled") {
+		t.Errorf("output never names the class:\n%s", out)
+	}
+	// The live one must stay off the short list; a split that raises both is a
+	// split in name only.
+	if strings.Contains(out, "polecat/mirelurk/gt-live+ccc") {
+		t.Errorf("an active branch with a LIVE session reached the short list:\n%s", out)
+	}
+	if !strings.Contains(out, "1 STALLED") {
+		t.Errorf("the attention line does not break out the stalled count:\n%s", out)
+	}
+}
+
+// The check guidance — "a short list is NOT a claim that work was lost" — is
+// true of a check row and false of a stalled one. A reader who meets the
+// reassurance first carries it onto a row it does not cover, so the stalled
+// guidance must come before it and say something different.
+func TestPatrolBranchesHumanGivesStalledItsOwnRemedy(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", stalledFixture(), false); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{"not a question", "gt mq submit", "gt session status", "re-sling"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stalled guidance is missing %q:\n%s", want, out)
+		}
+	}
+	stalledAt := strings.Index(out, "not a question")
+	reassuranceAt := strings.Index(out, "NOT a claim that work was lost")
+	if stalledAt < 0 || reassuranceAt < 0 {
+		t.Fatalf("expected both guidance blocks:\n%s", out)
+	}
+	if stalledAt > reassuranceAt {
+		t.Errorf("the check reassurance is printed before the stalled guidance, so it reads as covering it:\n%s", out)
+	}
+	// Still read-only. The remedy is printed, never performed.
+	if !strings.Contains(out, "writes nothing") {
+		t.Errorf("stalled guidance does not say the command performs none of it:\n%s", out)
+	}
+}
+
+// An active verdict must carry the session state it rests on. Asserting it from
+// bead status alone is the defect; asserting it silently from a session probe
+// would be the same defect with a better answer.
+func TestPatrolBranchesHumanAllShowsSessionStateInTheNote(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", stalledFixture(), true); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "session for mirelurk is alive") {
+		t.Errorf("--all does not show the session state behind an active verdict:\n%s", out)
+	}
+	if !strings.Contains(out, "ace's session is GONE") {
+		t.Errorf("--all does not show the session state behind a stalled verdict:\n%s", out)
+	}
+}
+
+// A sweep that could not ask must not have its zero read as an all-clear. This
+// is the exact reading that let the 23-hour stranding pass as healthy.
+func TestPatrolBranchesHumanSaysWhenSessionsWereNotMeasured(t *testing.T) {
+	result := stalledFixture()
+	result.SessionsMeasured = false
+	result.Findings = result.Findings[1:] // no stalled row: nothing was asked
+	result.Scanned = 1
+
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", result, true); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "0 stalled") {
+		t.Errorf("the tally omits the stalled class entirely:\n%s", out)
+	}
+	if !strings.Contains(out, "session state UNMEASURED") {
+		t.Errorf("a zero stalled count is presented as measured:\n%s", out)
+	}
+	if !strings.Contains(out, "NOT ASKED") {
+		t.Errorf("the summary does not say the zero is an absence of a question:\n%s", out)
+	}
+}
+
+// A measured sweep must NOT carry the unmeasured caveat: a warning that is
+// always present is a warning nobody reads.
+func TestPatrolBranchesHumanOmitsTheCaveatWhenSessionsWereMeasured(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesHuman(&buf, "gastown", stalledFixture(), true); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), "session state UNMEASURED") {
+		t.Errorf("a measured sweep claims its sessions were unmeasured:\n%s", buf.String())
+	}
+}
+
+// JSON must carry the session fact on every row and the measurement flag on the
+// result, so a consumer selects for itself instead of re-running the sweep.
+func TestPatrolBranchesJSONCarriesSessionState(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writePatrolBranchesJSON(&buf, "gastown", stalledFixture()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	var out struct {
+		Attention        int  `json:"attention"`
+		SessionsMeasured bool `json:"sessions_measured"`
+		Findings         []struct {
+			Branch          string `json:"branch"`
+			Class           string `json:"class"`
+			SessionPresence string `json:"session_presence"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, buf.String())
+	}
+	if !out.SessionsMeasured {
+		t.Errorf("sessions_measured is false on a measured sweep:\n%s", buf.String())
+	}
+	if out.Attention != 1 {
+		t.Errorf("attention = %d, want 1 (the stalled row)", out.Attention)
+	}
+	want := map[string][2]string{
+		"polecat/ace/bd-uzt+mt7w4a5q":  {"stalled", "absent"},
+		"polecat/mirelurk/gt-live+ccc": {"active", "present"},
+	}
+	for _, f := range out.Findings {
+		w, ok := want[f.Branch]
+		if !ok {
+			t.Errorf("unexpected branch %s", f.Branch)
+			continue
+		}
+		if f.Class != w[0] || f.SessionPresence != w[1] {
+			t.Errorf("%s = (%s, %s), want (%s, %s)", f.Branch, f.Class, f.SessionPresence, w[0], w[1])
+		}
+		delete(want, f.Branch)
+	}
+	if len(want) != 0 {
+		t.Errorf("findings omitted %v", want)
+	}
+}
+
+// The class must be documented where an operator meets it. A verdict whose name
+// is not in --help is a verdict a reader has to guess at.
+func TestPatrolBranchesHelpDocumentsStalled(t *testing.T) {
+	long := patrolBranchesCmd.Long
+	for _, want := range []string{"stalled", "session"} {
+		if !strings.Contains(long, want) {
+			t.Errorf("gt patrol branches --help never mentions %q", want)
+		}
+	}
+	if !strings.Contains(long, "stalled, check and unknown are the short list") {
+		t.Errorf("--help still describes the old short list:\n%s", long)
 	}
 }

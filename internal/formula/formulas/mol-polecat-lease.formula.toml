@@ -173,10 +173,30 @@ gt session kill {{rig}}/polecats/{{polecat}}
 git worktree remove polecats/{{polecat}} --force
 ```
 
-**3. Delete local branch (if exists):**
+**3. Delete the polecat's local branches (gt-x6ji):**
+
+Polecat branches are THREE components — `polecat/<name>/<bead>+<suffix>` — so
+`git branch -D polecat/{{polecat}}` names a ref that cannot exist (git's D/F
+rule forbids it alongside `polecat/{{polecat}}/...`). This step deleted nothing,
+ever, and `2>/dev/null || true` hid that for months. Enumerate instead, use
+`-d` so unmerged work is refused rather than destroyed, and report refusals:
+
 ```bash
-git branch -D polecat/{{polecat}} 2>/dev/null || true
+REFUSED=0
+for BRANCH in $(git for-each-ref --format='%(refname:short)' 'refs/heads/polecat/{{polecat}}/*'); do
+  if ERR=$(git branch -d "$BRANCH" 2>&1 >/dev/null); then
+    echo "deleted $BRANCH"
+  else
+    echo "REFUSED $BRANCH: $ERR"
+    REFUSED=$((REFUSED + 1))
+  fi
+done
+[ "$REFUSED" -eq 0 ] || echo "$REFUSED branch(es) not deleted — unmerged work, leave them for the operator"
 ```
+
+A refusal is the correct outcome, not an error to suppress: `-d` refuses a
+branch whose commits are not contained in the target, which is exactly the work
+that must not be thrown away here. Leave those branches in place and say so.
 
 **4. Close this lease:**
 ```bash

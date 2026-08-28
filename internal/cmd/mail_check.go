@@ -94,11 +94,15 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		// The inbox snapshot is needed twice below: once as the unread list to
+		// render, and once as the liveness reference for queued nudges. Keep the
+		// full snapshot rather than reassigning over it.
+		inbox := messages
 		if unread > 0 {
-			messages = filterUnreadMessages(messages)
-			fmt.Print(formatInjectOutput(messages, mailbox))
+			unreadMessages := filterUnreadMessages(inbox)
+			fmt.Print(formatInjectOutput(unreadMessages, mailbox))
 			// Ack after output so message is delivered before being marked acked.
-			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
+			if ackErr := mailbox.AcknowledgeDeliveries(address, unreadMessages); ackErr != nil {
 				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
 			}
 		}
@@ -110,8 +114,14 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 			queuedNudges, drainErr := nudge.Drain(workDir, sessionName)
 			if drainErr != nil {
 				fmt.Fprintf(os.Stderr, "gt mail check: nudge queue drain error: %v\n", drainErr)
-			} else if len(queuedNudges) > 0 {
-				fmt.Print(nudge.FormatForInjection(queuedNudges))
+			} else {
+				// Drop notifications for mail this agent has already dealt with.
+				// The inbox snapshot above is the authority and is already loaded,
+				// so this costs nothing extra here (gt-loz6).
+				queuedNudges = mail.FilterLiveNudges(queuedNudges, inbox)
+				if len(queuedNudges) > 0 {
+					fmt.Print(nudge.FormatForInjection(queuedNudges))
+				}
 			}
 		}
 

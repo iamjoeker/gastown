@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
@@ -93,10 +94,46 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	reportMovedBead(beadID, owner)
 	info := owner.Info
 
+	// Guard against scheduling deferred beads (gt-bel1).
+	//
+	// runSling (sling.go) and executeSling (sling_dispatch.go) have refused
+	// deferred beads since gt-1326mw, but deferred DISPATCH MODE routes around
+	// both: with scheduler.max_polecats > 0, `gt sling <bead> <rig>` lands here
+	// instead, and here the gate was missing. That is not theoretical — bd-sdj,
+	// deferred since 2026-08-19 on a condition stated in its own title,
+	// accumulated five open sling contexts through this path while every other
+	// bead in the same window got one.
+	//
+	// This runs as soon as the status is known, ahead of the cross-rig guard and
+	// the sling-context lookup: deferral is a property of the bead alone, so
+	// nothing later can change the answer, and refusing first means a deferred
+	// bead never reaches the code that would write a context for it.
+	if isDeferredBead(info) && !opts.Force {
+		return fmt.Errorf("bead %s is deferred (use --force to override)", beadID)
+	}
+
 	if !opts.Force {
 		if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
 			return err
 		}
+	}
+
+	// Pre-flight the dispatcher's own cross-rig prefix guard (gt-ygb7).
+	//
+	// Deferred dispatch splits the decision in two: this command decides what to
+	// enqueue, and a later daemon process decides what to run. The daemon applies
+	// capacity.AcceptsPrefix, which this path never checked — so a bead the
+	// dispatcher will refuse still got a context bead, a convoy, and the "✓
+	// Scheduled" line below, and the refusal landed hours later on the daemon's
+	// stderr where no operator was reading. Five slings, five ticks, one dispatch.
+	//
+	// Refuse here instead, with the reason and the store that holds the row. Not
+	// bypassable by --force: --force overrides bead STATE, and this is a routing
+	// fact that no amount of forcing makes dispatchable.
+	rigPrefix := rigBeadsPrefix(townRoot, filepath.Join(townRoot, rigName), rigName)
+	if !capacity.AcceptsPrefix(rigPrefix, beadID) && !beadOwnedByRig(townRoot, rigName, beadID, owner) {
+		return fmt.Errorf("bead %s cannot be dispatched to rig %q: rig prefix is %q, bead prefix is %q, and the live row is in %s\nThe scheduler would refuse this bead after this command reported success — sling it to the rig that owns the row, or move the bead first",
+			beadID, rigName, rigPrefix, capacity.BeadIDPrefix(beadID), describeBeadStoreRig(owner.Rig))
 	}
 
 	// Idempotency: check for existing open sling context for this work bead.
@@ -115,8 +152,23 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("checking for existing sling context: %w", findErr)
 	}
 	if existingCtx != nil {
-		fmt.Printf("%s Bead %s is already scheduled (context: %s), no-op\n",
-			style.Dim.Render("○"), beadID, existingCtx.ID)
+		// "Already scheduled" is a claim about the QUEUE, and an open context is
+		// only half of it: the scheduler drops any context whose work bead is not
+		// open, so a closed or already-dispatched bead has a live context and no
+		// queue entry (gt-ygb7). Re-slinging is the natural operator response to a
+		// bead that never ran, and answering it with a tick is what turned one
+		// silent failure into a confirmed one. Say which it is.
+		switch {
+		case !beadStatusIsLive(info.Status):
+			return fmt.Errorf("bead %s has an open sling context (%s) but is %s in %s — it is not in the scheduler queue\nClose the context or reopen the bead; retrying the sling cannot fix this",
+				beadID, existingCtx.ID, info.Status, describeBeadStoreRig(owner.Rig))
+		case info.Status != "open":
+			fmt.Printf("%s Bead %s is already %s (context: %s), no-op — dispatched, not queued\n",
+				style.Dim.Render("○"), beadID, info.Status, existingCtx.ID)
+		default:
+			fmt.Printf("%s Bead %s is already scheduled (context: %s), no-op\n",
+				style.Dim.Render("○"), beadID, existingCtx.ID)
+		}
 		return nil
 	}
 
@@ -130,7 +182,28 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return closedBeadError(beadID, owner)
 	}
 
-	if (info.Status == "pinned" || info.Status == "hooked" || info.Status == "in_progress") && !opts.Force {
+	// Reclaim a hook whose holder is confirmed dead (gt-s1id).
+	//
+	// runSling (sling.go) and executeSling (sling_dispatch.go) have auto-forced
+	// past a dead assignee since gt-pqf9x/gt-npzy. Deferred dispatch routes
+	// around both: the daemon's convoy feeder runs `gt sling <bead> <rig>` with
+	// no --force, and with scheduler.max_polecats > 0 that lands here, where the
+	// check was missing. A polecat whose session died holding the hook therefore
+	// stranded its convoy permanently — the feeder retried the identical sling
+	// every 30s and logged the identical failure forever, and only a human
+	// noticing ever cleared it. Reproduced twice in one evening on one polecat.
+	//
+	// Bypassing the gate is not enough, and on its own would be worse: the
+	// scheduler dispatches a context only when its work bead is "open"
+	// (isScheduledWorkBeadReady), and cleanupStaleContexts closes any context
+	// whose work bead is "hooked" as "stale-work-bead". Enqueueing a still-hooked
+	// bead buys a context that is reaped before it can run — turning a loud
+	// livelock into a silent one. So release the hook here, and only then queue.
+	staleHookHolder := ""
+	if (info.Status == "hooked" || info.Status == "in_progress") && info.Assignee != "" && isHookedAgentDeadFn(info.Assignee) {
+		staleHookHolder = info.Assignee
+	}
+	if (info.Status == "pinned" || info.Status == "hooked" || info.Status == "in_progress") && !opts.Force && staleHookHolder == "" {
 		return fmt.Errorf("bead %s is already %s to %s\nUse --force to override", beadID, info.Status, info.Assignee)
 	}
 
@@ -150,11 +223,27 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 
 	if opts.DryRun {
 		fmt.Printf("Would schedule %s → %s\n", beadID, rigName)
+		if staleHookHolder != "" {
+			fmt.Printf("  Would release stale hook from %s (no active session)\n", staleHookHolder)
+		}
 		fmt.Printf("  Would create sling context bead\n")
 		if !opts.NoConvoy {
 			fmt.Printf("  Would create auto-convoy\n")
 		}
 		return nil
+	}
+
+	// Release the stale hook now that every gate above has passed — in
+	// particular checkPriorWorkGuard, which still sees opts.Force and so still
+	// refuses a bead whose branch is already queued to merge. A dead polecat is
+	// exactly how a bead ends up hooked with its work already pushed, and
+	// re-dispatching that is duplicate work, not recovery.
+	if staleHookHolder != "" {
+		if err := releaseStaleHookForSchedule(townRoot, beadID, staleHookHolder, info.Status); err != nil {
+			return err
+		}
+		info.Status = "open"
+		info.Assignee = ""
 	}
 
 	// Cook formula after dry-run check to avoid side effects
@@ -235,6 +324,43 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	_ = events.LogFeed(events.TypeSchedulerEnqueue, actor, events.SchedulerEnqueuePayload(beadID, rigName))
 
 	fmt.Printf("%s Scheduled %s → %s (context: %s)\n", style.Bold.Render("✓"), beadID, rigName, ctxBead.ID)
+	return nil
+}
+
+// releaseStaleHookForSchedule returns a bead held by a dead agent to open and
+// unassigned, so the capacity scheduler can dispatch it (gt-s1id).
+//
+// The write is verified by re-reading the row. An unverified release is worse
+// than a failed one here: the caller goes on to create a sling context, and a
+// context whose work bead is still hooked is closed as "stale-work-bead" on the
+// next cleanup pass — so a silently-ineffective release would report "Scheduled"
+// for work that can never be dispatched. Failing loudly leaves the convoy
+// visibly stranded, which is what the feeder's retry is for.
+func releaseStaleHookForSchedule(townRoot, beadID, holder, priorStatus string) error {
+	fmt.Printf("%s Hooked agent %s has no active session, releasing stale hook on %s...\n",
+		style.Warning.Render("⚠"), holder, beadID)
+
+	unhookDir := beads.ResolveHookDir(townRoot, beadID, "")
+	if out, err := BdCmd("update", beadID, "--status=open", "--assignee=").
+		Dir(unhookDir).
+		WithAutoCommit().
+		CombinedOutput(); err != nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			err = fmt.Errorf("%w: %s", err, trimmed)
+		}
+		return fmt.Errorf("releasing stale hook on %s from dead agent %s: %w", beadID, holder, err)
+	}
+
+	verified, err := getBeadInfoFromTownRoot(townRoot, beadID)
+	if err != nil {
+		return fmt.Errorf("verifying stale hook release on %s: %w", beadID, err)
+	}
+	if verified.Status == "hooked" || verified.Status == "in_progress" {
+		return fmt.Errorf("stale hook release on %s did not take: still %s to %q (was %s to %s)\nThe bead lives in %s — release it there before re-slinging",
+			beadID, verified.Status, verified.Assignee, priorStatus, holder, unhookDir)
+	}
+
+	fmt.Printf("%s Released %s from %s (now %s)\n", style.Dim.Render("○"), beadID, holder, verified.Status)
 	return nil
 }
 
@@ -354,22 +480,18 @@ func areScheduled(beadIDs []string) map[string]bool {
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
-	contexts, err := listAllSlingContexts(townRoot)
+	//
+	// The scan is shared with the dashboard: "scheduled" has to mean the same
+	// thing to every surface that reports on a bead, or one of them renders a
+	// bead waiting for capacity as one nobody is looking at (gt-skzk.1).
+	// Cleanup owns stale-state closure; idempotency must not use a different
+	// definition of scheduled.
+	scheduledWorkBeads, err := convoyops.OpenSlingContextWorkBeads(townRoot)
 	if err != nil {
 		for _, id := range beadIDs {
 			result[id] = true
 		}
 		return result
-	}
-
-	// Build lookup of work bead IDs from open contexts. Cleanup owns stale-state
-	// closure; idempotency must not use a different definition of scheduled.
-	scheduledWorkBeads := make(map[string]bool)
-	for _, ctx := range contexts {
-		fields := beads.ParseSlingContextFields(ctx.Description)
-		if fields != nil {
-			scheduledWorkBeads[fields.WorkBeadID] = true
-		}
 	}
 
 	// Filter to just the requested IDs

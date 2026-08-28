@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -41,6 +42,18 @@ const (
 	// policy permits a witness to take. Surfaced in check-recovery JSON as
 	// witness_action so the policy is machine-readable, not just prose.
 	witnessActionRestart = "restart"
+
+	// witnessActionClearState is the second permitted action, and it exists
+	// because restart could not do this job: no restart path writes agent_state,
+	// so a polecat parked at a paused state (stuck, awaiting-gate, paused,
+	// escalated) read paused again the moment its new session came up. Every
+	// action a witness is permitted to take left the state untouched and nuking
+	// is forbidden, so the prescribed remedy and the permitted actions did not
+	// intersect and the slot's disposition never moved (gt-fbgq).
+	//
+	// Like restart, it is non-destructive: it writes one field on the agent bead
+	// and touches neither the worktree nor the session.
+	witnessActionClearState = "clear-state"
 )
 
 // nukeCallerIdentity resolves the identity of whoever is invoking a destructive
@@ -100,9 +113,35 @@ can pass --%s to proceed anyway`,
 // witnessActionFor names the action the restart-first policy permits a witness
 // to take for a given check-recovery verdict. Every verdict resolves to
 // something other than nuking — that is the point.
-func witnessActionFor(verdict string) string {
+//
+// state is the polecat's lifecycle state, and it matters only on the
+// SAFE_TO_NUKE road: see the default arm. The zero value ("state was not
+// measured") leaves that arm's answer at restart, unchanged.
+func witnessActionFor(verdict string, state polecat.State) string {
 	switch verdict {
 	case "NEEDS_MQ_SUBMIT", "NEEDS_RECOVERY":
+		return "escalate"
+	case polecat.WorkstateVerdictNeedsStateClear:
+		// Not "escalate": nothing is at risk and there is nothing for the Mayor
+		// to recover — only a field the witness is permitted to clear itself.
+		return witnessActionClearState
+	case polecat.WorkstateVerdictNeedsLogin:
+		// Escalate, not restart — and this is the one verdict where the default
+		// arm below would actively make things worse. No restart path can supply
+		// credentials, so restarting a logged-out agent produces another
+		// logged-out agent; only a human at a browser clears it. Restart-first is
+		// correct for ordinary stalls and wrong for exactly this one (gt-acb1).
+		return "escalate"
+	case polecat.WorkstateVerdictSuspectStall:
+		// Escalate, not restart, and not leave-alone.
+		//
+		// Leave-alone is what this case USED to get — a wedged agent renders the
+		// busy marker, so it read as WORKING — and that is the whole defect
+		// (gt-y39t). Restart is wrong in the other direction: the evidence is
+		// two pane samples a minute apart, which is enough to say nothing is
+		// moving and not enough to say the agent is dead, and restarting throws
+		// away its context to find out. A person can settle it by looking at
+		// the pane.
 		return "escalate"
 	case "PENDING_MR":
 		return "leave-alone"
@@ -120,6 +159,37 @@ func witnessActionFor(verdict string) string {
 		// reclaim yet.
 		return "leave-alone"
 	default:
+		// SAFE_TO_NUKE, and the question restart has to answer here is "what
+		// does this change that the reuse gate does not already do?"
+		//
+		// For an idle or done polecat the answer is nothing. Pool eligibility is
+		// not a latch a restart flips — polecat.StateEligibleForPoolReuse is
+		// evaluated afresh on every sling, and it already accepts both states —
+		// so a polecat in one of them is a candidate right now and there is no
+		// slot to reclaim. `gt session restart` writes no lifecycle state at
+		// all; it stops a tmux session and starts another.
+		//
+		// The restart is not merely inert, it has a live downside. The new
+		// session primes, finds nothing on its hook, and runs `gt done`, and
+		// that is the exit path gt-j9uv and gt-gubw are about: a fork-mode
+		// polecat whose source bead is already closed can park at
+		// agent_state=stuck instead of exiting. Measured 2026-08-23 — the
+		// witness followed this prescription on ghoul and synth, both parked,
+		// and both had to be cleared by hand with `gt polecat clear-state`. Two
+		// healthy done polecats spent as the price of reclaiming nothing.
+		//
+		// So the honest prescription is none: leave-alone, the same answer the
+		// mol-witness-patrol preamble has always given in prose ("Done polecat
+		// (bead closed) → leave alone (sandbox preserved)") and the only
+		// machine-readable surface disagreed with (gt-t6k2).
+		//
+		// StateHandedOff deliberately keeps restart. The reuse gate does NOT
+		// accept it, so unlike the two above it really is a slot nothing else
+		// will reclaim, and restart is the one lever the restart-first policy
+		// leaves a witness.
+		if polecat.StateEligibleForPoolReuse(state) {
+			return "leave-alone"
+		}
 		return witnessActionRestart
 	}
 }

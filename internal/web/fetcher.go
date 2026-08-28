@@ -21,6 +21,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -293,7 +294,7 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 		tmuxCmdTimeout:          config.ParseDurationOrDefault(webCfg.TmuxCmdTimeout, 2*time.Second),
 		staleThreshold:          config.ParseDurationOrDefault(workerCfg.StaleThreshold, 5*time.Minute),
 		stuckThreshold:          config.ParseDurationOrDefault(workerCfg.StuckThreshold, constants.GUPPViolationTimeout),
-		heartbeatFreshThreshold: config.ParseDurationOrDefault(workerCfg.HeartbeatFreshThreshold, 5*time.Minute),
+		heartbeatFreshThreshold: config.ParseDurationOrDefault(workerCfg.HeartbeatFreshThreshold, config.DefaultDeaconHeartbeatStaleThreshold),
 		mayorActiveThreshold:    config.ParseDurationOrDefault(workerCfg.MayorActiveThreshold, 5*time.Minute),
 	}, nil
 }
@@ -329,6 +330,10 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 
+	// One classification environment for the whole pass: the scheduled-bead scan
+	// reads every store in town, so it must not run per convoy.
+	env := f.convoyClassifierEnv()
+
 	// Build convoy rows with activity data
 	rows := make([]ConvoyRow, 0, len(convoys))
 	for _, c := range convoys {
@@ -356,10 +361,6 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		for _, t := range tracked {
 			if t.Status == "closed" {
 				row.Completed++
-			} else if t.Assignee != "" {
-				row.InProgress++
-			} else {
-				row.ReadyBeads++
 			}
 			// Track most recent activity from workers
 			if t.LastActivity.After(mostRecentActivity) {
@@ -417,8 +418,19 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 			}
 		}
 
-		// Calculate work status based on progress and activity
-		row.WorkStatus = calculateWorkStatus(row.Completed, row.Total, row.LastActivity.ColorClass)
+		// Classify the convoy from execution state, using the same code
+		// `gt convoy stranded` uses. Activity age is rendered in its own column
+		// and decides nothing (gt-skzk.1).
+		row.WorkStatus, row.Evidence = f.convoyWorkStatus(tracked, env)
+
+		// The work chips come off the same evidence as the badge. Counting an
+		// assignee as "active" is the presence-for-state substitution this bead
+		// is about at bead scale: a polecat that died mid-run leaves its name on
+		// the bead, and a bead that was never routable is not work anyone can
+		// pick up.
+		row.ReadyBeads = row.Evidence[convoyops.DispoReady]
+		row.InProgress = row.Evidence[convoyops.DispoWorking]
+		row.InQueue = row.Evidence[convoyops.DispoInQueue]
 
 		// Get tracked issues for expandable view
 		row.TrackedIssues = make([]TrackedIssue, len(tracked))
@@ -452,30 +464,100 @@ type trackedIssueInfo struct {
 	ID           string
 	Title        string
 	Status       string
+	IssueType    string
 	Assignee     string
+	Blocked      bool
 	LastActivity time.Time
 	UpdatedAt    time.Time // Fallback for activity when no assignee
 }
 
+// webTrackedIssues narrows the panel's rows to the fields that decide a
+// disposition, so the dashboard hands the shared classifier exactly what
+// `gt convoy stranded` hands it.
+func webTrackedIssues(tracked []trackedIssueInfo) []convoyops.TrackedIssue {
+	out := make([]convoyops.TrackedIssue, 0, len(tracked))
+	for _, t := range tracked {
+		out = append(out, convoyops.TrackedIssue{
+			ID:        t.ID,
+			Status:    t.Status,
+			IssueType: t.IssueType,
+			Assignee:  t.Assignee,
+			Blocked:   t.Blocked,
+		})
+	}
+	return out
+}
+
+// convoyClassifierEnv assembles the live lookups the shared convoy classifier
+// needs. It is built once per fetch: the sling-context scan reads every beads
+// store in town, and the merge-queue lookup is consulted only for beads whose
+// session has died, which is where it changes the answer.
+//
+// One deliberate difference from `gt convoy stranded`: when the sling-context
+// scan cannot read every store, the CLI treats every bead as scheduled, because
+// there the answer guards dispatch and over-reporting "scheduled" only costs a
+// missed dispatch. Here the same choice would paint every convoy in town as
+// benignly waiting on the strength of a scan that failed, so the panel uses the
+// partial result and logs what it could not read.
+func (f *LiveConvoyFetcher) convoyClassifierEnv() convoyops.Env {
+	liveSessions := f.liveSessionNames()
+
+	scheduled, err := fetcherScheduledBeads(f.townRoot)
+	if err != nil {
+		log.Printf("dashboard: %v — scheduled beads may render as ready", err)
+	}
+
+	return convoyops.Env{
+		Scheduled:    scheduled,
+		SessionAlive: func(sessionName string) bool { return liveSessions[sessionName] },
+		QueuedMR:     func(beadID string) bool { return fetcherHasQueuedMR(f.townRoot, beadID) },
+	}
+}
+
+// Injection points for the two live lookups (stubbed in tests). Both talk to
+// beads stores directly rather than through runBdCmd.
+var (
+	fetcherScheduledBeads = convoyops.OpenSlingContextWorkBeads
+	fetcherHasQueuedMR    = convoyops.HasQueuedMergeRequest
+)
+
+// convoyWorkStatus decides a convoy's verdict from its tracked beads.
+//
+// Nothing here reads a clock. That is the fix: the previous version took the
+// activity-age COLOR as its only input beyond the completed count, so silence
+// and stalling were the same observation to it (gt-skzk.1).
+func (f *LiveConvoyFetcher) convoyWorkStatus(tracked []trackedIssueInfo, env convoyops.Env) (string, map[string]int) {
+	_, evidence := convoyops.ClassifyAll(f.townRoot, webTrackedIssues(tracked), env)
+	return convoyops.WorkStatus(len(tracked), evidence), evidence
+}
+
+// liveSessionNames returns the set of tmux sessions currently running on the
+// town's socket. One listing answers "is this worker alive?" for every convoy in
+// the pass; asking per assignee would be one tmux exec per tracked bead.
+//
+// An unreadable tmux server yields an empty set, which reads as "no worker is
+// alive". That is the same answer `gt convoy stranded` gives when has-session
+// fails, and it errs toward showing work as needing attention rather than
+// toward a worker that is not there.
+func (f *LiveConvoyFetcher) liveSessionNames() map[string]bool {
+	live := make(map[string]bool)
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}")
+	if err != nil {
+		return live
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			live[name] = true
+		}
+	}
+	return live
+}
+
 // getTrackedIssues fetches tracked issues for a convoy.
 func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInfo, error) {
-	// Query tracked dependencies using bd dep list
-	stdout, err := f.runBdCmd(f.townRoot, "dep", "list", convoyID, "-t", "tracks", "--json")
+	issueIDs, err := f.trackedIssueIDs(convoyID)
 	if err != nil {
-		return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
-	}
-
-	var deps []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &deps); err != nil {
-		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, err)
-	}
-
-	// Collect resolved issue IDs, unwrapping external:prefix:id format
-	issueIDs := make([]string, 0, len(deps))
-	for _, dep := range deps {
-		issueIDs = append(issueIDs, beads.ExtractIssueID(dep.ID))
+		return nil, err
 	}
 
 	// Batch fetch issue details
@@ -495,11 +577,16 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInf
 		if d, ok := details[id]; ok {
 			info.Title = d.Title
 			info.Status = d.Status
+			info.IssueType = d.IssueType
 			info.Assignee = d.Assignee
+			info.Blocked = d.Blocked
 			info.UpdatedAt = d.UpdatedAt
 		} else {
+			// Not observed, not absent: the bead's store was unreadable from
+			// here. The classifier reads this as "unknown" rather than guessing
+			// a status for it.
 			info.Title = "(external)"
-			info.Status = "unknown"
+			info.Status = convoyops.StatusUnknown
 		}
 
 		if w, ok := workers[id]; ok && w.LastActivity != nil {
@@ -512,12 +599,58 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInf
 	return result, nil
 }
 
+// trackedIssueIDs returns the IDs a convoy tracks.
+//
+// It reads the dependencies table directly, because `bd dep list -t tracks`
+// joins against the issues table and so returns NOTHING for a dependency whose
+// target lives in another Dolt database — which is every HQ convoy tracking rig
+// work. Measured 2026-08-25: the join returned [] for all five live convoys
+// while the raw table returned one tracked bead each, so the panel rendered a
+// town of working polecats as five convoys with no work in them (gt-skzk.1).
+//
+// The join is kept as a fallback for stores that are not Dolt-in-server-mode,
+// where there is no server to query.
+func (f *LiveConvoyFetcher) trackedIssueIDs(convoyID string) ([]string, error) {
+	ids, err := fetcherTrackedIssueIDs(f.townRoot, convoyID)
+	if err == nil {
+		return ids, nil
+	}
+
+	stdout, bdErr := f.runBdCmd(f.townRoot, "dep", "list", convoyID, "-t", "tracks", "--json")
+	if bdErr != nil {
+		// Report BOTH: "the dep table was unreachable" and "bd also failed" are
+		// different outages, and a panel that names only the second sends an
+		// operator to the wrong place.
+		return nil, fmt.Errorf("querying tracked issues for %s: dep table: %v; bd dep list: %w", convoyID, err, bdErr)
+	}
+
+	var deps []struct {
+		ID string `json:"id"`
+	}
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &deps); jsonErr != nil {
+		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, jsonErr)
+	}
+
+	// Collect resolved issue IDs, unwrapping external:prefix:id format
+	issueIDs := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		issueIDs = append(issueIDs, beads.ExtractIssueID(dep.ID))
+	}
+	return issueIDs, nil
+}
+
+// fetcherTrackedIssueIDs is the injection point for the dep-table read
+// (stubbed in tests).
+var fetcherTrackedIssueIDs = convoyops.TrackedIssueIDs
+
 // issueDetail holds basic issue info.
 type issueDetail struct {
 	ID        string
 	Title     string
 	Status    string
+	IssueType string
 	Assignee  string
+	Blocked   bool
 	UpdatedAt time.Time
 }
 
@@ -536,23 +669,23 @@ func (f *LiveConvoyFetcher) getIssueDetailsBatch(issueIDs []string) (map[string]
 		return nil, fmt.Errorf("bd show failed (issue_count=%d): %w", len(issueIDs), err)
 	}
 
-	var issues []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		Assignee  string `json:"assignee"`
-		UpdatedAt string `json:"updated_at"`
-	}
+	// Decoded into the shared beads.Issue so blocker state is read the same way
+	// everywhere: blocked_by_count alone is not reliable (bd omits it on some
+	// paths), and HasUnresolvedBlockers falls back to the live dependency edges.
+	var issues []beads.Issue
 	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
 		return nil, fmt.Errorf("bd show returned invalid JSON (issue_count=%d): %w", len(issueIDs), err)
 	}
 
-	for _, issue := range issues {
+	for i := range issues {
+		issue := &issues[i]
 		detail := &issueDetail{
-			ID:       issue.ID,
-			Title:    issue.Title,
-			Status:   issue.Status,
-			Assignee: issue.Assignee,
+			ID:        issue.ID,
+			Title:     issue.Title,
+			Status:    issue.Status,
+			IssueType: issue.Type,
+			Assignee:  issue.Assignee,
+			Blocked:   beads.HasUnresolvedBlockers(issue),
 		}
 		// Parse updated_at timestamp
 		if issue.UpdatedAt != "" {
@@ -703,26 +836,13 @@ func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 	return &mostRecent
 }
 
-// calculateWorkStatus determines the work status based on progress and activity.
-// Returns: "complete", "active", "stale", "stuck", or "waiting"
-func calculateWorkStatus(completed, total int, activityColor string) string {
-	// Check if all work is done
-	if total > 0 && completed == total {
-		return "complete"
-	}
-
-	// Determine status based on activity color
-	switch activityColor {
-	case activity.ColorGreen:
-		return "active"
-	case activity.ColorYellow:
-		return "stale"
-	case activity.ColorRed:
-		return "stuck"
-	default:
-		return "waiting"
-	}
-}
+// calculateWorkStatus is gone: it decided a convoy's verdict from the AGE of
+// the last activity event, so every convoy doing work slower than the ten-minute
+// red threshold turned STUCK and stayed stuck until it completed — measured
+// against 8-minute gate runs and 20-40 minute polecat work items, that is every
+// convoy that does real work. Age answers "was anything logged recently", which
+// is a different question from "is anyone on this". See convoy.WorkStatus for
+// the replacement and gt-skzk.1 for the measurement.
 
 // mergeRequestLabel marks a bead as a merge request. Same label `gt mq list`
 // filters on — the dashboard and CLI must read the same source (gt-4qp).
@@ -1347,10 +1467,19 @@ func parseActivityTimestamp(s string) (int64, bool) {
 	return unix, true
 }
 
+// mailFetchLimit caps the mail query. Unlike the caps on the other panels this
+// one is meant: the panel shows recent traffic, and the town root held 386
+// message beads when this was measured, nearly all of them long read.
+//
+// A deliberate cap is still a cap. len(rows) reaching it means the query came
+// back full and the panel is showing a floor, which is why the handler turns
+// this number into MailTruncated rather than letting the count render bare.
+const mailFetchLimit = 50
+
 // FetchMail fetches recent mail messages from the beads database.
 func (f *LiveConvoyFetcher) FetchMail() ([]MailRow, error) {
 	// List all message issues (mail)
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:message", "--json", "--limit=50")
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:message", "--json", fmt.Sprintf("--limit=%d", mailFetchLimit))
 	if err != nil {
 		return nil, fmt.Errorf("listing mail: %w", err)
 	}
@@ -1605,13 +1734,26 @@ func (f *LiveConvoyFetcher) FetchDogs() ([]DogRow, error) {
 // exactly when escalations are most likely to exist, and swallowing the failure
 // made the town look calmest at its worst moment (gt-edty).
 func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
-	// List open escalations
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", "--json")
-	if err != nil {
-		return nil, fmt.Errorf("listing escalations: %w", err)
-	}
-
-	var issues []struct {
+	// List open escalations.
+	//
+	// --limit=0 is load-bearing, not tidiness: `bd list` defaults to 50, so
+	// omitting the flag capped this query silently. The escalation count is a
+	// banner stat and the banner had no way to say it was short — a town with
+	// 60 open escalations would have displayed 50, in the same typeface as a
+	// measured count, and the ten it could not see are the ten nobody is
+	// coming for. An unbounded query cannot be truncated, so there is nothing
+	// to mark; the count is a true count (gt-skzk.2).
+	//
+	// The pinned half is asked for separately for the same reason `--limit=0`
+	// is passed: bd's default `--status=open` is silently `--no-pinned`, and it
+	// has no include-pinned flag. Measured on hq 2026-08-26 the single default
+	// query returned 1 of the 4 open escalations, the other 3 being pinned —
+	// two of them HIGH. Truncation at least has a cause a reader could guess;
+	// this one drops precisely the rows an operator pinned to keep in view, and
+	// the panel renders the town calmest at its worst moment (gt-z5h7, and the
+	// same shape as gt-edty and gt-qee3). Unioned by ID rather than switched
+	// between, so it stays correct if bd's default ever changes.
+	type escalationIssue struct {
 		ID          string   `json:"id"`
 		Title       string   `json:"title"`
 		CreatedAt   string   `json:"created_at"`
@@ -1619,8 +1761,26 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 		Labels      []string `json:"labels"`
 		Description string   `json:"description"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		return nil, fmt.Errorf("parsing escalations: %w", err)
+
+	var issues []escalationIssue
+	seen := make(map[string]bool)
+	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
+		stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", pinnedFilter, "--json", "--limit=0")
+		if err != nil {
+			return nil, fmt.Errorf("listing escalations (%s): %w", pinnedFilter, err)
+		}
+
+		var half []escalationIssue
+		if err := json.Unmarshal(stdout.Bytes(), &half); err != nil {
+			return nil, fmt.Errorf("parsing escalations (%s): %w", pinnedFilter, err)
+		}
+		for _, issue := range half {
+			if seen[issue.ID] {
+				continue
+			}
+			seen[issue.ID] = true
+			issues = append(issues, issue)
+		}
 	}
 
 	var rows []EscalationRow
@@ -1732,8 +1892,10 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 // queues" are different facts, and only one of them means the panel can be
 // trusted.
 func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
-	// List queue beads
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:queue", "--json")
+	// List queue beads. --limit=0 for the same reason FetchEscalations carries
+	// it: bd's own default of 50 would cap this read with nothing on the page
+	// to say so.
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:queue", "--json", "--limit=0")
 	if err != nil {
 		return nil, fmt.Errorf("listing queues: %w", err)
 	}
@@ -2041,17 +2203,40 @@ func stripModelSuffix(model string) string {
 	return model
 }
 
-// issuesPerStoreLimit caps how many raw beads each store contributes to the
-// Work panel, per status listed.
+// issuesPerStoreLimit is a SAFETY CAP on the backlog fetch. It is not the size
+// of the panel, and it must stay far above any real store's backlog.
 //
-// The town-root-only query this replaced asked for 50. Keeping 50 PER STORE
-// rather than 50 shared is deliberate: the stores are wildly uneven (521 open
-// beads in the town root against 65 in the gastown rig when measured), so a
-// shared budget would be spent by the town root before a single rig was read
-// and the panel would stay blind. See perStoreLimit.
-const issuesPerStoreLimit = 50
+// It used to be 50 per store, and the number the dashboard showed was the size
+// of that sample presented as the size of the backlog. Measured 2026-08-25, the
+// gastown rig held 59 non-internal open beads against a cap of 50, so it
+// contributed exactly 50 whether it held 51 or 500: closing a bead only slid
+// the next one into the sampled window, and the Work count could not fall until
+// the store dropped below 50. The town root failed the other way — 28 of the 50
+// rows it contributed were gt:message, fetched, counted against the cap and
+// only then hidden, so it displayed 22 of its 186 real work items and NEW MAIL
+// PUSHED WORK OUT OF THE SAMPLE. The displayed number fell as the backlog rose
+// (gt-eolg).
+//
+// A cap this high is affordable because the panel reads six scalar fields and
+// asks bd for nothing else: --brief took the town root's unlimited open query
+// from 2.4MB/0.80s to 414KB/0.09s, the same cost as the 50-row query it
+// replaces. A store that returns this many rows is still recorded in
+// TruncatedStores, which is what keeps the count an explicit floor rather than
+// a wrong number.
+//
+// It is set far above the largest store measured (the town root, 620 open beads
+// including its mail) rather than just above it, because the cost of the fetch
+// scales with the rows a store actually holds and not with the cap: raising it
+// is free until the day it is needed, and the day it is needed is the day the
+// count would otherwise start lying again.
+const issuesPerStoreLimit = 5000
 
-// FetchIssues returns open issues (the backlog) from every store.
+// FetchIssues returns open and hooked issues (the backlog) from every store.
+//
+// Rows is the whole backlog, not a page of it. The caller decides how much of
+// it to render; len(Rows) is the count an operator can act on, and it falls
+// when work is closed. Trimming for display belongs at the render site so the
+// two numbers stay visibly distinct.
 //
 // Issues are per-rig data: measured against this town, the town root held 521
 // open beads while the rigs held 65, 7 and 2 that this panel never showed.
@@ -2074,6 +2259,11 @@ func (f *LiveConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 	// The town root is mostly gt:message rows, so a store can fill its whole
 	// allowance and still show almost nothing — that is a truncated store, and
 	// filtering first would have hidden it.
+	//
+	// This also keeps isInternal the single authority on what counts as work.
+	// Excluding the gt: labels in the bd query would be cheaper, but then the
+	// count and the rows would answer to two different predicates, and any drift
+	// between them would be invisible on the page.
 	result := mapStoreRows(open.merge(hooked), func(b issueBead) (IssueRow, bool) {
 		if b.isInternal() {
 			return IssueRow{}, false
@@ -2101,10 +2291,16 @@ func (f *LiveConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 
 // issueBead is one bead as the backlog panel reads it from bd, before the
 // panel decides whether to display it.
+//
+// Type is tagged issue_type because that is the key `bd list --json` emits;
+// there is no "type" key in its output at all. Tagged "type", the field decoded
+// as "" on every bead ever fetched, which made the type arm of isInternal
+// unreachable — a merge-request bead carrying no gt: label counted as work and
+// nothing showed it.
 type issueBead struct {
 	ID        string   `json:"id"`
 	Title     string   `json:"title"`
-	Type      string   `json:"type"`
+	Type      string   `json:"issue_type"`
 	Priority  int      `json:"priority"`
 	Labels    []string `json:"labels"`
 	CreatedAt string   `json:"created_at"`
@@ -2167,8 +2363,13 @@ func (b issueBead) row() IssueRow {
 // Unlike the query it replaced, a bd failure is an error rather than a silently
 // skipped list: the resolver names the store that could not answer, so a store
 // that broke stops looking like a store that was empty.
+//
+// --brief drops the free-form text (description, design, notes, payload), none
+// of which issueBead reads. It is what makes a backlog-sized limit affordable:
+// on the town root's open beads it is the difference between 2.4MB in 0.80s and
+// 414KB in 0.09s.
 func (f *LiveConvoyFetcher) listIssueBeads(storeDir, status string, limit int) ([]issueBead, error) {
-	stdout, err := f.runBdCmd(storeDir, "list", "--status="+status, "--json", fmt.Sprintf("--limit=%d", limit))
+	stdout, err := f.runBdCmd(storeDir, "list", "--status="+status, "--json", "--brief", fmt.Sprintf("--limit=%d", limit))
 	if err != nil {
 		return nil, fmt.Errorf("listing %s beads: %w", status, err)
 	}

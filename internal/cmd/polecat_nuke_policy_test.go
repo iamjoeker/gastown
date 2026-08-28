@@ -3,6 +3,8 @@ package cmd
 import (
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
 // The restart-first policy (gt-dsgp) says the witness NEVER nukes polecats and
@@ -219,6 +221,9 @@ func TestNukeCallerIdentity(t *testing.T) {
 // restart — never on nuking.
 func TestWitnessActionFor(t *testing.T) {
 	tests := map[string]string{
+		// StateHandedOff, spelled out below in TestWitnessActionForSafeToNuke:
+		// the reuse gate does not accept it, so it really is a slot restart can
+		// reclaim. The state-carrying cases live in that test.
 		"SAFE_TO_NUKE":    "restart",
 		"NEEDS_RECOVERY":  "escalate",
 		"NEEDS_MQ_SUBMIT": "escalate",
@@ -226,17 +231,105 @@ func TestWitnessActionFor(t *testing.T) {
 		// A mid-turn agent is not a slot to reclaim: restart preserves the
 		// worktree but throws away the context of a polecat that is very likely
 		// running `gt done` right now (gt-5tg).
-		"WORKING":        "leave-alone",
+		"WORKING": "leave-alone",
+		// Not "restart": no restart path writes agent_state, so restarting a
+		// paused polecat leaves it paused and the slot's disposition never moves.
+		// Not "escalate" either: nothing is at risk and there is nothing for the
+		// Mayor to recover — only a field the witness may clear itself (gt-fbgq).
+		"NEEDS_STATE_CLEAR": "clear-state",
+		// The one verdict where the default arm would actively make things worse.
+		// No restart path supplies credentials, so restarting a logged-out agent
+		// produces another logged-out agent and destroys its context on the way;
+		// only a human at a browser clears it (gt-acb1).
+		"NEEDS_LOGIN": "escalate",
+		// Not leave-alone, which is what this case got while it was reported as
+		// WORKING, and not restart either: two pane samples a minute apart show
+		// nothing moving, which is not the same as showing the agent is dead,
+		// and a restart discards its context to find out (gt-y39t).
+		"SUSPECT_STALL":  "escalate",
 		"":               "restart",
 		"SOME_NEW_STATE": "restart",
 	}
 
 	for verdict, want := range tests {
-		if got := witnessActionFor(verdict); got != want {
+		if got := witnessActionFor(verdict, polecat.StateHandedOff); got != want {
 			t.Errorf("witnessActionFor(%q) = %q, want %q", verdict, got, want)
 		}
-		if strings.Contains(witnessActionFor(verdict), "nuke") {
+		if strings.Contains(witnessActionFor(verdict, polecat.StateHandedOff), "nuke") {
 			t.Errorf("witnessActionFor(%q) offered nuking to a witness", verdict)
+		}
+	}
+}
+
+// SAFE_TO_NUKE is the one verdict whose permitted action depends on the
+// polecat's lifecycle state, because it is the only one whose action claims to
+// reclaim a slot — and for two of the three states that reach it, there is no
+// slot to reclaim (gt-t6k2).
+//
+// The prescription was measured doing harm, not merely doing nothing: the
+// witness restarted ghoul and synth on it, both hit gt done's fork-mode exit
+// path with an already-closed bead, and both parked at agent_state=stuck until
+// they were cleared by hand (gt-j9uv, gt-gubw).
+func TestWitnessActionForSafeToNuke(t *testing.T) {
+	tests := []struct {
+		name  string
+		state polecat.State
+		want  string
+		why   string
+	}{{
+		name:  "done is already pool-eligible",
+		state: polecat.StateDone,
+		want:  "leave-alone",
+		why:   "StateEligibleForPoolReuse accepts done, so the next sling can take it as it stands",
+	}, {
+		name:  "idle is already pool-eligible",
+		state: polecat.StateIdle,
+		want:  "leave-alone",
+		why:   "StateEligibleForPoolReuse accepts idle for the same reason",
+	}, {
+		name:  "handed-off is not pool-eligible",
+		state: polecat.StateHandedOff,
+		want:  "restart",
+		why:   "the reuse gate refuses handed-off, so this is a real slot and restart is the witness's only lever",
+	}, {
+		name:  "unmeasured state keeps the old answer",
+		state: "",
+		want:  "restart",
+		why:   "a caller that reported no state has not earned the quieter prescription",
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := witnessActionFor(polecat.WorkstateVerdictSafeToNuke, tt.state); got != tt.want {
+				t.Errorf("witnessActionFor(SAFE_TO_NUKE, %q) = %q, want %q — %s", tt.state, got, tt.want, tt.why)
+			}
+		})
+	}
+}
+
+// The gate is the reuse predicate itself, not a hand-copied list of states.
+// gt-2uqy was one state missing from one condition, silently; this asserts the
+// two cannot drift apart again — every state the pool would already consider
+// must get a prescription that does not claim to reclaim its slot.
+//
+// The three states below are exactly the ones DecideWorkstate lets through to
+// SAFE_TO_NUKE; every other state returns NEEDS_RECOVERY or WORKING before the
+// tail runs, so pairing them with this verdict would assert over a combination
+// that cannot occur.
+func TestWitnessActionForTracksPoolReuseGate(t *testing.T) {
+	for _, state := range []polecat.State{
+		polecat.StateIdle,
+		polecat.StateDone,
+		polecat.StateHandedOff,
+	} {
+		got := witnessActionFor(polecat.WorkstateVerdictSafeToNuke, state)
+		if polecat.StateEligibleForPoolReuse(state) && got == witnessActionRestart {
+			t.Errorf("state=%s is pool-eligible but SAFE_TO_NUKE still prescribes restart —"+
+				" a restart cannot make an already-eligible polecat more eligible", state)
+		}
+		if !polecat.StateEligibleForPoolReuse(state) && got != witnessActionRestart {
+			t.Errorf("state=%s is NOT pool-eligible and SAFE_TO_NUKE prescribes %q —"+
+				" the slot needs an action and restart is the only permitted one", state, got)
 		}
 	}
 }

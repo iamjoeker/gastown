@@ -171,7 +171,7 @@ esac
 func TestCheckPendingEscalations_BoundsSlowBdList(t *testing.T) {
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
-	  "list --status=open --tag=escalation --json --flat") sleep 2; exit 0 ;;
+	  "list --status=open --label=gt:escalation --no-pinned --json --flat") sleep 2; exit 0 ;;
 esac
 `, `
 `)
@@ -181,9 +181,75 @@ esac
 		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
 	})
 	assertElapsedUnder(t, time.Since(start), time.Second)
-	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
+	assertPrimeToolCalled(t, "bd:list --status=open --label=gt:escalation --no-pinned --json --flat")
 
 	if strings.Contains(output, "PENDING ESCALATIONS") {
 		t.Fatalf("timed-out escalation output should not be emitted: %q", output)
+	}
+}
+
+// The banner must query the label escalations actually carry.
+//
+// It asked for `--tag=escalation`, which is not a bd flag: bd exited 1 with
+// "unknown flag: --tag" and no stdout, and the handler skipped silently, so the
+// Mayor's startup escalation banner had never fired for anyone. The only test
+// covering it asserted the timeout bound and the ABSENCE of output, and hard-
+// coded the broken flag into its own stub — green over a query that could not
+// run. This asserts the banner appears, so the flag cannot rot back (gt-z5h7).
+//
+// The two pinned halves answer differently: `bd list --status=open` is silently
+// `--no-pinned`, so a handler asking once sees only hq-unpinned.
+func TestCheckPendingEscalations_QueriesTheLabelEscalationsCarry(t *testing.T) {
+	workDir := setupPrimeExternalToolTest(t, `
+case "$*" in
+	  "list --status=open --label=gt:escalation --no-pinned --json --flat")
+	    printf '%s\n' '[{"id":"hq-unpinned","title":"Dolt unreachable","priority":0}]'; exit 0 ;;
+	  "list --status=open --label=gt:escalation --pinned --json --flat")
+	    printf '%s\n' '[{"id":"hq-pinned","title":"Agent logged out","priority":1}]'; exit 0 ;;
+esac
+`, `
+`)
+
+	output := captureStdout(t, func() {
+		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
+	})
+
+	if !strings.Contains(output, "PENDING ESCALATIONS") {
+		t.Fatalf("banner did not fire on a store with open escalations: %q", output)
+	}
+	if !strings.Contains(output, "There are 2 escalation(s)") {
+		t.Errorf("want both halves counted once, got: %q", output)
+	}
+	if !strings.Contains(output, "hq-pinned") {
+		t.Errorf("pinned escalation missing: pinning must not delete it from the banner: %q", output)
+	}
+	if !strings.Contains(output, "hq-unpinned") {
+		t.Errorf("unpinned escalation missing: %q", output)
+	}
+}
+
+// A query that could not run must not render as a quiet town. The silent skip
+// is what let the broken flag survive: from the Mayor's seat, "no escalations"
+// and "the escalation check is dead" looked identical.
+func TestCheckPendingEscalations_FailedQueryIsNotSilent(t *testing.T) {
+	workDir := setupPrimeExternalToolTest(t, `
+case "$*" in
+	  "list --status=open --label=gt:escalation --no-pinned --json --flat")
+	    echo "Error: unknown flag: --nope" >&2; exit 1 ;;
+esac
+`, `
+`)
+
+	output := captureStdout(t, func() {
+		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
+	})
+
+	if !strings.Contains(output, "NOT an all-clear") {
+		t.Errorf("a failed escalation query must say so, got: %q", output)
+	}
+	// bd's own message is the one that names the cause, and it was exactly what
+	// the old code discarded.
+	if !strings.Contains(output, "unknown flag") {
+		t.Errorf("bd's stderr must reach the reader, got: %q", output)
 	}
 }

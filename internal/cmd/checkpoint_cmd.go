@@ -235,7 +235,7 @@ func detectMoleculeContext(workDir string, ctx RoleInfo) (moleculeID, stepID, st
 	}
 
 	// Find in-progress issues for this agent
-	issues, err := b.List(beads.ListOptions{
+	issues, err := b.ListAcrossAgentAddressForms(beads.ListOptions{
 		Status:   "in_progress",
 		Assignee: assignee,
 		Priority: -1,

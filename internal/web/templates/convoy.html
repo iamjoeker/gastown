@@ -87,11 +87,15 @@
                     <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{if .Summary.HooksUnavailable}}?{{else}}{{.Summary.HookCount}}{{end}}</span>
+                    <!-- "N+" not "N": a count short by a store that could not be
+                         read, or that filled its whole row allowance, is a floor.
+                         The panel headers already say this; the banner is where
+                         the operator actually forms their impression. -->
+                    <span class="stat-value">{{if .Summary.HooksUnavailable}}?{{else}}{{.Summary.HookCount}}{{if .Summary.HooksPartial}}+{{end}}{{end}}</span>
                     <span class="stat-label">🪝 Hooks</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-value">{{if .Summary.IssuesUnavailable}}?{{else}}{{.Summary.IssueCount}}{{end}}</span>
+                    <span class="stat-value">{{if .Summary.IssuesUnavailable}}?{{else}}{{.Summary.IssueCount}}{{if .Summary.IssuesPartial}}+{{end}}{{end}}</span>
                     <span class="stat-label">📋 Work</span>
                 </div>
                 <div class="stat">
@@ -122,6 +126,18 @@
                 {{end}}
                 {{if .Summary.MergeQueueUnavailable}}
                 <span class="alert-item alert-red">🔀 merge queue unreadable</span>
+                {{end}}
+                <!-- A short count is a quieter failure than an unreadable one,
+                     so it is yellow rather than red — but it is still the
+                     difference between "✓ All clear" and a number to distrust. -->
+                {{if .Summary.HooksPartial}}
+                <span class="alert-item alert-yellow">🪝 hooks count is a floor</span>
+                {{end}}
+                {{if .Summary.IssuesPartial}}
+                <span class="alert-item alert-yellow">📋 work count is a floor</span>
+                {{end}}
+                {{if .Summary.MergeQueuePartial}}
+                <span class="alert-item alert-yellow">🔀 merge queue count is a floor</span>
                 {{end}}
                 {{if .Summary.MailUnavailable}}
                 <span class="alert-item alert-red">✉️ mail unreadable</span>
@@ -193,15 +209,19 @@
                                     <td>
                                         <span class="convoy-toggle">▶</span>
                                         {{if eq .WorkStatus "complete"}}
-                                        <span class="badge badge-green" title="All issues completed">✓ Done</span>
-                                        {{else if eq .WorkStatus "active"}}
-                                        <span class="badge badge-green" title="Workers actively progressing">Active</span>
-                                        {{else if eq .WorkStatus "stale"}}
-                                        <span class="badge badge-yellow" title="No activity in 5-10 minutes">Stale</span>
+                                        <span class="badge badge-green" title="Every tracked issue is closed">✓ Done</span>
+                                        {{else if eq .WorkStatus "working"}}
+                                        <span class="badge badge-green" title="A worker's session is live on a tracked issue: {{.EvidenceSummary}}">Working</span>
+                                        {{else if eq .WorkStatus "in-queue"}}
+                                        <span class="badge badge-blue" title="Tracked work is an open merge request awaiting merge: {{.EvidenceSummary}}">In queue</span>
+                                        {{else if eq .WorkStatus "ready"}}
+                                        <span class="badge badge-yellow" title="Dispatchable work with no worker on it: {{.EvidenceSummary}}">Ready</span>
                                         {{else if eq .WorkStatus "stuck"}}
-                                        <span class="badge badge-red" title="No activity for 10+ minutes">Stuck</span>
+                                        <span class="badge badge-red" title="Blocked, unroutable, or unreadable — an agent must look: {{.EvidenceSummary}}">Stuck</span>
+                                        {{else if eq .WorkStatus "empty"}}
+                                        <span class="badge badge-muted" title="No tracked issues — needs cleanup">Empty</span>
                                         {{else}}
-                                        <span class="badge badge-muted" title="No workers assigned yet">Waiting</span>
+                                        <span class="badge badge-muted" title="Deferred or scheduled — waiting by design: {{.EvidenceSummary}}">Waiting</span>
                                         {{end}}
                                     </td>
                                     <td>
@@ -223,8 +243,9 @@
                                     <td class="convoy-work-cell">
                                         {{if .Total}}
                                         <div class="convoy-work-breakdown">
-                                            {{if .ReadyBeads}}<span class="work-chip work-ready" title="Ready to pick up">{{.ReadyBeads}} ready</span>{{end}}
-                                            {{if .InProgress}}<span class="work-chip work-inprogress" title="Being worked on">{{.InProgress}} active</span>{{end}}
+                                            {{if .ReadyBeads}}<span class="work-chip work-ready" title="Dispatchable now — no worker on them">{{.ReadyBeads}} ready</span>{{end}}
+                                            {{if .InProgress}}<span class="work-chip work-inprogress" title="A worker's session is live on them">{{.InProgress}} active</span>{{end}}
+                                            {{if .InQueue}}<span class="work-chip work-inprogress" title="Submitted — an open merge request is awaiting merge">{{.InQueue}} in queue</span>{{end}}
                                             {{if eq .WorkStatus "complete"}}<span class="work-chip work-done">all done</span>{{end}}
                                         </div>
                                         {{end}}
@@ -543,7 +564,7 @@
             <div class="panel" id="mail-panel">
                 <div class="panel-header">
                     <h2>✉️ Mail</h2>
-                    <span class="count" id="mail-count">{{if .MailUnavailable}}?{{else}}{{len .Mail}}{{end}}</span>
+                    <span class="count" id="mail-count">{{if .MailUnavailable}}?{{else}}{{len .Mail}}{{if .MailTruncated}}+{{end}}{{end}}</span>
                     <div class="mail-tabs">
                         <button class="mail-tab active" data-tab="inbox">Inbox</button>
                         <button class="mail-tab" data-tab="all">All Traffic</button>
@@ -572,6 +593,9 @@
                             <p>This is NOT "no mail" — the dashboard could not read it.</p>
                         </div>
                         {{else if .Mail}}
+                        {{if .MailTruncated}}
+                        <p class="truncation-notice">⚠️ Showing the most recent {{len .Mail}} messages — the count is a floor, not the town's whole mail</p>
+                        {{end}}
                         <table class="mail-all-table">
                             <thead>
                                 <tr>
@@ -968,7 +992,9 @@
             <div class="panel" id="work-panel">
                 <div class="panel-header">
                     <h2>📋 Work</h2>
-                    <span class="count">{{if .IssuesUnavailable}}?{{else}}{{len .Issues}}{{if .IssuesWarning}}+{{end}}{{end}}</span>
+                    <!-- IssueCount, not len .Issues: the list below is a page of the
+                         backlog and the number is the size of it. -->
+                    <span class="count">{{if .IssuesUnavailable}}?{{else}}{{.IssueCount}}{{if .IssuesWarning}}+{{end}}{{end}}</span>
                     <button class="new-issue-btn" onclick="openIssueModal()">+ New</button>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
@@ -982,7 +1008,10 @@
                     {{if .IssuesUnavailable}}
                     <p class="truncation-notice">⚠️ Work backlog unavailable: {{.IssuesUnavailable}}</p>
                     {{else if .IssuesWarning}}
-                    <p class="truncation-notice">⚠️ Work backlog {{.IssuesWarning}} — count is incomplete</p>
+                    <p class="truncation-notice">⚠️ Work backlog {{.IssuesWarning}} — count is a floor</p>
+                    {{end}}
+                    {{if lt (len .Issues) .IssueCount}}
+                    <p class="truncation-notice">Showing {{len .Issues}} of {{.IssueCount}}, highest priority first — the count is the whole backlog</p>
                     {{end}}
                     <!-- Issues List View -->
                     <div id="issues-list">

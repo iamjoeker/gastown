@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 )
@@ -811,6 +813,79 @@ func TestDefaultRoutesAllDeliver(t *testing.T) {
 // gt escalate --help pointed at ~/gt/settings/escalation.json, which is not a
 // town root on any host: it cost duly_noted/witness a patrol cycle looking for a
 // config file that does not exist.
+// escalateCloseCmdDeclaredSilenceUsage captures the declared value before any
+// test can mutate the shared command: package-level vars initialize after
+// escalateCloseCmd itself and before any test body, so this is the value in the
+// source, not one an earlier test left behind.
+var escalateCloseCmdDeclaredSilenceUsage = escalateCloseCmd.SilenceUsage
+
+// TestEscalateCloseUsageOnlyForMalformedInvocations covers gt-u3mo, the same
+// defect gt-5h2 fixed for `gt nudge`. Cobra honours SilenceUsage only from the
+// executed command and the ROOT, so the flag declared on `escalate` never
+// reached `escalate close`: a close that failed printed its error and then
+// dumped ~8 lines of usage over it. That is how three failed closes read as
+// quiet successes — the operator's `| tail -1` showed the last line of the
+// usage block rather than the error.
+//
+// The malformed case is the control: suppressing usage everywhere would be just
+// as wrong, and it fails independently if the fix is moved onto the command
+// literal.
+func TestEscalateCloseUsageOnlyForMalformedInvocations(t *testing.T) {
+	if escalateCloseCmdDeclaredSilenceUsage {
+		t.Fatal("escalateCloseCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runEscalateClose instead (gt-u3mo)")
+	}
+
+	newCloseTestCmd := func(out *bytes.Buffer) *cobra.Command {
+		c := &cobra.Command{
+			Use:          escalateCloseCmd.Use,
+			Args:         escalateCloseCmd.Args,
+			RunE:         runEscalateClose,
+			SilenceUsage: escalateCloseCmdDeclaredSilenceUsage,
+		}
+		c.SetOut(out)
+		c.SetErr(out)
+		return c
+	}
+
+	t.Run("runtime error prints no usage", func(t *testing.T) {
+		// Both env vars as well as the cwd: GT_TOWN_ROOT and GT_ROOT outrank the
+		// working directory in workspace resolution, so chdir alone would still
+		// resolve the live town and go on to touch its beads.
+		outside := t.TempDir()
+		t.Setenv("GT_TOWN_ROOT", outside)
+		t.Setenv("GT_ROOT", outside)
+		t.Chdir(outside)
+
+		var out bytes.Buffer
+		c := newCloseTestCmd(&out)
+		c.SetArgs([]string{"hq-wisp-nosuch"})
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() outside a workspace returned nil, want an error")
+		}
+		got := out.String()
+		if !strings.Contains(got, "not in a Gas Town workspace") {
+			t.Errorf("output does not carry the diagnosis; the error itself must keep printing:\n%s", got)
+		}
+		if strings.Contains(got, "Usage:") {
+			t.Errorf("runtime failure printed cobra's usage block over its error:\n%s", got)
+		}
+	})
+
+	t.Run("malformed invocation still prints usage", func(t *testing.T) {
+		var out bytes.Buffer
+		c := newCloseTestCmd(&out)
+		c.SetArgs([]string{}) // violates Args: ExactArgs(1), so RunE never runs
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() with no arguments returned nil, want an arg-count error")
+		}
+		if got := out.String(); !strings.Contains(got, "Usage:") {
+			t.Errorf("malformed invocation lost its usage block:\n%s", got)
+		}
+	})
+}
+
 func TestEscalateHelpDoesNotPointAtTildeGt(t *testing.T) {
 	if strings.Contains(escalateCmd.Long, "~/gt/settings") {
 		t.Error("escalate help documents ~/gt/settings, which is not where the config lives")
@@ -831,5 +906,128 @@ func TestGetNextSeverityMatchesConfig(t *testing.T) {
 			t.Errorf("getNextSeverity(%q) = %q but config.NextSeverity(%q) = %q — they diverge!",
 				s, cmdResult, s, configResult)
 		}
+	}
+}
+
+// --- The hidden half of the escalation queue (gt-f0b3) -----------------------
+//
+// `gt escalate list` hides a delivered copy whose escalation record is closed.
+// That is right (gt-4xl) and it was silent, which is not: measured on hq
+// 2026-08-23 the list printed 3 while `bd list --label=gt:escalation
+// --status=open` returned 4, and nothing anywhere accounted for the fourth.
+
+func TestPrintStrandedEscalations_NamesTheHiddenBeadsAndTheReconcile(t *testing.T) {
+	stranded := []*beads.Issue{{
+		ID:     "hq-budjm",
+		Status: "open",
+		Title:  "[HIGH] Scheduler dispatch dead town-wide 1h19m",
+		Labels: []string{"gt:escalation", "escalation:hq-wisp-aor1wa"},
+	}}
+
+	var buf strings.Builder
+	printStrandedEscalations(&buf, stranded)
+	got := buf.String()
+
+	for _, want := range []string{
+		"hq-budjm",                   // the bead the count disagreement is made of
+		"hq-wisp-aor1wa",             // the record whose closure hid it
+		"gt escalate close hq-budjm", // the command that reconciles the halves
+		"1 lower",                    // the size of the gap, stated
+		"not proof",                  // a closed record is not evidence of handling
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report must contain %q, got:\n%s", want, got)
+		}
+	}
+}
+
+// Nothing to report must print nothing at all: an unconditional footer would
+// train readers to skip the one case that matters.
+func TestPrintStrandedEscalations_SilentWhenNothingHidden(t *testing.T) {
+	var buf strings.Builder
+	printStrandedEscalations(&buf, nil)
+	if buf.String() != "" {
+		t.Errorf("no hidden beads must print nothing, got: %q", buf.String())
+	}
+}
+
+// --- What a close reports it did (gt-w0z8) -----------------------------------
+//
+// The report used to be derived from an ID the close RESOLVED rather than from
+// a bead it WROTE TO, so it printed a checkmark for a reconcile that cleared
+// nothing — twice, in front of an operator who only caught it by re-reading the
+// state afterwards. And the ID on that checkmark was the record's, not the one
+// they typed.
+
+func TestPrintEscalateCloseReport_NamesTheIDThatWasPassed(t *testing.T) {
+	var buf strings.Builder
+	printEscalateCloseReport(&buf, &beads.EscalationCloseResult{
+		RequestedID: "hq-9mxa7",
+		RecordID:    "hq-wisp-51nirc",
+		CopyIDs:     []string{"hq-9mxa7"},
+	}, "reconciled")
+	got := buf.String()
+
+	// The operator typed hq-9mxa7. The first line must be about hq-9mxa7.
+	firstLine := strings.SplitN(got, "\n", 2)[0]
+	if !strings.Contains(firstLine, "hq-9mxa7") {
+		t.Errorf("success line must name the id that was passed, got: %q", firstLine)
+	}
+	if strings.Contains(firstLine, "hq-wisp-51nirc") {
+		t.Errorf("success line must not lead with the resolved record id, got: %q", firstLine)
+	}
+	// The record is still worth naming — just not as the thing that was closed.
+	if !strings.Contains(got, "hq-wisp-51nirc") {
+		t.Errorf("report should still disclose the escalation record, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Cleared from queue: hq-9mxa7") {
+		t.Errorf("report must name the copies it cleared, got:\n%s", got)
+	}
+}
+
+// The load-bearing negative: nothing closed, no checkmark. Every stranded copy
+// has a closed record by definition, so this is the exact shape the reconcile
+// produced for the whole population it was offered to.
+func TestPrintEscalateCloseReport_NoCheckmarkWhenNothingClosed(t *testing.T) {
+	var buf strings.Builder
+	printEscalateCloseReport(&buf, &beads.EscalationCloseResult{
+		RequestedID: "hq-9mxa7",
+		RecordID:    "hq-wisp-51nirc",
+	}, "reconciled")
+	got := buf.String()
+
+	if strings.Contains(got, "✓") {
+		t.Errorf("a close that closed nothing must not print a checkmark, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Nothing to close") {
+		t.Errorf("a no-op must say so, got:\n%s", got)
+	}
+	if !strings.Contains(got, "hq-9mxa7") {
+		t.Errorf("the no-op report must still name the id that was passed, got:\n%s", got)
+	}
+}
+
+// Control for the two above: a real close of a record by its own ID still
+// reports success, so "no checkmark" is a property of doing nothing rather than
+// of the report having lost the ability to print one.
+func TestPrintEscalateCloseReport_StillReportsARealClose(t *testing.T) {
+	var buf strings.Builder
+	printEscalateCloseReport(&buf, &beads.EscalationCloseResult{
+		RequestedID:  "hq-wisp-51nirc",
+		RecordID:     "hq-wisp-51nirc",
+		RecordClosed: true,
+		CopyIDs:      []string{"hq-9mxa7"},
+	}, "dolt restarted")
+	got := buf.String()
+
+	if !strings.Contains(got, "✓") {
+		t.Errorf("a close that closed both halves must report success, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Reason: dolt restarted") {
+		t.Errorf("report must carry the resolution, got:\n%s", got)
+	}
+	// Requested == record here, so the record line would be pure noise.
+	if strings.Contains(got, "Escalation record:") {
+		t.Errorf("record line is redundant when it is the id that was passed, got:\n%s", got)
 	}
 }

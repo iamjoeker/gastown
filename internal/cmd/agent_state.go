@@ -50,6 +50,11 @@ OPERATIONS:
   Delete a label:
     gt agents state <agent-bead> --del idle
 
+A modification that would leave the labels exactly as they already are is
+skipped rather than written: every bd update is a permanent Dolt commit, and
+setting a label to the value it already holds buys nothing. Output says which
+happened.
+
 COMMON LABELS:
   idle:<n>           - Consecutive idle patrol cycles
   backoff:<duration> - Current backoff interval
@@ -212,6 +217,20 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 		args = append(args, "--set-labels=")
 	}
 
+	// Skip the write when it would not change anything. bd update is a Dolt
+	// commit that lives forever, and the commonest caller by far is the
+	// "reset idle" step in the witness, refinery and deacon patrol formulas —
+	// which runs on every signal wake against a counter await-signal has
+	// already reset in-process (gt-609). That step therefore spends a
+	// permanent commit per wake, per patrol agent, to write the value that is
+	// already there. await-signal's own setAgentIdleCycles is guarded the same
+	// way; this closes the same hole for the caller-side path (gt-i7g9).
+	if labelSetsEqual(allLabels, finalLabels) {
+		fmt.Printf("%s Agent state for %s already matches — no write\n",
+			style.Dim.Render("="), agentBead)
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
 	defer cancel()
 
@@ -231,6 +250,32 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 	fmt.Printf("%s Updated agent state for %s\n", style.Bold.Render("✓"), agentBead)
 
 	return nil
+}
+
+// labelSetsEqual reports whether two label lists describe the same set of
+// labels, ignoring order. bd stores labels unordered and modifyAgentState
+// rebuilds the list from a map, so order carries no meaning and comparing it
+// would report a difference on every call.
+//
+// Duplicates are significant: a bead carrying the same label twice differs
+// from one carrying it once, and the rebuild collapses that, so the write must
+// still go through to repair it. Hence a count-per-label comparison rather
+// than a set membership test.
+func labelSetsEqual(current, next []string) bool {
+	if len(current) != len(next) {
+		return false
+	}
+	counts := make(map[string]int, len(current))
+	for _, l := range current {
+		counts[l]++
+	}
+	for _, l := range next {
+		counts[l]--
+		if counts[l] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // getAgentLabels retrieves state labels from an agent bead.

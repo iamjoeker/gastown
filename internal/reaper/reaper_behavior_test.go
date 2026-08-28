@@ -1198,7 +1198,7 @@ func closedEntryIDs(result *AutoCloseResult) []string {
 // The four defects gt-nhp describes compound here, so a partial guard is worse
 // than an obvious gap. Protecting only the DELETE leaves reap closing the record,
 // and a closed record makes `gt escalate list` hide every delivered copy of a
-// still-live escalation (dropResolvedEscalations) — the escalation is gone from
+// still-live escalation (partitionResolvedEscalations) — the escalation is gone from
 // the operator's only surface while still needing attention. Protecting only the
 // CLOSE leaves the row in the delete set the moment anything else closes it.
 //
@@ -1405,5 +1405,220 @@ func TestAutoCloseSparesOpenEscalations(t *testing.T) {
 	if got := f.closedIssueIDs(t); !reflect.DeepEqual(got, []string{"close-control"}) {
 		t.Errorf("closed issues = %v, want [close-control] — an AutoClose that closed nothing "+
 			"would satisfy the exemption assertion for the wrong reason", got)
+	}
+}
+
+// TestStrandedMoleculeProbeBehaviour runs the stranded-molecule probe's real SQL
+// against a real engine. It is the acceptance test for gt-id8x.
+//
+// The unit tests in reaper_test.go go through a fake driver that re-implements
+// the predicate in Go, so they cannot fail when the SQL stops matching that
+// logic. This one can: the engine evaluates the query the daemon actually
+// sends, against a table whose `issues.description` column is where the dispatch
+// record lives.
+//
+// Both controls are present and both are load-bearing:
+//   - mol-attached is a healthy in-flight polecat molecule — open, hours old,
+//     assignee NULL (root-only molecules never carry one; the assignment sits on
+//     the issue) and named by a hook bead's attached_molecule line. Reporting it
+//     is the bug: the old predicate flagged every one of these, escalated five
+//     times in a day, and sent three agents hunting an emitter that was just
+//     `gt mol attach`.
+//   - mol-orphan differs from it in exactly one respect — nothing names it — and
+//     must still be reported, or a probe that went silent would pass.
+func TestStrandedMoleculeProbeBehaviour(t *testing.T) {
+	f := newFixture(t, "stranded_molecule")
+	now := time.Now().UTC()
+	old := now.Add(-4 * time.Hour)
+
+	f.insertIssues(t,
+		// The hook bead. This is the shape gt sling writes for mol-polecat-work.
+		issueRow{id: "gt-id8x", status: "hooked", priority: 1, updatedAt: old,
+			description: "attached_molecule: mol-attached\nattached_formula: mol-polecat-work\nattached_at: 2026-08-25T23:41:04Z"},
+		// CONTAMINATION CONTROL: a bug report that quotes the field inline without
+		// recording an attachment. The LIKE prefilter matches it, so it reaches the
+		// parser, and a naive `description LIKE '%attached_molecule: <id>%'` would
+		// launder mol-orphan straight out of the anomaly. Parsing the line as a
+		// field rejects it: the key here is "Quoting the reaper", not
+		// attached_molecule. Text ABOUT a thing must not satisfy a search FOR it.
+		issueRow{id: "gt-report", status: "open", priority: 2, updatedAt: old,
+			description: "Quoting the reaper: it says attached_molecule: mol-orphan, but no bead records that."},
+	)
+	f.insertWisps(t,
+		// Dispatched by attachment. Healthy work in flight.
+		wispRow{id: "mol-attached", status: "open", issueType: "molecule", createdAt: old},
+		// NEGATIVE CONTROL: identical but for the dispatch record.
+		wispRow{id: "mol-orphan", status: "open", issueType: "molecule", createdAt: old},
+		// Too young to judge — a dispatcher may still be on its way.
+		wispRow{id: "mol-fresh", status: "open", issueType: "molecule", createdAt: now.Add(-time.Minute)},
+		// Dispatched the other way: the wisp itself carries the assignee.
+		wispRow{id: "mol-assigned", status: "hooked", issueType: "molecule", createdAt: old, assignee: "deacon/dogs/alpha"},
+		// A hook bead that is itself a wisp. Attachment records live in both
+		// tables, and a molecule attached from either one was dispatched.
+		wispRow{id: "hq-wisp-hook", status: "hooked", createdAt: old,
+			description: "attached_molecule: mol-wisp-attached"},
+		wispRow{id: "mol-wisp-attached", status: "open", issueType: "molecule", createdAt: old},
+	)
+
+	scan, err := Scan(f.db, f.dbName, staleAge, purgeAge, purgeAge, staleAge)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	var found *Anomaly
+	for i := range scan.Anomalies {
+		if scan.Anomalies[i].Type == "stranded_molecules" {
+			found = &scan.Anomalies[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("mol-orphan has no dispatch record and must be reported; anomalies: %+v", scan.Anomalies)
+	}
+	if found.Count != 1 {
+		t.Errorf("stranded_molecules Count = %d, want 1 (mol-orphan alone). Anything higher means a "+
+			"dispatched molecule was called stranded — the gt-id8x defect. Message: %q", found.Count, found.Message)
+	}
+	if strings.Contains(found.Message, "never dispatched") {
+		t.Errorf("the probe observes the absence of a dispatch RECORD, not the absence of a "+
+			"dispatch; got %q", found.Message)
+	}
+
+	// The probe must also survive a database with no issues table — the reaper
+	// reaches servers where beads keeps issues elsewhere (that is what
+	// isTableNotFound exists for). Losing one attachment source must degrade the
+	// probe, not silence it: the wisp-side records must still be read.
+	//
+	// strandedMoleculeIDs is called directly here because dropping the table also
+	// breaks Scan's unrelated molecule-step count, which would mask this.
+	f.exec(t, "DROP TABLE issues")
+	stranded, err := strandedMoleculeIDs(context.Background(), f.db, now.Add(-StrandedMoleculeAge))
+	if err != nil {
+		t.Fatalf("strandedMoleculeIDs with no issues table: %v", err)
+	}
+	sort.Strings(stranded)
+	// mol-attached loses its dispatch record along with the table, so it joins
+	// mol-orphan. mol-wisp-attached keeps its wisp-side record and must not.
+	if want := []string{"mol-attached", "mol-orphan"}; !reflect.DeepEqual(stranded, want) {
+		t.Errorf("stranded = %v, want %v — with issues gone the wisp-side attachment must still "+
+			"be read, and the probe must not go silent", stranded, want)
+	}
+}
+
+// TestPurgeReportsWhatItPurgedNotJustHowMany is the acceptance test for gt-mkuw.
+//
+// The purge already computed a wisp_type digest and threw everything but the
+// total away, so the entire record one of these deletions left behind was
+// `reaper: purge 29 closed wisps from beads`. Wisp tables are in dolt_ignore,
+// so the DOLT_COMMIT is empty and its MESSAGE is the only artifact — there is
+// no diff to read afterwards, ever.
+//
+// On 2026-08-26 three such lines on the beads database (5 + 29 + 7 = 41 rows in
+// 45 minutes) were read as ~40 destroyed merge-request records and filed as a
+// P1 second-deleter incident. Nothing was missing. The rows were molecule steps
+// and sling-context wisps, and purgeProtectWhere makes this path structurally
+// incapable of taking a merge-request row at all. The count could not say so.
+//
+// The NEGATIVE CONTROL is w-mr: same status, same age, protected only by its
+// label. It must appear in NEITHER the total NOR the breakdown — a breakdown
+// that named it would be describing candidates rather than deletions, which is
+// the failure this test exists to catch.
+func TestPurgeReportsWhatItPurgedNotJustHowMany(t *testing.T) {
+	f := newFixture(t, "purge_digest")
+	now := time.Now().UTC()
+	oldClose := now.Add(-30 * 24 * time.Hour)
+
+	f.insertWisps(t,
+		wispRow{id: "w-patrol-1", status: "closed", wispType: "patrol", createdAt: oldClose, closedAt: &oldClose},
+		wispRow{id: "w-patrol-2", status: "closed", wispType: "patrol", createdAt: oldClose, closedAt: &oldClose},
+		wispRow{id: "w-patrol-3", status: "closed", wispType: "patrol", createdAt: oldClose, closedAt: &oldClose},
+		wispRow{id: "w-hb", status: "closed", wispType: "heartbeat", createdAt: oldClose, closedAt: &oldClose},
+		// wisp_type NULL. Real rows reach this state in bulk — measured on the
+		// gastown rig, 703 of 703 carried no type — so "unknown" is the label
+		// most of a real digest wears, not an edge case.
+		wispRow{id: "w-untyped", status: "closed", createdAt: oldClose, closedAt: &oldClose},
+		// NEGATIVE CONTROL: identical window, held back by its label alone.
+		wispRow{id: "w-mr", status: "closed", wispType: "merge_request", createdAt: oldClose, closedAt: &oldClose,
+			labels: []string{"gt:merge-request"}},
+	)
+
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if result.WispsPurged != 5 {
+		t.Fatalf("WispsPurged = %d, want 5", result.WispsPurged)
+	}
+
+	want := map[string]int{"patrol": 3, "heartbeat": 1, "unknown": 1}
+	if !reflect.DeepEqual(result.WispsPurgedByType, want) {
+		t.Errorf("WispsPurgedByType = %v, want %v", result.WispsPurgedByType, want)
+	}
+	if _, named := result.WispsPurgedByType["merge_request"]; named {
+		t.Errorf("WispsPurgedByType names merge_request (%v) — the protected control was not "+
+			"deleted, so a breakdown that counts it describes candidates rather than deletions",
+			result.WispsPurgedByType)
+	}
+
+	// The breakdown must sum to the total it accompanies. A partition that does
+	// not add up is what the purge_digest_mismatch anomaly is for; here there is
+	// nothing to mismatch, so the run must be clean.
+	sum := 0
+	for _, n := range result.WispsPurgedByType {
+		sum += n
+	}
+	if sum != result.WispsPurged {
+		t.Errorf("breakdown sums to %d but WispsPurged = %d", sum, result.WispsPurged)
+	}
+	if len(result.Anomalies) != 0 {
+		t.Errorf("unexpected anomalies: %+v", result.Anomalies)
+	}
+
+	// The commit message is the only durable trace. It must name the population
+	// and say the rows were unprotected, so the reading that produced gt-mkuw
+	// cannot survive contact with it.
+	commits := f.doltCommitMessages()
+	if len(commits) != 1 {
+		t.Fatalf("DOLT_COMMIT messages = %v, want exactly one", commits)
+	}
+	msg := commits[0]
+	for _, want := range []string{"unprotected", "patrol 3", "heartbeat 1", "unknown 1"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("DOLT_COMMIT message %q does not contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "merge_request") {
+		t.Errorf("DOLT_COMMIT message %q names merge_request, which this path cannot delete", msg)
+	}
+
+	if got := f.ids(t, "wisps"); !reflect.DeepEqual(got, []string{"w-mr"}) {
+		t.Errorf("surviving wisps = %v, want [w-mr] — the label-protected control must remain", got)
+	}
+}
+
+// TestFormatWispTypeDigestIsStableAndOrdered pins the rendering itself.
+//
+// Commonest first with ties broken by name, so the same population always
+// renders the same string: a message that reorders itself between runs cannot
+// be compared across two purges, which is most of what reading a digest is for.
+func TestFormatWispTypeDigestIsStableAndOrdered(t *testing.T) {
+	digest := map[string]int{"unknown": 1, "patrol": 12, "heartbeat": 12, "step": 40}
+	const want = "step 40, heartbeat 12, patrol 12, unknown 1"
+	for i := 0; i < 8; i++ {
+		if got := FormatWispTypeDigest(digest); got != want {
+			t.Fatalf("FormatWispTypeDigest run %d = %q, want %q", i, got, want)
+		}
+	}
+
+	// An empty digest must say so rather than render as "()" in the commit
+	// message, where an empty parenthesis reads as a truncated line.
+	if got := FormatWispTypeDigest(nil); got != "no types recorded" {
+		t.Errorf("FormatWispTypeDigest(nil) = %q, want %q", got, "no types recorded")
+	}
+
+	// A quote would end the SQL string literal the commit message is
+	// interpolated into. No production wisp_type carries one; the guard is here
+	// so that stays true by construction rather than by luck.
+	if got := FormatWispTypeDigest(map[string]int{"it's": 2}); strings.Contains(got, "'") {
+		t.Errorf("FormatWispTypeDigest = %q, want the single quote stripped", got)
 	}
 }

@@ -9,6 +9,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`main`'s duplicated lineage is written down instead of rediscovered**
+  (gt-9ff4). `main` contains commits that are content-duplicates of other
+  commits in `main` under different SHAs — 350 of them arrived in a single
+  otherwise-legitimate merge on 2026-08-23, brought in by the gt-lj2n defect
+  that rebased MR-bound branches onto `upstream/main` on fork-backed rigs. That
+  defect is fixed (`5512b73f`), but the copies in trunk are permanent short of
+  rewriting a shared branch, and every agent who reasons about lineage here
+  meets them: chrome's four phantom conflicts (gt-82cw) and the two branches
+  that reached the refinery with a merge base 700 commits back (gt-0w2l) were
+  both this property, read as real divergence.
+
+  New guide at `docs/guides/lineage-and-patch-id.md`, with the measurement
+  reproducible rather than asserted — on `origin/main` at `5e84c5b44`, 7268
+  non-merge commits, 208 patch-ids occurring more than once across 449 commits,
+  241 of them redundant copies, stated as an upper bound because patch-id
+  equality proves same content and never same provenance.
+
+  The guide's substance is the four probes that lie here, all verified against
+  the repo rather than reasoned about. `git patch-id` emits **no line at all**
+  for a merge commit and for an empty one — 35 of main's non-merge commits plus
+  every merge — so a loop reading its output positionally shifts by one and
+  attributes the next commit's patch-id to this one; key on the SHA in
+  patch-id's own second column and treat an absent line as UNKNOWN. `git cherry`
+  drops a commit entirely when it is already an ancestor of upstream, so empty
+  output is ambiguous between "contained", "range empty" and "nothing to say",
+  and it can never surface duplicates living inside upstream. Patch-id
+  *inequality* stays what it always was — a prompt to read the diff, not a
+  verdict — because a change replayed onto a different base legitimately hashes
+  differently. And the fingerprint is recorded: a rebase cannot replay a merge,
+  so it flattens it, leaving an **empty commit whose subject begins `Merge … into
+  main`** beside a re-sha'd copy of the change. `main` carries one such
+  quadruple at `8a8a625c`/`a3bc0a3d`/`8127893d`/`fffcacac`.
+
+  Whether to clean the pairs up is deliberately not acted on — it needs history
+  rewriting on a shared branch, the mayor, and a human. The bead is labelled
+  `gt:record` so the record stops being dispatched as implementable work
+  (gt-f8td).
+
+- **`gt patrol branches` can be told a branch is settled, and remembers** (gt-8xcg).
+  The sweep re-derived every verdict on every run because a correct answer had
+  nowhere to live. Measured on gastown: 39 branches scanned, and 22 of them — 6
+  on the CHECK list, 16 landed-but-not-an-ancestor — came back unchanged across
+  cycles 1, 6 and 16 of a single witness session. The sweep cannot tell
+  "superseded — correctly closed, branch redundant" from "closed prematurely —
+  work stranded", so every new reader re-did the whole classification to learn
+  which it was. Two agents independently settled the same five branches by
+  different instruments within an hour of each other; both derivations were
+  correct and both were discarded.
+
+  `gt patrol branches mark <branch> -m "why"` records the settlement,
+  `unmark` takes it back, `marks` lists them, and `--superseded` shows what has
+  been settled next to the tips it was settled against. A marked branch is
+  classified `superseded`, drops off the short list and out of `--deletable`,
+  and its reason travels in the note. The class it would otherwise have had is
+  kept on the row, so an audit can still tell a settled check from a settled
+  landed one. A reason is required: a marker carrying only the verdict
+  reproduces the original defect one level up.
+
+  The marker lives in git — a ref under `refs/gt/superseded/<branch>` pointing
+  at a blob of JSON — because the governing constraint is a lifetime one: the
+  marker must live at least as long as the thing it marks. A branch persists
+  indefinitely; a wisp is purged at 168h and the purge takes `wisp_events`,
+  `wisp_comments` AND `wisp_labels` with it, so any marker held there is
+  guaranteed to die before the branch it describes, by configuration rather than
+  by bug. A ref shares its lifetime with the branch structurally, travels with
+  the repo, survives every Dolt operation, and costs no database round trip.
+
+  The marker names the exact commit it settles, and suppression is conditional
+  on that still being the tip. Push to a settled branch and the marker stops
+  applying, the row returns to the short list, and the sweep says which commit
+  was settled and which is now the tip — a marker can never hide work that
+  arrived after it. Suppressed rows are tallied in the summary and in JSON
+  (`superseded`, `stale_marks`), and a marker store that cannot be read is
+  reported as UNMEASURED rather than as a rig with no markers.
+
+- **`gt mol await-signal` filters the activity feed by rig** (gt-p54t). The feed
+  is one town-wide file, and await-signal returned on the first new line
+  whatever produced it — so an idle rig's witness woke on every event every rig
+  emitted. That is the exact inverse of what the exponential backoff behind
+  `--backoff-base`/`--backoff-max` is for: the busier the town, the more often
+  the idlest rig was woken, and its wait never got to grow. Waits are now scoped
+  to the caller's own rig, from `--rig`, else `GT_RIG`, else the working
+  directory. `--all-rigs` asks for the old town-wide behaviour, which is what
+  the Deacon and Mayor legitimately want and what the Deacon patrol formula now
+  passes explicitly.
+
+  Measured over the live feed at the time of the change (6,254 events, same
+  volume for every row): town-wide 6,254 wakes; gastown 3,983 (36.3% fewer);
+  beads 3,012 (51.8% fewer); duly_noted — one polecat, near-idle — 2,403 (61.6%
+  fewer). await-signal now reports the suppressed count on every return, so the
+  saving stays a measurement rather than an assumption.
+
+  Suppression applies to exactly one case: the event names one or more rigs and
+  none of them is yours. Three paths deliberately fail open, because a wake that
+  was not needed costs a turn while a wake that was dropped loses work.
+  Attribution is a set and includes addressees, so **cross-rig mail still wakes
+  the addressee** — a filter that swallowed it would trade a cost defect for a
+  correctness one. Town-scoped events (Mayor↔Deacon traffic, boot sessions,
+  escalation closes) name no rig and so wake everyone. And a line that cannot be
+  parsed wakes rather than being discarded.
+
+  Two attribution traps are handled explicitly because both fail closed, which
+  is the dangerous direction: `gt nudge` writes `channel:<name>` into
+  `payload.target`, and `gt escalate` writes a bead ID where the payload helper
+  expects a rig. Neither is a rig name, and reading either as one would have
+  suppressed the event for every rig in town.
+
 - **`gt patrol branches` finds strandings that already exist** (gt-by1e). The
   refinery reports a stranding at the moment it makes one (gt-h1cw); nothing
   found the ones already made. On 2026-08-19 a single session produced six, each
@@ -147,6 +254,246 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fall back to `$GT_TOWN_ROOT` / `$GT_ROOT`.
 
 ### Fixed
+
+- **`gt mail search` can reach archived and sent mail, and always says what it
+  searched** (gt-7gvk). The search was scoped to the inbox, so it answered 0 for
+  every term the moment the inbox was empty — including terms in mail read
+  minutes earlier. The reported control: archive a message whose body repeatedly
+  names the polecat `brahmin`, then `gt mail search brahmin` one minute later →
+  `0 message(s)`. A command whose positive control fails carries no information,
+  and this one sat under a class of self-check: an agent reporting a recurring
+  observation across patrol cycles had no way to ask whether an earlier cycle had
+  already reported it, and would re-report indefinitely with no signal that it
+  was duplicating.
+
+  The cause is that archiving does not move a message anywhere the inbox query
+  can see. `gt mail archive` CLOSES the message bead where it stands, and a
+  closed bead is exactly what the inbox query filters out. What Search read
+  instead was `archive.jsonl` — a flat file whose only writer in the tree is the
+  dog dispatch path, so an agent archiving its own mail filed it somewhere Search
+  never looked. Measured: exactly one `archive.jsonl` exists in this town, at the
+  town root, and the gastown rig's beads directory has none.
+
+  Where that file DOES exist the failure inverted, and nobody had reported this
+  half. It belongs to a beads DIRECTORY, not to an identity, and was read
+  unfiltered. Measured from a polecat whose inbox held one message:
+  `gt mail search polecat` → **56832 results, 0 of them addressed to the
+  searching identity** — 23922 for `deacon/dogs/alpha`, 13342 bravo, 10303
+  charlie, 9264 delta — under a header reading "Search results for
+  gastown/polecats/fury". Controls: a nonsense term returned 0 and a string from
+  that one real inbox message returned 1, so the matcher discriminated and the
+  56832 was leakage. It now returns 1.
+
+  `--archive` was a third defect on its own: declared, bound with the help text
+  "Include archived messages", and read nowhere. Verified over every `.go` file
+  by a traversal that does not honour `.gitignore` — 2 hits, the declaration and
+  the binding, 0 readers.
+
+  Archived mail is now the closed message beads (assignee and CC, issues and
+  wisps) plus the flat file filtered to this recipient. The bead query asks for
+  `--all` and tests status in Go rather than asking bd for `--status closed`,
+  because status and pinning are independent: on the live store `--status closed`
+  returned 1864 message beads and `--status closed --pinned` a further 53 that
+  the first query did not include. New `--sent` searches mail this identity sent,
+  selected by the `from:` label the send path already stamps on every message —
+  a surface that did not exist at all. `--all` takes both.
+
+  Every run now prints the scope it searched AND names the stores it did not,
+  with the flag that would include them, the same shape `gt mq list` uses.
+  Naming the exclusion is the load-bearing half: a reader told only what was
+  covered still has to know the full set of stores to work out what is missing,
+  and the reader who most needs telling is the one who does not. A store that
+  cannot be read is named as unavailable rather than silently dropped, and the
+  matches from the stores that did answer are still returned. `--json` grew the
+  same envelope, because a bare empty array cannot distinguish "no such message"
+  from "the store holding it was never read". The reported case, re-measured:
+  `beads/witness` searching `brahmin` returns 1 on the inbox, 18 with
+  `--archive`, 21 with `--sent`, 38 with `--all`.
+
+  Two smaller corrections came with it. The help said the query was a regular
+  expression and gave a regex example; the code has escaped the query with
+  `QuoteMeta` since the ReDoS fix, so it is literal text, and a user who believes
+  a regex ran will misread a 0. Sent mail that was CC'd back to the sender is in
+  two stores at once and is now reported once.
+
+- **`gt stale` reads the build branch from the remote, and the rebuild loop can
+  now heal itself** (gt-ympl, gt-side of hq-cak50). Staleness was computed
+  against `$GT_ROOT/gastown/mayor/rig` — a working clone. Its `main` moves only
+  when something pulls and its `origin/main` only when something fetches, and in
+  a Gas Town nothing does either on a schedule. So a merge landed, the compare
+  ref did not move, and the binary was measured against the commit it had been
+  built from: `stale: false`, which is precisely the answer that makes
+  `rebuild-gt` do nothing. Measured live while writing this fix, from two
+  instruments at the same instant — `ls-remote` put `origin/main` at `5b7846e9`;
+  the rig's `main` and the installed binary were both at `bea47f05`, five
+  commits back, and `gt stale` called it fresh. The evening it was filed cost
+  three hand-rebuilds in two hours, the last decaying inside twenty minutes.
+  Every previous fix had been a DATA fix — fast-forward the checkout — which
+  re-decays on the next merge.
+
+  `gt stale` and `gt doctor` now fetch the branch tip from the push remote into
+  a private ref (`--no-write-fetch-head`; `FETCH_HEAD` is one file shared by
+  every worktree on the rig's gitdir) and compare against that. The per-command
+  startup warning stays local and network-free: it can only under-report, so its
+  firing is evidence and its silence is not. `gt stale --offline` asks for the
+  local-only check explicitly, and `compare_ref_refreshed` in `--json` says
+  which answer you got.
+
+  A failed remote read does not fall back to reporting freshness. Staleness is
+  one-sided — a local ref can only lag the remote, never lead it — so "behind
+  the local ref" still proves stale and is reported, while "level with the local
+  ref" proves nothing and is reported as `skipped`.
+
+  `rebuild-gt` had two more ways to do nothing quietly, both fixed. It read
+  `stale` before `skipped`, so a check that could not MEASURE presented as a
+  binary that was FRESH and the `safe_to_rebuild` guard underneath was
+  unreachable in exactly the case it existed for. And it rebuilt the rig
+  checkout without fast-forwarding it: with detection fixed, that compiles the
+  commit the binary already had, so the binary never advances and the plugin
+  reports success on every cycle forever. It now fast-forwards (`--ff-only`,
+  never a merge) before building, and re-runs `gt stale` against the newly
+  installed binary — exercising changed behaviour rather than reading `gt
+  version` or an mtime, both of which agreed with a rebuild that had not
+  happened. A rebuild that leaves the binary stale escalates instead of
+  recording success.
+
+- **`gt mq list --verify` no longer renders reachability as merge clearance**
+  (gt-0w2l). The good state was spelled `OK`, styled green, in a column called
+  `GIT`, beside a `STATUS` column reading `ready`. It meant only
+  present-and-non-empty — `MISSING` is for deleted branches and `EMPTY` for
+  branches with no commits over their target, so a present, non-empty,
+  17-way-conflicting branch was correctly `OK` by that definition. The
+  definition was invisible at the call site, and the Mayor read "3 MRs, all
+  verify GIT=OK" as clearance and instructed the refinery to merge two branches
+  that conflicted in **17 and 12 files** — both carrying 700 commits over a
+  merge base 700 commits back. The refinery had already landed the queue by
+  cherry-pick, so nothing burned; had the order been reversed, two merges that
+  were never going to work would have.
+
+  `OK` is now `PRESENT`, unstyled, and the listing says at the call site what
+  `PRESENT` does not mean, with the command that answers the other question.
+  `gt mq next` reports the same way. The JSON `git_state` field carries
+  `PRESENT` in place of `OK`.
+
+  **`--merge-check` is the verdict `--verify` never was.** It rehearses each
+  merge with `git merge-tree --write-tree` against the same refs the queue would
+  merge — object store only, no worktree, no index, nothing to unwind — and adds
+  a `MERGE` column reading `CLEAN` or `CONFLICTS=<n>`, plus `merge_state`,
+  `merge_clean` and `conflict_files` in `--json`. It implies `--verify`.
+
+  A rehearsal git could not run reports `ERR`, and the summary names it as
+  UNKNOWN rather than clean. That distinction needed defending in code:
+  `merge-tree` is documented to exit 1 for a conflicted merge and >1 for a
+  failure, but on git 2.55 an **unresolvable ref also exits 1**, writing to
+  stderr with stdout EMPTY. A reader that trusts the exit code parses that empty
+  stdout into zero conflicted files and reports `CLEAN` — the same
+  non-answer-as-verdict this change exists to end. The result tree's OID on the
+  first line of stdout is therefore the discriminator, and its absence is an
+  error.
+
+- **Answering by nudge now retires the reply reminder** (gt-w4ba). A reply
+  reminder was retired by exactly one event: a mail reply on the same thread.
+  Every agent's CLAUDE.md tells it to prefer `gt nudge` for routine replies —
+  "`gt nudge` costs zero, `gt mail send` costs one Dolt commit forever" — so an
+  agent that answered the recommended way answered a trigger that could not
+  observe it, and the only way to stop being reminded was to spend the permanent
+  commit the rule exists to avoid. Following the hygiene rule guaranteed the
+  spurious reminder; breaking it was the documented cure.
+
+  Reminders now carry the address they are owed to, not just the thread they are
+  about, and `gt nudge <agent>` clears the reminders the nudger owes that agent
+  across every thread. The reminder text names both channels rather than mail
+  alone, since the reminder is the only instruction the recipient sees.
+
+  Addresses are compared through `beads.SameAgentAddress`, not `==`: the address
+  on the reminder is whatever the mail sender wrote and the one on the answer is
+  whatever the nudger typed, and the two spellings routinely differ in nesting
+  and case. Reminders written before the field existed name nobody and are never
+  matched — retiring those on any nudge would be worse than the bug. Clearing is
+  best-effort and never fails a delivered nudge.
+
+  Note the scope difference from the mail path, which is deliberate: a mail
+  reply retires the reminders for one thread, because mail is addressed to a
+  thread. A nudge retires every reminder owed to that agent, because a nudge is
+  addressed to an agent and carries no thread at all. Archiving the message
+  still retires its reminder at drain time (gt-loz6), and reading it does not —
+  the obligation is to reply, not to read.
+
+- **The queued-nudge banner no longer replays mail the reader already dealt
+  with** (gt-loz6). A nudge announcing mail is a pointer — "you have new mail
+  from X, subject Y" — and nothing connected it back to the message it points
+  at. Delivery makes that permanent: the poller, the idle watcher and the ACP
+  propeller drain the whole queue into one banner and type it at the target, and
+  when the submit is not verified (a busy or dirty composer, even though the
+  text lands and the agent reads it) every drained entry is requeued with its
+  original timestamp. So the banner both showed and kept its entries, and only
+  the TTL ever retired one — 2h for urgent, 30m for normal.
+
+  Measured on gastown/witness over ~40 minutes: 7, then 11, then 10 entries,
+  every one of them already read, replied to and archived. Six of the ten were
+  successive Mayor orders revising each other; the correction that carried the
+  live state had aged out while a revoked order that happened to be newer
+  stayed. Because the banner carried sender and subject only, the witness could
+  not tell which of the ten was in force — and priority grouping means position
+  does not answer it either. The polarity was lucky: the surviving stale order
+  forbade a destructive action. The same mechanism with an authorization on the
+  stale side keeps a revoked permission alive.
+
+  Liveness is now decided at the drain, the one point every consumer passes
+  through: `mail.DrainLive` discards a mail or escalation nudge once its message
+  is read, and a reply reminder once its message is archived. It fails open — a
+  stale notification is noise, a dropped one is a lost message — and leaves
+  nudges that carry their own content (`gt nudge`, hook signals) untouched.
+  `QueuedNudge` gains a `MessageID`, because thread was too coarse to decide
+  this: a thread outlives the messages on it, so a spent notification stayed
+  "live" as long as anything newer on the same thread was unread, which is
+  exactly how the revoked order survived. Nudges written before the field fall
+  back to thread state. `gt mail read`, `mark-read`, `archive`, `archive
+  --stale` and cc-clear also clear the queue eagerly, and `Enqueue` sweeps
+  expired entries before enforcing the depth cap — a queue full of nudges the
+  next drain would discard unread used to reject the live message arriving now.
+  Finally, each banner line carries when it was sent: `[URGENT from mayor/ ·
+  18:43 CDT (2h14m ago)]`.
+
+- **`gt compact` no longer deletes another agent's live molecule on age alone**
+  (gt-98hh). Compaction's delete policy asked only how old a wisp was. Its
+  `molecule step past TTL` branch is reached only when the status is *not*
+  closed — the closed case is handled above it — so the one thing that branch
+  deleted was a step that was still open, hooked, blocked or in_progress: the
+  checklist of a molecule an agent is working right now. There is no restore.
+  The wisp tables are dolt-ignored (hq-del4), so there is no history to read
+  `AS OF` and no backup.
+
+  `gt compact` now builds an ancestry index over the whole `wisps` table before
+  it decides anything, and holds any wisp whose own status is not `closed`, or
+  which sits at any depth under a molecule whose root is not `closed`. Held
+  wisps are reported under `Protected` naming the molecule that held them,
+  alongside the existing pin and label guards. The release arm is a wisp whose
+  parent row is absent: that molecule has already been swept and cannot be
+  live. A failure to build the index is carried inside the value the guard
+  reads rather than returned to a caller who might not check it, so an
+  unreadable ancestry holds every candidate and says why.
+
+  The index query deliberately carries no infra-type exclusion, unlike
+  `mutableWispWhere`. That filter is right about what compaction may *mutate*
+  and wrong about what it may *look at*: an infra-typed parent compaction must
+  never touch can still be the parent of a step it may, and excluding it would
+  make that parent invisible and release its live children as orphans.
+
+  Measured against live `hq` on 2026-08-23 (14,495 wisps): the guard holds
+  nothing today — every one of the ~4,600 rows a bare run would delete is
+  closed under a closed parent, and the paired dry-run delete sets differ only
+  by a row crossing its TTL between the two runs. That is a fact about one
+  afternoon's data, not about the code. The same database holds 3,286 typed
+  step wisps under the dog molecules (`mol-dog-doctor`, `mol-dog-checkpoint`,
+  `mol-dog-jsonl`, `mol-dog-reaper`), all stamped `gc_report` with a 24h TTL; a
+  dog whose session dies mid-molecule leaves those steps open, and 24 hours
+  later they are exactly what the branch deleted — destroying the evidence of
+  the stuck dog. Verified end to end against a planted molecule on the
+  `gastown` rig: with the guard, a closed step of a `hooked` molecule moves
+  from `Deleted` to `Protected` naming the root, while the same step under a
+  *closed* root, an unprotected sibling and a plain past-TTL wisp all stay in
+  `Deleted`. `--dry-run` throughout; fixtures removed afterwards.
 
 - **A half-read planning scan no longer reports itself as an idle scheduler**
   (gt-vpds). When a store cannot be read, the sling-context scan skips it and

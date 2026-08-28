@@ -232,15 +232,27 @@ func (r *Router) ensureCustomTypes(beadsDir string) error {
 	return nil
 }
 
-func (r *Router) buildLabels(msg *Message) []string {
-	var labels []string
-	labels = append(labels, "gt:message")
+// messageIdentityLabels returns the labels every mail bead carries regardless
+// of which destination shape it lands in — direct, queue, announce or channel.
+//
+// msg-type belongs here rather than in each caller. The queue, announce and
+// channel writers each hand-rolled their own label slice under a comment
+// promising "labels for type, from/thread/reply-to/cc", and all three omitted
+// the type (gt-do5c). Sharing the line is what stops a fourth writer from
+// making the same omission just as quietly.
+func messageIdentityLabels(msg *Message) []string {
+	labels := []string{"gt:message", "from:" + msg.From, "msg-type:" + string(msg.Type)}
 	if msg.Type == TypeEscalation {
 		labels = append(labels, "gt:escalation")
 	}
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "msg-type:"+string(msg.Type))
-	labels = append(labels, DeliverySendLabels()...)
+	return labels
+}
+
+// messageThreadLabels returns the threading and CC metadata every mail bead
+// carries. Companion to messageIdentityLabels; the destination-specific label
+// (queue:, announce:, channel:) goes between the two.
+func messageThreadLabels(msg *Message) []string {
+	var labels []string
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -248,10 +260,38 @@ func (r *Router) buildLabels(msg *Message) []string {
 		labels = append(labels, "reply-to:"+msg.ReplyTo)
 	}
 	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
+		labels = append(labels, "cc:"+AddressToIdentity(cc))
 	}
 	return labels
+}
+
+func (r *Router) buildLabels(msg *Message) []string {
+	labels := messageIdentityLabels(msg)
+	labels = append(labels, DeliverySendLabels()...)
+	return append(labels, messageThreadLabels(msg)...)
+}
+
+// queueLabels builds the label set for a message landing in a work queue.
+func queueLabels(msg *Message, queueName string) []string {
+	labels := append(messageIdentityLabels(msg), "queue:"+queueName)
+	labels = append(labels, DeliverySendLabels()...)
+	return append(labels, messageThreadLabels(msg)...)
+}
+
+// announceLabels builds the label set for the origin copy of an announce
+// broadcast. delivery:pending is intentionally omitted — a broadcast has no
+// single recipient to ack against. Subscriber fan-out copies go through
+// sendToSingle, which adds delivery tracking.
+func announceLabels(msg *Message, announceName string) []string {
+	labels := append(messageIdentityLabels(msg), "announce:"+announceName)
+	return append(labels, messageThreadLabels(msg)...)
+}
+
+// channelLabels builds the label set for the origin copy of a channel post.
+// delivery:pending is omitted for the same reason as announceLabels.
+func channelLabels(msg *Message, channelName string) []string {
+	labels := append(messageIdentityLabels(msg), "channel:"+channelName)
+	return append(labels, messageThreadLabels(msg)...)
 }
 
 // isTownLevelAddress returns true if the address is for a town-level agent or the overseer.
@@ -1283,22 +1323,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 		return err
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus queue metadata
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "queue:"+queueName)
-	labels = append(labels, DeliverySendLabels()...)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := queueLabels(msg, queueName)
 
 	// Build command: bd create --assignee=queue:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1365,24 +1390,7 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 		}
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus announce metadata.
-	// Note: delivery:pending is intentionally omitted for announce messages —
-	// broadcast messages have no single recipient to ack against. Subscriber
-	// fan-out copies go through sendToSingle which adds delivery tracking.
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "announce:"+announceName)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := announceLabels(msg, announceName)
 
 	// Build command: bd create --assignee=announce:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1451,24 +1459,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 		return fmt.Errorf("channel %s is closed", channelName)
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus channel metadata.
-	// Note: delivery:pending is intentionally omitted for the channel-origin
-	// copy — it has no single recipient to ack. Subscriber fan-out copies go
-	// through sendToSingle which adds delivery tracking.
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, "channel:"+channelName)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := channelLabels(msg, channelName)
 
 	// Build command: bd create --assignee=channel:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1703,12 +1694,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			// Timeout (agent busy) — queue for cooperative delivery
 			// at the next turn boundary.
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:   msg.From,
-				Message:  notification,
-				Priority: priority,
-				Kind:     nudgeKindForMessage(msg),
-				ThreadID: msg.ThreadID,
-				Severity: prioritySeverityLabel(msg.Priority),
+				Sender:    msg.From,
+				Message:   notification,
+				Priority:  priority,
+				Kind:      nudgeKindForMessage(msg),
+				ThreadID:  msg.ThreadID,
+				MessageID: msg.ID,
+				Severity:  prioritySeverityLabel(msg.Priority),
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
@@ -1740,12 +1732,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 				continue
 			}
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:   msg.From,
-				Message:  notification,
-				Priority: priority,
-				Kind:     nudgeKindForMessage(msg),
-				ThreadID: msg.ThreadID,
-				Severity: prioritySeverityLabel(msg.Priority),
+				Sender:    msg.From,
+				Message:   notification,
+				Priority:  priority,
+				Kind:      nudgeKindForMessage(msg),
+				ThreadID:  msg.ThreadID,
+				MessageID: msg.ID,
+				Severity:  prioritySeverityLabel(msg.Priority),
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
@@ -1779,9 +1772,9 @@ func (r *Router) isSessionMuted(sessionID string) bool {
 
 func nudgeKindForMessage(msg *Message) string {
 	if msg.Type == TypeEscalation {
-		return "escalation"
+		return nudge.KindEscalation
 	}
-	return "mail"
+	return nudge.KindMail
 }
 
 func nudgePriorityForMailPriority(priority Priority) string {
@@ -1814,7 +1807,12 @@ func prioritySeverityLabel(priority Priority) string {
 }
 
 // enqueueReplyReminder queues a deferred nudge reminding the recipient to reply
-// via gt mail send rather than in chat. Best-effort: errors are logged, not returned.
+// over a channel the sender can actually receive, rather than in chat.
+// Best-effort: errors are logged, not returned.
+//
+// The reminder carries who it is owed to, not just what it is about, so that
+// answering by nudge retires it as a mail reply does — see
+// ClearReplyRemindersTo for why a mail-only trigger was unsatisfiable.
 //
 // Skipped when:
 //   - No town root (can't use nudge queue)
@@ -1837,10 +1835,12 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	}
 	reminder := nudge.QueuedNudge{
 		Sender:       "system",
-		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
+		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) — `gt nudge %s` for a routine answer, `gt mail send %s` if it must survive session death. Not in chat.", msg.From, msg.Subject, msg.From, msg.From),
 		Priority:     nudge.PriorityNormal,
-		Kind:         "reply-reminder",
+		Kind:         nudge.KindReplyReminder,
 		ThreadID:     msg.ThreadID,
+		MessageID:    msg.ID,
+		ReplyTo:      msg.From,
 		DeliverAfter: time.Now().Add(delay),
 	}
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
@@ -1898,7 +1898,37 @@ func (r *Router) ClearReplyReminders(address, threadID string) error {
 
 	var firstErr error
 	for _, sessionID := range AddressToSessionIDs(address) {
-		if _, err := nudge.RemoveKindByThread(r.townRoot, sessionID, "reply-reminder", threadID); err != nil && firstErr == nil {
+		if _, err := nudge.RemoveKindByThread(r.townRoot, sessionID, nudge.KindReplyReminder, threadID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ClearReplyRemindersTo retires the reply reminders address owes to repliedTo,
+// whatever thread they sit on. Call it when address answers repliedTo over a
+// channel that leaves no mail record.
+//
+// A reminder that only a mail reply can satisfy is a reminder the town's own
+// hygiene rule cannot satisfy: agents are told to prefer `gt nudge` precisely
+// because mail costs a permanent Dolt commit, so answering the recommended way
+// left the reminder in force and the only way to silence it was to spend the
+// commit the rule exists to avoid (gt-w4ba).
+//
+// Matching is by agent, not by string: the address on a reminder is whatever
+// the mail sender wrote, and the one on the answer is whatever the nudger
+// typed. SameAgentAddress is where those spellings are reconciled.
+func (r *Router) ClearReplyRemindersTo(address, repliedTo string) error {
+	if r.townRoot == "" || address == "" || repliedTo == "" {
+		return nil
+	}
+	owedTo := func(replyTo string) bool {
+		return beads.SameAgentAddress(replyTo, repliedTo)
+	}
+
+	var firstErr error
+	for _, sessionID := range AddressToSessionIDs(address) {
+		if _, err := nudge.RemoveReplyReminders(r.townRoot, sessionID, owedTo); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

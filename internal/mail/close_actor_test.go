@@ -14,10 +14,14 @@ import (
 // the agent reached for --force, which is spelled the same as closing someone
 // else's mail. The fake bd below enforces the same guard bd does.
 func TestCloseActsUnderCanonicalIdentity(t *testing.T) {
+	// A successful close is APPLIED here, not merely acknowledged: closeMessage
+	// re-reads the bead to confirm the close took, so a fake whose show always
+	// answers "open" is modelling the gt-khq8 defect rather than bd.
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$BD_LOG"
 if [ "$1" = "show" ]; then
-  printf '%s\n' '[{"id":"hq-msg-mine","title":"Mine","description":"","status":"open","priority":2,"assignee":"gastown/toast","created_at":"2026-08-19T01:31:00Z","labels":["gt:message","from:gastown/witness"]}]'
+  if [ -f "$BD_LOG.closed" ]; then st=closed; else st=open; fi
+  printf '[{"id":"hq-msg-mine","title":"Mine","description":"","status":"%s","priority":2,"assignee":"gastown/toast","created_at":"2026-08-19T01:31:00Z","labels":["gt:message","from:gastown/witness"]}]\n' "$st"
   exit 0
 fi
 if [ "$1" = "label" ]; then
@@ -25,7 +29,7 @@ if [ "$1" = "label" ]; then
 fi
 if [ "$1" = "close" ]; then
   case "$*" in
-    *--actor=gastown/toast*) exit 0 ;;
+    *--actor=gastown/toast*) : > "$BD_LOG.closed"; exit 0 ;;
   esac
   printf 'cannot close hq-msg-mine: assignee is "gastown/toast", actor is "gastown/polecats/toast"; reclaim or use --force to override\n' >&2
   exit 1
@@ -61,10 +65,15 @@ func TestCloseQueueMailboxKeepsAmbientActor(t *testing.T) {
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$BD_LOG"
 if [ "$1" = "show" ]; then
-  printf '%s\n' '[{"id":"hq-msg-queued","title":"Queued","description":"","status":"open","priority":2,"assignee":"queue:builds","created_at":"2026-08-19T01:31:00Z","labels":["gt:message","from:gastown/witness"]}]'
+  if [ -f "$BD_LOG.closed" ]; then st=closed; else st=open; fi
+  printf '[{"id":"hq-msg-queued","title":"Queued","description":"","status":"%s","priority":2,"assignee":"queue:builds","created_at":"2026-08-19T01:31:00Z","labels":["gt:message","from:gastown/witness"]}]\n' "$st"
   exit 0
 fi
-if [ "$1" = "close" ] || [ "$1" = "label" ]; then
+if [ "$1" = "close" ]; then
+  : > "$BD_LOG.closed"
+  exit 0
+fi
+if [ "$1" = "label" ]; then
   exit 0
 fi
 printf 'unexpected bd args: %s\n' "$*" >&2

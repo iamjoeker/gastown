@@ -189,17 +189,60 @@ func (d *Daemon) reapWisps() {
 
 	vars := reaperFormulaVars(d.patrolConfig)
 
-	// Pour the molecule for observability tracking.
-	mol := d.pourDogMolecule(constants.MolDogReaper, vars)
-	defer mol.close()
-
 	if config.DryRun {
 		d.logger.Printf("wisp_reaper: DRY RUN — reporting only, no changes will be made")
 	}
 
 	// Try dispatching to a Dog for formula-driven execution.
+	//
+	// The observability molecule is poured only on the fallback path, because on
+	// the dispatch path it is a duplicate. dispatchReaperDog slings the FORMULA
+	// NAME, not a molecule we poured, so `gt sling` pours its own — and a molecule
+	// poured here would be closed by this function while the Dog is still running
+	// the one it was given. Measured on hq 2026-08-24: every reaper cycle emitted
+	// two mol-dog-reaper roots 2-3 seconds apart, one assigned to
+	// deacon/dogs/alpha and one unassigned with six step children, and the
+	// unassigned seven-wisp molecule was the redundant half (gt-bnpw).
+	//
+	// The inline path is different: nothing else records that run, and
+	// reapWispsInline closes each step as it completes, so there the molecule is
+	// the only trace of the work.
 	if err := d.dispatchReaperDog(vars); err != nil {
-		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
+		// A DESTRUCTIVE operation is about to run down a different path than the
+		// one that was chosen, because an unrelated binary failed.
+		//
+		// This used to be the INFO line above and nothing else. On 2026-08-24 a
+		// broken `gt` made every cycle take this branch and 229 wisps were purged
+		// inline; wisps are unversioned with no restore, so that is unrecoverable
+		// deletion authorised by an error nobody was told about. The log line was
+		// truthful and still useless: it went to the daemon log at the same level
+		// as the routine "dispatched to Dog" line one branch over, so the signal
+		// that the safe path was gone looked exactly like the signal that it was
+		// working.
+		//
+		// The fallback still runs — suppressing the reaper on a dispatch failure
+		// trades unrecoverable deletion for unbounded wisp growth, which is its
+		// own outage — but taking it is now an escalation, not a note. What is
+		// reported is what was ATTEMPTED (Dog dispatch), what FAILED, and what is
+		// about to happen instead. That is the honest form for a path whose
+		// post-condition this function cannot check.
+		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v) — falling back to INLINE DESTRUCTIVE reaping (deletes are unversioned and cannot be restored)", err)
+
+		// escalateE, not escalate: this escalation spawns `gt`, and the branch it
+		// is reporting was taken BECAUSE a `gt` invocation failed. A broken gt
+		// binary therefore silences the report of its own breakage — the report
+		// and the fault share a failure mode. Assuming it landed would be the same
+		// defect one level up, so when it does not land the daemon log says
+		// plainly that the destructive path ran with nobody told.
+		if escErr := d.escalateE("wisp_reaper", fmt.Sprintf(
+			"Dog dispatch failed (%v); running the inline fallback, which DELETES wisp rows directly. "+
+				"Deletes are unversioned with no restore. Check the gt binary — this path is chosen by an unrelated failure, not by configuration.", err)); escErr != nil {
+			d.logger.Printf("wisp_reaper: UNREPORTED DESTRUCTIVE FALLBACK — escalation could not be sent (%v); "+
+				"the inline purge below ran with no notice to the Mayor. Both this and the dispatch failure above run `gt`, so a broken gt suppresses its own alarm.", escErr)
+		}
+
+		mol := d.pourDogMolecule(constants.MolDogReaper, vars)
+		defer mol.close()
 		d.reapWispsInline(config, maxAge, deleteAge, staleAge, mailAge, mol)
 		return
 	}
@@ -343,6 +386,16 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 		totalMailPurged += result.MailPurged
 		totalArchived += result.WispsArchived
 		totalProtected += result.WispsProtected
+		// Log WHAT was purged, not only how many. The daemon is the reaper that
+		// actually runs on a schedule, so its log and the DOLT_COMMIT message
+		// are the only two places a purge is described at all — wisp tables are
+		// dolt-ignored, so there is no diff to read afterwards. A bare count in
+		// both is how a routine sweep of molecule steps was read as ~40
+		// destroyed merge-request records (gt-mkuw).
+		if result.WispsPurged > 0 {
+			d.logger.Printf("wisp_reaper: %s: purged %d closed unprotected wisps (%s)",
+				dbName, result.WispsPurged, reaper.FormatWispTypeDigest(result.WispsPurgedByType))
+		}
 		if result.WispsArchived > 0 && archive != nil {
 			d.logger.Printf("wisp_reaper: %s: archived and released %d protected wisps to %s",
 				dbName, result.WispsArchived, archive.Location())

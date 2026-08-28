@@ -32,14 +32,37 @@ func ExecWithOutput(workDir, cmd string, args ...string) (string, error) {
 	c.Stderr = &stderr
 
 	if err := c.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return "", fmt.Errorf("%s", errMsg)
-		}
-		return "", err
+		return "", subprocessError(err, stderr.String())
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// ExecCaptureStdout is ExecWithOutput except that it returns stdout whether or
+// not the command succeeded.
+//
+// ExecWithOutput drops stdout on a non-zero exit, which is right when the exit
+// status means "there is no answer" and wrong when the command reports its
+// answer on stdout AND uses the exit status to grade it. `gt polecat
+// check-recovery --json --reconcile-cleanup` is the second kind: it exits
+// non-zero when a repair it was asked for did not happen, with the verdict and
+// its blockers still on stdout (gt-hm0v). Callers that parse that output need
+// it; the error is returned alongside so nobody loses the failure either.
+func ExecCaptureStdout(workDir, cmd string, args ...string) (string, error) {
+	c := exec.Command(cmd, args...) //nolint:gosec // G204: callers validate args
+	c.Dir = workDir
+	SetDetachedProcessGroup(c) // suppress console window flash on Windows
+
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+
+	err := c.Run()
+	out := strings.TrimSpace(stdout.String())
+	if err != nil {
+		return out, subprocessError(err, stderr.String())
+	}
+	return out, nil
 }
 
 // ExecRun runs a command in the specified directory.
@@ -53,12 +76,27 @@ func ExecRun(workDir, cmd string, args ...string) error {
 	c.Stderr = &stderr
 
 	if err := c.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return fmt.Errorf("%s", errMsg)
-		}
-		return err
+		return subprocessError(err, stderr.String())
 	}
 
 	return nil
+}
+
+// subprocessError turns a failed command into the most informative error
+// available: the subprocess's own stderr when it managed to write any, and
+// otherwise a description of how it died.
+//
+// A killed process writes nothing — SIGKILL gives it no chance — so an empty
+// stderr is exactly the case where the wait status is all the information
+// there is. Reporting it as Go's bare "signal: killed" loses both the exit
+// code an operator would recognize and the fact that an unrequested SIGKILL is
+// usually the OOM killer.
+func subprocessError(err error, stderr string) error {
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		return fmt.Errorf("%s", msg)
+	}
+	if info := ClassifyExitError(err, nil); info.Signaled {
+		return fmt.Errorf("%s", info.Describe())
+	}
+	return err
 }

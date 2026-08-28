@@ -36,7 +36,7 @@ type ConvoyFailureResult struct {
 // For each zombie that had active work on a hook_bead (polecat failed without
 // completing), checks if the issue belongs to a convoy and tracks the failure.
 // Called from DetectZombiePolecats after all zombies are collected.
-func trackConvoyFailures(bd *BdCli, workDir string, result *DetectZombiePolecatsResult) {
+func trackConvoyFailures(bd *BdCli, workDir string, result *DetectZombiePolecatsResult, eff scanEffects) {
 	for i := range result.Zombies {
 		zombie := &result.Zombies[i]
 
@@ -48,7 +48,7 @@ func trackConvoyFailures(bd *BdCli, workDir string, result *DetectZombiePolecats
 			continue
 		}
 
-		cfr := TrackConvoyFailure(bd, workDir, zombie.HookBead)
+		cfr := trackConvoyFailure(bd, workDir, zombie.HookBead, eff)
 		if cfr == nil {
 			continue // Not convoy-tracked
 		}
@@ -91,6 +91,14 @@ func zombieImpliesActiveFailure(zombie ZombieResult) bool {
 //
 // Returns nil if the issue has no tracking convoy.
 func TrackConvoyFailure(bd *BdCli, workDir, issueID string) *ConvoyFailureResult {
+	return trackConvoyFailure(bd, workDir, issueID, scanEffects{})
+}
+
+// trackConvoyFailure is TrackConvoyFailure with the sweep's permissions made
+// explicit. Under a dry run the failure count is still computed and reported —
+// including whether this failure would trip the auto-skip — but neither the
+// count label nor the skip is written (gt-3516).
+func trackConvoyFailure(bd *BdCli, workDir, issueID string, eff scanEffects) *ConvoyFailureResult {
 	if issueID == "" {
 		return nil
 	}
@@ -113,7 +121,7 @@ func TrackConvoyFailure(bd *BdCli, workDir, issueID string) *ConvoyFailureResult
 		}
 
 		if isMountain {
-			result.Error = trackMountainFailure(bd, workDir, issueID, result)
+			result.Error = trackMountainFailure(bd, workDir, issueID, result, eff)
 		} else {
 			result.Warning = fmt.Sprintf("polecat failure on convoy-tracked issue %s (convoy %s)", issueID, convoyID)
 		}
@@ -128,12 +136,19 @@ func TrackConvoyFailure(bd *BdCli, workDir, issueID string) *ConvoyFailureResult
 
 // trackMountainFailure increments the failure count for a mountain-tracked
 // issue and auto-skips if the count reaches MountainMaxFailures.
-func trackMountainFailure(bd *BdCli, workDir, issueID string, result *ConvoyFailureResult) error {
+func trackMountainFailure(bd *BdCli, workDir, issueID string, result *ConvoyFailureResult, eff scanEffects) error {
 	// Get current failure count from issue labels
 	issueLabels := getBeadLabels(bd, workDir, issueID)
 	currentCount := getMountainFailureCount(issueLabels)
 	newCount := currentCount + 1
 	result.FailureCount = newCount
+
+	// The count and the skip decision above are derived from reads, so a dry run
+	// reports both truthfully; only the two writes below are withheld.
+	if eff.dryRun {
+		result.Skipped = newCount >= MountainMaxFailures
+		return nil
+	}
 
 	// Update failure count label
 	if err := updateMountainFailureCount(bd, workDir, issueID, currentCount, newCount); err != nil {

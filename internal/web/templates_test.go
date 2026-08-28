@@ -194,10 +194,10 @@ func TestConvoyTemplate_StatusIndicators(t *testing.T) {
 	data := ConvoyData{
 		Convoys: []ConvoyRow{
 			{
-				ID:         "hq-cv-active",
-				Title:      "Active Convoy",
+				ID:         "hq-cv-working",
+				Title:      "Working Convoy",
 				Status:     "open",
-				WorkStatus: "active",
+				WorkStatus: "working",
 			},
 			{
 				ID:         "hq-cv-stuck",
@@ -218,7 +218,7 @@ func TestConvoyTemplate_StatusIndicators(t *testing.T) {
 
 	// Check work status badges are rendered (replaced status-open/closed classes)
 	if !strings.Contains(output, "badge-green") {
-		t.Error("Template should contain badge-green class for active status")
+		t.Error("Template should contain badge-green class for working status")
 	}
 	if !strings.Contains(output, "badge-red") {
 		t.Error("Template should contain badge-red class for stuck status")

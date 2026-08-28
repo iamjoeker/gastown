@@ -30,6 +30,16 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		mailBody = strings.TrimRight(string(data), "\n")
 	}
 
+	// gt-gxxm: refuse an empty body rather than delivering a subject with
+	// nothing under it. The failure is silent on BOTH ends — the sender sees
+	// the same "✓ Message sent" line as a real send, and the recipient cannot
+	// tell an empty body from a body that was never written — so nothing
+	// downstream can recover it. Guard the send path itself: the callers that
+	// get burned are exactly the ones whose harness does not attach stdin.
+	if err := checkMailBody(mailBody, mailBodySource(cmd), mailAllowEmpty); err != nil {
+		return err
+	}
+
 	var to string
 
 	if mailSendSelf {
@@ -102,8 +112,15 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		msg.Priority = mail.PriorityHigh
 	}
 
-	// Set message type
-	msg.Type = mail.ParseMessageType(mailType)
+	// Set message type. Reject an unrecognised value rather than rewriting it
+	// to "notification": the silent coercion meant `--type query` reported
+	// success and stored `msg-type:notification`, so a sender trying to be
+	// honest was overruled without being told (gt-do5c).
+	msgType, err := mail.ValidateMessageType(mailType)
+	if err != nil {
+		return err
+	}
+	msg.Type = msgType
 
 	// Set pinned flag
 	msg.Pinned = mailPinned
@@ -247,6 +264,42 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// mailBodySource names the flag that produced the resolved body, so a refusal
+// can say which input came back empty. Returns "" when no body flag was passed
+// at all — a different mistake, and one that deserves a different message.
+func mailBodySource(cmd *cobra.Command) string {
+	if mailStdin {
+		return "--stdin"
+	}
+	if cmd == nil {
+		return ""
+	}
+	// --body and --message write the same variable; report whichever was typed.
+	for _, name := range []string{"message", "body"} {
+		if f := cmd.Flags().Lookup(name); f != nil && f.Changed {
+			if name == "message" {
+				return "--message/-m"
+			}
+			return "--body"
+		}
+	}
+	return ""
+}
+
+// checkMailBody rejects a message whose resolved body has no content. An empty
+// mail is almost never intended and is undetectable downstream, so refusal is
+// the default whatever the source; --allow-empty is the opt-in for a caller
+// that genuinely wants a subject-only message (gt-gxxm).
+func checkMailBody(body, source string, allowEmpty bool) error {
+	if allowEmpty || strings.TrimSpace(body) != "" {
+		return nil
+	}
+	if source == "" {
+		return fmt.Errorf("refusing to send: no message body (pass --message/-m, --stdin, or --allow-empty for a subject-only message)")
+	}
+	return fmt.Errorf("refusing to send: %s produced an empty body (pass --allow-empty for a subject-only message)", source)
 }
 
 // applyRoutingFlags sets the storage class from --wisp/--permanent.

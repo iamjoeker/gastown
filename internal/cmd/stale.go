@@ -12,6 +12,7 @@ import (
 
 var staleJSON bool
 var staleQuiet bool
+var staleOffline bool
 
 var staleCmd = &cobra.Command{
 	Use:     "stale",
@@ -20,11 +21,15 @@ var staleCmd = &cobra.Command{
 	Long: `Check if the gt binary was built from an older commit than a build ref.
 
 This command compares the commit hash embedded in the binary at build time
-with the resolved build branch of the gastown repository (main/master/carry/*).
+with the build branch of the gastown repository (main/master/carry/*), read
+from the remote so the answer does not depend on when a local checkout was
+last updated. --offline skips that read; it can then only under-report
+staleness, and reports "skipped" rather than "fresh" when it cannot tell.
 
 Examples:
   gt stale              # Human-readable output
   gt stale --json       # Machine-readable JSON output
+  gt stale --offline    # No network; local refs only
   gt stale --quiet      # Exit code only (0=stale, 1=fresh, 2=undetermined)
 
 Exit codes:
@@ -37,6 +42,7 @@ Exit codes:
 func init() {
 	staleCmd.Flags().BoolVar(&staleJSON, "json", false, "Output as JSON")
 	staleCmd.Flags().BoolVarP(&staleQuiet, "quiet", "q", false, "Exit code only (0=stale, 1=fresh, 2=undetermined)")
+	staleCmd.Flags().BoolVar(&staleOffline, "offline", false, "Do not read the build branch from the remote (local refs only)")
 	rootCmd.AddCommand(staleCmd)
 }
 
@@ -50,9 +56,14 @@ type StaleOutput struct {
 	RepoCommit    string `json:"repo_commit"`
 	CompareRef    string `json:"compare_ref,omitempty"`
 	CommitsBehind int    `json:"commits_behind,omitempty"`
-	Skipped       bool   `json:"skipped,omitempty"`
-	SkipReason    string `json:"skip_reason,omitempty"`
-	Error         string `json:"error,omitempty"`
+	// Refreshed distinguishes "compared against the remote" from "compared
+	// against whatever a local checkout happened to hold". Consumers that act
+	// on stale:false should require it.
+	Refreshed    bool   `json:"compare_ref_refreshed"`
+	RefreshError string `json:"refresh_error,omitempty"`
+	Skipped      bool   `json:"skipped,omitempty"`
+	SkipReason   string `json:"skip_reason,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 func runStale(cmd *cobra.Command, args []string) error {
@@ -68,8 +79,12 @@ func runStale(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot find gastown repo: %w", err)
 	}
 
-	// Check staleness
-	info := version.CheckStaleBinary(repoRoot)
+	// Check staleness. The remote read is the default: this command is what the
+	// rebuild-gt dog keys on, and a compare ref nothing updates made it a
+	// no-op for hours at a time (gt-ympl).
+	info := version.CheckStaleBinaryWithOptions(repoRoot, version.StaleOptions{
+		RefreshRemote: !staleOffline,
+	})
 
 	// Handle errors
 	if info.Error != nil {
@@ -99,6 +114,8 @@ func runStale(cmd *cobra.Command, args []string) error {
 		RepoCommit:    info.RepoCommit,
 		CompareRef:    info.CompareRef,
 		CommitsBehind: info.CommitsBehind,
+		Refreshed:     info.Refreshed,
+		RefreshError:  info.RefreshError,
 		Skipped:       info.Skipped,
 		SkipReason:    info.SkipReason,
 	}
@@ -156,8 +173,19 @@ func outputStaleText(output StaleOutput) error {
 		fmt.Printf("%s Binary is fresh\n", style.Success.Render("✓"))
 		fmt.Printf("  Commit: %s\n", version.ShortCommit(output.BinaryCommit))
 		if output.CompareRef != "" {
-			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("(compared against %s)", output.CompareRef)))
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("(compared against %s%s)",
+				output.CompareRef, staleRefProvenance(output))))
 		}
 	}
 	return nil
+}
+
+// staleRefProvenance names where the compare ref's commit came from, because
+// "fresh" against a local checkout nothing updates and "fresh" against the
+// remote are different claims and only one of them is evidence.
+func staleRefProvenance(output StaleOutput) string {
+	if output.Refreshed {
+		return ", read from the remote"
+	}
+	return ", from a local ref — not read from the remote"
 }

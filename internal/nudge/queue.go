@@ -32,6 +32,19 @@ const (
 	PriorityUrgent = "urgent"
 )
 
+// Kinds of queued nudge. A kind names what the nudge is *about*, which is what
+// lets a consumer decide whether the nudge is still live: a "mail" nudge whose
+// message has been read is spent, while a plain `gt nudge` carries its whole
+// content inline and can never go stale. Kind is empty for those.
+const (
+	// KindMail announces an ordinary mail message.
+	KindMail = "mail"
+	// KindEscalation announces escalation mail.
+	KindEscalation = "escalation"
+	// KindReplyReminder reminds the recipient to reply via gt mail send.
+	KindReplyReminder = "reply-reminder"
+)
+
 // Operational limits and defaults.
 // These are compiled-in fallbacks. Configurable via operational.nudge
 // in settings/config.json (ZFC pattern).
@@ -57,17 +70,41 @@ func nudgeConfig(townRoot string) *config.NudgeThresholds {
 
 // QueuedNudge represents a nudge message stored in the queue.
 type QueuedNudge struct {
-	Sender    string    `json:"sender"`
-	Message   string    `json:"message"`
-	Priority  string    `json:"priority"`
-	Kind      string    `json:"kind,omitempty"`
-	ThreadID  string    `json:"thread_id,omitempty"`
+	Sender   string `json:"sender"`
+	Message  string `json:"message"`
+	Priority string `json:"priority"`
+	Kind     string `json:"kind,omitempty"`
+	ThreadID string `json:"thread_id,omitempty"`
+	// MessageID is the mail bead this nudge announces, when it announces one.
+	// Thread ID alone is too coarse to decide liveness: a thread outlives any
+	// single message on it, so a spent notification for an old message stays
+	// "live" as long as anything newer on the thread is unread — which is
+	// exactly how a revoked order kept being replayed (gt-loz6).
+	MessageID string `json:"message_id,omitempty"`
+	// ReplyTo is the address a reply-reminder is owed to — the sender of the
+	// message the reminder is about. Without it a reminder records only what it
+	// is about and not who it is to, so the only event that could retire it was
+	// a mail reply on the same thread. An answer sent over the channel agents
+	// are told to prefer left no trace the reminder could see, and the reminder
+	// outlived the conversation it was chasing (gt-w4ba).
+	ReplyTo   string    `json:"reply_to,omitempty"`
 	Severity  string    `json:"severity,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 	// DeliverAfter, if non-zero, defers delivery until this time has passed.
 	// Drain skips (but does not discard) the nudge until the deadline is met.
 	DeliverAfter time.Time `json:"deliver_after,omitempty"`
+}
+
+// IsMailDerived reports whether a nudge merely points at a mail message rather
+// than carrying its own content. These are the nudges that can outlive what
+// they announce, and the only ones a liveness filter may discard.
+func (n QueuedNudge) IsMailDerived() bool {
+	switch n.Kind {
+	case KindMail, KindEscalation, KindReplyReminder:
+		return true
+	}
+	return false
 }
 
 // queueDir returns the nudge queue directory for a given session.
@@ -105,8 +142,19 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	}
 
 	// Check queue depth before writing to prevent runaway senders.
+	//
+	// Expired entries are swept first. Without that sweep the cap is enforced by
+	// age alone: a queue full of nudges that are already past their TTL — and so
+	// would be discarded unread by the very next Drain — refuses the live message
+	// arriving now. State has to be consulted before age, or a dead entry
+	// outlives the message that supersedes it (gt-loz6).
 	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
 	pending, _ := Pending(townRoot, session)
+	if pending >= maxDepth {
+		if swept, _ := PurgeExpired(townRoot, session); swept > 0 {
+			pending, _ = Pending(townRoot, session)
+		}
+	}
 	if pending >= maxDepth {
 		return fmt.Errorf("nudge queue for %s is full (%d/%d pending)", session, pending, maxDepth)
 	}
@@ -329,7 +377,67 @@ func RemoveKindByThread(townRoot, session, kind, threadID string) (int, error) {
 	if kind == "" || threadID == "" {
 		return 0, nil
 	}
+	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
+		return n.Kind == kind && n.ThreadID == threadID
+	})
+}
 
+// RemoveReplyReminders deletes queued reply-reminder nudges for a session whose
+// ReplyTo address satisfies owedTo, returning the number removed.
+//
+// The address comparison is the caller's: agent addresses have several live
+// spellings and reconciling them is the mail package's boundary, not this one.
+//
+// Reminders written before ReplyTo existed carry an empty address and are never
+// matched — owedTo is not consulted for them. They still retire on their own
+// TTL, and on a mail reply through RemoveKindByThread.
+func RemoveReplyReminders(townRoot, session string, owedTo func(replyTo string) bool) (int, error) {
+	if owedTo == nil {
+		return 0, nil
+	}
+	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
+		return n.Kind == KindReplyReminder && n.ReplyTo != "" && owedTo(n.ReplyTo)
+	})
+}
+
+// PurgeExpired removes queued nudges whose TTL has already elapsed, returning
+// the number removed. In-flight .claimed files are left alone so a concurrent
+// drainer can finish.
+//
+// Drain already discards expired entries as it reads them, but Drain only runs
+// when someone is there to receive; a queue nobody is draining keeps its dead
+// entries indefinitely and they count against the depth cap.
+func PurgeExpired(townRoot, session string) (int, error) {
+	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
+		return !n.ExpiresAt.IsZero() && time.Now().After(n.ExpiresAt)
+	})
+}
+
+// RemoveByMessage deletes queued nudges announcing the given mail message.
+// Called when the message is read or archived: the notification is spent, and
+// leaving it queued is what replays a dead order at an agent (gt-loz6).
+//
+// Nudges predating the MessageID field carry only a thread ID; those are
+// matched on threadID when one is supplied, which is as precise as the record
+// they were written with allows.
+func RemoveByMessage(townRoot, session, messageID, threadID string) (int, error) {
+	if messageID == "" && threadID == "" {
+		return 0, nil
+	}
+	return removeMatching(townRoot, session, func(n QueuedNudge) bool {
+		if !n.IsMailDerived() {
+			return false
+		}
+		if messageID != "" && n.MessageID == messageID {
+			return true
+		}
+		return n.MessageID == "" && threadID != "" && n.ThreadID == threadID
+	})
+}
+
+// removeMatching deletes queued .json entries for which match returns true.
+// Claimed files are skipped: a concurrent drainer owns those.
+func removeMatching(townRoot, session string, match func(QueuedNudge) bool) (int, error) {
 	dir := queueDir(townRoot, session)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -358,7 +466,7 @@ func RemoveKindByThread(townRoot, session, kind, threadID string) (int, error) {
 		if err := json.Unmarshal(data, &n); err != nil {
 			continue
 		}
-		if n.Kind != kind || n.ThreadID != threadID {
+		if !match(n) {
 			continue
 		}
 
@@ -394,26 +502,69 @@ func FormatForInjection(nudges []QueuedNudge) string {
 		}
 	}
 
+	now := time.Now()
 	if len(urgent) > 0 {
 		b.WriteString(fmt.Sprintf("QUEUED NUDGE (%d urgent):\n\n", len(urgent)))
 		for _, n := range urgent {
-			b.WriteString(fmt.Sprintf("  [URGENT from %s] %s\n", n.Sender, n.Message))
+			b.WriteString(fmt.Sprintf("  [URGENT from %s%s] %s\n", n.Sender, stamp(n, now), n.Message))
 		}
 		if len(normal) > 0 {
 			b.WriteString(fmt.Sprintf("\nPlus %d non-urgent nudge(s):\n", len(normal)))
 			for _, n := range normal {
-				b.WriteString(fmt.Sprintf("  [from %s] %s\n", n.Sender, n.Message))
+				b.WriteString(fmt.Sprintf("  [from %s%s] %s\n", n.Sender, stamp(n, now), n.Message))
 			}
 		}
 		b.WriteString("\nHandle urgent nudges before continuing current work.\n")
 	} else {
 		b.WriteString(fmt.Sprintf("QUEUED NUDGE (%d message(s)):\n\n", len(normal)))
 		for _, n := range normal {
-			b.WriteString(fmt.Sprintf("  [from %s] %s\n", n.Sender, n.Message))
+			b.WriteString(fmt.Sprintf("  [from %s%s] %s\n", n.Sender, stamp(n, now), n.Message))
 		}
 		b.WriteString("\nThis is a background notification. Continue current work unless the nudge is higher priority.\n")
 	}
 
 	b.WriteString("</system-reminder>\n")
 	return b.String()
+}
+
+// stamp renders when a nudge was sent, as " · 18:43 CDT (2h14m ago)".
+//
+// The banner used to carry sender and subject only. A queue can hold hours of
+// messages at once, and several of them can be revisions of each other, so
+// without a time on the line there is no way to tell which instruction is the
+// current one — a witness reading ten Mayor orders said exactly that (gt-loz6).
+// Ordering alone does not answer it either: entries are grouped by priority
+// before they are printed.
+func stamp(n QueuedNudge, now time.Time) string {
+	if n.Timestamp.IsZero() {
+		return ""
+	}
+	ts := n.Timestamp.Local()
+	age := now.Sub(ts)
+	layout := "15:04 MST"
+	if age >= 24*time.Hour || age < 0 {
+		layout = "Jan 2 15:04 MST"
+	}
+	switch {
+	case age < 0:
+		return fmt.Sprintf(" · %s", ts.Format(layout))
+	case age < time.Minute:
+		return fmt.Sprintf(" · %s (just now)", ts.Format(layout))
+	default:
+		return fmt.Sprintf(" · %s (%s ago)", ts.Format(layout), humanAge(age))
+	}
+}
+
+// humanAge renders a duration as "3m", "2h14m" or "2d3h" — the resolution a
+// reader needs to rank two instructions, without the seconds Duration.String
+// would print.
+func humanAge(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+	}
 }

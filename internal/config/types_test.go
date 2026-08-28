@@ -100,9 +100,13 @@ func TestDefaultWorkerStatusConfig(t *testing.T) {
 	if stale >= stuck {
 		t.Errorf("StaleThreshold (%v) must be < StuckThreshold (%v)", stale, stuck)
 	}
+	// The dashboard grades the same Deacon heartbeat the daemon does, so it has
+	// to use the same window. A shorter one here reports a working Deacon as
+	// not-fresh for most of every patrol cycle (gt-cbd).
 	hbFresh := ParseDurationOrDefault(cfg.HeartbeatFreshThreshold, 0)
-	if hbFresh != 5*time.Minute {
-		t.Errorf("HeartbeatFreshThreshold = %v, want 5m", hbFresh)
+	if hbFresh != DefaultDeaconHeartbeatStaleThreshold {
+		t.Errorf("HeartbeatFreshThreshold = %v, want %v (operational.deacon.heartbeat_stale_threshold)",
+			hbFresh, DefaultDeaconHeartbeatStaleThreshold)
 	}
 	mayorActive := ParseDurationOrDefault(cfg.MayorActiveThreshold, 0)
 	if mayorActive != 5*time.Minute {

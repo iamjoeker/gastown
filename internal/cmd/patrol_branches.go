@@ -21,13 +21,17 @@ import (
 )
 
 var (
-	patrolBranchesJSON      bool
-	patrolBranchesAll       bool
-	patrolBranchesDeletable bool
-	patrolBranchesRig       string
-	patrolBranchesTarget    string
-	patrolBranchesRemote    string
-	patrolBranchesNoFetch   bool
+	patrolBranchesJSON       bool
+	patrolBranchesAll        bool
+	patrolBranchesDeletable  bool
+	patrolBranchesSuperseded bool
+	patrolBranchesRig        string
+	patrolBranchesTarget     string
+	patrolBranchesRemote     string
+	patrolBranchesNoFetch    bool
+
+	patrolBranchesMarkReason string
+	patrolBranchesMarkForce  bool
 )
 
 var patrolBranchesCmd = &cobra.Command{
@@ -49,47 +53,164 @@ an ancestor of the target may still have landed by squash or cherry-pick.
 
 Each branch is classified:
 
+  stalled   the bead is HELD by a polecat whose session is gone — nobody will
+            submit this, and the hook stops it being re-dispatched
   check     unmerged, no open MR, terminal bead, unreported — needs a decision
   unknown   could not be classified; a question, not an all-clear
   reported  an open stranded-rejection report already names this bead
   queued    an open merge request is holding it — queued, not stranded
-  active    the bead is still re-slingable, so nothing is stranded yet
+  active    the bead is re-slingable AND nothing says its agent is gone
   landed    content is already in the target
 
-Only check and unknown are the short list. The rest are shown with --all.
+stalled, check and unknown are the short list. The rest are shown with --all.
+
+active and stalled are the same bead status split by one fact: does the
+polecat's tmux session still exist. Without that fact "active" was asserted from
+bead status alone, and a dead polecat holding a hooked bead over 67 pushed
+commits read as needing no decision for 23 hours (gt-6i5d). Every active row now
+carries the session state it rests on, and a sweep that could not ask says so.
 
 A landed branch is two situations under one name, and --deletable separates
-them. Branch hygiene deletes a remote branch only when it is an ANCESTOR of the
-target; this sweep also proves containment by an empty merge and by patch
-identity. A branch rebased before landing is contained but is not an ancestor,
-so hygiene will not collect it and the short list will not raise it — it is
-reported as landed on every future sweep, forever. Those rows carry the
-strongest evidence of redundancy in the listing (patch-id EQUALITY, the
-reliable direction) and are marked landed* in the table.
+them. The post-merge cleanup that deletes a branch runs ONCE, at the moment its
+own MR merges, and never comes back: a branch it skipped — an unreadable PR
+lookup, a delete that failed, cleanup disabled — is left on the remote with
+nothing scheduled to revisit it. A branch rebased before landing is contained
+but is not an ancestor, so the short list will not raise it either; it is
+reported as landed on every future sweep until something clears it. Those rows
+carry the strongest evidence of redundancy in the listing (patch-id EQUALITY,
+the reliable direction) and are marked landed* in the table.
+
+The sweeper that CAN clear them is:
+
+  gt polecat prune <rig> --remote --dry-run   # preview
+  gt polecat prune <rig> --remote             # collect
+
+It keys on the same three-step containment this sweep uses rather than on
+ancestry alone. It is not run on a schedule, which is why the backlog
+accumulates.
+
+The sweep RE-DERIVES every verdict on every run, and that is what 'mark' is
+for. A branch settled once — superseded, its substance landed by different
+commits, its residual measured at nothing — has no way to say so, so it comes
+back on the next cycle looking exactly like a branch nobody has looked at yet.
+Measured on gastown: 21 of 36 branches re-reported unchanged across cycles 1, 6
+and 16 of one witness session, and two agents independently re-derived the same
+verdict on five of them within an hour.
+
+  gt patrol branches mark <branch> -m "why"   # record the settlement, in git
+  gt patrol branches unmark <branch>          # take it back
+  gt patrol branches marks                    # what has been settled, and by whom
+
+A marked branch is reported as 'superseded' and drops off the short list and out
+of --deletable. The marker names the exact commit it settles: push to the branch
+again and the marker stops applying, the row comes back, and the sweep says why.
 
 This command WRITES NOTHING: it files no beads, reopens no issues and deletes
 no branches. It cannot tell a prematurely closed bead from a correctly closed
 one whose branch is redundant — that needs a rehearsal merge and a human — so
 it reports branches to CHECK and never claims work was lost. --deletable is a
 listing too: these are shared remote refs, so it prints the commands and stops.
+(The mark/unmark SUBCOMMANDS do write, and only to a ref of their own.)
 
 Examples:
   gt patrol branches                    # short list for the current rig
   gt patrol branches --all              # every polecat branch, classified
   gt patrol branches --deletable        # landed branches hygiene cannot reach
+  gt patrol branches --superseded       # branches already settled by a marker
   gt patrol branches --json             # machine-readable
   gt patrol branches --rig gastown --target main`,
 	RunE: runPatrolBranches,
+}
+
+// patrolBranchesMarkCmd records a settlement so the next sweep does not
+// re-derive it.
+//
+// It writes ONE ref in the rig's own repository and nothing else: no bead, no
+// wisp, no label, no remote write, and it does not touch the branch it marks.
+// The storage is a lifetime decision rather than a convenience one — a wisp is
+// purged at 168h and takes its labels with it, so any marker held there is
+// guaranteed to die before the branch it describes.
+var patrolBranchesMarkCmd = &cobra.Command{
+	Use:   "mark <branch>",
+	Short: "Record that a branch is settled, so the sweep stops re-deriving it",
+	Long: `Mark a branch superseded: settled, understood, and not worth re-deriving.
+
+The sweep cannot tell "superseded — correctly closed, branch redundant" from
+"closed prematurely — work stranded". Both present identically, so each new
+reader re-does the whole classification to learn which it is. That derivation is
+the expensive part and it had nowhere to live; this is where it lives.
+
+A reason is REQUIRED. A marker carrying only the verdict reproduces the original
+defect one level up — the next reader still cannot tell settled from abandoned,
+and re-derives anyway. Write what you checked and what you found.
+
+The marker names the branch tip it settles, read from the remote at mark time.
+If the branch is pushed to afterwards the marker stops applying, the branch
+returns to the short list, and the sweep says which commit was settled and which
+is now the tip. So a marker can never hide work that arrived after it.
+
+Storage: a ref under refs/gt/superseded/ in the rig's repository, pointing at a
+blob of JSON. It shares a lifetime with the branch structurally — it cannot be
+purged while the branch stands, it survives every Dolt operation, and the sweep
+already enumerates refs so it costs no database round trip.
+
+Examples:
+  gt patrol branches mark polecat/dust/gt-k3v+aaa \
+    -m "substance landed as 7a108237 out of band; git cherry residual is 2 test files, both since deleted"
+  gt patrol branches mark polecat/foo/gt-1+bbb -m "superseded by gt-u5c; net contribution measured at zero" --force`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPatrolBranchesMark,
+}
+
+var patrolBranchesUnmarkCmd = &cobra.Command{
+	Use:   "unmark <branch>",
+	Short: "Remove a branch's superseded marker, putting it back on the sweep",
+	Long: `Delete the superseded marker for a branch.
+
+Use it when a settlement turns out to be wrong — the work was stranded after all,
+or the reason no longer holds. The branch returns to whatever class the sweep
+computes for it on the next run.
+
+This deletes only the marker ref. The branch, its commits and its bead are
+untouched.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPatrolBranchesUnmark,
+}
+
+var patrolBranchesMarksCmd = &cobra.Command{
+	Use:   "marks",
+	Short: "List the superseded markers recorded for this rig",
+	Long: `Show every superseded marker: which branch, which commit, who settled it, why.
+
+This reads the markers alone and does not contact the remote, so it answers "what
+has been settled" without the cost of a sweep. It cannot say whether a marker
+still APPLIES — that needs the current tip, which is what 'gt patrol branches
+--superseded' reports.`,
+	Args: cobra.NoArgs,
+	RunE: runPatrolBranchesMarks,
 }
 
 func init() {
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesJSON, "json", false, "Output as JSON")
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesAll, "all", false, "Show every branch, including landed, queued and active ones")
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesDeletable, "deletable", false, "List only landed branches that are NOT ancestors of the target — contained, but out of branch hygiene's reach (lists them; deletes nothing)")
+	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesSuperseded, "superseded", false, "List only branches a marker has settled, with the reason each was settled for")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRig, "rig", "", "Rig to sweep (default: GT_RIG, else inferred from cwd, else the only registered rig)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesTarget, "target", "", "Target branch to compare against (default: the rig's default branch)")
 	patrolBranchesCmd.Flags().StringVar(&patrolBranchesRemote, "remote", "origin", "Remote to sweep (branches are listed from its PUSH url)")
 	patrolBranchesCmd.Flags().BoolVar(&patrolBranchesNoFetch, "no-fetch", false, "Skip refreshing the target ref before comparing (faster, and wrong if the target moved)")
+
+	for _, sub := range []*cobra.Command{patrolBranchesMarkCmd, patrolBranchesUnmarkCmd, patrolBranchesMarksCmd} {
+		sub.Flags().StringVar(&patrolBranchesRig, "rig", "", "Rig to act on (default: GT_RIG, else inferred from cwd, else the only registered rig)")
+		sub.Flags().StringVar(&patrolBranchesRemote, "remote", "origin", "Remote the branch lives on (its PUSH url is the one read)")
+	}
+	patrolBranchesMarkCmd.Flags().StringVarP(&patrolBranchesMarkReason, "reason", "m", "", "Why this branch is settled — REQUIRED; a marker without a derivation is one the next reader has to redo")
+	patrolBranchesMarkCmd.Flags().BoolVar(&patrolBranchesMarkForce, "force", false, "Overwrite an existing marker (refused by default: overwriting silently discards the derivation this exists to keep)")
+	patrolBranchesMarksCmd.Flags().BoolVar(&patrolBranchesJSON, "json", false, "Output as JSON")
+
+	patrolBranchesCmd.AddCommand(patrolBranchesMarkCmd)
+	patrolBranchesCmd.AddCommand(patrolBranchesUnmarkCmd)
+	patrolBranchesCmd.AddCommand(patrolBranchesMarksCmd)
 
 	patrolCmd.AddCommand(patrolBranchesCmd)
 }
@@ -105,26 +226,46 @@ type PatrolBranchesOutput struct {
 	// separate total from Attention because it asks for a deletion rather than
 	// for a decision.
 	HygieneUnreachable int `json:"hygiene_unreachable"`
+
+	// Superseded is how many rows a durable marker settled on this run, and
+	// StaleMarks how many carry a marker that no longer applies because the tip
+	// moved. Both are emitted unconditionally: a zero here is a measurement,
+	// and an absent key would read the same as a build that never looked.
+	Superseded int `json:"superseded"`
+	StaleMarks int `json:"stale_marks"`
 }
 
-func runPatrolBranches(cmd *cobra.Command, args []string) error {
+// resolvePatrolBranchesRepo answers "which rig, and which repository" once, for
+// the sweep and for the marker subcommands alike. A marker written against a
+// different repository from the one the sweep reads would be a marker that
+// never suppresses anything, so the two must not resolve the rig by different
+// routes.
+func resolvePatrolBranchesRepo() (rigName, rigPath string, repoGit *git.Git, err error) {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+		return "", "", nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
 	rigName, rigSource, err := resolvePatrolBranchesRig(townRoot, patrolBranchesRig)
 	if err != nil {
-		return err
+		return "", "", nil, err
 	}
 
-	rigPath := filepath.Join(townRoot, rigName)
+	rigPath = filepath.Join(townRoot, rigName)
 	if _, statErr := os.Stat(rigPath); statErr != nil {
-		return fmt.Errorf("rig %s not found at %s (%s)", rigName, rigPath, rigSource)
+		return "", "", nil, fmt.Errorf("rig %s not found at %s (%s)", rigName, rigPath, rigSource)
 	}
 
-	repoGit := getRepoGitForRig(rigPath)
+	repoGit = getRepoGitForRig(rigPath)
 	if err := ensureRigRepoUsable(rigName, rigPath, rigSource, repoGit); err != nil {
+		return "", "", nil, err
+	}
+	return rigName, rigPath, repoGit, nil
+}
+
+func runPatrolBranches(cmd *cobra.Command, args []string) error {
+	rigName, rigPath, repoGit, err := resolvePatrolBranchesRepo()
+	if err != nil {
 		return err
 	}
 	remote := strings.TrimSpace(patrolBranchesRemote)
@@ -143,19 +284,57 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 			if fetchErr := repoGit.FetchPrune(targetRemote); fetchErr != nil {
 				// A stale target overstates the short list rather than
 				// understating it, so this is a warning and not a stop.
+				//
+				// A deadline kill is said apart from an ordinary refresh
+				// failure, because the two ask for different things. Stale
+				// means "re-read the list with suspicion". Unresponsive means
+				// the remote is not answering ANYONE, and everything below it
+				// is about to be unmeasured — the refresh is simply the first
+				// place it shows. This is the call that was measured hanging
+				// past four minutes on two rigs at once (gt-i9wz); it now
+				// returns, and this line is where a reader learns why.
+				if git.IsRemoteUnresponsive(fetchErr) {
+					warnings = append(warnings, fmt.Sprintf("%s STOPPED RESPONDING while refreshing: %v — it was killed on its deadline rather than waited on, and the classification below is unreliable for the same reason. Re-run when the remote answers", targetRemote, fetchErr))
+					continue
+				}
 				warnings = append(warnings, fmt.Sprintf("could not refresh %s: %v (its ref may be stale, so 'check' may include branches that have since landed)", targetRemote, fetchErr))
 			}
 		}
 	}
 
+	// Markers are read before the sweep and passed in, so the sweep stays a
+	// classifier over gathered facts. A failure here over-reports rather than
+	// under-reports — every settled branch comes back as though nobody had
+	// settled it — which is the safe direction, and the warning is what stops
+	// that reading as a rig where nothing has been marked.
+	marks, marksErr := repoGit.SupersededMarks()
+	if marksErr != nil {
+		marks = nil
+		warnings = append(warnings, fmt.Sprintf(
+			"could not read superseded markers (%s): %v — every branch below is classified as if UNMARKED, so settled work will be re-reported",
+			git.SupersededRefPrefix, marksErr))
+	}
+
+	// A failure to build the polecat manager is not fatal either: the sweep
+	// degrades to "session state UNMEASURED" on every row and says so in its own
+	// errors, which is strictly better than refusing to sweep at all. It is a
+	// warning here so the reason reaches the reader, because from the output
+	// alone "no session probe" is otherwise indistinguishable between a caller
+	// that never tried and one that tried and could not.
+	sessions, sessErr := branchSweepSessions(rigName)
+	if sessErr != nil {
+		warnings = append(warnings, fmt.Sprintf("could not open a session probe for %s: %v (the active/stalled split cannot fire)", rigName, sessErr))
+	}
+
 	result, err := witness.SweepUnmergedPolecatBranches(
 		repoGit,
 		beads.New(rigPath),
-		witness.BranchSweepOptions{Remote: remote, Targets: targets},
+		witness.BranchSweepOptions{Remote: remote, Targets: targets, Superseded: marks, Sessions: sessions},
 	)
 	if err != nil {
 		return err
 	}
+	result.MarksMeasured = marksErr == nil
 	result.Errors = append(result.Errors, warnings...)
 
 	// JSON is not filtered by either mode: it carries every branch with
@@ -167,7 +346,211 @@ func runPatrolBranches(cmd *cobra.Command, args []string) error {
 	if patrolBranchesDeletable {
 		return writePatrolBranchesDeletable(cmd.OutOrStdout(), rigName, result)
 	}
+	if patrolBranchesSuperseded {
+		return writePatrolBranchesSuperseded(cmd.OutOrStdout(), rigName, result)
+	}
 	return writePatrolBranchesHuman(cmd.OutOrStdout(), rigName, result, patrolBranchesAll)
+}
+
+func runPatrolBranchesMark(cmd *cobra.Command, args []string) error {
+	branch := strings.TrimPrefix(strings.TrimSpace(args[0]), "refs/heads/")
+	reason := strings.TrimSpace(patrolBranchesMarkReason)
+	if reason == "" {
+		return fmt.Errorf("a marker needs a reason: pass -m \"why this branch is settled\"\n" +
+			"  A marker recording only the verdict is one the next reader has to re-derive,\n" +
+			"  which is the whole defect this exists to fix. Say what you checked and found.")
+	}
+
+	rigName, _, repoGit, err := resolvePatrolBranchesRepo()
+	if err != nil {
+		return err
+	}
+	remote := strings.TrimSpace(patrolBranchesRemote)
+	if remote == "" {
+		remote = "origin"
+	}
+
+	// The tip is read from the PUSH url, the same side the sweep lists from.
+	// Reading the fetch side on a split-remote rig would record a commit the
+	// sweep never sees, and the marker would be permanently stale — present,
+	// correct in substance, and suppressing nothing.
+	tip, tipErr := repoGit.PushRemoteBranchTip(remote, branch)
+	if tipErr != nil {
+		return fmt.Errorf("reading %s/%s to find the commit to settle: %w", remote, branch, tipErr)
+	}
+	if strings.TrimSpace(tip) == "" {
+		// Not a technicality. A marker for a branch that is not there settles
+		// nothing and will never be consulted, so reporting success would be
+		// the same lie the read-back checks exist to catch.
+		return fmt.Errorf("branch %q does not exist on %s, so there is nothing to settle\n"+
+			"  gt patrol branches --all --rig %s   # the branches that do exist",
+			branch, remote, rigName)
+	}
+
+	existing, err := repoGit.SupersededMarkFor(branch)
+	if err != nil {
+		return fmt.Errorf("checking for an existing marker on %s: %w", branch, err)
+	}
+	if existing != nil && !patrolBranchesMarkForce {
+		// Refusing rather than overwriting: the stored reason is a derivation
+		// somebody paid for, and silently replacing it destroys exactly the
+		// artifact this feature exists to keep.
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s already carries a superseded marker; pass --force to replace it\n", branch)
+		fmt.Fprintf(&b, "  settled at: %s\n", orDash(shortCommit(existing.Commit)))
+		if existing.MarkedBy != "" || existing.MarkedAt != "" {
+			fmt.Fprintf(&b, "  settled by: %s %s\n", orDash(existing.MarkedBy), existing.MarkedAt)
+		}
+		fmt.Fprintf(&b, "  reason:     %s\n", orDash(existing.Reason))
+		if existing.StaleFor(tip) {
+			fmt.Fprintf(&b, "  NOTE: the tip is now %s, so that marker no longer applies — re-settling is probably right,\n", shortCommit(tip))
+			fmt.Fprintf(&b, "        but check what arrived on the branch first: git log %s..%s\n", shortCommit(existing.Commit), shortCommit(tip))
+		}
+		return fmt.Errorf("%s", strings.TrimRight(b.String(), "\n"))
+	}
+
+	mark := git.SupersededMark{
+		Branch:   branch,
+		Commit:   tip,
+		Reason:   reason,
+		MarkedBy: markerActor(),
+		MarkedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := repoGit.MarkSuperseded(mark); err != nil {
+		return err
+	}
+
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "%s %s is settled at %s\n", style.SuccessPrefix, branch, shortCommit(tip))
+	fmt.Fprintf(w, "  reason: %s\n", reason)
+	fmt.Fprintf(w, "  marker: %s\n", git.SupersededRef(branch))
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("The branch, its commits and its bead are untouched — only a ref was written."))
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("Push to this branch again and the marker stops applying, by design."))
+	return nil
+}
+
+func runPatrolBranchesUnmark(cmd *cobra.Command, args []string) error {
+	branch := strings.TrimPrefix(strings.TrimSpace(args[0]), "refs/heads/")
+	_, _, repoGit, err := resolvePatrolBranchesRepo()
+	if err != nil {
+		return err
+	}
+
+	existing, err := repoGit.SupersededMarkFor(branch)
+	if err != nil {
+		return fmt.Errorf("reading the marker on %s: %w", branch, err)
+	}
+	removed, err := repoGit.UnmarkSuperseded(branch)
+	if err != nil {
+		return err
+	}
+
+	w := cmd.OutOrStdout()
+	if !removed {
+		// "Nothing to remove" is a different fact from "removed", and printing
+		// the success line for both is how a caller comes to believe a marker
+		// on another rig has been cleared.
+		fmt.Fprintf(w, "%s %s carries no superseded marker — nothing was removed.\n", style.Dim.Render("○"), branch)
+		return nil
+	}
+	fmt.Fprintf(w, "%s removed the superseded marker on %s\n", style.SuccessPrefix, branch)
+	if existing != nil && strings.TrimSpace(existing.Reason) != "" {
+		// Echo the derivation on the way out. It is about to stop existing, and
+		// the terminal is the last place it can be caught if the removal was a
+		// mistake.
+		fmt.Fprintf(w, "  it had said: %s\n", existing.Reason)
+	}
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("The branch will be classified from scratch on the next sweep."))
+	return nil
+}
+
+func runPatrolBranchesMarks(cmd *cobra.Command, args []string) error {
+	rigName, _, repoGit, err := resolvePatrolBranchesRepo()
+	if err != nil {
+		return err
+	}
+	marks, err := repoGit.SupersededMarks()
+	if err != nil {
+		return err
+	}
+
+	branches := make([]string, 0, len(marks))
+	for branch := range marks {
+		branches = append(branches, branch)
+	}
+	sort.Strings(branches)
+
+	w := cmd.OutOrStdout()
+	if patrolBranchesJSON {
+		out := struct {
+			Rig   string               `json:"rig"`
+			Ref   string               `json:"ref_prefix"`
+			Count int                  `json:"count"`
+			Marks []git.SupersededMark `json:"marks"`
+		}{Rig: rigName, Ref: git.SupersededRefPrefix, Count: len(branches)}
+		for _, branch := range branches {
+			out.Marks = append(out.Marks, marks[branch])
+		}
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
+	if len(branches) == 0 {
+		fmt.Fprintf(w, "%s no superseded markers on %s (looked in %s).\n",
+			style.Dim.Render("○"), rigName, git.SupersededRefPrefix)
+		fmt.Fprintf(w, "  %s\n", style.Dim.Render("gt patrol branches mark <branch> -m \"why\"   # record one"))
+		return nil
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "BRANCH\tSETTLED AT\tBY\tWHEN\tREASON")
+	for _, branch := range branches {
+		mark := marks[branch]
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			branch, orDash(shortCommit(mark.Commit)), orDash(mark.MarkedBy), orDash(mark.MarkedAt), orDash(mark.Reason))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\n%s %d marker(s) in %s\n", style.Bold.Render("Total:"), len(branches), git.SupersededRefPrefix)
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("This lists markers, not whether they still apply — a branch pushed to since being"))
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("marked is no longer settled. gt patrol branches --superseded compares against the tips."))
+	return nil
+}
+
+// markerActor names who settled a branch, for provenance.
+//
+// BD_ACTOR first because it is the identity every other gt write is attributed
+// to, then GT_ROLE, then git's configured user. An empty string is returned
+// rather than a placeholder: "unknown" reads as a recorded value and this is an
+// absent one.
+func markerActor() string {
+	for _, key := range []string{"BD_ACTOR", "GT_ROLE"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// branchSweepSessions builds the probe that answers "does this polecat still
+// have a tmux session".
+//
+// It returns a nil INTERFACE rather than a nil *polecat.Manager on failure. A
+// typed nil stored in an interface is non-nil to every `!= nil` test, so the
+// sweep would believe it had a probe and call a method on nothing; the sweep
+// guards against that too, and both guards are cheap next to the failure mode
+// they prevent — a panic in a read-only patrol.
+func branchSweepSessions(rigName string) (witness.BranchSweepSessions, error) {
+	mgr, _, err := getPolecatManager(rigName)
+	if err != nil {
+		return nil, err
+	}
+	if mgr == nil {
+		return nil, fmt.Errorf("no polecat manager for rig %s", rigName)
+	}
+	return mgr, nil
 }
 
 // resolvePatrolBranchesRig decides which rig to sweep and reports where the
@@ -258,102 +641,18 @@ func ensureRigRepoUsable(rigName, rigPath, source string, repoGit *git.Git) erro
 		rigName, rigPath, source, bare, worktree)
 }
 
-// branchSweepRefResolver is the slice of git that target selection needs.
-type branchSweepRefResolver interface {
-	RemoteDefaultBranch() string
-	CleanBaseRef(remote, defaultBranch, target string) string
-	RefExists(ref string) (bool, error)
-	IsAncestor(ancestor, descendant string) (bool, error)
-}
-
 // branchSweepTargets picks the refs a branch must be absent from before it is
-// worth anyone's attention.
-//
-// One trunk is the normal case and two is the fork case, and picking the wrong
-// one of two is not a rounding error: on gastown, origin/main is 289 commits
-// ahead of upstream/main, and comparing against upstream alone put six branches
-// on the short list of which three had demonstrably landed. So when both refs
-// exist, both are checked, and containment in either counts.
-//
-// A fully qualified --target is honoured exactly — an operator naming
-// upstream/main is asking about upstream/main. A bare --target names a BRANCH,
-// so it expands the same way the default does.
-//
-// Candidates are ordered most-advanced first, so the ref quoted back in the
-// guidance is the one work actually lands on rather than whichever the
-// fork-detection heuristic happens to prefer.
-func branchSweepTargets(g branchSweepRefResolver, remote, explicit string) []string {
-	explicit = strings.TrimSpace(explicit)
-	if explicit != "" && (strings.HasPrefix(explicit, "refs/") || git.RemoteForRef(explicit) != "") {
-		return []string{explicit}
-	}
-
-	branch := strings.TrimSpace(g.RemoteDefaultBranch())
-	if explicit != "" {
-		branch = explicit
-	}
-	if branch == "" {
-		branch = "main"
-	}
-
-	var candidates []string
-	for _, candidate := range []string{remote + "/" + branch, "upstream/" + branch} {
-		if slicesContains(candidates, candidate) {
-			continue
-		}
-		if ok, err := g.RefExists(candidate); err == nil && ok {
-			candidates = append(candidates, candidate)
-		}
-	}
-	if len(candidates) == 0 {
-		// Nothing resolved. Fall back to the repo's own notion of a base
-		// rather than inventing one, and let the sweep report against it.
-		if fallback := strings.TrimSpace(g.CleanBaseRef(remote, branch, "")); fallback != "" {
-			return []string{fallback}
-		}
-		return nil
-	}
-	return orderTargetsByReach(g, candidates)
-}
-
-// orderTargetsByReach sorts candidates so that a ref containing another comes
-// first. The count of other candidates a ref contains is a stable sort key, so
-// this stays well-defined however many trunks a rig grows.
-func orderTargetsByReach(g branchSweepRefResolver, candidates []string) []string {
-	if len(candidates) < 2 {
-		return candidates
-	}
-	reach := make(map[string]int, len(candidates))
-	for _, a := range candidates {
-		for _, b := range candidates {
-			if a == b {
-				continue
-			}
-			if contained, err := g.IsAncestor(b, a); err == nil && contained {
-				reach[a]++
-			}
-		}
-	}
-	ordered := append([]string(nil), candidates...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return reach[ordered[i]] > reach[ordered[j]]
-	})
-	return ordered
+// worth anyone's attention. The logic lives in the witness package because the
+// orphan-bead landed-check asks the same containment question and must pick the
+// same trunks (gt-e7dd); getting different answers from the two would be worse
+// than either answer alone.
+func branchSweepTargets(g witness.BranchSweepRefResolver, remote, explicit string) []string {
+	return witness.ResolveComparisonTargets(g, remote, explicit)
 }
 
 // targetRemotes lists the remotes that must be refreshed for these targets.
 func targetRemotes(targets []string, fallback string) []string {
-	var remotes []string
-	for _, target := range targets {
-		name := git.RemoteForRef(target)
-		if name == "" {
-			name = fallback
-		}
-		if name != "" && !slicesContains(remotes, name) {
-			remotes = append(remotes, name)
-		}
-	}
-	return remotes
+	return witness.TargetRemotes(targets, fallback)
 }
 
 func slicesContains(haystack []string, needle string) bool {
@@ -372,6 +671,8 @@ func writePatrolBranchesJSON(w io.Writer, rigName string, result *witness.Branch
 		BranchSweepResult:  result,
 		Attention:          result.AttentionCount(),
 		HygieneUnreachable: result.HygieneUnreachableCount(),
+		Superseded:         result.SupersededCount(),
+		StaleMarks:         result.StaleMarkCount(),
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -439,10 +740,33 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 	case attention == 0:
 		fmt.Fprintf(w, "%s nothing needs a decision. Re-run with --all to see the classified branches.\n", style.SuccessPrefix)
 	default:
+		if stale := result.StaleMarkCount(); stale > 0 {
+			// Printed BEFORE the count, because a reader who marked these
+			// branches will otherwise read the list as the marker failing.
+			fmt.Fprintf(w, "%s %d branch(es) below carry a superseded marker that NO LONGER APPLIES:\n",
+				style.Warning.Render("⚠"), stale)
+			fmt.Fprintf(w, "  the branch was pushed to after it was settled, so the marker describes a commit\n")
+			fmt.Fprintf(w, "  that is no longer the tip. They are listed on purpose — see the note on each row.\n\n")
+		}
 		counts := result.CountByClass()
-		fmt.Fprintf(w, "%s %d branch(es) need a look: %d to CHECK, %d that could not be classified.\n",
+		fmt.Fprintf(w, "%s %d branch(es) need a look: %d STALLED, %d to CHECK, %d that could not be classified.\n",
 			style.Warning.Render("⚠"), attention,
+			counts[witness.BranchSweepStalled],
 			counts[witness.BranchSweepCheck], counts[witness.BranchSweepUnknown])
+		if stalled := counts[witness.BranchSweepStalled]; stalled > 0 {
+			// Said before the check guidance and separately from it. "A short
+			// list is not a claim that work was lost" is true of a check row and
+			// false here, and a reader who meets the reassurance first carries it
+			// onto rows it does not cover.
+			fmt.Fprintf(w, "\n  %s\n", style.Error.Render(fmt.Sprintf("%d STALLED branch(es) are not a question — the work is live and unattended.", stalled)))
+			fmt.Fprintf(w, "  The bead is held by a polecat whose session was MEASURED and is gone. Nothing\n")
+			fmt.Fprintf(w, "  will submit the branch, and the hook is what stops the bead being re-dispatched,\n")
+			fmt.Fprintf(w, "  so this state does not resolve on its own. For each one:\n")
+			fmt.Fprintf(w, "    gt session status <rig>/<polecat> --json   # confirm the session is still gone\n")
+			fmt.Fprintf(w, "    gt mq submit --branch <branch> --issue <bead> --no-cleanup   # raise the MR it never did\n")
+			fmt.Fprintf(w, "  Or clear the hook and re-sling the bead, if the branch turns out to be worthless.\n")
+			fmt.Fprintf(w, "  %s\n\n", style.Dim.Render("This command does neither — it writes nothing."))
+		}
 		fmt.Fprintf(w, "  This is a short list, NOT a claim that work was lost. A branch can be unmerged\n")
 		fmt.Fprintf(w, "  because it was superseded (correctly closed, branch redundant) or because its bead\n")
 		fmt.Fprintf(w, "  closed underneath live work (stranded). Separating them needs a rehearsal merge —\n")
@@ -456,10 +780,31 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 		fmt.Fprintf(w, "    git cherry %s <branch>           # '-' prefixed lines already landed\n", result.Target)
 		fmt.Fprintf(w, "  Then reopen the bead if the work is real, or leave it closed and delete the branch.\n")
 		fmt.Fprintf(w, "  %s\n", style.Dim.Render("This command does not do either — it writes nothing."))
+		fmt.Fprintf(w, "  Settled one? Record it, so the next sweep does not make you derive it again:\n")
+		fmt.Fprintf(w, "    gt patrol branches mark <branch> -m \"what you checked and what you found\"\n")
 	}
 
-	writeBranchSweepHygieneNotice(w, result, showAll)
+	writeBranchSweepSupersededNotice(w, result)
+	writeBranchSweepHygieneNotice(w, rigName, result, showAll)
 	return nil
+}
+
+// writeBranchSweepSupersededNotice accounts for the rows a marker removed.
+//
+// It prints even when the short list is empty, and especially then: a sweep
+// reporting "nothing needs a decision" over 36 branches means one thing when
+// none was settled by hand and quite another when 21 were, and the difference
+// is exactly whether a reader should trust the quiet. A suppression that leaves
+// no trace in the summary is how a marker turns from a record into a blindfold.
+func writeBranchSweepSupersededNotice(w io.Writer, result *witness.BranchSweepResult) {
+	settled := result.SupersededCount()
+	if settled == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%s %d branch(es) are held by a superseded marker and are not listed above.\n",
+		style.Dim.Render("○"), settled)
+	fmt.Fprintf(w, "  Each was settled once, with a reason, and stays settled while its tip is unchanged.\n")
+	fmt.Fprintf(w, "    gt patrol branches --superseded   # what was settled, by whom, and why\n")
 }
 
 // writeBranchSweepHygieneNotice raises the landed rows that nothing collects.
@@ -469,7 +814,7 @@ func writePatrolBranchesHuman(w io.Writer, rigName string, result *witness.Branc
 // under --all, folded into a dim "landed" that reads as finished. A reader who
 // never passes --all never learns they exist, and they accumulate in a listing
 // whose worth is its shortness (gt-l65a).
-func writeBranchSweepHygieneNotice(w io.Writer, result *witness.BranchSweepResult, showAll bool) {
+func writeBranchSweepHygieneNotice(w io.Writer, rigName string, result *witness.BranchSweepResult, showAll bool) {
 	unreachable := result.HygieneUnreachableCount()
 	if unreachable == 0 {
 		return
@@ -480,10 +825,11 @@ func writeBranchSweepHygieneNotice(w io.Writer, result *witness.BranchSweepResul
 		fmt.Fprintln(w, "  Marked landed* in the table above.")
 	}
 	fmt.Fprintf(w, "  Their content is provably in the target — patch-id EQUALITY, the reliable\n")
-	fmt.Fprintf(w, "  direction, and the strongest evidence of redundancy this sweep produces. But\n")
-	fmt.Fprintf(w, "  branch hygiene deletes by ancestry alone, so nothing will ever collect them and\n")
-	fmt.Fprintf(w, "  every future sweep reports them again.\n")
+	fmt.Fprintf(w, "  direction, and the strongest evidence of redundancy this sweep produces. The\n")
+	fmt.Fprintf(w, "  post-merge delete that should have collected each one has already run and gone,\n")
+	fmt.Fprintf(w, "  so they will be reported again on every future sweep until something clears them.\n")
 	fmt.Fprintf(w, "    gt patrol branches --deletable   # the list, with the commands to verify and delete\n")
+	fmt.Fprintf(w, "    gt polecat prune %s --remote --dry-run   # the sweeper, which does key on patch identity\n", rigName)
 }
 
 // writeBranchSweepTable renders the shared row format. landed* marks a landed
@@ -522,9 +868,15 @@ func writePatrolBranchesDeletable(w io.Writer, rigName string, result *witness.B
 		return nil
 	}
 
+	// A settled branch is left out even though HygieneUnreachable is still true
+	// of it. The field is a measurement — hygiene genuinely cannot delete it —
+	// but this list is a request to ACT, and the marker is a recorded decision
+	// not to. On the rig this was built for, that decision was explicit: the
+	// branch commits are the only surviving copy of the work as originally
+	// authored, because the substance landed via different commits.
 	var rows []witness.BranchSweepFinding
 	for _, f := range result.Findings {
-		if f.HygieneUnreachable {
+		if f.HygieneUnreachable && f.Class != witness.BranchSweepSuperseded {
 			rows = append(rows, f)
 		}
 	}
@@ -536,6 +888,13 @@ func writePatrolBranchesDeletable(w io.Writer, rigName string, result *witness.B
 		// facts about the rig and must not render identically.
 		fmt.Fprintf(w, "%s no landed branch is out of hygiene's reach — of %d scanned, %d landed and every one is an ancestor of %s.\n",
 			style.SuccessPrefix, result.Scanned, counts[witness.BranchSweepLanded], result.Target)
+		if settled := result.SupersededCount(); settled > 0 {
+			// Without this line a zero here is ambiguous between "nothing was
+			// out of reach" and "everything that was, has been settled" — and
+			// the second is the state this command's own remedy produces.
+			fmt.Fprintf(w, "  %s\n", style.Dim.Render(fmt.Sprintf(
+				"%d further branch(es) are held by a superseded marker and are not listed: gt patrol branches --superseded", settled)))
+		}
 		return nil
 	}
 
@@ -544,10 +903,11 @@ func writePatrolBranchesDeletable(w io.Writer, rigName string, result *witness.B
 	}
 
 	fmt.Fprintf(w, "%s  %s\n", style.Bold.Render("Summary:"), branchSweepSummary(result))
-	fmt.Fprintf(w, "%s %d of %d landed branch(es) are NOT ancestors of %s, so branch hygiene\n",
+	fmt.Fprintf(w, "%s %d of %d landed branch(es) are NOT ancestors of %s, so their\n",
 		style.Warning.Render("⚠"), len(rows), counts[witness.BranchSweepLanded], result.Target)
-	fmt.Fprintf(w, "  will never delete them. Their content is in the target by patch identity, which\n")
-	fmt.Fprintf(w, "  is positive evidence of redundancy — stronger than anything on the CHECK list.\n")
+	fmt.Fprintf(w, "  post-merge delete is gone and nothing is scheduled to revisit them. Their content\n")
+	fmt.Fprintf(w, "  is in the target by patch identity, which is positive evidence of redundancy —\n")
+	fmt.Fprintf(w, "  stronger than anything on the CHECK list.\n")
 	fmt.Fprintf(w, "\n  Verify each one, then delete it:\n")
 	for _, f := range rows {
 		base := strings.TrimSpace(f.ContainedIn)
@@ -562,17 +922,98 @@ func writePatrolBranchesDeletable(w io.Writer, rigName string, result *witness.B
 	return nil
 }
 
+// writePatrolBranchesSuperseded lists the branches a marker has settled, with
+// the derivation each was settled by.
+//
+// It exists so that suppression is auditable. A marker that quietly removes
+// rows and cannot be reviewed is the same failure as a sweep that cannot
+// distinguish settled from stranded, arriving from the other side: the reader
+// no longer sees the branch AND no longer sees the reasoning, so a wrong
+// settlement becomes permanent. This is the view that makes one reversible.
+func writePatrolBranchesSuperseded(w io.Writer, rigName string, result *witness.BranchSweepResult) error {
+	if !writeBranchSweepHeader(w, rigName, result) {
+		return nil
+	}
+
+	var settled, stale []witness.BranchSweepFinding
+	for _, f := range result.Findings {
+		switch {
+		case f.Class == witness.BranchSweepSuperseded:
+			settled = append(settled, f)
+		case f.SupersededStale:
+			stale = append(stale, f)
+		}
+	}
+
+	if len(settled) == 0 && len(stale) == 0 {
+		fmt.Fprintf(w, "%s no branch on %s carries a superseded marker — of %d scanned, none has been settled.\n",
+			style.SuccessPrefix, result.Remote, result.Scanned)
+		fmt.Fprintf(w, "  %s\n", style.Dim.Render("gt patrol branches mark <branch> -m \"why\"   # record one"))
+		return nil
+	}
+
+	if len(settled) > 0 {
+		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "BRANCH\tWAS\tSETTLED AT\tBY\tWHEN\tREASON")
+		for _, f := range settled {
+			mark := f.Superseded
+			if mark == nil {
+				mark = &git.SupersededMark{}
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				f.Branch,
+				orDash(string(f.UnderlyingClass)),
+				orDash(shortCommit(mark.Commit)),
+				orDash(mark.MarkedBy),
+				orDash(mark.MarkedAt),
+				orDash(mark.Reason),
+			)
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		fmt.Fprintln(w)
+	}
+
+	if len(stale) > 0 {
+		fmt.Fprintf(w, "%s %d marker(s) NO LONGER APPLY — the branch was pushed to after it was settled:\n",
+			style.Warning.Render("⚠"), len(stale))
+		for _, f := range stale {
+			fmt.Fprintf(w, "    %s  (now %s)\n", f.Branch, f.Class)
+		}
+		fmt.Fprintf(w, "  These are on the short list, not off it. Re-settle one only after checking what\n")
+		fmt.Fprintf(w, "  arrived on it:  gt patrol branches mark <branch> -m \"...\" --force\n\n")
+	}
+
+	fmt.Fprintf(w, "%s  %s\n", style.Bold.Render("Summary:"), branchSweepSummary(result))
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("Markers live at "+git.SupersededRefPrefix+"<branch> in the rig repository."))
+	fmt.Fprintf(w, "  %s\n", style.Dim.Render("gt patrol branches unmark <branch>   # if a settlement was wrong"))
+	return nil
+}
+
+// shortCommit abbreviates a SHA for a table column without hiding that a
+// missing one is missing.
+func shortCommit(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 // branchSweepSummary renders the per-class tally, including the classes that
 // are zero, so a reader can tell "measured, none" from "not looked at".
 func branchSweepSummary(result *witness.BranchSweepResult) string {
 	counts := result.CountByClass()
 	order := []witness.BranchSweepClass{
+		witness.BranchSweepStalled,
 		witness.BranchSweepCheck,
 		witness.BranchSweepUnknown,
 		witness.BranchSweepReported,
 		witness.BranchSweepQueued,
 		witness.BranchSweepActive,
 		witness.BranchSweepLanded,
+		witness.BranchSweepSuperseded,
 	}
 	parts := make([]string, 0, len(order)+1)
 	parts = append(parts, fmt.Sprintf("%d scanned", result.Scanned))
@@ -587,8 +1028,24 @@ func branchSweepSummary(result *witness.BranchSweepResult) string {
 		}
 		parts = append(parts, part)
 	}
+	if stale := result.StaleMarkCount(); stale > 0 {
+		// Said in the summary rather than only on the row, because a stale
+		// marker is the one state in which the feature is actively NOT doing
+		// what its owner believes it is doing.
+		parts = append(parts, fmt.Sprintf("%d marker(s) STALE", stale))
+	}
 	if !result.MRsMeasured {
 		parts = append(parts, "MR column UNMEASURED")
+	}
+	if !result.MarksMeasured {
+		parts = append(parts, "superseded markers UNMEASURED")
+	}
+	if !result.SessionsMeasured {
+		// Without this, "0 stalled" above is a claim the sweep did not make.
+		// The tally prints every class including the empty ones precisely so a
+		// reader can tell "measured, none" from "not looked at" — a zero from an
+		// absent probe would defeat the thing that line exists for.
+		parts = append(parts, "session state UNMEASURED (0 stalled means NOT ASKED)")
 	}
 	return strings.Join(parts, ", ")
 }
@@ -598,6 +1055,8 @@ func branchSweepSummary(result *witness.BranchSweepResult) string {
 // deletes it, and the table is where a reader first meets that fact.
 func renderBranchSweepClass(f witness.BranchSweepFinding) string {
 	switch f.Class {
+	case witness.BranchSweepStalled:
+		return style.Error.Render(string(f.Class))
 	case witness.BranchSweepCheck:
 		return style.Warning.Render(string(f.Class))
 	case witness.BranchSweepUnknown:
@@ -606,6 +1065,8 @@ func renderBranchSweepClass(f witness.BranchSweepFinding) string {
 		if f.HygieneUnreachable {
 			return style.Warning.Render(string(f.Class) + "*")
 		}
+		return style.Dim.Render(string(f.Class))
+	case witness.BranchSweepSuperseded:
 		return style.Dim.Render(string(f.Class))
 	default:
 		return string(f.Class)

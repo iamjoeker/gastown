@@ -2,9 +2,11 @@ package beads
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -582,16 +584,24 @@ func newEscalationStub(t *testing.T) *escalationStub {
 
 	// Subcommand is the first non-flag arg (bd may be called as
 	// `bd --allow-stale show <id> --json`); the ID is the next non-flag arg.
+	// The pinned suffix matters: `bd list --status=open` is silently
+	// `--no-pinned`, so the two halves are genuinely different result sets and a
+	// stub that cannot tell them apart cannot show a caller losing one (gt-qee3).
+	// It falls back to the unsuffixed fixture, which is what every test that does
+	// not care about pinning registers.
 	script := `#!/bin/sh
 sub=""
 id=""
 label=""
+pin=""
 for arg in "$@"; do
   case "$arg" in
     --label=*)
       if [ -z "$label" ]; then label="${arg#--label=}"; fi
       continue
       ;;
+    --pinned) pin="-pinned"; continue ;;
+    --no-pinned) pin="-nopinned"; continue ;;
     -*) continue ;;
   esac
   if [ -z "$sub" ]; then sub="$arg"; continue; fi
@@ -604,8 +614,14 @@ case "$sub" in
     if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi
     ;;
   list)
-    f="` + dir + `/list-$(printf '%s' "$label" | tr ':/' '__').json"
-    if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi
+    base="` + dir + `/list-$(printf '%s' "$label" | tr ':/' '__')"
+    if [ -n "$pin" ] && [ -f "$base$pin.json" ]; then
+      cat "$base$pin.json"
+    elif [ -f "$base.json" ]; then
+      cat "$base.json"
+    else
+      echo '[]'
+    fi
     ;;
   *)
     printf '%s\n' "$*" >> "` + logPath + `"
@@ -647,6 +663,33 @@ func (s *escalationStub) list(label string, issues ...*Issue) {
 	name := strings.NewReplacer(":", "_", "/", "_").Replace(label)
 	if err := os.WriteFile(filepath.Join(s.dir, "list-"+name+".json"), data, 0644); err != nil {
 		s.t.Fatalf("write list fixture %s: %v", label, err)
+	}
+}
+
+// listSplit registers what `bd list --label=<label>` returns for each half of
+// the pinned split: `--no-pinned` (bd's silent default) and `--pinned`.
+//
+// Registering only one half is what production does to a caller that asks only
+// once, so a caller that still asks once sees the unpinned half and nothing
+// else.
+func (s *escalationStub) listSplit(label string, unpinned, pinned []*Issue) {
+	s.t.Helper()
+	s.listVariant(label, "-nopinned", unpinned)
+	s.listVariant(label, "-pinned", pinned)
+}
+
+func (s *escalationStub) listVariant(label, suffix string, issues []*Issue) {
+	s.t.Helper()
+	if issues == nil {
+		issues = []*Issue{}
+	}
+	data, err := json.Marshal(issues)
+	if err != nil {
+		s.t.Fatalf("marshal list fixture %s%s: %v", label, suffix, err)
+	}
+	name := strings.NewReplacer(":", "_", "/", "_").Replace(label)
+	if err := os.WriteFile(filepath.Join(s.dir, "list-"+name+suffix+".json"), data, 0644); err != nil {
+		s.t.Fatalf("write list fixture %s%s: %v", label, suffix, err)
 	}
 }
 
@@ -781,7 +824,11 @@ func TestCloseEscalation_ClosesDeliveredCopies(t *testing.T) {
 		t.Errorf("CopyIDs = %v, want both delivered copies", result.CopyIDs)
 	}
 
-	if !stub.hasWrite("close", "hq-wisp-r1", "--reason=resolved: dolt restarted") {
+	// --force on the record too: escalation records are routinely pinned against
+	// bd purge, and the pin guard refuses a plain close (gt-u3mo). This is the
+	// control for TestCloseEscalation_ClosesPinnedRecord — an UNPINNED record
+	// closes by the same path, so the fix did not simply special-case pinning.
+	if !stub.hasWrite("close", "hq-wisp-r1", "--force", "--reason=resolved: dolt restarted") {
 		t.Errorf("record was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
 	}
 	for _, id := range []string{"hq-c1", "hq-c2"} {
@@ -964,8 +1011,9 @@ func TestAckEscalation_LabelsDeliveredCopies(t *testing.T) {
 }
 
 // Copies stranded by pre-fix closes must drop out of the queue with no
-// migration — but only on positive evidence that the record is closed.
-func TestDropResolvedEscalations(t *testing.T) {
+// migration — but only on positive evidence that the record is closed, and the
+// ones dropped must be handed back rather than lost (gt-f0b3).
+func TestPartitionResolvedEscalations(t *testing.T) {
 	stub := newEscalationStub(t)
 
 	closedRecord := escalationRecord("hq-wisp-closed")
@@ -981,16 +1029,131 @@ func TestDropResolvedEscalations(t *testing.T) {
 	standalone := escalationRecord("hq-wisp-open2")
 
 	b := New(t.TempDir())
-	got := b.dropResolvedEscalations([]*Issue{resolved, live, orphan, standalone})
+	kept, strandedCopies := b.partitionResolvedEscalations([]*Issue{resolved, live, orphan, standalone})
 
+	want := []string{"hq-live", "hq-orphan", "hq-wisp-open2"}
+	if got := issueIDs(kept); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("kept = %v, want %v (a reaped record is not evidence of resolution)", got, want)
+	}
+	// Every bead in this half is still OPEN, so it still counts wherever beads
+	// are counted. Losing it here is what made `gt escalate list` disagree with
+	// `bd list --label=gt:escalation --status=open` with nothing to explain it.
+	if got := issueIDs(strandedCopies); strings.Join(got, ",") != "hq-resolved" {
+		t.Errorf("stranded = %v, want [hq-resolved]: the hidden copies must be reported, not discarded", got)
+	}
+}
+
+// ListEscalationsWithStranded is what `gt escalate list` reads. Its second
+// return is exactly the gap between that list and any count of open
+// gt:escalation beads.
+func TestListEscalationsWithStranded_ReportsTheHiddenCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	closedRecord := escalationRecord("hq-wisp-closed")
+	closedRecord.Status = "closed"
+	openRecord := escalationRecord("hq-wisp-open")
+	stub.bead(closedRecord)
+	stub.bead(openRecord)
+
+	resolved := escalationCopy("hq-resolved", "hq-wisp-closed", "mayor/")
+	live := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	stub.list("gt:escalation", resolved, live)
+
+	b := New(t.TempDir())
+	open, strandedCopies, err := b.ListEscalationsWithStranded()
+	if err != nil {
+		t.Fatalf("ListEscalationsWithStranded: %v", err)
+	}
+	if got := issueIDs(open); strings.Join(got, ",") != "hq-live" {
+		t.Errorf("open = %v, want [hq-live]", got)
+	}
+	if got := issueIDs(strandedCopies); strings.Join(got, ",") != "hq-resolved" {
+		t.Errorf("stranded = %v, want [hq-resolved]", got)
+	}
+	// The two halves must account for every open bead the query returned:
+	// anything in neither is hidden with no signal at all.
+	if len(open)+len(strandedCopies) != 2 {
+		t.Errorf("open(%d) + stranded(%d) must account for all 2 open escalation beads", len(open), len(strandedCopies))
+	}
+}
+
+// --- Pinned escalations (gt-qee3) --------------------------------------------
+//
+// `bd list --status=open` is silently `--no-pinned`: measured on hq 2026-08-26,
+// the default returned 686 open issues, `--pinned` returned 3 more, and SQL
+// confirmed 686/3. `gt escalate list` therefore printed "No escalations found"
+// while three escalations sat open — including a HIGH — and `--all` rendered all
+// of them, which is what made the renderer look healthy while the filter was not.
+func TestListEscalationsWithStranded_IncludesPinnedEscalations(t *testing.T) {
+	stub := newEscalationStub(t)
+	stub.bead(escalationRecord("hq-wisp-open"))
+	stub.bead(escalationRecord("hq-wisp-pinned"))
+
+	unpinned := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	pinned := escalationCopy("hq-pinned", "hq-wisp-pinned", "mayor/")
+	stub.listSplit("gt:escalation", []*Issue{unpinned}, []*Issue{pinned})
+
+	b := New(t.TempDir())
+	open, strandedCopies, err := b.ListEscalationsWithStranded()
+	if err != nil {
+		t.Fatalf("ListEscalationsWithStranded: %v", err)
+	}
+	if len(strandedCopies) != 0 {
+		t.Errorf("stranded = %v, want none: both records are open", issueIDs(strandedCopies))
+	}
+	got := issueIDs(open)
+	sort.Strings(got)
+	if strings.Join(got, ",") != "hq-live,hq-pinned" {
+		t.Errorf("open = %v, want both hq-live and hq-pinned: pinning an escalation must not delete it from the list", got)
+	}
+}
+
+// The union must not double-count. Nothing distinguishes the two queries at the
+// bd level but the flag, so a store that answers both with the same row — or a
+// bd whose default starts including pinned issues — must still render it once.
+func TestListEscalationsWithStranded_UnionDoesNotDuplicate(t *testing.T) {
+	stub := newEscalationStub(t)
+	stub.bead(escalationRecord("hq-wisp-open"))
+
+	live := escalationCopy("hq-live", "hq-wisp-open", "mayor/")
+	// One fixture, no pinned suffix: the stub returns it to BOTH halves.
+	stub.list("gt:escalation", live)
+
+	b := New(t.TempDir())
+	open, _, err := b.ListEscalationsWithStranded()
+	if err != nil {
+		t.Fatalf("ListEscalationsWithStranded: %v", err)
+	}
+	if got := issueIDs(open); strings.Join(got, ",") != "hq-live" {
+		t.Errorf("open = %v, want [hq-live] exactly once", got)
+	}
+}
+
+// Duplicate suppression reads the same open-escalation query. A pinned
+// escalation missing from it does not merely go unseen — it stops matching its
+// own fingerprint, so the identical escalation re-fires on every raise.
+func TestListEscalationsByFingerprint_FindsPinnedEscalations(t *testing.T) {
+	stub := newEscalationStub(t)
+	stub.bead(escalationRecord("hq-wisp-pinned"))
+
+	pinned := escalationCopy("hq-pinned", "hq-wisp-pinned", "mayor/")
+	stub.listSplit("gt:escalation", nil, []*Issue{pinned})
+
+	b := New(t.TempDir())
+	got, err := b.ListEscalationsByFingerprint("escalation-fp:abc123")
+	if err != nil {
+		t.Fatalf("ListEscalationsByFingerprint: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "hq-pinned" {
+		t.Errorf("ListEscalationsByFingerprint = %v, want [hq-pinned]: a pinned duplicate must still suppress", issueIDs(got))
+	}
+}
+
+func issueIDs(issues []*Issue) []string {
 	var ids []string
-	for _, issue := range got {
+	for _, issue := range issues {
 		ids = append(ids, issue.ID)
 	}
-	want := []string{"hq-live", "hq-orphan", "hq-wisp-open2"}
-	if strings.Join(ids, ",") != strings.Join(want, ",") {
-		t.Errorf("dropResolvedEscalations() = %v, want %v (a reaped record is not evidence of resolution)", ids, want)
-	}
+	return ids
 }
 
 // ListEscalations is what `gt escalate list`, the Mayor's queue, and
@@ -1157,6 +1320,123 @@ func TestCloseEscalation_StillFailsOnUnknownID(t *testing.T) {
 	}
 }
 
+// --- Pinned escalations must still close (gt-u3mo) ---------------------------
+//
+// Escalation records were pinned town-wide to keep `bd purge` from deleting
+// them. bd's pin guard rejects a plain `bd close`, so the mitigation for
+// "escalations can be deleted" produced "escalations cannot be resolved": every
+// escalation in the town became un-closeable through the command that exists to
+// close it. Pinning protects a record from DELETION; a pinned+closed row is
+// still purge-protected, so closing must go through.
+
+// pinGuard puts a bd in front of the stub that refuses any close lacking
+// --force, exactly as bd's pin guard does, and passes everything else through
+// so the stub keeps answering shows and recording writes.
+func (s *escalationStub) pinGuard() {
+	s.t.Helper()
+	s.interpose(`
+forced=""
+for arg in "$@"; do
+  if [ "$arg" = "--force" ]; then forced=1; fi
+done
+case "$1" in
+  close)
+    if [ -z "$forced" ]; then
+      echo "Error: cannot modify pinned issue $2 (use --force to override)" >&2
+      exit 1
+    fi
+    ;;
+esac
+`)
+}
+
+// interpose installs a bd on PATH that runs body and then execs the stub's bd.
+func (s *escalationStub) interpose(body string) {
+	s.t.Helper()
+	dir := s.t.TempDir()
+	script := "#!/bin/sh\n" + body + "\nexec \"" + filepath.Join(s.dir, "bd") + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "bd"), []byte(script), 0755); err != nil {
+		s.t.Fatalf("write interposed bd: %v", err)
+	}
+	s.t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+}
+
+func TestCloseEscalation_ClosesPinnedRecord(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+	stub.pinGuard()
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved: dolt restarted")
+	if err != nil {
+		t.Fatalf("CloseEscalation on a pinned record: %v", err)
+	}
+
+	// Both halves, not just the record: forcing one half by hand is exactly the
+	// closed-record/open-copy split gt-4xl fixed.
+	if !stub.hasWrite("close", "hq-wisp-r1", "--force") {
+		t.Errorf("pinned record was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
+	}
+	if !stub.hasWrite("close", "hq-c1", "--force") {
+		t.Errorf("delivered copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// bd's guard advises "(use --force to override)". That remedy is unreachable
+// from where the operator stands — `gt escalate close` has no --force flag, so
+// following it verbatim produces "unknown flag" — and stale besides, since the
+// close path already passes --force. Surfacing it sends the reader after a flag
+// that does not exist.
+func TestCloseEscalation_DoesNotAdviseAFlagTheCommandLacks(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	stub.bead(record)
+	stub.list(EscalationLinkLabelPrefix + "hq-wisp-r1")
+	// A bd that refuses the close even WITH --force, still advising the flag.
+	stub.interpose(`
+case "$1" in
+  close)
+    echo "Error: cannot modify pinned issue $2 (use --force to override)" >&2
+    exit 1
+    ;;
+esac
+`)
+
+	b := New(t.TempDir())
+	_, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved")
+	if err == nil {
+		t.Fatal("CloseEscalation reported success while the record stayed open")
+	}
+	if strings.Contains(err.Error(), "use --force to override") {
+		t.Errorf("error advises a flag gt escalate close does not accept: %v", err)
+	}
+	// The diagnosis itself must survive the scrub — dropping "pinned" would
+	// trade misleading advice for no advice at all.
+	if !strings.Contains(err.Error(), "pinned") {
+		t.Errorf("error lost the reason for the failure: %v", err)
+	}
+}
+
+// Anything that is not bd's exact --force remedy passes through untouched: a
+// scrub that rewrote unrelated errors would hide real diagnoses.
+func TestScrubForceAdvice_LeavesOtherErrorsAlone(t *testing.T) {
+	if got := scrubForceAdvice(nil); got != nil {
+		t.Errorf("scrubForceAdvice(nil) = %v, want nil", got)
+	}
+	orig := errors.New("bd close hq-c1: assignee is mayor/, actor is gastown/witness")
+	if got := scrubForceAdvice(orig); got != orig {
+		t.Errorf("scrubForceAdvice rewrote an unrelated error: %v", got)
+	}
+}
+
 // --- Re-escalation applies the new severity where it is read (gt-psh) --------
 
 func TestReescalateEscalation_RaisesPriorityWithSeverity(t *testing.T) {
@@ -1315,5 +1595,186 @@ func TestParseEscalationFields_ExplicitEscalatedByWinsOverFrom(t *testing.T) {
 				t.Errorf("EscalatedBy = %q, want gastown/refinery", got)
 			}
 		})
+	}
+}
+
+// --- The stranded-copy reconcile (gt-w0z8) -----------------------------------
+//
+// gt-qee3 fixed the pinned exclusion on the escalation LIST query and left it in
+// place on the COPIES query, which is what every reconcile path walks. So the
+// list learned to name its stranded copies and print a reconcile command, and
+// that command could not clear any of them: it resolved the copy to its record,
+// found the record already closed (which is what "stranded" MEANS), listed zero
+// copies because the copy was pinned, wrote to nothing, and printed a checkmark.
+//
+// Measured on hq 2026-08-26 against the real stranded copy hq-9mxa7:
+//
+//	bd list --label=escalation:hq-wisp-51nirc --status=open              -> []
+//	bd list --label=escalation:hq-wisp-51nirc --status=open --pinned     -> hq-9mxa7
+//	bd list --label=escalation:hq-wisp-51nirc --status=open --no-pinned  -> 0
+//
+// The remedy was unreachable for the entire population it was offered to.
+
+// The pinned half of the copies query, isolated: the close is issued by the
+// RECORD's ID, so the named-bead path below cannot rescue it and only the query
+// can find the copy.
+func TestCloseEscalation_ClosesPinnedStrandedCopy(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed" // stranded is closed-record-by-definition
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(pinnedCopy)
+	// The copy answers ONLY the --pinned half, exactly as hq-9mxa7 does.
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "reconciled")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]: a pinned copy is still a copy", result.CopyIDs)
+	}
+	if !stub.hasWrite("close", "hq-c1") {
+		t.Errorf("pinned stranded copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+	if !result.Changed() {
+		t.Error("Changed() = false after closing a copy")
+	}
+}
+
+// The named-bead path, isolated: the copies query returns nothing at all in
+// BOTH halves, and closing by the copy's own ID must still close that copy.
+// This is the guarantee the printed reconcile command rests on — it names a
+// copy ID, so that copy is closed by construction rather than by whatever the
+// label query happens to be able to see.
+func TestCloseEscalation_ClosesTheNamedCopyWhenTheQueryMissesIt(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed"
+	strandedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(strandedCopy)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, nil) // blind query
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-c1", "mayor/", "reconciled")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]: the bead the operator named must be closed", result.CopyIDs)
+	}
+	if !stub.hasWrite("close", "hq-c1") {
+		t.Errorf("named copy was not closed; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// The result must name the ID the caller passed, not the record it resolved to.
+// The tell was on screen the whole time — "✓ Escalation closed: hq-wisp-51nirc"
+// after typing hq-9mxa7 — and only a reader who noticed the ID had changed
+// could have caught it.
+func TestCloseEscalation_ResultNamesTheRequestedID(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	copyA := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(copyA)
+	stub.list(EscalationLinkLabelPrefix+"hq-wisp-r1", copyA)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-c1", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if result.RequestedID != "hq-c1" {
+		t.Errorf("RequestedID = %q, want hq-c1", result.RequestedID)
+	}
+	if result.RecordID != "hq-wisp-r1" {
+		t.Errorf("RecordID = %q, want hq-wisp-r1", result.RecordID)
+	}
+	if !result.RecordClosed {
+		t.Error("RecordClosed = false, but the record was open and was closed by this call")
+	}
+}
+
+// A close that wrote to nothing must report that it wrote to nothing. Without a
+// negative case the success line is unfalsifiable: it was printed for two real
+// reconciles that cleared nothing, and the operator saw two green checkmarks.
+func TestCloseEscalation_ReportsANoOpAsANoOp(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed"
+	stub.bead(record)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, nil)
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-r1", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation: %v", err)
+	}
+	if result.Changed() {
+		t.Errorf("Changed() = true, but nothing was closed: %#v", result)
+	}
+	// Control: the same assertion must go the other way when there IS work.
+	// A Changed() that is always false would pass the check above.
+	if stub.hasWrite("close", "hq-wisp-r1") {
+		t.Errorf("an already-closed record must not be closed again; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// Ack and re-escalation walk the same copies query, so the pinned blindness was
+// never confined to close: an ack of a pinned escalation labelled the record and
+// left the bead the queue renders unmarked.
+func TestAckEscalation_LabelsPinnedCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(pinnedCopy)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	if err := b.AckEscalation("hq-wisp-r1", "mayor/"); err != nil {
+		t.Fatalf("AckEscalation: %v", err)
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=acked") {
+		t.Errorf("pinned copy was not marked acked; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+func TestReescalateEscalation_UpdatesPinnedCopies(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-r1", "mayor/")
+	stub.bead(record)
+	stub.bead(pinnedCopy)
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-r1", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	if _, err := b.ReescalateEscalation("hq-wisp-r1", "gastown/witness", 0); err != nil {
+		t.Fatalf("ReescalateEscalation: %v", err)
+	}
+	if !stub.hasWrite("update hq-c1", "--add-label=severity:critical") {
+		t.Errorf("pinned copy kept the old severity; bd writes:\n%s", strings.Join(stub.writes(), "\n"))
+	}
+}
+
+// A record that has been reaped is reachable only through its copies, so the
+// pinned blindness also decided whether the close could resolve the ID at all.
+func TestCloseEscalation_ResolvesReapedRecordThroughAPinnedCopy(t *testing.T) {
+	stub := newEscalationStub(t)
+	pinnedCopy := escalationCopy("hq-c1", "hq-wisp-gone", "mayor/")
+	stub.bead(pinnedCopy) // no fixture for hq-wisp-gone: bd show returns []
+	stub.listSplit(EscalationLinkLabelPrefix+"hq-wisp-gone", nil, []*Issue{pinnedCopy})
+
+	b := New(t.TempDir())
+	result, err := b.CloseEscalation("hq-wisp-gone", "mayor/", "resolved")
+	if err != nil {
+		t.Fatalf("CloseEscalation by a reaped record ID with only a pinned copy: %v", err)
+	}
+	if len(result.CopyIDs) != 1 || result.CopyIDs[0] != "hq-c1" {
+		t.Errorf("CopyIDs = %v, want [hq-c1]", result.CopyIDs)
 	}
 }
