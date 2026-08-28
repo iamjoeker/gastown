@@ -311,13 +311,12 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	}
 
 	// List all open issues and filter locally so legacy type=convoy beads remain visible.
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--status=open", "--json", "--limit=0")
-	if err != nil {
-		f.convoyBreaker.recordFailure()
-		return nil, fmt.Errorf("listing convoys: %w", err)
-	}
-
-	var convoys []struct {
+	//
+	// Asked as both pinned halves and unioned by ID: `bd list --status=open`
+	// defaults to `--no-pinned` with no include-pinned flag, so a pinned convoy
+	// would otherwise vanish from this panel silently (same shape as gt-z5h7,
+	// gt-qee3, hq-ztj4g).
+	type convoyIssue struct {
 		ID        string   `json:"id"`
 		Title     string   `json:"title"`
 		Status    string   `json:"status"`
@@ -325,9 +324,27 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		IssueType string   `json:"issue_type"`
 		Labels    []string `json:"labels"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
-		f.convoyBreaker.recordFailure()
-		return nil, fmt.Errorf("parsing convoy list: %w", err)
+	var convoys []convoyIssue
+	seenConvoys := make(map[string]bool)
+	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
+		stdout, err := f.runBdCmd(f.townRoot, "list", "--status=open", pinnedFilter, "--json", "--limit=0")
+		if err != nil {
+			f.convoyBreaker.recordFailure()
+			return nil, fmt.Errorf("listing convoys (%s): %w", pinnedFilter, err)
+		}
+
+		var half []convoyIssue
+		if err := json.Unmarshal(stdout.Bytes(), &half); err != nil {
+			f.convoyBreaker.recordFailure()
+			return nil, fmt.Errorf("parsing convoy list (%s): %w", pinnedFilter, err)
+		}
+		for _, c := range half {
+			if seenConvoys[c.ID] {
+				continue
+			}
+			seenConvoys[c.ID] = true
+			convoys = append(convoys, c)
+		}
 	}
 
 	// One classification environment for the whole pass: the scheduled-bead scan
