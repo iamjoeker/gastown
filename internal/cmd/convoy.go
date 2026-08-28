@@ -2498,6 +2498,14 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 	// Fetch fresh issue details via bd show (uses prefix routing for cross-rig).
 	freshDetails := getIssueDetailsBatch(trackedIDs)
 
+	// A tracked bead moved across rigs (gt-ad32) keeps its original id, so the
+	// prefix-routed lookup above can return the CLOSED source-rig copy while a
+	// live row sits open in the destination rig. Convoy completion trusted that
+	// closed copy and declared the convoy done while the actual dispatch had
+	// been refused — the failure and the "complete" verdict landed in the same
+	// minute (gt-ju7k). Follow the live row before deciding completion.
+	adoptMovedTrackedIssueDetails(townBeads, trackedIDs, freshDetails)
+
 	// Build tracked dependency structs from fresh details. When fresh details
 	// are missing (cross-rig DB unreachable, missing, parked, or unroutable
 	// from town root), mark the dep with trackedStatusUnknown so callers can
@@ -2647,6 +2655,49 @@ func (d issueDetails) IsBlocked() bool {
 	}
 
 	return false
+}
+
+// adoptMovedTrackedIssueDetails replaces a tracked issue's prefix-routed details
+// with its live row when the prefix store's copy is closed, is a tombstone, or
+// is missing, and a live row exists in a different rig's store. Mirrors
+// adoptMovedWorkBeadRows for the scheduler queue (gt-ygb7); this is the same
+// gap in convoy completion (gt-ju7k).
+func adoptMovedTrackedIssueDetails(townRoot string, ids []string, details map[string]*issueDetails) {
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if d, ok := details[id]; ok && d != nil && beadStatusIsLive(d.Status) {
+			continue
+		}
+		owner, err := resolveBeadOwner(townRoot, id)
+		if err != nil || owner == nil || !owner.Moved || owner.Info == nil {
+			continue
+		}
+		details[id] = issueDetailsFromBeadInfo(id, owner.Info)
+	}
+}
+
+// issueDetailsFromBeadInfo adapts a resolveBeadOwner lookup's raw bead row into
+// the shape getTrackedIssues works with.
+func issueDetailsFromBeadInfo(id string, info *beadInfo) *issueDetails {
+	deps := make([]issueDependency, 0, len(info.Dependencies))
+	for _, dep := range info.Dependencies {
+		deps = append(deps, issueDependency{
+			ID:             dep.ID,
+			Status:         dep.Status,
+			DependencyType: dep.DependencyType,
+		})
+	}
+	return &issueDetails{
+		ID:           id,
+		Title:        info.Title,
+		Status:       info.Status,
+		IssueType:    info.IssueType,
+		Assignee:     info.Assignee,
+		Labels:       info.Labels,
+		Dependencies: deps,
+	}
 }
 
 // getIssueDetailsBatch fetches details through the central routed beads lookup.
