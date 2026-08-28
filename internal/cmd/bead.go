@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var beadCmd = &cobra.Command{
@@ -107,6 +108,71 @@ type moveBeadInfo struct {
 	Status      string   `json:"status"`
 }
 
+// beadMoveTarget names the store a move will file its copy into.
+//
+// bd has no flag that targets a database: `bd create` files into whatever store
+// its working directory resolves to. The working directory IS the targeting
+// mechanism, so a move that cannot resolve one has no target at all (gt-ecff).
+type beadMoveTarget struct {
+	townRoot string
+	// workDir is the directory bd must run in for the copy to land in the
+	// store that owns targetPrefix.
+	workDir string
+}
+
+// resolveBeadMoveTarget resolves the target store for a prefix, or explains why
+// it cannot. An unroutable prefix is an error rather than a fallback: falling
+// back to the caller's cwd would file the copy in a silently wrong database,
+// which is worse than refusing the move.
+func resolveBeadMoveTarget(targetPrefix string) (beadMoveTarget, error) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return beadMoveTarget{}, fmt.Errorf("resolving town root for prefix %s: %w", targetPrefix, err)
+	}
+	return resolveBeadMoveTargetIn(townRoot, targetPrefix)
+}
+
+// resolveBeadMoveTargetIn is resolveBeadMoveTarget with the town root supplied.
+func resolveBeadMoveTargetIn(townRoot, targetPrefix string) (beadMoveTarget, error) {
+	if targetPrefix == "" || targetPrefix == "-" {
+		return beadMoveTarget{}, fmt.Errorf("target prefix is required (e.g. gt-, bd-, hq-)")
+	}
+	if beads.GetRigPathForPrefix(townRoot, targetPrefix) == "" {
+		return beadMoveTarget{}, fmt.Errorf("no route for prefix %q in %s: bd files by working directory, so an unrouted prefix names no database",
+			targetPrefix, filepath.Join(townRoot, ".beads", "routes.jsonl"))
+	}
+	return beadMoveTarget{
+		townRoot: townRoot,
+		workDir:  resolveBeadDirFromTownRoot(townRoot, targetPrefix),
+	}, nil
+}
+
+// beadMoveCreateArgs builds the `bd create` argv for the copy.
+//
+// Every flag here must be one `bd create` actually accepts. There is no
+// database-targeting flag among them — `--prefix` is a `bd init` flag, and
+// passing it made every move fail (gt-ecff). Targeting is done by the working
+// directory the command runs in, not by argv.
+func beadMoveCreateArgs(source moveBeadInfo) []string {
+	args := []string{
+		"create",
+		"--title=" + source.Title,
+		"--type", source.Type,
+		"--priority", fmt.Sprintf("%d", source.Priority),
+		"--silent", // Only output the ID
+	}
+	if source.Description != "" {
+		args = append(args, "--description", source.Description)
+	}
+	if source.Assignee != "" {
+		args = append(args, "--assignee", source.Assignee)
+	}
+	for _, label := range source.Labels {
+		args = append(args, "--label", label)
+	}
+	return args
+}
+
 func runBeadMove(cmd *cobra.Command, args []string) error {
 	sourceID := args[0]
 	targetPrefix := args[1]
@@ -116,10 +182,18 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 		targetPrefix = targetPrefix + "-"
 	}
 
+	// Resolve the target store before anything reports the move as possible.
+	// The dry run below must not certify a path the real move cannot take.
+	target, err := resolveBeadMoveTarget(targetPrefix)
+	if err != nil {
+		return err
+	}
+
 	// Get source bead details — resolve rig directory from prefix so that
 	// rig-prefixed beads are found in their rig database (GH#2126).
+	sourceDir := resolveBeadDir(sourceID)
 	output, err := BdCmd("show", sourceID, "--json").
-		Dir(resolveBeadDir(sourceID)).
+		Dir(sourceDir).
 		StripBeadsDir().
 		Output()
 	if err != nil {
@@ -144,6 +218,8 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Moving %s to %s...\n", style.Bold.Render("→"), sourceID, targetPrefix)
 	fmt.Printf("  Title: %s\n", source.Title)
 	fmt.Printf("  Type: %s\n", source.Type)
+	fmt.Printf("  Source store: %s\n", sourceDir)
+	fmt.Printf("  Target store: %s\n", target.workDir)
 
 	// Guard against flag-like titles propagating during move (gt-e0kx5)
 	if beads.IsFlagLikeTitle(source.Title) {
@@ -152,54 +228,50 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 
 	if beadMoveDryRun {
 		fmt.Printf("\nDry run - would:\n")
-		fmt.Printf("  1. Create new bead with prefix %s\n", targetPrefix)
-		fmt.Printf("  2. Close %s with reference to new bead\n", sourceID)
+		fmt.Printf("  1. Create a copy of %s in %s (prefix %s)\n", sourceID, target.workDir, targetPrefix)
+		fmt.Printf("  2. Close %s in %s with a reference to the new bead\n", sourceID, sourceDir)
 		return nil
 	}
 
-	// Build create command for target.
-	// Skip --prefix for empty or bare "-" (normalization above turns "" into "-").
-	createArgs := []string{"create"}
-	if targetPrefix != "" && targetPrefix != "-" {
-		createArgs = append(createArgs, "--prefix", targetPrefix)
-	}
-	createArgs = append(createArgs,
-		"--title="+source.Title,
-		"--type", source.Type,
-		"--priority", fmt.Sprintf("%d", source.Priority),
-		"--silent", // Only output the ID
-	)
-
-	if source.Description != "" {
-		createArgs = append(createArgs, "--description", source.Description)
-	}
-	if source.Assignee != "" {
-		createArgs = append(createArgs, "--assignee", source.Assignee)
-	}
-	for _, label := range source.Labels {
-		createArgs = append(createArgs, "--label", label)
-	}
-
-	// Create the new bead
-	createCmd := exec.Command("bd", createArgs...)
-	createCmd.Stderr = os.Stderr
-	newIDBytes, err := createCmd.Output()
+	// Create the new bead in the target store.
+	newIDBytes, err := BdCmd(beadMoveCreateArgs(source)...).
+		Dir(target.workDir).
+		StripBeadsDir().
+		WithAutoCommit().
+		Output()
 	if err != nil {
-		return fmt.Errorf("creating new bead: %w", err)
+		return fmt.Errorf("creating new bead in %s: %w", target.workDir, err)
 	}
 	newID := strings.TrimSpace(string(newIDBytes))
+	if newID == "" {
+		return fmt.Errorf("bd create in %s reported success but returned no bead ID", target.workDir)
+	}
+
+	// Confirm the copy landed where it was aimed. Routing by working directory
+	// fails silently — a copy filed in the wrong store still returns an ID and a
+	// zero exit — so check where the new ID routes back to (gt-ecff).
+	if landed := resolveBeadDirFromTownRoot(target.townRoot, newID); landed != target.workDir {
+		return fmt.Errorf("created %s, but it landed in %s instead of %s (prefix %s); %s was left open and unchanged",
+			newID, landed, target.workDir, targetPrefix, sourceID)
+	}
 
 	fmt.Printf("%s Created %s\n", style.Bold.Render("✓"), newID)
 
 	// Close the source bead with reference
 	closeReason := fmt.Sprintf("Moved to %s", newID)
-	closeCmd := exec.Command("bd", "close", sourceID, "--reason", closeReason)
-	closeCmd.Stderr = os.Stderr
-	if err := closeCmd.Run(); err != nil {
+	if err := BdCmd("close", sourceID, "--reason", closeReason).
+		Dir(sourceDir).
+		StripBeadsDir().
+		WithAutoCommit().
+		Run(); err != nil {
 		// Clean up the new bead since we couldn't close the source
 		fmt.Fprintf(os.Stderr, "Warning: failed to close source bead: %v\n", err)
-		cleanupCmd := exec.Command("bd", "close", newID, "--reason", "Cleanup: source bead close failed during move")
-		if cleanupErr := cleanupCmd.Run(); cleanupErr != nil {
+		cleanupErr := BdCmd("close", newID, "--reason", "Cleanup: source bead close failed during move").
+			Dir(target.workDir).
+			StripBeadsDir().
+			WithAutoCommit().
+			Run()
+		if cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: also failed to clean up new bead %s: %v\n", newID, cleanupErr)
 			fmt.Fprintf(os.Stderr, "Both %s and %s remain open - manual cleanup needed\n", sourceID, newID)
 		} else {
