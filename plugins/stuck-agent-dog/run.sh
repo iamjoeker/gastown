@@ -207,6 +207,30 @@ session_health_status() {
   printf '%s\n' "$status"
 }
 
+# --- check-recovery cross-check (gt-zt4o, mirrors hq-h6c2i) -------------------
+# session_health_status answers "is the runtime alive", not "does this polecat
+# need recovery". `gt polecat check-recovery` is the authoritative source for
+# NEEDS_RECOVERY: its verdict reads cleanup_status, active_mr, and git-state
+# predicates the session probe never touches. A polecat can look healthy at
+# the session layer (tmux alive, recent activity) while check-recovery's own
+# verdict disagrees, and without this cross-check the HEALTHY bucket asserts
+# something no probe here actually confirmed — the same shape of defect as the
+# zombie counted healthy, reached through a different arm than agent-hung.
+#
+# Fails OPEN (trusts session health) when check-recovery itself is unreachable
+# or unparseable: an unrelated outage in the recovery-check surface must not
+# turn every healthy polecat into a false NEEDS_RECOVERY report.
+needs_recovery_per_check_recovery() {
+  local rig="$1" pcat="$2"
+  local json=""
+
+  if ! json=$(gt polecat check-recovery "$rig/$pcat" --json 2>/dev/null); then
+    log "  NOTICE: check-recovery unavailable for $rig/$pcat; trusting session health"
+    return 1
+  fi
+  [ "$(printf '%s' "$json" | jq -r '.needs_recovery // false' 2>/dev/null)" = "true" ]
+}
+
 operational_rig_prefix_map() {
   local rig_json="" rows=""
 
@@ -517,6 +541,12 @@ POST_SUBMISSION=0
 # PENDING: a crash candidate on its FIRST observation. Not acted on and not
 # counted toward mass death until it survives CRASH_PERSIST_SECONDS.
 PENDING=0
+# NEEDS_RECOVERY_MISMATCH: session health said healthy, but `gt polecat
+# check-recovery`'s own verdict says needs_recovery=true. Split out of HEALTHY
+# rather than folded into it, for the same reason OBSERVED was split out of
+# HEALTHY for agent-hung: the summary must not assert a clean bill of health
+# the check-recovery probe itself denies.
+NEEDS_RECOVERY_MISMATCH=0
 # ENUMERATED: polecat directories walked. Every one of them must land in exactly
 # one bucket; the guard after the loop says so out loud rather than trusting it.
 ENUMERATED=0
@@ -539,7 +569,12 @@ while IFS='|' read -r RIG PREFIX; do
     HEALTH_STATUS=$(session_health_status "$SESSION_NAME" || true)
     case "$HEALTH_STATUS" in
       healthy)
-        HEALTHY=$((HEALTHY + 1))
+        if needs_recovery_per_check_recovery "$RIG" "$PCAT_NAME"; then
+          NEEDS_RECOVERY_MISMATCH=$((NEEDS_RECOVERY_MISMATCH + 1))
+          log "  NEEDS_RECOVERY: $SESSION_NAME session healthy but check-recovery verdict says needs_recovery=true"
+        else
+          HEALTHY=$((HEALTHY + 1))
+        fi
         ;;
       agent-dead|agent_dead)
         HOOK_ASSIGNMENT=$(rig_hook_assignment "$RIG" "$PCAT_NAME")
@@ -607,14 +642,14 @@ done <<< "$RIG_PREFIX_MAP"
 persist_crash_candidates
 
 log ""
-log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, $PENDING pending"
+log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
 
 # Conservation guard. The defect this plugin keeps re-acquiring is a bucket that
 # silently drops rows, and a shrinking denominator reads exactly like an
 # all-clear. State the identity instead of assuming it. POST_SUBMISSION and
 # PENDING are excluded from action but NOT from the denominator, for the same
 # reason: an exclusion that does not show up in the arithmetic is invisible.
-BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL + POST_SUBMISSION + PENDING ))
+BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL + POST_SUBMISSION + PENDING + NEEDS_RECOVERY_MISMATCH ))
 if [ "$BUCKET_TOTAL" -eq "$ENUMERATED" ]; then
   log "Denominator: $BUCKET_TOTAL bucketed == $ENUMERATED polecat directories enumerated"
 else
@@ -775,7 +810,7 @@ fi
 
 # --- Report -------------------------------------------------------------------
 
-SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, $PENDING pending"
+SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
 [ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 [ -n "$DEACON_DIVERGENCE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_DIVERGENCE (not escalated)"
 log ""
