@@ -314,6 +314,66 @@ has_submitted_mr() {
   printf '%s' "$MR_SOURCE_ISSUES" | grep -Fxq -- "$rig|$bead"
 }
 
+# --- Stranded-branch detection (gt-j994, mirrors hq-o3xwk) --------------------
+# has_submitted_mr distinguishes "in the queue" from "not in the queue", but
+# reality has a third state the MQ join cannot see: pushed to the remote, with
+# real commits, and NEVER submitted. That polecat presents identically to a
+# genuine crash (no MR, session dead) — restarting it destroys finished work
+# that a restart is supposed to protect. The discriminator here is the push
+# remote itself: a branch whose local tip matches its remote tip has commits
+# nothing but a submit or a ruling should touch.
+polecat_worktree_dir() {
+  local pcat_path="$1"
+  local git_marker=""
+
+  git_marker=$(find "$pcat_path" -mindepth 2 -maxdepth 2 -name .git 2>/dev/null | head -1) || true
+  [ -n "$git_marker" ] || return 1
+  dirname "$git_marker"
+}
+
+# pushed_unsubmitted_branch answers "does this polecat have a branch, naming
+# this hook bead, whose tip is confirmed pushed and sits ahead of main?" True
+# sets STRANDED_BRANCH/STRANDED_WORKTREE for the caller and means STRANDED:
+# do not restart, submit instead.
+STRANDED_BRANCH=""
+STRANDED_WORKTREE=""
+
+pushed_unsubmitted_branch() {
+  local pcat_path="$1" bead="$2"
+  local wt_dir="" branch="" local_sha="" remote_sha="" ahead=0
+
+  STRANDED_BRANCH=""
+  STRANDED_WORKTREE=""
+  [ -n "$bead" ] || return 1
+
+  wt_dir=$(polecat_worktree_dir "$pcat_path") || return 1
+  [ -d "$wt_dir" ] || return 1
+
+  branch=$(cd "$wt_dir" && git branch --show-current 2>/dev/null) || return 1
+  [ -n "$branch" ] || return 1
+  case "$branch" in
+    *"$bead"*) ;;
+    *) return 1 ;;
+  esac
+
+  local_sha=$(cd "$wt_dir" && git rev-parse HEAD 2>/dev/null) || return 1
+  remote_sha=$(cd "$wt_dir" && git ls-remote origin "refs/heads/$branch" 2>/dev/null | awk '{print $1; exit}') || true
+  [ -n "$remote_sha" ] || return 1
+  # Exact tip match: local HEAD is confirmed present on the push remote, not
+  # merely "a branch exists there under this name".
+  [ "$local_sha" = "$remote_sha" ] || return 1
+
+  ahead=$(cd "$wt_dir" && git rev-list --count "origin/main..$branch" 2>/dev/null || echo 0)
+  case "$ahead" in
+    ''|*[!0-9]*) ahead=0 ;;
+  esac
+  [ "$ahead" -gt 0 ] || return 1
+
+  STRANDED_BRANCH="$branch"
+  STRANDED_WORKTREE="$wt_dir"
+  return 0
+}
+
 # --- Crash-candidate persistence store ----------------------------------------
 # Keyed on rig/polecat/hook_bead: a NEW assignment restarts the clock, because a
 # different bead is a different claim and must earn its own second observation.
@@ -514,6 +574,11 @@ fi
 
 CRASHED=()
 STUCK=()
+# STRANDED: session/agent dead, hook still open, no MR anywhere — but the
+# branch is confirmed pushed and ahead of main. Submitted instead of
+# restarted (gt-j994, mirrors hq-o3xwk): restarting here would destroy
+# finished work a restart is supposed to protect.
+STRANDED=()
 HEALTHY=0
 # OBSERVED: probe says healthy:false but policy is deliberately not to act
 # (e.g. agent-hung: a quiet live runtime may be a long research turn).
@@ -587,6 +652,9 @@ while IFS='|' read -r RIG PREFIX; do
             # inside a live session is not the merge/terminal race.
             POST_SUBMISSION=$((POST_SUBMISSION + 1))
             log "  POST-SUBMISSION: $SESSION_NAME runtime dead but hook=$HOOK_BEAD has an MR; not killing a submitted polecat"
+          elif pushed_unsubmitted_branch "$PCAT_PATH" "$HOOK_BEAD"; then
+            STRANDED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|$STRANDED_BRANCH|$STRANDED_WORKTREE")
+            log "  STRANDED: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD, branch=$STRANDED_BRANCH pushed with no MR); submitting instead of restarting"
           else
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
@@ -611,6 +679,9 @@ while IFS='|' read -r RIG PREFIX; do
           if has_submitted_mr "$RIG" "$HOOK_BEAD"; then
             POST_SUBMISSION=$((POST_SUBMISSION + 1))
             log "  POST-SUBMISSION: $SESSION_NAME exited with hook=$HOOK_BEAD still open, but an MR references it — submitted, not crashed"
+          elif pushed_unsubmitted_branch "$PCAT_PATH" "$HOOK_BEAD"; then
+            STRANDED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|$STRANDED_BRANCH|$STRANDED_WORKTREE")
+            log "  STRANDED: $SESSION_NAME (hook=$HOOK_BEAD, branch=$STRANDED_BRANCH pushed with no MR); submitting instead of restarting"
           elif crash_candidate_persisted "$RIG" "$PCAT_NAME" "$HOOK_BEAD"; then
             CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
             log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD, unchanged for ${CANDIDATE_AGE}s, no MR in any state)"
@@ -642,14 +713,14 @@ done <<< "$RIG_PREFIX_MAP"
 persist_crash_candidates
 
 log ""
-log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
+log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, ${#STRANDED[@]} stranded, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
 
 # Conservation guard. The defect this plugin keeps re-acquiring is a bucket that
 # silently drops rows, and a shrinking denominator reads exactly like an
 # all-clear. State the identity instead of assuming it. POST_SUBMISSION and
 # PENDING are excluded from action but NOT from the denominator, for the same
 # reason: an exclusion that does not show up in the arithmetic is invisible.
-BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL + POST_SUBMISSION + PENDING + NEEDS_RECOVERY_MISMATCH ))
+BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + ${#STRANDED[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL + POST_SUBMISSION + PENDING + NEEDS_RECOVERY_MISMATCH ))
 if [ "$BUCKET_TOTAL" -eq "$ENUMERATED" ]; then
   log "Denominator: $BUCKET_TOTAL bucketed == $ENUMERATED polecat directories enumerated"
 else
@@ -789,6 +860,26 @@ reason: $REASON
 action: restart requested
 BODY
   done
+
+  # Stranded polecats: pushed but never submitted (gt-j994, mirrors hq-o3xwk).
+  # Restarting here is the exact bug this fixes — the session is dead, but the
+  # work already reached the push remote, and a restart destroys the very
+  # thing a restart is meant to protect. Submit it instead of requesting one.
+  for ENTRY in ${STRANDED[@]+"${STRANDED[@]}"}; do
+    IFS='|' read -r SESSION RIG PCAT HOOK BRANCH WORKTREE <<< "$ENTRY"
+    log "Submitting stranded branch for $RIG/polecats/$PCAT (hook=$HOOK, branch=$BRANCH)"
+    if ( cd "$WORKTREE" && gt mq submit --issue "$HOOK" --branch "$BRANCH" --no-cleanup ) >/dev/null 2>&1; then
+      log "  SUBMITTED: $RIG/polecats/$PCAT (hook=$HOOK) reached the merge queue"
+      gt mail send "$RIG/witness" -s "MR_SUBMITTED: $RIG/$PCAT (was stranded)" --stdin <<BODY || log "  WARN: notify mail failed for $RIG/$PCAT"
+Polecat $PCAT was pushed but never submitted to the merge queue.
+Submitted on its behalf by stuck-agent-dog instead of restarting.
+hook_bead: $HOOK
+branch: $BRANCH
+BODY
+    else
+      log "  WARN: gt mq submit failed for $RIG/$PCAT (hook=$HOOK, branch=$BRANCH); not restarting a stranded branch"
+    fi
+  done
 fi
 
 # Deacon issues: escalate
@@ -810,7 +901,7 @@ fi
 
 # --- Report -------------------------------------------------------------------
 
-SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
+SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, ${#STRANDED[@]} stranded, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
 [ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 [ -n "$DEACON_DIVERGENCE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_DIVERGENCE (not escalated)"
 log ""

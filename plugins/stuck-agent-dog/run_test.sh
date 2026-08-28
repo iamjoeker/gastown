@@ -190,6 +190,13 @@ case "${1:-}" in
       printf ']\n'
       exit 0
     fi
+    if [ "${2:-}" = "submit" ]; then
+      printf '%s|%s\n' "$PWD" "$*" >> "$TEST_STATE/mq_submit.log"
+      if [ -f "$TEST_STATE/mq_submit_fail" ]; then
+        exit 1
+      fi
+      exit 0
+    fi
     ;;
   rig)
     if [ "${2:-}" = "list" ] && [ "${3:-}" = "--json" ]; then
@@ -339,6 +346,54 @@ printf 'unexpected ps call: %s\n' "$*" >&2
 exit 1
 SH
   chmod +x "$bin_dir/ps"
+
+  # Fake git for the stranded-branch check (gt-j994). Control files live under
+  # a .faketest/ dir inside the worktree being probed, keyed off $PWD rather
+  # than a lookup table, since run.sh always cd's into the worktree first.
+  cat > "$bin_dir/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  branch)
+    if [ "${2:-}" = "--show-current" ]; then
+      [ -f "$PWD/.faketest/branch" ] && cat "$PWD/.faketest/branch"
+      exit 0
+    fi
+    ;;
+  rev-parse)
+    if [ "${2:-}" = "HEAD" ]; then
+      if [ -f "$PWD/.faketest/local_sha" ]; then
+        cat "$PWD/.faketest/local_sha"
+      else
+        printf 'localsha0000\n'
+      fi
+      exit 0
+    fi
+    ;;
+  ls-remote)
+    if [ -f "$PWD/.faketest/remote_sha" ]; then
+      remote_sha=$(cat "$PWD/.faketest/remote_sha")
+      [ -n "$remote_sha" ] && printf '%s\trefs/heads/%s\n' "$remote_sha" "${4:-}"
+    fi
+    exit 0
+    ;;
+  rev-list)
+    if [ "${2:-}" = "--count" ]; then
+      if [ -f "$PWD/.faketest/ahead" ]; then
+        cat "$PWD/.faketest/ahead"
+      else
+        printf '0\n'
+      fi
+      exit 0
+    fi
+    ;;
+esac
+
+printf 'unexpected git call: %s\n' "$*" >&2
+exit 1
+SH
+  chmod +x "$bin_dir/git"
 }
 
 setup_case() {
@@ -419,6 +474,28 @@ add_polecat_in_rig() {
   fi
 }
 
+# add_stranded_polecat creates a polecat whose worktree's branch is confirmed
+# pushed (local HEAD == remote tip) and ahead of main — the STRANDED case
+# (gt-j994, mirrors hq-o3xwk): a restart here would destroy finished work.
+# pushed=false / ahead=0 let individual tests build the near-miss cases.
+add_stranded_polecat() {
+  local name="$1" health_status="$2" pushed="${3:-true}" ahead="${4:-1}"
+  local rig="gastown" bead="gt-hook-$name"
+  local wt_dir="$GT_TOWN_ROOT/$rig/polecats/$name/repo"
+
+  add_polecat "$name" "$health_status"
+  mkdir -p "$wt_dir/.faketest"
+  : > "$wt_dir/.git"
+  printf 'polecat/%s/%s+abc123\n' "$name" "$bead" > "$wt_dir/.faketest/branch"
+  printf 'deadbeef0000000000000000000000000000\n' > "$wt_dir/.faketest/local_sha"
+  if [ "$pushed" = "true" ]; then
+    printf 'deadbeef0000000000000000000000000000\n' > "$wt_dir/.faketest/remote_sha"
+  else
+    : > "$wt_dir/.faketest/remote_sha"
+  fi
+  printf '%s\n' "$ahead" > "$wt_dir/.faketest/ahead"
+}
+
 run_script() {
   bash "$SCRIPT" > "$TEST_STATE/output.log" 2>&1
 }
@@ -470,7 +547,7 @@ test_healthy_session_but_needs_recovery_is_not_counted_healthy() {
 
   assert_file_contains "$TEST_STATE/check_recovery_calls.log" "gastown/wedged" "needs-recovery mismatch: check-recovery consulted"
   assert_file_contains "$TEST_STATE/output.log" "NEEDS_RECOVERY: gt-wedged session healthy but check-recovery verdict says needs_recovery=true" "needs-recovery mismatch: named"
-  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 0 uncounted, 0 terminal, 0 post-submission, 0 pending, 1 needs_recovery" "needs-recovery mismatch: split out of healthy"
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 0 uncounted, 0 terminal, 0 post-submission, 0 stranded, 0 pending, 1 needs_recovery" "needs-recovery mismatch: split out of healthy"
   assert_file_empty "$TEST_STATE/mail.log" "needs-recovery mismatch: no restart mail (reporting only)"
   assert_file_not_contains "$TEST_STATE/output.log" "WARN:" "needs-recovery mismatch: denominator still balances"
 }
@@ -965,6 +1042,70 @@ test_chrome_real_zombie_with_clean_git_is_crashed() {
   assert_file_contains "$TEST_STATE/output.log" "no MR in any state" "chrome zombie: stated the discriminator"
 }
 
+# --- Stranded branches (gt-j994, mirrors hq-o3xwk) ----------------------------
+# A polecat that pushed its branch but never reached the merge queue presents
+# identically to a crash at the session probe. The old rule restarted it,
+# destroying the very work a restart is meant to protect. The fix: submit the
+# branch instead of requesting a restart.
+
+test_stranded_session_dead_branch_is_submitted_not_restarted() {
+  setup_case
+  add_stranded_polecat rhino session-dead true 3
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "STRANDED: gt-rhino" "rhino stranded: classified stranded, not crashed"
+  assert_file_not_contains "$TEST_STATE/output.log" "CRASHED: gt-rhino" "rhino stranded: not classified crashed"
+  assert_file_empty "$TEST_STATE/kill.log" "rhino stranded: no session kill"
+  assert_file_contains "$TEST_STATE/mq_submit.log" "--issue gt-hook-rhino" "rhino stranded: submitted with the hook bead"
+  assert_file_not_contains "$TEST_STATE/mail.log" "RESTART_POLECAT" "rhino stranded: never restarted"
+  assert_file_contains "$TEST_STATE/mail.log" "MR_SUBMITTED: gastown/rhino" "rhino stranded: notified witness of the submit"
+  assert_file_contains "$TEST_STATE/output.log" "1 stranded" "rhino stranded: counted in its own bucket"
+}
+
+test_stranded_agent_dead_branch_is_submitted_not_restarted() {
+  setup_case
+  add_stranded_polecat wombat agent-dead true 2
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "STRANDED: gt-wombat" "wombat stranded: classified stranded"
+  assert_file_empty "$TEST_STATE/kill.log" "wombat stranded: no session kill"
+  assert_file_not_contains "$TEST_STATE/mail.log" "RESTART_POLECAT" "wombat stranded: never restarted"
+  assert_file_contains "$TEST_STATE/mq_submit.log" "--issue gt-hook-wombat" "wombat stranded: submitted"
+}
+
+test_unpushed_branch_is_still_crashed() {
+  setup_case
+  add_stranded_polecat marten session-dead false 3
+  seed_crash_candidate gastown marten gt-hook-marten 3600
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "CRASHED: gt-marten" "marten unpushed: still classified crashed"
+  assert_file_not_contains "$TEST_STATE/output.log" "STRANDED: gt-marten" "marten unpushed: not stranded"
+  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/marten" "marten unpushed: restart requested"
+}
+
+test_pushed_branch_with_nothing_ahead_is_still_crashed() {
+  setup_case
+  add_stranded_polecat otter session-dead true 0
+  seed_crash_candidate gastown otter gt-hook-otter 3600
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "CRASHED: gt-otter" "otter zero-ahead: still classified crashed"
+  assert_file_not_contains "$TEST_STATE/output.log" "STRANDED: gt-otter" "otter zero-ahead: not stranded"
+  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/otter" "otter zero-ahead: restart requested"
+}
+
+test_stranded_submit_failure_does_not_restart() {
+  setup_case
+  add_stranded_polecat badger session-dead true 1
+  touch "$TEST_STATE/mq_submit_fail"
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "WARN: gt mq submit failed" "badger submit-fail: warned"
+  assert_file_empty "$TEST_STATE/mail.log" "badger submit-fail: not restarted, not falsely notified"
+  assert_file_not_contains "$TEST_STATE/output.log" "CRASHED: gt-badger" "badger submit-fail: still not classified crashed"
+}
+
 # The persistence gate: any point-in-time predicate is racing the
 # merge -> bead-terminal transition, so a candidate has to look crashed TWICE,
 # more than one window apart, before anything acts on it.
@@ -975,7 +1116,7 @@ test_crash_candidate_pends_on_first_observation() {
 
   assert_file_empty "$TEST_STATE/mail.log" "first observation: no restart mail"
   assert_file_contains "$TEST_STATE/output.log" "PENDING: gt-chrome" "first observation: held pending"
-  assert_file_contains "$TEST_STATE/output.log" "0 terminal, 0 post-submission, 1 pending" "first observation: counted pending"
+  assert_file_contains "$TEST_STATE/output.log" "0 terminal, 0 post-submission, 0 stranded, 1 pending" "first observation: counted pending"
 }
 
 # ...and the second observation, once the window has elapsed, does act. Run the
@@ -1254,6 +1395,11 @@ test_mass_death_skips_actions
 test_fury_merged_mr_with_open_hook_is_not_crashed
 test_open_mr_also_reads_as_post_submission
 test_chrome_real_zombie_with_clean_git_is_crashed
+test_stranded_session_dead_branch_is_submitted_not_restarted
+test_stranded_agent_dead_branch_is_submitted_not_restarted
+test_unpushed_branch_is_still_crashed
+test_pushed_branch_with_nothing_ahead_is_still_crashed
+test_stranded_submit_failure_does_not_restart
 test_crash_candidate_pends_on_first_observation
 test_crash_candidate_acts_on_second_observation
 test_recovered_candidate_drops_out_of_the_store
