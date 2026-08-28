@@ -106,3 +106,82 @@ func TestCompactStepDropsTheFalseAsOfClaim(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactStepsBindTheBdCzfHoldToGtCompact guards the carrier, not the hold.
+//
+// The 2026-08-11 Mayor ruling (hq-wisp-g698w) that holds bulk wisp destruction
+// names `preserve-then-gc.sh` and nothing else. `gt compact` reaches the same
+// destination by a different road, and it was safe here only by ACCIDENT until
+// 2026-08-21: it sourced its wisp list from `bd list`, which does not query the
+// wisps table, so it scanned 0 (hq-xlwa). Repairing that blindness armed this
+// step overnight — the next dry run proposed 4,373 deletions, and 4,548 a day
+// later. So the step has to say the ruling binds THIS command; a step citing a
+// hold that names a different binary reads as a hold on something else.
+//
+// That sentence was added in prose, and prose is where carriers decay. Deleting
+// every bd-czf line from both held steps leaves the four tests above green:
+// they assert gt-hv3p, "ON HOLD", the restore condition, and the absence of a
+// runnable command — none of which is the binding. bd-czf is also the hold that
+// OUTLIVES gt-hv3p, whose code defects are already fixed, so it is the half
+// most likely to be tidied away as stale.
+//
+// See: gt-1nww, hq-6y9dp, hq-wisp-g698w, hq-xlwa
+func TestCompactStepsBindTheBdCzfHoldToGtCompact(t *testing.T) {
+	steps := deaconPatrolSteps(t)
+
+	for _, id := range compactHeldSteps {
+		desc := steps[id].Description
+		if !strings.Contains(desc, "bd-czf") {
+			t.Errorf("step %q cites no bd-czf hold. gt-hv3p holds the command's flag "+
+				"forms and its code defects are fixed; bd-czf holds the DESTRUCTION and "+
+				"outlives it. Losing the second citation lifts a hold nobody lifted.", id)
+		}
+		if !strings.Contains(desc, "gt compact") {
+			t.Errorf("step %q never names `gt compact`. The step exists to hold that "+
+				"command; a hold that does not name what it holds is not a carrier.", id)
+		}
+	}
+
+	// The binding sentence lives on wisp-compact; compact-report points back at
+	// it. Assert it where it is written.
+	wispCompact := steps["wisp-compact"].Description
+	if !statesHoldBinding(wispCompact) {
+		t.Error("wisp-compact does not state, in one sentence, that the hold reaches " +
+			"`gt compact`. The ruling it cites names preserve-then-gc.sh, so without " +
+			"that sentence the Deacon is reading a hold on a different command (gt-1nww).")
+	}
+
+	// While BOTH holds stand, the step has to say they are independent —
+	// otherwise verifying gt-hv3p's restore condition reads as lifting the step.
+	// If gt-hv3p is ever lifted and its text removed, this check goes quiet
+	// rather than demanding the step assert something untrue.
+	if strings.Contains(wispCompact, "gt-hv3p") &&
+		!strings.Contains(wispCompact, "lifting one does not lift the other") {
+		t.Error("wisp-compact carries two holds but does not say that lifting one does " +
+			"not lift the other. gt-hv3p lifts on a measurement; bd-czf lifts on a Mayor " +
+			"ruling. Whoever satisfies the first will otherwise run the step.")
+	}
+}
+
+// statesHoldBinding reports whether the text says IN ONE SENTENCE that the hold
+// reaches `gt compact`, rather than merely mentioning both somewhere in the
+// step. Both strings appear in the step's history section too, so a whole-text
+// Contains pair is satisfied by prose that binds nothing.
+//
+// Whitespace is normalised before the split so that re-wrapping the paragraph —
+// the most likely innocent edit — cannot fail the check.
+func statesHoldBinding(desc string) bool {
+	flat := strings.Join(strings.Fields(desc), " ")
+	for _, sentence := range strings.Split(flat, ". ") {
+		lower := strings.ToLower(sentence)
+		if !strings.Contains(lower, "gt compact") {
+			continue
+		}
+		for _, verb := range []string{"bind", "cover", "reach", "appl"} {
+			if strings.Contains(lower, verb) {
+				return true
+			}
+		}
+	}
+	return false
+}
