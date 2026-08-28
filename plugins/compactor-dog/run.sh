@@ -30,6 +30,10 @@ DRY_RUN=false
 CHECK_ONLY=false
 LOGFILE=""
 LOCKFILE="/tmp/compactor-dog.lock"
+# Set on any failure path. The EXIT trap consults this so the stderr log
+# (and pre-compaction counts) survive a failed run for post-mortem —
+# only a fully clean run cleans them up.
+HAD_FAILURE=false
 
 # --- Argument parsing ---------------------------------------------------------
 
@@ -59,7 +63,7 @@ if ! mkdir "$LOCKFILE" 2>/dev/null; then
   echo "[compactor-dog] If stale, remove with: rmdir $LOCKFILE"
   exit 1
 fi
-trap 'rmdir "$LOCKFILE" 2>/dev/null; rm -f "$LOGFILE"' EXIT
+trap 'rmdir "$LOCKFILE" 2>/dev/null; if ! $HAD_FAILURE; then rm -f "$LOGFILE"; fi' EXIT
 
 # --- Helpers ------------------------------------------------------------------
 
@@ -140,6 +144,7 @@ if [[ "$DEFAULT_DBS" == "auto" ]]; then
     log "ERROR: No production databases found (is Dolt running on $DOLT_HOST:$DOLT_PORT?)"
     gt escalate "compactor-dog: no databases found" -s MEDIUM \
       --reason "Dolt server at $DOLT_HOST:$DOLT_PORT returned no production databases" 2>/dev/null || true
+    HAD_FAILURE=true
     exit 1
   fi
 else
@@ -162,6 +167,7 @@ log "Production databases ($DB_COUNT): $(printf '%s' "$ALL_DBS" | tr '\n' ' ')"
 
 if [[ "$DB_COUNT" -eq 0 ]]; then
   log "ERROR: No valid databases to process"
+  HAD_FAILURE=true
   exit 1
 fi
 
@@ -237,7 +243,7 @@ ERROR_DETAILS=""
 
 # Temp file for pre-flight row counts (bash 3.2 compatible — no associative arrays).
 PRE_COUNTS_FILE=$(mktemp /tmp/compactor-dog-precounts.XXXXXX)
-trap 'rmdir "$LOCKFILE" 2>/dev/null; rm -f "$LOGFILE" "$PRE_COUNTS_FILE"' EXIT
+trap 'rmdir "$LOCKFILE" 2>/dev/null; if ! $HAD_FAILURE; then rm -f "$LOGFILE" "$PRE_COUNTS_FILE"; fi' EXIT
 
 for entry in "${CANDIDATES[@]}"; do
   DB="${entry%%:*}"
@@ -383,6 +389,7 @@ for entry in "${CANDIDATES[@]}"; do
 
   log "  Verifying integrity..."
   INTEGRITY_OK=true
+  INTEGRITY_FAIL_DETAILS=""
 
   while IFS= read -r TABLE; do
     [[ -z "$TABLE" ]] && continue
@@ -401,6 +408,7 @@ for entry in "${CANDIDATES[@]}"; do
     if [[ -n "$POST_COUNT" && "$POST_COUNT" -lt "$PRE" ]]; then
       log "  INTEGRITY FAILURE: $DB.$TABLE — data loss: pre=$PRE post=$POST_COUNT"
       INTEGRITY_OK=false
+      INTEGRITY_FAIL_DETAILS="${INTEGRITY_FAIL_DETAILS}${TABLE} (pre=$PRE post=$POST_COUNT); "
     fi
   done <<< "$PRE_TABLES"
 
@@ -412,6 +420,7 @@ for entry in "${CANDIDATES[@]}"; do
     if ! printf '%s' "$POST_TABLES" | grep -qx "$TABLE"; then
       log "  INTEGRITY FAILURE: Table $TABLE missing after compaction"
       INTEGRITY_OK=false
+      INTEGRITY_FAIL_DETAILS="${INTEGRITY_FAIL_DETAILS}${TABLE} (missing after compaction); "
     fi
   done < "$PRE_COUNTS_FILE"
 
@@ -419,9 +428,9 @@ for entry in "${CANDIDATES[@]}"; do
     log "  ERROR: Integrity check FAILED for $DB"
     log "  WARNING: DATABASE LEFT IN COMPACTED STATE — MANUAL INSPECTION REQUIRED"
     ERRORS=$((ERRORS + 1))
-    ERROR_DETAILS="${ERROR_DETAILS}${DB}: integrity check failed (DB left in compacted state)\n"
+    ERROR_DETAILS="${ERROR_DETAILS}${DB}: integrity check failed — ${INTEGRITY_FAIL_DETAILS}(DB left in compacted state)\n"
     gt escalate "compactor-dog: integrity failure in $DB" -s HIGH \
-      --reason "Row count mismatch after flatten compaction on $DB. DATABASE LEFT IN COMPACTED STATE — MANUAL INSPECTION REQUIRED." 2>/dev/null || true
+      --reason "Row count mismatch after flatten compaction on $DB: ${INTEGRITY_FAIL_DETAILS}DATABASE LEFT IN COMPACTED STATE — MANUAL INSPECTION REQUIRED. Full stderr log preserved at $LOGFILE (not deleted because this run had failures)." 2>/dev/null || true
     continue
   fi
 
@@ -467,6 +476,7 @@ log "  Errors:    $ERRORS"
 SUMMARY="compactor-dog: compacted=$COMPACTED skipped=${#SKIPPED[@]} errors=$ERRORS (threshold=$COMMIT_THRESHOLD)"
 
 if [[ $ERRORS -gt 0 ]]; then
+  HAD_FAILURE=true
   log ""
   log "Error details:"
   printf '%b\n' "$ERROR_DETAILS" | while read -r line; do
