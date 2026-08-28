@@ -41,13 +41,32 @@ DOLT_USER="root"
 
 ## Step 1: JSONL export
 
-Export all issues from each production database to JSONL files. These are
-human-readable, diffable, and survive any storage backend failure.
+Export all issues from each production database to JSONL files, via direct
+Dolt SQL (not `bd export` — see below). These are human-readable, diffable,
+and survive any storage backend failure.
+
+**Wisp tables are exported separately, alongside `issues`.** Wisps (mail,
+MRs, escalations — ~14866+ rows town-wide) live in their own `wisps` and
+`wisp_events` tables, are excluded from Dolt commit history (`dolt_ignore`),
+and are NOT rows in the `issues` table, so a plain `SELECT * FROM issues`
+never captures them (hq-6loo). Without the separate export below, this
+"last-resort recovery layer" cannot recover the data it exists for.
+
+Historical note: earlier revisions of this script called `bd export --db
+"$DB" --format jsonl`. Both flags were invalid outside proxied-server mode
+(`--format` doesn't exist; `--db` errors unless the server is proxied), so
+every invocation silently fell through to the SQL fallback below. The
+current script (`run.sh`) has dropped the `bd export` call entirely in favor
+of direct SQL against the shared Dolt server, which works unconditionally
+for any database by name.
 
 ```bash
 echo "=== JSONL Export ==="
 EXPORTED=0
 EXPORT_FAILED=0
+WISP_TABLES=("wisps" "wisp_events")
+WISP_EXPORTED=0
+WISP_EXPORT_FAILED=0
 
 mkdir -p "$JSONL_EXPORT_DIR"
 
@@ -57,45 +76,64 @@ for DB in "${PROD_DBS[@]}"; do
 
   echo "Exporting $DB..."
 
-  # Use bd export if available, otherwise query directly
-  if bd export --db "$DB" --format jsonl > "$EXPORT_FILE" 2>/dev/null; then
-    LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
-    FILE_SIZE=$(du -h "$EXPORT_FILE" | cut -f1)
-    echo "  $DB: $LINE_COUNT issues exported ($FILE_SIZE)"
+  # Query Dolt directly for issue data
+  dolt sql -q "SELECT * FROM issues ORDER BY id" \
+    --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
+    -d "$DB" --no-auto-commit --result-format json \
+    > "$EXPORT_FILE" 2>/dev/null
 
-    # Update latest symlink
+  if [ $? -eq 0 ] && [ -s "$EXPORT_FILE" ]; then
+    LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
+    echo "  $DB: exported via SQL ($LINE_COUNT lines)"
     ln -sf "$EXPORT_FILE" "$LATEST_LINK"
     EXPORTED=$((EXPORTED + 1))
   else
-    # Fallback: query Dolt directly for issue data
-    dolt sql -q "SELECT * FROM issues ORDER BY id" \
+    echo "  WARN: $DB export failed"
+    rm -f "$EXPORT_FILE"
+    EXPORT_FAILED=$((EXPORT_FAILED + 1))
+  fi
+
+  # Export wisp tables alongside issues, when present, into their own files.
+  for TABLE in "${WISP_TABLES[@]}"; do
+    WISP_EXPORT_FILE="$JSONL_EXPORT_DIR/${DB}-${TABLE}-$(date +%Y%m%d-%H%M).jsonl"
+    WISP_LATEST_LINK="$JSONL_EXPORT_DIR/${DB}-${TABLE}-latest.jsonl"
+
+    dolt sql -q "SELECT * FROM \`$TABLE\` ORDER BY id" \
       --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
       -d "$DB" --no-auto-commit --result-format json \
-      > "$EXPORT_FILE" 2>/dev/null
+      > "$WISP_EXPORT_FILE" 2>/dev/null
 
-    if [ $? -eq 0 ] && [ -s "$EXPORT_FILE" ]; then
-      LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
-      echo "  $DB: exported via SQL ($LINE_COUNT lines)"
-      ln -sf "$EXPORT_FILE" "$LATEST_LINK"
-      EXPORTED=$((EXPORTED + 1))
+    if [ $? -eq 0 ] && [ -s "$WISP_EXPORT_FILE" ]; then
+      WISP_LINE_COUNT=$(wc -l < "$WISP_EXPORT_FILE" | tr -d ' ')
+      echo "  $DB/$TABLE: exported via SQL ($WISP_LINE_COUNT lines)"
+      ln -sf "$WISP_EXPORT_FILE" "$WISP_LATEST_LINK"
+      WISP_EXPORTED=$((WISP_EXPORTED + 1))
     else
-      echo "  WARN: $DB export failed"
-      rm -f "$EXPORT_FILE"
-      EXPORT_FAILED=$((EXPORT_FAILED + 1))
+      echo "  $DB/$TABLE: skipped or failed (table absent or empty)"
+      rm -f "$WISP_EXPORT_FILE"
+      WISP_EXPORT_FAILED=$((WISP_EXPORT_FAILED + 1))
     fi
-  fi
+  done
 done
 
-# Prune old exports (keep last 24 snapshots per DB)
+# Prune old exports (keep last 24 snapshots per DB, per table)
 for DB in "${PROD_DBS[@]}"; do
   SNAPSHOTS=$(ls -t "$JSONL_EXPORT_DIR/${DB}-2"*.jsonl 2>/dev/null | tail -n +25)
   if [ -n "$SNAPSHOTS" ]; then
     echo "$SNAPSHOTS" | xargs rm -f
     echo "Pruned old $DB snapshots"
   fi
+  for TABLE in "${WISP_TABLES[@]}"; do
+    WISP_SNAPSHOTS=$(ls -t "$JSONL_EXPORT_DIR/${DB}-${TABLE}-2"*.jsonl 2>/dev/null | tail -n +25)
+    if [ -n "$WISP_SNAPSHOTS" ]; then
+      echo "$WISP_SNAPSHOTS" | xargs rm -f
+      echo "Pruned old $DB/$TABLE snapshots"
+    fi
+  done
 done
 
 echo "Exported: $EXPORTED, failed: $EXPORT_FAILED"
+echo "Wisp tables exported: $WISP_EXPORTED, failed: $WISP_EXPORT_FAILED"
 ```
 
 ## Step 2: Git commit and push
@@ -112,12 +150,18 @@ BACKUP_REPO="$HOME/gt/.dolt-archive/git"
 if [ -d "$BACKUP_REPO/.git" ]; then
   cd "$BACKUP_REPO"
 
-  # Copy latest JSONL files
+  # Copy latest JSONL files (issues, plus wisp tables when present)
   for DB in "${PROD_DBS[@]}"; do
     LATEST="$JSONL_EXPORT_DIR/${DB}-latest.jsonl"
     if [ -f "$LATEST" ]; then
       cp "$(readlink "$LATEST" || echo "$LATEST")" "$BACKUP_REPO/${DB}.jsonl"
     fi
+    for TABLE in "${WISP_TABLES[@]}"; do
+      WISP_LATEST="$JSONL_EXPORT_DIR/${DB}-${TABLE}-latest.jsonl"
+      if [ -f "$WISP_LATEST" ]; then
+        cp "$(readlink "$WISP_LATEST" || echo "$WISP_LATEST")" "$BACKUP_REPO/${DB}-${TABLE}.jsonl"
+      fi
+    done
   done
 
   # Check for changes
@@ -252,11 +296,11 @@ echo "Verified: $VERIFY_PASSED, failed: $VERIFY_FAILED"
 ## Record Result
 
 ```bash
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), verify=$VERIFY_PASSED/$((VERIFY_PASSED + VERIFY_FAILED))"
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), wisps=$WISP_EXPORTED/$((WISP_EXPORTED + WISP_EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), verify=$VERIFY_PASSED/$((VERIFY_PASSED + VERIFY_FAILED))"
 echo "=== $SUMMARY ==="
 
 RESULT="success"
-if [ "$EXPORT_FAILED" -gt 0 ] || [ "$DOLT_PUSH_FAILED" -gt 0 ] || [ "$VERIFY_FAILED" -gt 0 ]; then
+if [ "$EXPORT_FAILED" -gt 0 ] || [ "$WISP_EXPORT_FAILED" -gt 0 ] || [ "$DOLT_PUSH_FAILED" -gt 0 ] || [ "$VERIFY_FAILED" -gt 0 ]; then
   RESULT="warning"
 fi
 
@@ -267,5 +311,11 @@ if [ "$EXPORT_FAILED" -gt 0 ]; then
   gt escalate "JSONL export failed for $EXPORT_FAILED databases" \
     --severity critical \
     --reason "JSONL is our last-resort recovery layer. $EXPORT_FAILED databases failed to export."
+fi
+
+if [ "$WISP_EXPORT_FAILED" -gt 0 ]; then
+  gt escalate "Wisp table export failed for $WISP_EXPORT_FAILED database/table pairs" \
+    --severity critical \
+    --reason "Wisps (mail, MRs, escalations) have no Dolt commit history and are otherwise unrecoverable."
 fi
 ```

@@ -107,6 +107,15 @@ EXPORTED=0
 EXPORT_FAILED=0
 EXPORT_ERRORS=""
 
+# Wisp/wisp-event tables hold mail, MRs, and escalations (~14866+ rows
+# town-wide). They are excluded from Dolt commit history (dolt_ignore) and
+# from the `issues` table this loop otherwise exports, so without a separate
+# export they have zero coverage in this last-resort recovery layer (hq-6loo).
+WISP_TABLES=("wisps" "wisp_events")
+WISP_EXPORTED=0
+WISP_EXPORT_FAILED=0
+WISP_EXPORT_ERRORS=""
+
 for DB in "${PROD_DBS[@]}"; do
   EXPORT_FILE="$JSONL_EXPORT_DIR/${DB}-$(date +%Y%m%d-%H%M).jsonl"
   LATEST_LINK="$JSONL_EXPORT_DIR/${DB}-latest.jsonl"
@@ -131,18 +140,49 @@ for DB in "${PROD_DBS[@]}"; do
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB} "
   fi
+
+  # Export wisp tables alongside issues, when present, into their own files.
+  for TABLE in "${WISP_TABLES[@]}"; do
+    if ! dolt_query "$DB" "SHOW TABLES LIKE '$TABLE'" 2>/dev/null | grep -q "$TABLE"; then
+      log "  $DB/$TABLE: skipped (no $TABLE table)"
+      continue
+    fi
+
+    WISP_EXPORT_FILE="$JSONL_EXPORT_DIR/${DB}-${TABLE}-$(date +%Y%m%d-%H%M).jsonl"
+    WISP_LATEST_LINK="$JSONL_EXPORT_DIR/${DB}-${TABLE}-latest.jsonl"
+
+    if dolt_query_json "$DB" "SELECT * FROM \`$TABLE\` ORDER BY id" > "$WISP_EXPORT_FILE" 2>/dev/null && [[ -s "$WISP_EXPORT_FILE" ]]; then
+      WISP_LINE_COUNT=$(wc -l < "$WISP_EXPORT_FILE" | tr -d ' ')
+      log "  $DB/$TABLE: exported via SQL ($WISP_LINE_COUNT lines)"
+      ln -sf "$(basename "$WISP_EXPORT_FILE")" "$WISP_LATEST_LINK"
+      WISP_EXPORTED=$((WISP_EXPORTED + 1))
+    else
+      log "  WARN: $DB/$TABLE export failed"
+      rm -f "$WISP_EXPORT_FILE"
+      WISP_EXPORT_FAILED=$((WISP_EXPORT_FAILED + 1))
+      WISP_EXPORT_ERRORS="${WISP_EXPORT_ERRORS}${DB}/${TABLE} "
+    fi
+  done
 done
 
-# Prune old exports (keep last 24 snapshots per DB)
+# Prune old exports (keep last 24 snapshots per DB, per table)
 for DB in "${PROD_DBS[@]}"; do
   SNAPSHOTS=$(ls -t "$JSONL_EXPORT_DIR/${DB}-2"*.jsonl 2>/dev/null | tail -n +25)
   if [[ -n "$SNAPSHOTS" ]]; then
     echo "$SNAPSHOTS" | xargs rm -f
     log "Pruned old $DB snapshots"
   fi
+  for TABLE in "${WISP_TABLES[@]}"; do
+    WISP_SNAPSHOTS=$(ls -t "$JSONL_EXPORT_DIR/${DB}-${TABLE}-2"*.jsonl 2>/dev/null | tail -n +25)
+    if [[ -n "$WISP_SNAPSHOTS" ]]; then
+      echo "$WISP_SNAPSHOTS" | xargs rm -f
+      log "Pruned old $DB/$TABLE snapshots"
+    fi
+  done
 done
 
 log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
+log "Wisp table export: $WISP_EXPORTED succeeded, $WISP_EXPORT_FAILED failed"
 
 # --- Step 2: Git commit and push ---------------------------------------------
 
@@ -152,7 +192,7 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
   log "=== Git Push ==="
 
-  # Copy latest JSONL files to git repo
+  # Copy latest JSONL files to git repo (issues, plus wisp tables when present)
   for DB in "${PROD_DBS[@]}"; do
     LATEST="$JSONL_EXPORT_DIR/${DB}-latest.jsonl"
     if [[ -L "$LATEST" ]]; then
@@ -163,6 +203,18 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
     elif [[ -f "$LATEST" ]]; then
       cp "$LATEST" "$BACKUP_REPO/${DB}.jsonl"
     fi
+
+    for TABLE in "${WISP_TABLES[@]}"; do
+      WISP_LATEST="$JSONL_EXPORT_DIR/${DB}-${TABLE}-latest.jsonl"
+      if [[ -L "$WISP_LATEST" ]]; then
+        WISP_REAL_FILE="$JSONL_EXPORT_DIR/$(readlink "$WISP_LATEST")"
+        if [[ -f "$WISP_REAL_FILE" ]]; then
+          cp "$WISP_REAL_FILE" "$BACKUP_REPO/${DB}-${TABLE}.jsonl"
+        fi
+      elif [[ -f "$WISP_LATEST" ]]; then
+        cp "$WISP_LATEST" "$BACKUP_REPO/${DB}-${TABLE}.jsonl"
+      fi
+    done
   done
 
   cd "$BACKUP_REPO"
@@ -234,11 +286,11 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED))"
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), wisps=$WISP_EXPORTED/$((WISP_EXPORTED + WISP_EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED))"
 log "$SUMMARY"
 
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$WISP_EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
   RESULT="warning"
 fi
 
@@ -249,6 +301,12 @@ if [[ "$EXPORT_FAILED" -gt 0 ]]; then
   gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
     -s critical \
     --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>/dev/null || true
+fi
+
+if [[ "$WISP_EXPORT_FAILED" -gt 0 ]]; then
+  gt escalate "dolt-archive: wisp table export failed for $WISP_EXPORT_FAILED database/table pairs ($WISP_EXPORT_ERRORS)" \
+    -s critical \
+    --reason "Wisps (mail, MRs, escalations) have no Dolt commit history and are otherwise unrecoverable. Failed: $WISP_EXPORT_ERRORS" 2>/dev/null || true
 fi
 
 log "Done."
