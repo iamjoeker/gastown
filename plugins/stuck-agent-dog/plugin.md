@@ -385,6 +385,16 @@ For DEACON stuck (stale heartbeat):
 3. If central health is `agent-hung` → observe/report only; do not restart polecat research sessions
 4. If confirmed mass death remains after live re-check (threshold default 3) → escalate and skip all per-agent actions
 
+**STRANDED is a fifth case, checked before 1/2 fire (gt-j994, mirrors hq-o3xwk):**
+a session-dead or agent-dead polecat with no MR anywhere can still be finished,
+not crashed — pushed to the remote with no MR ever created. `has_submitted_mr`
+alone cannot see this: it only distinguishes "in the queue" from "not in the
+queue", and a never-submitted branch reads as "not in the queue" either way.
+The executable script (`pushed_unsubmitted_branch`) checks the push remote
+directly: local `HEAD` confirmed present on `origin` and ahead of `main`. When
+true, the polecat is submitted via `gt mq submit` instead of restarted —
+restarting here would destroy the exact work a restart exists to protect.
+
 ## Step 5: Mass death check
 
 If multiple active polecats crash in the same cycle, this may indicate a
