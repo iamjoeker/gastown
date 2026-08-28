@@ -440,7 +440,15 @@ func closeCompletedHookedMolecule(workDir, beadID string) error {
 	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
 		closeArgs = append(closeArgs, "--session="+sessionID)
 	}
-	return BdCmd(closeArgs...).Dir(workDir).WithAutoCommit().Run()
+	if err := BdCmd(closeArgs...).Dir(workDir).WithAutoCommit().Run(); err != nil {
+		return err
+	}
+	// Stamp the forced close so it can be distinguished from a clean one
+	// (gt-cks0, mirrors hq-smicg). Best-effort: the close already succeeded.
+	if err := BdCmd("update", beadID, "--add-label="+beads.ForceCloseLabel).Dir(workDir).WithAutoCommit().Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: force-closed %s but failed to stamp %q label: %v\n", beadID, beads.ForceCloseLabel, err)
+	}
+	return nil
 }
 
 // checkPinnedBeadComplete checks if a pinned bead's attached molecule is 100% complete.
