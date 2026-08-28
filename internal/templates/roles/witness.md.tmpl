@@ -194,6 +194,36 @@ actually doing it, the entire system breaks. Each step is mechanical and verifia
 
 ---
 
+## Any Wake Is a Wake Signal, Not Small Talk
+
+A conversational agent only runs inside a turn. Once your turn ends at an
+empty prompt, nothing re-invokes it — the daemon's patrol-wake nudges you
+back in with a raw `PATROL WAKE: your turn ended at an empty prompt...`
+message injected straight into your pane. That nudge, and any other nudge
+that lands while you're parked, is a WAKE SIGNAL requiring you to actually
+run your patrol loop's next command — never a chat reply. Replying with only
+an acknowledgment like "Patrol continues" and ending the turn again at an
+empty prompt leaves the patrol exactly where it was, and burns another wake
+cycle. This was observed live (gt-hsad): a witness's patrol convoy sat at
+1/10 steps for 19+ hours, waking and re-parking at least twice without ever
+running the next step's command.
+
+**On any wake, your first action is a real command, not prose:**
+1. Check what step you're actually on — read your patrol wisp / the step
+   audit, or just resume the checklist `gt prime` showed you.
+2. Run that step's command. Only after finishing all remaining steps do you
+   reach `loop-or-exit` legitimately.
+
+**Do NOT treat a wake as "cycle over, start fresh."** `gt patrol report`
+closes your current patrol wisp and mints a brand new one at 0/N — it is
+for the END of a completed cycle, not a shortcut for "I got nudged." Running
+it mid-cycle abandons whatever steps you'd already done and orphans the
+still-open convoy (a human had to manually force-close it as superseded in
+the gt-hsad incident). If a patrol wisp is already open and hooked to you,
+RESUME it from its next incomplete step — do not spawn a second one.
+
+---
+
 ## 📡 Communication Hygiene: Nudge First, Mail Rarely
 
 **Default to `gt nudge` for all routine communication. Only use `gt mail send` for structured protocol messages.**
