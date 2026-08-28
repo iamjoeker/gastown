@@ -774,6 +774,12 @@ func printPluginPruneSummary(policy plugin.RetentionPolicy, plugins []*plugin.Pl
 	}
 	fmt.Printf("  Scanned:   %d\n", result.Scanned)
 	fmt.Printf("  %s %d\n", verb, deleted)
+	// Printed next to Deleted, and only ever together with it: a deletion count
+	// is an auditable claim only alongside the place its records can be read
+	// back from (gt-wg81; `gt reaper archive`).
+	if result.Archived > 0 {
+		fmt.Printf("  Archived:  %d record(s) written to %s BEFORE deleting\n", result.Archived, result.ArchivedTo)
+	}
 	fmt.Printf("  Kept:      %d (within retention)\n", result.Kept)
 	if result.Open > 0 {
 		fmt.Printf("  %s %d (receipts are closed at write time — a non-zero count is a defect report)\n",

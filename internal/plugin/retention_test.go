@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/reaper"
 )
 
 func cooldownPlugin(name, duration string) *Plugin {
@@ -228,6 +230,9 @@ else:
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("BD_ARGS_LOG", logPath)
 	t.Setenv("BD_ROWS", rowsPath)
+	// Isolate the durable archive PruneReceipts now writes to before deleting
+	// (gt-wg81) from the real user's ~/.gt/wisp-archive.
+	t.Setenv(reaper.ArchiveDirEnv, filepath.Join(t.TempDir(), "wisp-archive"))
 
 	return NewRecorder(townRoot), logPath
 }
@@ -405,6 +410,116 @@ func TestPruneReceiptsReportsTheCapItHit(t *testing.T) {
 	}
 	if result.Remaining != 3 {
 		t.Errorf("Remaining = %d, want 3", result.Remaining)
+	}
+}
+
+// failingReceiptArchive is an Archiver that cannot keep a record — the
+// property under test is what PruneReceipts does when it meets one (gt-wg81,
+// mirrors internal/cmd/compact_archive_test.go's failingArchive).
+type failingReceiptArchive struct{ calls int }
+
+func (a *failingReceiptArchive) ArchiveWisps(records []reaper.ArchivedWisp) error {
+	a.calls++
+	return fmt.Errorf("disk full")
+}
+func (a *failingReceiptArchive) Location() string { return "/nowhere" }
+
+func TestArchiveReceiptsHoldsEverythingWhenTheRecordCannotBeWritten(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("fake bd stub needs python3")
+	}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	recorder, _ := fakeBDRecorder(t, []map[string]any{
+		receiptFixture("gt-old-1", "rebuild-gt", now.Add(-400*time.Hour)),
+	})
+	eligible := []PrunedReceipt{{ID: "gt-old-1", Plugin: "rebuild-gt"}}
+	result := &ReceiptPruneResult{}
+	archive := &failingReceiptArchive{}
+
+	if recorder.archiveReceiptsTo(eligible, now, archive, result) {
+		t.Fatal("archiveReceiptsTo returned true after the archive failed — the caller " +
+			"would then delete a receipt that nothing anywhere records, which is gt-wg81")
+	}
+	if archive.calls != 1 {
+		t.Errorf("ArchiveWisps calls = %d, want 1", archive.calls)
+	}
+	if result.Archived != 0 || result.ArchivedTo != "" {
+		t.Errorf("Archived/ArchivedTo = %d/%q, want 0/\"\" — a failed archive must not "+
+			"be reported as a kept record", result.Archived, result.ArchivedTo)
+	}
+}
+
+func TestPruneReceiptsHoldsEligibleReceiptsWhenArchiveIsUnavailable(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("fake bd stub needs python3")
+	}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	recorder, logPath := fakeBDRecorder(t, []map[string]any{
+		receiptFixture("gt-old-1", "rebuild-gt", now.Add(-400*time.Hour)),
+	})
+	// A file where the archive directory should be forces NewFileArchive to
+	// fail (it cannot MkdirAll through a regular file), simulating an
+	// unwritable archive without touching the real one.
+	blocked := filepath.Join(t.TempDir(), "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0644); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	t.Setenv(reaper.ArchiveDirEnv, blocked)
+	policy := NewRetentionPolicy([]*Plugin{cooldownPlugin("rebuild-gt", "1h")})
+
+	result, err := recorder.PruneReceipts(policy, now, ReceiptPruneOptions{})
+	if err != nil {
+		t.Fatalf("PruneReceipts: %v", err)
+	}
+	if len(result.Deleted) != 0 {
+		t.Fatalf("deleted %d receipt(s) with no durable record of them — this is gt-wg81's exact "+
+			"shape: a destructive cleanup whose own record can be lost", len(result.Deleted))
+	}
+	if len(result.Held) != 1 || result.Held[0].ID != "gt-old-1" {
+		t.Errorf("Held = %+v, want [gt-old-1]", result.Held)
+	}
+	if len(result.Errors) == 0 {
+		t.Error("expected an error naming the unwritable archive")
+	}
+	args, _ := os.ReadFile(logPath)
+	if strings.Contains(string(args), "delete ") {
+		t.Errorf("issued a delete despite the archive being unwritable:\n%s", args)
+	}
+}
+
+// TestPruneReceiptsArchivesBeforeDeleting is the positive half: plant a
+// known-doomed receipt, run the prune, and confirm the durable archive names
+// it afterwards — the verification CLAUDE.md prescribes for this bug class
+// rather than trusting a clean-looking summary.
+func TestPruneReceiptsArchivesBeforeDeleting(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("fake bd stub needs python3")
+	}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	recorder, _ := fakeBDRecorder(t, []map[string]any{
+		receiptFixture("gt-doomed-1", "rebuild-gt", now.Add(-400*time.Hour)),
+	})
+	archiveDir := os.Getenv(reaper.ArchiveDirEnv)
+	policy := NewRetentionPolicy([]*Plugin{cooldownPlugin("rebuild-gt", "1h")})
+
+	result, err := recorder.PruneReceipts(policy, now, ReceiptPruneOptions{})
+	if err != nil {
+		t.Fatalf("PruneReceipts: %v", err)
+	}
+	if len(result.Deleted) != 1 || result.Deleted[0].ID != "gt-doomed-1" {
+		t.Fatalf("expected gt-doomed-1 to be deleted, got %+v", result.Deleted)
+	}
+	if result.Archived != 1 {
+		t.Errorf("Archived = %d, want 1", result.Archived)
+	}
+
+	scan, err := reaper.ReadArchive(archiveDir, reaper.ArchiveFilter{ID: "gt-doomed-1"})
+	if err != nil {
+		t.Fatalf("ReadArchive: %v", err)
+	}
+	if len(scan.Records) != 1 {
+		t.Fatalf("the deleted receipt's own record is gone from the place that survives its "+
+			"deletion — got %d records, want 1", len(scan.Records))
 	}
 }
 

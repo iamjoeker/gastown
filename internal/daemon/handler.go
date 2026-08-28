@@ -297,8 +297,8 @@ func (d *Daemon) prunePluginReceipts(rigsConfig *config.RigsConfig) {
 	// population of lines that drowns this log. Remaining is the post-run
 	// re-read, which is the number worth believing.
 	if len(result.Deleted) > 0 || result.Deferred > 0 {
-		d.logger.Printf("Handler: pruned %d plugin receipt(s) (kept %d, held %d, deferred %d, %d remaining)",
-			len(result.Deleted), result.Kept, len(result.Held), result.Deferred, result.Remaining)
+		d.logger.Printf("Handler: pruned %d plugin receipt(s) (archived %d to %s, kept %d, held %d, deferred %d, %d remaining)",
+			len(result.Deleted), result.Archived, result.ArchivedTo, result.Kept, len(result.Held), result.Deferred, result.Remaining)
 	}
 	for _, e := range result.Errors {
 		d.logger.Printf("Handler: receipt prune: %s", e)

@@ -263,8 +263,17 @@ type ReceiptPruneResult struct {
 	// Remaining is a re-read: how many receipts are in the table after the run.
 	// It is the control on the numbers above, which are derived from what this
 	// process believes it did.
-	Remaining int      `json:"remaining"`
-	Errors    []string `json:"errors,omitempty"`
+	Remaining int `json:"remaining"`
+	// Archived counts the records written and fsynced to the durable wisp
+	// archive BEFORE the delete pass ran, and ArchivedTo names where they went.
+	// They exist because "N deleted" is only an auditable claim next to the
+	// place the N records can be read back from (gt-wg81; see
+	// retention_archive.go) — the wisps table this deletes from is
+	// dolt-ignored, so a deletion with no archive record is unrecoverable and
+	// unnamed.
+	Archived   int      `json:"archived,omitempty"`
+	ArchivedTo string   `json:"archived_to,omitempty"`
+	Errors     []string `json:"errors,omitempty"`
 }
 
 // receiptRow is one row of the receipts projection.
@@ -391,6 +400,14 @@ func (r *Recorder) PruneReceipts(policy RetentionPolicy, now time.Time, opts Rec
 
 	if opts.DryRun {
 		result.Deleted = eligible
+		result.Remaining = r.countReceipts(result)
+		return result, nil
+	}
+
+	// The record goes to durable storage before the first deletion, or nothing
+	// is deleted this run (gt-wg81; see retention_archive.go).
+	if !r.archiveReceipts(eligible, now, result) {
+		result.Held = append(result.Held, eligible...)
 		result.Remaining = r.countReceipts(result)
 		return result, nil
 	}
