@@ -1283,9 +1283,13 @@ case "$*" in
   "--allow-stale version")
     exit 0
     ;;
-	  "--allow-stale list --status=open --json --limit=0 --flat"|"list --status=open --json --limit=0 --flat")
+	  "--allow-stale list --status=open --no-pinned --json --limit=0 --flat"|"list --status=open --no-pinned --json --limit=0 --flat")
 	assert_town_read_env
 	    echo '[{"id":"hq-cv-l9","title":"Cross-rig convoy","status":"open","description":"","issue_type":"convoy"}]'
+    ;;
+	  "--allow-stale list --status=open --pinned --json --limit=0 --flat"|"list --status=open --pinned --json --limit=0 --flat")
+	assert_town_read_env
+	    echo '[]'
     ;;
   "--allow-stale dep list hq-cv-l9 --direction=down --type=tracks --json"|"dep list hq-cv-l9 --direction=down --type=tracks --json")
     assert_town_read_env

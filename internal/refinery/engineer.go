@@ -2583,18 +2583,12 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	routingReadEnv := beads.BuildReadOnlyRoutingBDEnv(os.Environ(), townBeads)
 
 	// List all open issues and filter locally so legacy type=convoy beads remain visible.
-	listArgs := beads.InjectFlatForListJSON([]string{"list", "--status=open", "--json", "--limit=0"})
-	listArgs = beads.MaybePrependAllowStaleWithEnv(townReadEnv, listArgs)
-	listCmd := beads.Command(townBeads, townBeads, beads.ReadOnlyPinned, listArgs...)
-	var stdout bytes.Buffer
-	listCmd.Stdout = &stdout
-
-	if err := listCmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to list convoys: %v\n", err)
-		return nil
-	}
-
-	var convoys []struct {
+	//
+	// Asked as both pinned halves and unioned by ID: `bd list --status=open`
+	// defaults to `--no-pinned` with no include-pinned flag, so a pinned convoy
+	// would otherwise be invisible to this closer forever (same shape as
+	// gt-z5h7, gt-qee3, hq-ztj4g).
+	type convoyIssue struct {
 		ID          string   `json:"id"`
 		Title       string   `json:"title"`
 		Status      string   `json:"status"`
@@ -2602,9 +2596,32 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 		IssueType   string   `json:"issue_type"`
 		Labels      []string `json:"labels"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to parse convoy list: %v\n", err)
-		return nil
+	var convoys []convoyIssue
+	seenConvoys := make(map[string]bool)
+	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
+		listArgs := beads.InjectFlatForListJSON([]string{"list", "--status=open", pinnedFilter, "--json", "--limit=0"})
+		listArgs = beads.MaybePrependAllowStaleWithEnv(townReadEnv, listArgs)
+		listCmd := beads.Command(townBeads, townBeads, beads.ReadOnlyPinned, listArgs...)
+		var stdout bytes.Buffer
+		listCmd.Stdout = &stdout
+
+		if err := listCmd.Run(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to list convoys (%s): %v\n", pinnedFilter, err)
+			return nil
+		}
+
+		var half []convoyIssue
+		if err := json.Unmarshal(stdout.Bytes(), &half); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to parse convoy list (%s): %v\n", pinnedFilter, err)
+			return nil
+		}
+		for _, c := range half {
+			if seenConvoys[c.ID] {
+				continue
+			}
+			seenConvoys[c.ID] = true
+			convoys = append(convoys, c)
+		}
 	}
 
 	var closed []convoyInfo
