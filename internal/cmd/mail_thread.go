@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -160,6 +161,11 @@ func runMailReply(cmd *cobra.Command, args []string) error {
 	if err := router.ClearReplyReminders(from, reply.ThreadID); err != nil {
 		style.PrintWarning("could not clear satisfied reply reminders: %v", err)
 	}
+
+	// Log mail event to activity feed. Without this, a reply is silently
+	// worse than a fresh send at waking a parked agent: send emits this
+	// event and reply did not (gt-bq4m, mirrors hq-9uslp).
+	_ = events.LogFeed(events.TypeMail, from, events.MailPayload(reply.To, subject))
 
 	fmt.Printf("%s Reply sent to %s\n", style.Bold.Render("✓"), original.From)
 	fmt.Printf("  Subject: %s\n", subject)
