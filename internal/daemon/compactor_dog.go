@@ -322,18 +322,13 @@ func (d *Daemon) compactDatabase(dbName string) error {
 		return fmt.Errorf("post-compact row counts: %w", err)
 	}
 
-	for table, preCount := range preCounts {
-		postCount, ok := postCounts[table]
-		if !ok {
-			return fmt.Errorf("integrity check: table %q missing after compaction", table)
-		}
-		if postCount < preCount {
-			return fmt.Errorf("integrity check: table %q lost rows: pre=%d post=%d", table, preCount, postCount)
-		}
-		if postCount > preCount {
-			d.logger.Printf("compactor_dog: %s: table %q gained %d rows during compaction (concurrent write, safe)",
-				dbName, table, postCount-preCount)
-		}
+	gained, err := compactorCheckIntegrity(preCounts, postCounts)
+	if err != nil {
+		return err
+	}
+	for table, delta := range gained {
+		d.logger.Printf("compactor_dog: %s: table %q gained %d rows during compaction (concurrent write, safe)",
+			dbName, table, delta)
 	}
 	d.logger.Printf("compactor_dog: %s: integrity verified (%d tables match)", dbName, len(preCounts))
 
@@ -499,21 +494,13 @@ func (d *Daemon) surgicalRebaseOnce(dbName string, keepRecent int) error {
 	postCounts, err := d.compactorGetRowCounts(db, dbName)
 	if err != nil {
 		d.logger.Printf("compactor_dog: %s: WARNING: could not verify row counts after rebase: %v", dbName, err)
+	} else if gained, checkErr := compactorCheckIntegrity(preCounts, postCounts); checkErr != nil {
+		d.surgicalCleanup(db, baseBranch, workBranch)
+		return checkErr
 	} else {
-		for table, preCount := range preCounts {
-			postCount, ok := postCounts[table]
-			if !ok {
-				d.surgicalCleanup(db, baseBranch, workBranch)
-				return fmt.Errorf("integrity: table %q missing after rebase", table)
-			}
-			if postCount < preCount {
-				d.surgicalCleanup(db, baseBranch, workBranch)
-				return fmt.Errorf("integrity: table %q lost rows: pre=%d post=%d", table, preCount, postCount)
-			}
-			if postCount > preCount {
-				d.logger.Printf("compactor_dog: %s: table %q gained %d rows during rebase (concurrent write, safe)",
-					dbName, table, postCount-preCount)
-			}
+		for table, delta := range gained {
+			d.logger.Printf("compactor_dog: %s: table %q gained %d rows during rebase (concurrent write, safe)",
+				dbName, table, delta)
 		}
 		d.logger.Printf("compactor_dog: %s: integrity verified (%d tables)", dbName, len(preCounts))
 	}
@@ -672,6 +659,36 @@ func (d *Daemon) compactorGetRowCounts(db *sql.DB, dbName string) (map[string]in
 	}
 
 	return counts, nil
+}
+
+// compactorCheckIntegrity compares pre- and post-operation row counts and
+// reports a table that is missing or lost rows. It also returns the tables
+// that gained rows (safe: a concurrent write during compaction/rebase).
+//
+// An empty postCounts when preCounts is non-empty means the row-count query
+// itself came back empty (session hiccup, wrong db context) — not evidence
+// that every table vanished. Looping straight into the per-table comparison
+// would report that as "table X missing" for whichever table map iteration
+// landed on first, misreporting a query failure as confirmed data loss
+// (mirrors hq-emgkr).
+func compactorCheckIntegrity(preCounts, postCounts map[string]int) (map[string]int, error) {
+	if len(postCounts) == 0 && len(preCounts) > 0 {
+		return nil, fmt.Errorf("integrity check inconclusive: post-operation query returned 0 tables (expected %d) — cannot verify, not confirmed data loss", len(preCounts))
+	}
+	gained := make(map[string]int)
+	for table, preCount := range preCounts {
+		postCount, ok := postCounts[table]
+		if !ok {
+			return nil, fmt.Errorf("integrity check: table %q missing after operation", table)
+		}
+		if postCount < preCount {
+			return nil, fmt.Errorf("integrity check: table %q lost rows: pre=%d post=%d", table, preCount, postCount)
+		}
+		if postCount > preCount {
+			gained[table] = postCount - preCount
+		}
+	}
+	return gained, nil
 }
 
 // compactorRunGC runs dolt gc via SQL on the running server after compaction.
