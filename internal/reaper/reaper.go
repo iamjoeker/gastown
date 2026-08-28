@@ -1779,6 +1779,129 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	return result, nil
 }
 
+// AutoCloseAckedMail closes gt:message issues that have been delivery-acked
+// but never read.
+//
+// AutoCloseExemptLabels blanket-exempts gt:message from AutoClose on the
+// premise that reading a message closes its bead, so an OPEN one is by
+// definition unread (gt-jbn). Delivery acking breaks that premise: `gt mail
+// check --inject` writes `delivery:acked` on every unread message purely to
+// record that it was DELIVERED, without reading or closing it, so an open
+// gt:message bead can carry `delivery:acked` indefinitely. Measured on hq
+// 2026-08-28: 96 of ~235 open P1 issues were exactly this — delivered, acked,
+// never closed — inflating every ready-work count derived from status=open by
+// roughly 40% (gt-ljun).
+//
+// This closes only the ACKED ones, past staleAge. Mail that is still pending
+// delivery (no recipient has even acknowledged receiving it yet) stays under
+// the original AutoCloseExemptLabels exemption — closing that would be silent
+// data loss, not cleanup.
+func AutoCloseAckedMail(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
+	defer cancel()
+
+	staleCutoff := time.Now().UTC().Add(-staleAge)
+	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
+
+	selectQuery := fmt.Sprintf(`
+		SELECT i.id, i.title, i.updated_at FROM `+"`%s`"+`.issues i
+		WHERE i.status IN ('open', 'in_progress')
+		AND i.updated_at < ?
+		AND i.id IN (
+			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l WHERE l.label = 'gt:message'
+		)
+		AND i.id IN (
+			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l WHERE l.label = 'delivery:acked'
+		)`, dbName, dbName, dbName)
+
+	rows, err := db.QueryContext(ctx, selectQuery, staleCutoff)
+	if err != nil {
+		if isTableNotFound(err) {
+			return result, nil // issues/labels not on this server
+		}
+		return nil, fmt.Errorf("select acked mail: %w", err)
+	}
+	type candidate struct {
+		id        string
+		title     string
+		updatedAt time.Time
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.title, &c.updatedAt); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan acked mail id: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+
+	now := time.Now().UTC()
+	ids := make([]string, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.id
+		result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
+			ID:       c.id,
+			Title:    c.title,
+			AgeDays:  int(now.Sub(c.updatedAt).Hours() / 24),
+			Database: dbName,
+		})
+	}
+
+	if dryRun {
+		result.Closed = len(ids)
+		return result, nil
+	}
+
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	defer session.release()
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	updateQuery := fmt.Sprintf(
+		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW(), close_reason = 'stale:acked-mail auto-closed by reaper' WHERE id IN (%s)",
+		dbName, strings.Join(placeholders, ","))
+	if _, err := session.conn.ExecContext(ctx, updateQuery, args...); err != nil {
+		return nil, fmt.Errorf("auto-close acked mail: %w", err)
+	}
+
+	if err := session.commit(ctx); err != nil {
+		// release rolls the UPDATE back, so nothing was closed.
+		result.ClosedEntries = nil
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "sql_commit_failed",
+			Message: fmt.Sprintf("sql commit after acked-mail auto-close failed, closures rolled back: %v", err),
+		})
+		return result, nil
+	}
+	result.Closed = len(ids)
+
+	commitMsg := fmt.Sprintf("reaper: auto-close %d acked mail issues in %s", len(ids), dbName)
+	if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		// "nothing to commit" is expected when the updated tables are dolt_ignored.
+		if !isNothingToCommit(err) {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after acked-mail auto-close failed: %v", err),
+			})
+		}
+	}
+
+	return result, nil
+}
+
 // batchDeleteRows deletes rows from a primary table and its auxiliary tables in
 // batches. It takes a sqlRunner rather than a *sql.DB so callers can hand it the
 // connection they pinned for the write sequence — every batch must run on the

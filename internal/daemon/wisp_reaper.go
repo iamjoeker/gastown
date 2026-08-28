@@ -482,13 +482,25 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 			continue
 		}
 		result, err := reaper.AutoClose(db, dbName, staleAge, dryRun)
-		db.Close()
 		if err != nil {
+			db.Close()
 			d.logger.Printf("wisp_reaper: %s: auto-close error: %v", dbName, err)
 			autoCloseErrors++
 			continue
 		}
 		totalAutoClosed += result.Closed
+
+		// Acked mail: delivery-acked gt:message beads that were never read, so
+		// AutoCloseExemptLabels' blanket gt:message exemption never touches
+		// them (gt-ljun). Same staleness threshold as the general sweep.
+		ackedResult, err := reaper.AutoCloseAckedMail(db, dbName, staleAge, dryRun)
+		db.Close()
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: auto-close acked mail error: %v", dbName, err)
+			autoCloseErrors++
+			continue
+		}
+		totalAutoClosed += ackedResult.Closed
 	}
 	if autoCloseErrors > 0 {
 		mol.failStep("auto-close", fmt.Sprintf("%d databases had auto-close errors", autoCloseErrors))

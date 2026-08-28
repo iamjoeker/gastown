@@ -516,12 +516,22 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 			}
 
 			result, err := reaper.AutoClose(db, dbName, staleAge, reaperDryRun)
-			db.Close()
 			if err != nil {
+				db.Close()
 				fmt.Fprintf(os.Stderr, "%s: auto-close error: %v\n", dbName, err)
 				continue
 			}
 			results = append(results, result)
+
+			// Acked mail: delivery-acked gt:message beads never read, exempt
+			// from the sweep above by AutoCloseExemptLabels (gt-ljun).
+			ackedResult, err := reaper.AutoCloseAckedMail(db, dbName, staleAge, reaperDryRun)
+			db.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: auto-close acked mail error: %v\n", dbName, err)
+				continue
+			}
+			results = append(results, ackedResult)
 		}
 
 		if reaperJSON {
@@ -651,6 +661,19 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 						entry.ID, entry.Title, entry.AgeDays, entry.Database)
 				}
 				totalClosed += closeResult.Closed
+			}
+
+			// Acked mail: delivery-acked gt:message beads never read, exempt
+			// from the general sweep above by AutoCloseExemptLabels (gt-ljun).
+			ackedMailResult, err := reaper.AutoCloseAckedMail(db, dbName, staleAge, reaperDryRun)
+			if err != nil {
+				fmt.Printf("%s: auto-close acked mail error: %v\n", dbName, err)
+			} else {
+				for _, entry := range ackedMailResult.ClosedEntries {
+					fmt.Printf("  %s %s (%dd stale, db:%s, acked mail)\n",
+						entry.ID, entry.Title, entry.AgeDays, entry.Database)
+				}
+				totalClosed += ackedMailResult.Closed
 			}
 
 			db.Close()
