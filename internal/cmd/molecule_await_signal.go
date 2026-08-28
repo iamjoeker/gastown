@@ -29,6 +29,12 @@ var (
 	awaitSignalAllRigs     bool
 )
 
+// awaitSignalPollInterval is how often waitForEventsFile checks the events
+// file for new lines. A var, not a const, so tests can lengthen it past a
+// short ctx timeout to force the ctx.Done() path without a ticker fire ever
+// happening first — nothing in production reassigns it.
+var awaitSignalPollInterval = 200 * time.Millisecond
+
 var moleculeAwaitSignalCmd = &cobra.Command{
 	Use:   "await-signal",
 	Short: "Wait for activity feed signal with timeout",
@@ -533,7 +539,7 @@ func waitForEventsFile(ctx context.Context, eventsPath, watchRig string) (*Await
 	// resume after EOF). Reader.ReadString properly retries the underlying
 	// file reader, picking up appended data between polls.
 	reader := bufio.NewReader(f)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(awaitSignalPollInterval)
 	defer ticker.Stop()
 
 	// A tick drains every complete line that has landed, not just one. With
@@ -550,37 +556,68 @@ func waitForEventsFile(ctx context.Context, eventsPath, watchRig string) (*Await
 	for {
 		select {
 		case <-ctx.Done():
+			// select does not prefer ctx.Done() over ticker.C, or vice versa,
+			// when both are ready: an event written after the last drain but
+			// before the deadline fires sits unread in the file at exactly the
+			// moment this case is chosen. Without one last drain here, that
+			// event is reported as a timeout even though it landed inside the
+			// wait window — an intermittent miss whose odds are the ratio of
+			// the poll interval to the wait length, not a permanent failure,
+			// which is exactly why it was hard to reproduce (gt-5sxz).
+			res, err := drainEventLines(reader, &partial, watchRig, &suppressed)
+			if err != nil {
+				return nil, err
+			}
+			if res != nil {
+				return res, nil
+			}
 			return &AwaitSignalResult{
 				Reason:     "timeout",
 				Suppressed: suppressed,
 			}, nil
 		case <-ticker.C:
-			for {
-				chunk, err := reader.ReadString('\n')
-				if chunk != "" {
-					partial.WriteString(chunk)
-				}
-				if err == io.EOF {
-					// No complete line yet — keep whatever fragment we hold.
-					break
-				}
-				if err != nil {
-					return nil, fmt.Errorf("reading events file: %w", err)
-				}
-
-				line := partial.String()
-				partial.Reset()
-				if !events.LineWakesRig(line, watchRig) {
-					suppressed++
-					continue
-				}
-				return &AwaitSignalResult{
-					Reason:     "signal",
-					Signal:     strings.TrimRight(line, "\n"),
-					Suppressed: suppressed,
-				}, nil
+			res, err := drainEventLines(reader, &partial, watchRig, &suppressed)
+			if err != nil {
+				return nil, err
+			}
+			if res != nil {
+				return res, nil
 			}
 		}
+	}
+}
+
+// drainEventLines reads every complete line currently available from reader,
+// evaluating each against watchRig. It returns a non-nil result the instant a
+// waking line is found, leaving any lines after it unread for the next call.
+// A nil result with a nil error means no waking line was available right now;
+// partial retains any trailing fragment across calls, and suppressed is
+// incremented for each line that was read but did not wake the watcher.
+func drainEventLines(reader *bufio.Reader, partial *strings.Builder, watchRig string, suppressed *int) (*AwaitSignalResult, error) {
+	for {
+		chunk, err := reader.ReadString('\n')
+		if chunk != "" {
+			partial.WriteString(chunk)
+		}
+		if err == io.EOF {
+			// No complete line yet — keep whatever fragment we hold.
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading events file: %w", err)
+		}
+
+		line := partial.String()
+		partial.Reset()
+		if !events.LineWakesRig(line, watchRig) {
+			*suppressed++
+			continue
+		}
+		return &AwaitSignalResult{
+			Reason:     "signal",
+			Signal:     strings.TrimRight(line, "\n"),
+			Suppressed: *suppressed,
+		}, nil
 	}
 }
 

@@ -1004,6 +1004,40 @@ func TestWaitForEventsFile_PartialLineIsNotAWake(t *testing.T) {
 	}
 }
 
+func TestWaitForEventsFile_EventJustBeforeDeadlineStillWakes(t *testing.T) {
+	// The race: select does not favor ctx.Done() or ticker.C when both are
+	// ready, and an event written after the last poll but before the deadline
+	// fires sits unread in the file at the instant ctx.Done() is chosen.
+	// Lengthening the poll interval past the ctx timeout forces that instant
+	// deterministically — no ticker fire happens at all, so this exercises only
+	// the ctx.Done() path (gt-5sxz).
+	oldInterval := awaitSignalPollInterval
+	awaitSignalPollInterval = time.Hour
+	t.Cleanup(func() { awaitSignalPollInterval = oldInterval })
+
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		appendEvents(t, eventsPath, evtGastownSling)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gastown")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Fatalf("reason = %q, want %q: the event landed 30ms before the deadline "+
+			"but with no ticker fire in between it was reported as a timeout", result.Reason, "signal")
+	}
+	if !strings.Contains(result.Signal, "gt-p54t") {
+		t.Errorf("Signal = %q, want the gastown sling", result.Signal)
+	}
+}
+
 func TestResolveAwaitSignalRig(t *testing.T) {
 	oldRig, oldAll := awaitSignalRig, awaitSignalAllRigs
 	t.Cleanup(func() {
