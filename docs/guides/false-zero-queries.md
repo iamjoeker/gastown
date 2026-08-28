@@ -128,6 +128,45 @@ The rule survives the fix, because the fix only covers this one command:
 > use `--json`. A rendered table is built for a reader; the characters it drops
 > are exactly the ones that make an identifier unique.
 
+## An unquoted predicate is a shell command, not a query
+
+`bd` has no JSONB containment operator. There is no `labels @> [...]` syntax —
+the documented way to filter on more than one label is repeated `--label`
+flags: `bd list --all --label type:plugin-run --label plugin:rebuild-gt
+--created-after 1h -n 1`. An agent that reaches for `@>` out of Postgres/JSONB
+familiarity is inventing syntax `bd` does not accept.
+
+That invention then compounds with a second, independent failure: run
+unquoted in a real shell, `bd query labels @> ["plugin:rebuild-gt"]` is not a
+query at all. The shell sees `>`, treats everything after it as a redirect
+target, creates a file, and runs `bd query labels` with the predicate gone.
+`bd` answers a different, valid-looking question and the caller reads the
+result as "no matching beads" — a false zero with no error anywhere in the
+chain (hq-m584 / gt-03lz).
+
+Observed 2026-08-10 in dog worker directories — the redirect targets
+themselves, left behind as zero-byte evidence:
+
+```
+bravo/plugin:dolt-backup            0 bytes
+bravo/["plugin:rebuild-gt"]       120 bytes   <- stdout of the mangled call
+bravo/plugin:submodule-commit       0 bytes
+charlie/plugin:dolt-archive         0 bytes
+charlie/"type:plugin-run"           0 bytes
+charlie/type:plugin-run             0 bytes
+```
+
+Two distinct quoting failures across two workers (bracketed-JSON and bare
+label forms) is proof this is not one bad script — it is a class of mistake
+any agent can make fresh by typing a query predicate straight into a shell.
+
+**Repair:** never hand-type a `bd query`/`bd list` predicate containing `>`,
+`<`, `|`, or unescaped brackets directly into a shell. Use the documented
+`--label` flag form, or the purpose-built surface if one exists — plugin run
+history in particular has one already: `gt plugin history <plugin-name>`.
+If a raw `bd query` expression is unavoidable, single-quote the whole
+expression so the shell cannot interpret any character inside it.
+
 ## What to use
 
 **To audit merge requests, use `gt mq list <rig> --status closed`.** It was the
@@ -181,6 +220,8 @@ rebuilding a store — could cost real data.
 
 - `gt-lf1n` — status panels querying only `hq`, so rig state read as absent.
 - `bd-99f` — `bd ready` leaking foreign rows across the same boundary.
+- `hq-m584` / `gt-03lz` — an unquoted `bd query` predicate eaten by the shell
+  as a redirect; see "An unquoted predicate is a shell command" above.
 
 Same shape each time: a query silently scoped to one store, rendering its
 partial view as a complete answer.

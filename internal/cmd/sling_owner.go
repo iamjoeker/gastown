@@ -189,6 +189,36 @@ func adoptMovedWorkBeadRows(townRoot string, ids []string, rows map[string]beadS
 	}
 }
 
+// adoptMovedTrackedDeps corrects convoy tracking for tracked issues that moved
+// to another rig after being enqueued. getIssueDetailsBatch resolves ids by
+// prefix, so a tracked bead moved elsewhere and closed at its filed-in copy
+// reads as "closed" here even though its live row, elsewhere, is still open.
+// Left uncorrected, a convoy auto-closes the moment the SOURCE copy closes,
+// regardless of whether the tracked work ever ran (gt-ju7k).
+//
+// Mirrors adoptMovedWorkBeadRows: only tracked deps that read closed/tombstone
+// via prefix routing pay for the extra lookup, and a bead that is genuinely
+// closed everywhere is left alone.
+func adoptMovedTrackedDeps(townRoot string, deps []trackedDependency) {
+	for i := range deps {
+		dep := &deps[i]
+		if beadStatusIsLive(dep.Status) {
+			continue
+		}
+		owner, err := resolveBeadOwner(townRoot, dep.ID)
+		if err != nil || owner == nil || !owner.Moved || owner.Info == nil {
+			continue
+		}
+		dep.Status = owner.Info.Status
+		if owner.Info.Title != "" {
+			dep.Title = owner.Info.Title
+		}
+		dep.IssueType = owner.Info.IssueType
+		dep.Assignee = owner.Info.Assignee
+		dep.Labels = owner.Info.Labels
+	}
+}
+
 // beadOwnedByRig reports whether beadID's live row lives in rigName. A non-nil
 // owner is used as given; otherwise ownership is resolved on the spot. Returns
 // false for an unnamed rig and for a bead that exists in no store — callers use

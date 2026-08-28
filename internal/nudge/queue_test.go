@@ -328,6 +328,106 @@ func TestDrainSkipsExpired(t *testing.T) {
 	}
 }
 
+// A TTL-expired nudge that Drain discards must leave a durable trace instead
+// of vanishing outright — that silent destruction is what ate 87 of 95 real
+// queued nudges (gt-1g2q/gt-ceoz).
+func TestDrainRecordsDiscardedExpiredNudge(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-discard-drain"
+
+	expired := QueuedNudge{
+		Sender:    "old-sender",
+		Message:   "stale message",
+		Timestamp: time.Now().Add(-time.Hour),
+		ExpiresAt: time.Now().Add(-30 * time.Minute),
+	}
+	if err := Enqueue(townRoot, session, expired); err != nil {
+		t.Fatalf("Enqueue expired: %v", err)
+	}
+
+	if _, err := Drain(townRoot, session); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	discarded, err := DiscardedSince(townRoot, session, time.Time{})
+	if err != nil {
+		t.Fatalf("DiscardedSince: %v", err)
+	}
+	if len(discarded) != 1 {
+		t.Fatalf("discarded log has %d entries, want 1: %+v", len(discarded), discarded)
+	}
+	if discarded[0].Sender != "old-sender" || discarded[0].Message != "stale message" {
+		t.Errorf("discarded[0] = %+v, want the expired nudge's content preserved", discarded[0])
+	}
+	if discarded[0].Reason != "ttl-expired-drain" {
+		t.Errorf("discarded[0].Reason = %q, want %q", discarded[0].Reason, "ttl-expired-drain")
+	}
+}
+
+// PurgeExpired is the sweep that runs when nobody is there to Drain — the
+// exact condition under which the original bug went unnoticed for weeks. It
+// must record discards too, not just Drain.
+func TestPurgeExpiredRecordsDiscard(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-discard-purge"
+
+	dead := QueuedNudge{Sender: "mayor", Message: "dead", ExpiresAt: time.Now().Add(-time.Hour)}
+	writeNudgeFile(t, townRoot, session, dead)
+
+	removed, err := PurgeExpired(townRoot, session)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	discarded, err := DiscardedSince(townRoot, session, time.Time{})
+	if err != nil {
+		t.Fatalf("DiscardedSince: %v", err)
+	}
+	if len(discarded) != 1 {
+		t.Fatalf("discarded log has %d entries, want 1: %+v", len(discarded), discarded)
+	}
+	if discarded[0].Reason != "ttl-expired-purge" {
+		t.Errorf("discarded[0].Reason = %q, want %q", discarded[0].Reason, "ttl-expired-purge")
+	}
+}
+
+// A live (non-expired) removal, e.g. RemoveByMessage retiring a delivered
+// notification, must NOT be recorded as a discard — that path removes a
+// nudge because it is spent, not because it was lost.
+func TestRemoveByMessageDoesNotRecordDiscard(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-no-discard-on-spend"
+
+	n := QueuedNudge{
+		Sender:    "mayor",
+		Message:   "mail notice",
+		Kind:      KindMail,
+		MessageID: "msg-1",
+	}
+	if err := Enqueue(townRoot, session, n); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	removed, err := RemoveByMessage(townRoot, session, "msg-1", "")
+	if err != nil {
+		t.Fatalf("RemoveByMessage: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	discarded, err := DiscardedSince(townRoot, session, time.Time{})
+	if err != nil {
+		t.Fatalf("DiscardedSince: %v", err)
+	}
+	if len(discarded) != 0 {
+		t.Errorf("discarded log has %d entries, want 0 for a spent (not lost) nudge: %+v", len(discarded), discarded)
+	}
+}
+
 func TestEnqueueQueueDepthLimit(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test-depth"
