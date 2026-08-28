@@ -3393,6 +3393,36 @@ func hasBusyIndicator(line string) bool {
 	return false
 }
 
+// blockedIndicators names the substrings an agent TUI renders in its footer
+// while holding open a selection dialog addressed to a human — most commonly
+// AskUserQuestion — rather than generating. An agent in this state is not
+// TurnActive (no busy indicator) and not meaningfully TurnEnded either: it is
+// waiting on a keypress no agent can supply, and until this existed every
+// liveness surface reported it as healthy idle, indistinguishable from a
+// stopped or working agent (hq-79f59 — the Mayor sat here for ~1h50m).
+//
+// FRAGILITY: same class as busyIndicators — this couples to upstream TUI
+// wording, unpinned by anything structural. If another agent TUI phrases its
+// selection prompt differently, add the marker here.
+var blockedIndicators = []string{"Enter to select"}
+
+func hasBlockedIndicator(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, marker := range blockedIndicators {
+		marker = strings.TrimSpace(marker)
+		if marker == "" {
+			continue
+		}
+		if strings.Contains(trimmed, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // shouldSendEscapeFromLines reports whether the vim-mode Escape keystroke
 // (nudge delivery step 5) is safe to send, given a snapshot of pane lines.
 //

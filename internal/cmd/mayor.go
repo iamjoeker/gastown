@@ -368,6 +368,16 @@ func runMayorStatus(cmd *cobra.Command, args []string) error {
 			style.Bold.Render("running"))
 		fmt.Printf("  Status: %s\n", attachedStatus)
 		fmt.Printf("  Created: %s\n", status.Tmux.Created)
+
+		// "running" is liveness, not loop participation: a Mayor parked on an
+		// AskUserQuestion prompt looks identical to a healthy idle one on every
+		// field above (hq-79f59, ~1h50m undetected). Surface the pane's turn
+		// state alongside it so a blocked Mayor is visible here rather than
+		// only in the pane itself.
+		turn := agentTurn(tmux.NewTmux(), mayor.SessionName())
+		if rendered := renderAgentTurn(turn); rendered != "" {
+			fmt.Printf("  Turn: %s\n", rendered)
+		}
 	}
 
 	if status.ACPPid != 0 {

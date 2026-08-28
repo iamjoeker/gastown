@@ -21,6 +21,10 @@ const (
 	ghostLine  = "\x1b[39m❯ \x1b[2mkeep patrolling\x1b[0m"
 	emptyLine  = "\x1b[38;5;246m❯ \x1b[7m \x1b[0m"
 	typedLine  = "\x1b[39m❯ gt patrol report --status green"
+	// footerBlocked mimics the chrome an AskUserQuestion-style dialog renders
+	// in place of the ordinary footer -- no "esc to interrupt", no composer
+	// row, just selection-prompt text (hq-79f59).
+	footerBlocked = "  Enter to select · ↑/↓ to navigate"
 )
 
 func joinPane(lines ...string) string {
@@ -117,6 +121,49 @@ func TestAnalyzeTurnState(t *testing.T) {
 			name: "trailing blank lines do not push the footer out of range",
 			content: joinPane(
 				boxLine, emptyLine, boxLine, footerBusy, "", "", "",
+			),
+			want: TurnActive,
+		},
+		{
+			// hq-79f59: the Mayor sat on an AskUserQuestion dialog for ~1h50m
+			// reporting "running" on every liveness surface. The dialog
+			// replaces the composer row entirely — there is no ❯ prompt line
+			// at all — so this must not fall into the "no composer" ->
+			// TurnUnknown path above it.
+			name: "AskUserQuestion dialog blocked on a human, no composer visible",
+			content: joinPane(
+				"  Which library should we use for date formatting?",
+				"",
+				"  ❯ 1. date-fns",
+				"    2. Luxon",
+				"",
+				footerBlocked,
+			),
+			want: TurnBlocked,
+		},
+		{
+			// Mirrors the busy-marker contamination case above: an agent's own
+			// transcript can discuss the blocked-detector's marker text
+			// without the agent actually being blocked. Anchoring on the
+			// trailing footer window (not a whole-pane scan) is what keeps
+			// this from misreading a working investigator as blocked.
+			name: "blocked marker in transcript prose does not mask a working agent",
+			content: joinPane(
+				"  The discriminator is 'Enter to select' in the footer;",
+				"  my own investigation quoted that exact string here.",
+				"",
+				boxLine, emptyLine, boxLine, footerBusy,
+			),
+			want: TurnActive,
+		},
+		{
+			// A footer that (implausibly) carries both markers reads as busy,
+			// not blocked — matching the existing isInRewindMode precedent
+			// (gt-z8ra) that a generating agent is never also showing a modal
+			// dialog to a human.
+			name: "busy indicator wins when both markers are in the footer window",
+			content: joinPane(
+				boxLine, emptyLine, boxLine, footerBusy, footerBlocked,
 			),
 			want: TurnActive,
 		},
