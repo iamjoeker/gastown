@@ -2450,6 +2450,62 @@ func TestProcessDiscoveredCompletion_NoMR(t *testing.T) {
 	}
 }
 
+// TestProcessDiscoveredCompletion_RefineryNudgeFailureDoesNotBlockRetryGate
+// covers gt-wlzi: a failed (non-fatal) nudge to the refinery must not leave
+// discovery.Error set, because DiscoverCompletions gates clearCompletionMetadata
+// on that field. Leaving it set reprocesses the same completion — including
+// re-notifying the Mayor — on every subsequent patrol cycle, flooding the
+// Mayor's inbox with duplicate SLOT_OPEN mail for one polecat completion.
+func TestProcessDiscoveredCompletion_RefineryNudgeFailureDoesNotBlockRetryGate(t *testing.T) {
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			// Any `show` call (for the MR or its source issue) reports an
+			// open, non-terminal issue so AssessActiveMR keeps Pending=true
+			// and processDiscoveredCompletion takes the hasMR branch.
+			return `[{"id":"gt-mr-1","status":"open"}]`, nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	origCreateWisp := effCreateCleanupWisp
+	origUpdateWisp := effUpdateCleanupWispState
+	origNudgeRefinery := effNudgeRefinery
+	origNotifyMayor := effNotifyMayorSlotOpen
+	t.Cleanup(func() {
+		effCreateCleanupWisp = origCreateWisp
+		effUpdateCleanupWispState = origUpdateWisp
+		effNudgeRefinery = origNudgeRefinery
+		effNotifyMayorSlotOpen = origNotifyMayor
+	})
+
+	notifyCount := 0
+	effCreateCleanupWisp = func(*BdCli, string, string, string, string) (string, error) {
+		return "gt-wisp-1", nil
+	}
+	effUpdateCleanupWispState = func(*BdCli, string, string, string) error { return nil }
+	effNudgeRefinery = func(string, string) error { return fmt.Errorf("refinery session busy") }
+	effNotifyMayorSlotOpen = func(string, string, string, string) { notifyCount++ }
+
+	payload := &PolecatDonePayload{
+		PolecatName: "nux",
+		Exit:        "COMPLETED",
+		IssueID:     "gt-source-1",
+		MRID:        "gt-mr-1",
+	}
+	discovery := &CompletionDiscovery{}
+	processDiscoveredCompletion(bd, "/tmp", "testrig", payload, discovery, scanEffects{})
+
+	if discovery.Error != nil {
+		t.Errorf("discovery.Error = %v, want nil — a non-fatal refinery nudge failure must not block clearCompletionMetadata (gt-wlzi)", discovery.Error)
+	}
+	if notifyCount != 1 {
+		t.Errorf("notifyMayorSlotOpen called %d times, want exactly 1", notifyCount)
+	}
+	if discovery.WispCreated != "gt-wisp-1" {
+		t.Errorf("WispCreated = %q, want %q", discovery.WispCreated, "gt-wisp-1")
+	}
+}
+
 func TestProcessDiscoveredCompletion_EscalatedNoMR(t *testing.T) {
 	t.Parallel()
 	payload := &PolecatDonePayload{
