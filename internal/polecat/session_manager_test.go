@@ -540,7 +540,12 @@ func TestAgentEnvOmitsGTAgent_FallbackRequired(t *testing.T) {
 func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
 	requireTmux(t)
 
-	tm := tmux.NewTmux()
+	// Use an isolated socket, not the default/production tmux server: a
+	// "gt-test-*" session on the default socket parses as a gastown polecat
+	// named "test-nudge-N" (gastown's beads prefix is "gt"), and gt polecat
+	// list can catch it mid-life and report a phantom ZOMBIE (gt-yfwv).
+	socket := fmt.Sprintf("gt-test-nudge-socket-%d", os.Getpid())
+	tm := tmux.NewTmuxWithSocket(socket)
 	// Use a unique session name per invocation to avoid "duplicate session" races
 	// with tmux's async cleanup when running with -count=N. (Fixes gt-eo8d)
 	sessionName := fmt.Sprintf("gt-test-nudge-%d", testSessionCounter.Add(1))
@@ -695,7 +700,12 @@ func TestModeABeaconVerificationCondition(t *testing.T) {
 func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
 	requireTmux(t)
 
-	tm := tmux.NewTmux()
+	// Use an isolated socket, not the default/production tmux server: a
+	// "gt-test-*" session on the default socket parses as a gastown polecat
+	// named "test-modeA-N" (gastown's beads prefix is "gt"), and gt polecat
+	// list can catch it mid-life and report a phantom ZOMBIE (gt-yfwv).
+	socket := fmt.Sprintf("gt-test-modea-socket-%d", os.Getpid())
+	tm := tmux.NewTmuxWithSocket(socket)
 	sessionName := fmt.Sprintf("gt-test-modeA-%d", testSessionCounter.Add(1))
 	_ = tm.KillSession(sessionName)
 
