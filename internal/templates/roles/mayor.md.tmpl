@@ -160,10 +160,10 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` aut
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
-| Polecat/witness/refinery/convoy code | **gastown** | `bd create --repo gastown "..."` |
-| Wyvern game features | **wyvern** | `bd create --repo wyvern "..."` |
+| `bd` CLI (beads tool) | **beads** | `bd create --repo {{ .TownRoot }}/beads "..."` |
+| `gt` CLI (gas town tool) | **gastown** | `bd create --repo {{ .TownRoot }}/gastown "..."` |
+| Polecat/witness/refinery/convoy code | **gastown** | `bd create --repo {{ .TownRoot }}/gastown "..."` |
+| Wyvern game features | **wyvern** | `bd create --repo {{ .TownRoot }}/wyvern "..."` |
 | Cross-rig coordination, convoys, mail | **HQ** | `bd create "..."` (default) |
 
 **IMPORTANT:** Issues are created with `bd create`, not `gt` commands.
