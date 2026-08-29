@@ -1343,6 +1343,65 @@ func TestEscalationRecordSurvivesTheWholeReaper(t *testing.T) {
 	}
 }
 
+// TestMergeRequestSurvivesReapClose is the acceptance test for gt-ojk1
+// (mirroring hq-lrfm): an MR wisp waiting on a human decision must be both
+// auditable (queue-visible, status "open") and durable (protected from
+// deletion), never forced to trade one for the other.
+//
+// w-mr-pending stands for exactly that case: open, pinned (as every MR wisp is
+// pinned at creation, gt-31nn), and old enough that nothing has touched it
+// since it was opened — the state a merge queue produces while it waits on a
+// human ruling. Before gt:merge-request was added to ReapProtectedWispLabels,
+// reap closed this row purely for being idle past max_age, and
+// isMergeRequestReadyForSelection (mq_ready.go) filters the queue view on
+// status=="open", so the closed MR vanished from `gt mq list` even though the
+// row itself survived (pinned + label-protected from purge). A durable record
+// invisible to the only surface an operator reads is not auditable.
+//
+// The NEGATIVE CONTROL, w-open-control, is the same age and status and differs
+// only in its label. A reaper that stopped closing anything would satisfy the
+// survival assertion below for the wrong reason; the control is what catches
+// that.
+func TestMergeRequestSurvivesReapClose(t *testing.T) {
+	f := newFixture(t, "mr_survives_reap")
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+
+	f.insertWisps(t,
+		// Waiting on a human decision: open, pinned, untouched since creation.
+		wispRow{id: "w-mr-pending", status: "open", issueType: "task", createdAt: old,
+			pinned: boolPtr(true), labels: []string{"gt:merge-request"}},
+		// NEGATIVE CONTROL: identical but for the label.
+		wispRow{id: "w-open-control", status: "open", issueType: "task", createdAt: old},
+	)
+
+	scan, err := Scan(f.db, f.dbName, 24*time.Hour, purgeAge, purgeAge, staleAge)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.ReapCandidates != 1 {
+		t.Errorf("Scan.ReapCandidates = %d, want 1 (w-open-control) — scan must not advertise "+
+			"a wisp reap will decline, or the Dog acts on a count that never lands", scan.ReapCandidates)
+	}
+
+	reap, err := Reap(f.db, f.dbName, 24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 1 {
+		t.Errorf("Reaped = %d, want 1 — a reap that closed nothing would satisfy the "+
+			"survival check below for the wrong reason", reap.Reaped)
+	}
+	if got := f.wispStatus(t, "w-mr-pending"); got != "open" {
+		t.Errorf("MR wisp status = %q, want open — reap closed it, which removes it from "+
+			"`gt mq list` (isMergeRequestReadyForSelection filters on status==open) even though "+
+			"the row itself survives", got)
+	}
+	if got := f.wispStatus(t, "w-open-control"); got != "closed" {
+		t.Errorf("control wisp status = %q, want closed — reap is inert, so the exemption "+
+			"above proves nothing", got)
+	}
+}
+
 // TestReapProtectionIsNotHardcodedToOneLabel guards the mechanism rather than
 // the current list, mirroring TestPurgeProtectionIsNotHardcodedToOneLabel: reap
 // protection is driven by ReapProtectedWispLabels, so a future entry takes
