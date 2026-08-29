@@ -3,6 +3,9 @@ package cmd
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestExtractPatrolRole(t *testing.T) {
@@ -234,5 +237,73 @@ func TestBuildStepAudit(t *testing.T) {
 				t.Errorf("buildStepAudit() = %q, want to contain %q", got, tt.wantContain)
 			}
 		})
+	}
+}
+
+// TestQueryPatrolDigestsFindsEphemeralWisps reproduces gt-1r3t: per-cycle
+// patrol digests are created with Ephemeral: true (wisps table) and label
+// "gt:task", not "digest". The old queryPatrolDigests ran "bd list
+// --status=closed --label=digest", which only reads the issues table and
+// filters on a label these beads never carry — it always returned zero rows,
+// silently, regardless of how many real digests existed.
+func TestQueryPatrolDigestsFindsEphemeralWisps(t *testing.T) {
+	requireBd(t)
+	_, b := setupPatrolTestDB(t)
+
+	issue, err := b.Create(beads.CreateOptions{
+		Title:     "Digest: mol-witness-patrol",
+		Labels:    []string{"gt:task"},
+		Priority:  4,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create ephemeral digest wisp: %v", err)
+	}
+	if err := b.CloseWithReason("test digest", issue.ID); err != nil {
+		t.Fatalf("close digest wisp: %v", err)
+	}
+
+	cycles, err := queryPatrolDigests(b, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("queryPatrolDigests: %v", err)
+	}
+	if len(cycles) != 1 {
+		t.Fatalf("queryPatrolDigests found %d cycles, want 1 (digest wisp %s was not found)", len(cycles), issue.ID)
+	}
+	if cycles[0].ID != issue.ID {
+		t.Errorf("cycles[0].ID = %q, want %q", cycles[0].ID, issue.ID)
+	}
+	if cycles[0].Role != "witness" {
+		t.Errorf("cycles[0].Role = %q, want %q", cycles[0].Role, "witness")
+	}
+}
+
+// TestQueryPatrolDigestsIgnoresOtherDates verifies the date filter still
+// excludes digests created on a different day, so the fix does not turn into
+// "aggregate everything ever" once the table/label bug is corrected.
+func TestQueryPatrolDigestsIgnoresOtherDates(t *testing.T) {
+	requireBd(t)
+	_, b := setupPatrolTestDB(t)
+
+	issue, err := b.Create(beads.CreateOptions{
+		Title:     "Digest: mol-deacon-patrol",
+		Labels:    []string{"gt:task"},
+		Priority:  4,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create ephemeral digest wisp: %v", err)
+	}
+	if err := b.CloseWithReason("test digest", issue.ID); err != nil {
+		t.Fatalf("close digest wisp: %v", err)
+	}
+
+	farPast := time.Now().UTC().AddDate(-1, 0, 0)
+	cycles, err := queryPatrolDigests(b, farPast)
+	if err != nil {
+		t.Fatalf("queryPatrolDigests: %v", err)
+	}
+	if len(cycles) != 0 {
+		t.Fatalf("queryPatrolDigests(%s) found %d cycles, want 0", farPast.Format("2006-01-02"), len(cycles))
 	}
 }

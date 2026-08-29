@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -108,6 +109,12 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 
 	dateStr := targetDate.Format("2006-01-02")
 
+	workDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting working directory: %w", err)
+	}
+	b := beads.New(workDir)
+
 	// Idempotency check: see if digest already exists for this date
 	existingID, err := findExistingPatrolDigest(dateStr)
 	if err != nil {
@@ -122,7 +129,7 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 	}
 
 	// Query ephemeral patrol digest beads for target date
-	cycles, err := queryPatrolDigests(targetDate)
+	cycles, err := queryPatrolDigests(b, targetDate)
 	if err != nil {
 		return fmt.Errorf("querying patrol digests: %w", err)
 	}
@@ -166,7 +173,7 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 	}
 
 	// Delete source digests (they're ephemeral)
-	deletedCount, deleteErr := deletePatrolDigests(targetDate)
+	deletedCount, deleteErr := deletePatrolDigests(b, targetDate)
 	if deleteErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to delete some source digests: %v\n", deleteErr)
 	}
@@ -184,56 +191,57 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 }
 
 // queryPatrolDigests queries ephemeral patrol digest beads for a target date.
-func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
-	// List closed issues with "digest" label that are ephemeral
-	// Patrol digests have titles like "Digest: mol-deacon-patrol", "Digest: mol-witness-patrol"
-	listCmd := exec.Command("bd", "list",
-		"--status=closed",
-		"--label=digest",
-		"--json",
-		"--limit=0", // Get all
-	)
-	listOutput, err := listCmd.Output()
+//
+// Per-cycle digests are created with Ephemeral: true (molecule_lifecycle.go),
+// which routes them into the wisps table, not the issues table (GH#2446).
+// They also carry the label "gt:task", not "digest" (they were never given a
+// dedicated label). "bd list --label=digest" queried the wrong table for the
+// wrong label, so it always returned zero rows, silently and successfully —
+// the same failure mode as gt-ktvs in gt compact. Use beads.List with
+// Ephemeral: true (which shells out to "bd query ephemeral=true ...", the
+// wisps-table-aware path) and filter by title prefix and date client-side,
+// same as compaction does for its own wisp scans.
+func queryPatrolDigests(b *beads.Beads, targetDate time.Time) ([]PatrolCycleEntry, error) {
+	issues, err := b.List(beads.ListOptions{
+		Status:    "closed",
+		Ephemeral: true,
+		Priority:  -1, // -1 = no priority filter; 0 would filter to P0 only
+		Limit:     0,  // Get all
+	})
 	if err != nil {
-		if patrolDigestVerbose {
-			fmt.Fprintf(os.Stderr, "[patrol] bd list failed: %v\n", err)
-		}
-		return nil, nil
+		return nil, fmt.Errorf("bd query (wisps, ephemeral=true, status=closed) failed: %w", err)
 	}
 
-	var issues []struct {
-		ID          string    `json:"id"`
-		Title       string    `json:"title"`
-		Description string    `json:"description"`
-		Status      string    `json:"status"`
-		CreatedAt   time.Time `json:"created_at"`
-		ClosedAt    time.Time `json:"closed_at"`
-		Ephemeral   bool      `json:"ephemeral"`
-	}
-
-	if err := json.Unmarshal(listOutput, &issues); err != nil {
-		return nil, fmt.Errorf("parsing issue list: %w", err)
+	if patrolDigestVerbose {
+		fmt.Fprintf(os.Stderr, "[patrol] scanned %d closed ephemeral wisps\n", len(issues))
 	}
 
 	// Compare dates in UTC: Dolt stores timestamps in UTC (gt-ty4).
 	targetDay := targetDate.UTC().Format("2006-01-02")
 	var patrolDigests []PatrolCycleEntry
+	titleMatches := 0
 
 	for _, issue := range issues {
-		// Only process ephemeral patrol digests
-		if !issue.Ephemeral {
-			continue
-		}
-
 		// Must be a patrol digest (title starts with "Digest: mol-")
 		if !strings.HasPrefix(issue.Title, "Digest: mol-") {
 			continue
 		}
+		titleMatches++
 
-		// Check if created on target date (both in UTC)
-		if issue.CreatedAt.UTC().Format("2006-01-02") != targetDay {
+		createdAt := parseBeadsTimestamp(issue.CreatedAt)
+		if createdAt.IsZero() {
+			if patrolDigestVerbose {
+				fmt.Fprintf(os.Stderr, "[patrol] skipping %s: unparseable created_at %q\n", issue.ID, issue.CreatedAt)
+			}
 			continue
 		}
+
+		// Check if created on target date (both in UTC)
+		if createdAt.UTC().Format("2006-01-02") != targetDay {
+			continue
+		}
+
+		closedAt := parseBeadsTimestamp(issue.ClosedAt)
 
 		// Extract role from title (e.g., "Digest: mol-deacon-patrol" -> "deacon")
 		role := extractPatrolRole(issue.Title)
@@ -243,9 +251,14 @@ func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
 			Role:        role,
 			Title:       issue.Title,
 			Description: issue.Description,
-			CreatedAt:   issue.CreatedAt,
-			ClosedAt:    issue.ClosedAt,
+			CreatedAt:   createdAt,
+			ClosedAt:    closedAt,
 		})
+	}
+
+	if patrolDigestVerbose {
+		fmt.Fprintf(os.Stderr, "[patrol] %d wisps matched title prefix %q, %d matched date %s\n",
+			titleMatches, "Digest: mol-", len(patrolDigests), targetDay)
 	}
 
 	return patrolDigests, nil
@@ -359,9 +372,9 @@ func findExistingPatrolDigest(dateStr string) (string, error) {
 }
 
 // deletePatrolDigests deletes ephemeral patrol digest beads for a target date.
-func deletePatrolDigests(targetDate time.Time) (int, error) {
+func deletePatrolDigests(b *beads.Beads, targetDate time.Time) (int, error) {
 	// Query patrol digests for the target date
-	cycles, err := queryPatrolDigests(targetDate)
+	cycles, err := queryPatrolDigests(b, targetDate)
 	if err != nil {
 		return 0, err
 	}
