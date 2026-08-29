@@ -781,23 +781,29 @@ func TestHealthyTownRendersHealthy(t *testing.T) {
 // "No alarm" is also what a panel that quietly lost its rows produces, so the
 // polecats must be visibly WORKING rather than merely not stuck.
 //
-// It asks about polecats and not about every worker because the Refinery row is
-// already broken in exactly this way, and pinning that here would either land
-// the suite red or fix the defect in place of the bead that owns it. Measured
-// against this fixture, with an MR sitting in the queue:
-//
-//	session="gt-refinery" name="" agentType="refinery" issueID="" workStatus="idle"
-//
-// The name is empty because ParseSessionNameWithRegistry leaves Name unset for
-// a "<prefix>-refinery" session, and both refinery arms downstream key on the
-// string workerName == "refinery" — so neither can fire, and the Refinery
-// renders nameless and idle while it is merging. Filed as gt-ahwc under the
-// same epic; extending this loop to every worker is that bead's check.
+// It also asks about the Refinery row, which used to be broken in exactly
+// this way: ParseSessionNameWithRegistry leaves Name unset for a
+// "<prefix>-refinery" session, and both refinery arms downstream used to key
+// on the string workerName == "refinery" — so neither could fire, and the
+// Refinery rendered idle with no status hint while it was merging (gt-ahwc).
+// Measured against this fixture, with an MR sitting in the queue, the
+// Refinery must render workStatus="working" and a non-empty StatusHint.
 func TestHealthyTownReportsPolecatsAsWorking(t *testing.T) {
 	data := newHealthyTown().collect(t)
 
 	seen := 0
+	refinerySeen := 0
 	for _, worker := range data.Workers {
+		if worker.AgentType == constants.RoleRefinery {
+			refinerySeen++
+			if worker.WorkStatus != "working" {
+				t.Errorf("refinery %s renders %q, want \"working\"", worker.SessionID, worker.WorkStatus)
+			}
+			if worker.StatusHint == "" {
+				t.Errorf("refinery %s carries no status hint while an MR is queued", worker.SessionID)
+			}
+			continue
+		}
 		if worker.AgentType != constants.RolePolecat {
 			continue
 		}
@@ -811,6 +817,9 @@ func TestHealthyTownReportsPolecatsAsWorking(t *testing.T) {
 	}
 	if seen != 3 {
 		t.Errorf("polecat rows = %d, want 3 — the assertions above are per-row and vacuous over none", seen)
+	}
+	if refinerySeen != 1 {
+		t.Errorf("refinery rows = %d, want 1 — the assertions above are per-row and vacuous over none", refinerySeen)
 	}
 
 	for _, convoy := range data.Convoys {

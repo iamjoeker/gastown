@@ -1277,7 +1277,8 @@ func (f *LiveConvoyFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
 
 		// Get status hint - special handling for refinery
 		var statusHint string
-		if workerName == "refinery" {
+		isRefinery := identity.Role == session.RoleRefinery
+		if isRefinery {
 			statusHint = f.getRefineryStatusHint(mergeQueueCount)
 		} else {
 			statusHint = f.getWorkerStatusHint(sessionName)
@@ -1294,7 +1295,7 @@ func (f *LiveConvoyFetcher) FetchWorkers() (StoreResult[WorkerRow], error) {
 		}
 
 		// Calculate work status based on activity age and issue assignment
-		workStatus := calculateWorkerWorkStatus(activityAge, issueID, workerName, f.staleThreshold, f.stuckThreshold)
+		workStatus := calculateWorkerWorkStatus(activityAge, issueID, isRefinery, f.staleThreshold, f.stuckThreshold)
 
 		workers = append(workers, WorkerRow{
 			Name:         workerName,
@@ -1401,9 +1402,9 @@ func assignedIssuesByAssignee(found []assignedBead) map[string]assignedIssue {
 
 // calculateWorkerWorkStatus determines the worker's work status based on activity and assignment.
 // Returns: "working", "stale", "stuck", or "idle"
-func calculateWorkerWorkStatus(activityAge time.Duration, issueID, workerName string, staleThreshold, stuckThreshold time.Duration) string {
+func calculateWorkerWorkStatus(activityAge time.Duration, issueID string, isRefinery bool, staleThreshold, stuckThreshold time.Duration) string {
 	// Refinery has special handling - it's always "working" if it has PRs
-	if workerName == "refinery" {
+	if isRefinery {
 		return "working"
 	}
 
