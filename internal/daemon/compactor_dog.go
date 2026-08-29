@@ -202,10 +202,22 @@ func (d *Daemon) runCompactorDog() {
 			errors++
 		} else {
 			compacted++
+			// Snapshot row counts immediately before gc so a post-gc check can
+			// tell whether gc itself destroyed anything (see compactorVerifyPostGC).
+			preGCCounts, countErr := d.compactorGetRowCountsForDB(dbName)
+			if countErr != nil {
+				d.logger.Printf("compactor_dog: %s: warning: could not capture pre-gc row counts: %v", dbName, countErr)
+			}
 			// Run gc after successful compaction to reclaim unreferenced chunks.
 			// Order matters: rebase first (compactDatabase), gc second.
 			if err := d.compactorRunGC(dbName); err != nil {
 				d.logger.Printf("compactor_dog: %s: gc after compaction failed: %v", dbName, err)
+			} else if preGCCounts != nil {
+				if err := d.compactorVerifyPostGC(dbName, preGCCounts); err != nil {
+					d.logger.Printf("compactor_dog: %s: POST-GC INTEGRITY FAILURE: %v", dbName, err)
+					d.escalate("compactor_dog", fmt.Sprintf("dolt_gc after compaction may have destroyed data in %s: %v", dbName, err))
+					errors++
+				}
 			}
 			// Force-push to DoltHub remote after compaction. Flatten rewrites
 			// the commit graph, so standard push always fails with non-fast-forward.
@@ -659,6 +671,46 @@ func (d *Daemon) compactorGetRowCounts(db *sql.DB, dbName string) (map[string]in
 	}
 
 	return counts, nil
+}
+
+// compactorGetRowCountsForDB opens its own connection and returns row counts
+// for every user table in dbName. Used to snapshot state immediately before
+// and after dolt_gc(), which runs as a separate step from compaction itself.
+func (d *Daemon) compactorGetRowCountsForDB(dbName string) (map[string]int, error) {
+	db, err := d.compactorOpenDB(dbName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	return d.compactorGetRowCounts(db, dbName)
+}
+
+// compactorVerifyPostGC re-checks row counts after dolt_gc() against a
+// snapshot taken right before it ran, and fails if any table lost rows.
+//
+// compactDatabase's own integrity check runs BEFORE dolt_gc(), so it cannot
+// see anything gc does. dolt_ignore'd tables (wisps/wisp_%) are excluded from
+// `DOLT_COMMIT('-Am', ...)` by construction and are therefore never part of
+// ANY commit's tree — in principle leaving their data unreferenced by the
+// commit graph and vulnerable to being reclaimed as garbage (see gt-3mnn /
+// hq-by6wo). Reproducing this against a real Dolt server (compactor_dog_
+// ignored_tables_integration_test.go) did not observe gc collecting such
+// data — Dolt's gc preserves the current working set regardless of commit
+// reachability — but that has only been confirmed for the Dolt version
+// under test, not proven as a permanent guarantee. This check converts the
+// open question into an actively monitored invariant: if a future Dolt
+// version (or an edge case this test didn't cover) ever violates it, this
+// catches the loss immediately after the run that caused it, rather than
+// leaving it undetected until something downstream notices missing data.
+func (d *Daemon) compactorVerifyPostGC(dbName string, preGCCounts map[string]int) error {
+	postGCCounts, err := d.compactorGetRowCountsForDB(dbName)
+	if err != nil {
+		return fmt.Errorf("post-gc row counts: %w", err)
+	}
+	if _, err := compactorCheckIntegrity(preGCCounts, postGCCounts); err != nil {
+		return fmt.Errorf("post-gc integrity check: %w", err)
+	}
+	return nil
 }
 
 // compactorCheckIntegrity compares pre- and post-operation row counts and

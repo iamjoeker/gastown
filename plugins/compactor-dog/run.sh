@@ -443,6 +443,33 @@ for entry in "${CANDIDATES[@]}"; do
   log "  Running dolt_gc..."
   if dolt_exec "$DB" "CALL dolt_gc()"; then
     log "  GC complete."
+
+    # Post-gc integrity re-check. The check above ran BEFORE dolt_gc(), so it
+    # cannot see anything gc does. dolt_ignore'd tables (wisps/wisp_%) are
+    # excluded from `DOLT_COMMIT('-Am', ...)` by construction and are never
+    # part of ANY commit's tree — in principle leaving their data
+    # unreferenced by the commit graph and vulnerable to gc reclaiming it as
+    # garbage (see gt-3mnn / hq-by6wo). This has not been reproduced against
+    # a real Dolt server, but re-checking here turns the open question into
+    # an actively monitored invariant instead of an unverified assumption.
+    GC_INTEGRITY_OK=true
+    GC_FAIL_DETAILS=""
+    while IFS=$'\t' read -r TABLE PRE; do
+      [[ -z "$TABLE" ]] && continue
+      POST_GC_COUNT=$(dolt_query "$DB" "SELECT COUNT(*) FROM \`$TABLE\`" 2>/dev/null | head -1)
+      if [[ -n "$POST_GC_COUNT" && "$POST_GC_COUNT" -lt "$PRE" ]]; then
+        log "  POST-GC INTEGRITY FAILURE: $DB.$TABLE — data loss: pre=$PRE post_gc=$POST_GC_COUNT"
+        GC_INTEGRITY_OK=false
+        GC_FAIL_DETAILS="${GC_FAIL_DETAILS}${TABLE} (pre=$PRE post_gc=$POST_GC_COUNT); "
+      fi
+    done < "$PRE_COUNTS_FILE"
+    if ! $GC_INTEGRITY_OK; then
+      log "  ERROR: dolt_gc destroyed data for $DB"
+      ERRORS=$((ERRORS + 1))
+      ERROR_DETAILS="${ERROR_DETAILS}${DB}: post-gc integrity check failed — ${GC_FAIL_DETAILS}\n"
+      gt escalate "compactor-dog: dolt_gc data loss in $DB" -s HIGH \
+        --reason "Row count mismatch after dolt_gc() on $DB: ${GC_FAIL_DETAILS}Full stderr log preserved at $LOGFILE." 2>/dev/null || true
+    fi
   else
     log "  [handled] dolt_gc failed for $DB (non-fatal, will retry next cycle)"
   fi
