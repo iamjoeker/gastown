@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -119,12 +120,12 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	// 2. Databases (only if server is running)
 	if report.Server.Running {
-		report.Databases = checkDatabaseHealth(report.Server.Port)
+		report.Databases = checkDatabaseHealth(townRoot, report.Server.Port)
 	}
 
 	// 3. Pollution scan
 	if report.Server.Running {
-		report.Pollution = checkPollution(report.Server.Port)
+		report.Pollution = checkPollution(townRoot, report.Server.Port)
 	}
 
 	// 4. Backups
@@ -177,8 +178,24 @@ func checkServerHealth(townRoot string) *ServerHealth {
 	return sh
 }
 
-func checkDatabaseHealth(port int) []DatabaseHealth {
-	productionDBs := []string{"hq", "gt", "mo"}
+// productionDatabases returns the databases actually referenced by the
+// town's rigs (via metadata.json dolt_database fields), sorted for
+// deterministic output. This replaces a hardcoded {hq, gt, mo} list that
+// named two databases ("gt", "mo") that were never the real dolt_database
+// name for any rig, while missing real production databases such as
+// "beads", "duly_noted", and "gastown" (gt-aac4).
+func productionDatabases(townRoot string) []string {
+	referenced := doltserver.ReferencedDatabases(townRoot)
+	dbs := make([]string, 0, len(referenced))
+	for name := range referenced {
+		dbs = append(dbs, name)
+	}
+	sort.Strings(dbs)
+	return dbs
+}
+
+func checkDatabaseHealth(townRoot string, port int) []DatabaseHealth {
+	productionDBs := productionDatabases(townRoot)
 	var results []DatabaseHealth
 
 	for _, dbName := range productionDBs {
@@ -218,8 +235,8 @@ func checkDatabaseHealth(port int) []DatabaseHealth {
 	return results
 }
 
-func checkPollution(port int) []PollutionRecord {
-	productionDBs := []string{"hq", "gt", "mo"}
+func checkPollution(townRoot string, port int) []PollutionRecord {
+	productionDBs := productionDatabases(townRoot)
 	var records []PollutionRecord
 
 	// Known pollution patterns to check in the issues table.
