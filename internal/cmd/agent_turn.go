@@ -37,6 +37,9 @@ func renderAgentTurn(turn string) string {
 	case tmux.TurnStranded.String():
 		return style.Warning.Render("⚠ ended") +
 			style.Dim.Render(" — unsent text is sitting in the composer")
+	case tmux.TurnBlocked.String():
+		return style.Warning.Render("⏸ blocked") +
+			style.Dim.Render(" — waiting on a human response (e.g. AskUserQuestion)")
 	default:
 		return ""
 	}
@@ -51,6 +54,8 @@ func annotateRunning(status, turn string) string {
 	switch turn {
 	case tmux.TurnEnded.String(), tmux.TurnStranded.String():
 		return "running (turn ended)"
+	case tmux.TurnBlocked.String():
+		return "running (blocked on human)"
 	default:
 		return status
 	}

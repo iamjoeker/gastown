@@ -34,6 +34,16 @@ const (
 	// it, so this state is reported separately rather than folded into
 	// TurnEnded.
 	TurnStranded
+
+	// TurnBlocked means the pane is showing a selection dialog addressed to a
+	// human — most commonly AskUserQuestion — rather than generating or
+	// sitting at an empty prompt. Nothing else in this package's liveness
+	// surfaces distinguishes this from a healthy idle agent: the Mayor sat
+	// here for ~1h50m while every liveness check reported it running (see
+	// hq-79f59). Waking it with typed text or an Escape would not help — no
+	// agent can answer the question — so this is reported rather than acted
+	// on; the caller's job is to escalate to a human, not to nudge.
+	TurnBlocked
 )
 
 func (s TurnState) String() string {
@@ -44,6 +54,8 @@ func (s TurnState) String() string {
 		return "ended"
 	case TurnStranded:
 		return "stranded"
+	case TurnBlocked:
+		return "blocked"
 	default:
 		return "unknown"
 	}
@@ -83,7 +95,33 @@ const (
 	// transcript output, so the search is both backwards (last match wins) and
 	// bounded.
 	turnComposerScanLines = 10
+
+	// turnFooterWindow is how many trailing pane lines are scanned for the
+	// blocked-on-human footer signature (see the blocked-dialog check in
+	// analyzeTurnState). Anchored on the tail of the pane rather than on the
+	// composer, because the dialog this detects replaces the composer row
+	// entirely. Validated across six live sessions in hq-79f59: the signature
+	// sits at the pane's last line with two lines of margin.
+	turnFooterWindow = 3
 )
+
+// indicatorInTrailingWindow reports whether match hits any of the last
+// `window` lines of a trimmed pane snapshot. Position-anchored rather than
+// content-anchored: unlike the composer-relative scans above, this makes no
+// assumption that a composer line exists, which is what lets it see a dialog
+// that has replaced the composer entirely.
+func indicatorInTrailingWindow(lines []string, window int, match func(string) bool) bool {
+	start := len(lines) - window
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(lines); i++ {
+		if match(lines[i]) {
+			return true
+		}
+	}
+	return false
+}
 
 // analyzeTurnState derives a [TurnState] from an escape-preserving pane
 // capture (tmux capture-pane -p -e). promptPrefix is the agent's ready-prompt
@@ -111,6 +149,25 @@ func analyzeTurnState(escContent, promptPrefix string) TurnState {
 	text := make([]string, len(lines))
 	for i, line := range lines {
 		text[i] = string(line)
+	}
+
+	// A human-facing selection dialog (AskUserQuestion and similar) replaces
+	// the composer row entirely, so this must be checked before the composer
+	// lookup below — which would otherwise return TurnUnknown for want of a
+	// composer and never reach the blocked check at all. Anchored on the
+	// trailing POSITION of the pane rather than on the composer, matching the
+	// tail-3 method validated across six live sessions in hq-79f59: the
+	// footer signature sits at the pane's last line with two lines of margin,
+	// which reaches the dialog chrome without reaching up into the
+	// transcript, where text ABOUT the dialog (this very investigation) lives
+	// and would otherwise satisfy the same search.
+	//
+	// Busy is checked first, matching the existing precedent (gt-z8ra) that a
+	// generating agent is never also showing a modal dialog — so a footer
+	// that (implausibly) carries both markers is read as busy, not blocked.
+	if !indicatorInTrailingWindow(text, turnFooterWindow, hasBusyIndicator) &&
+		indicatorInTrailingWindow(text, turnFooterWindow, hasBlockedIndicator) {
+		return TurnBlocked
 	}
 
 	composer := findComposerLine(text, promptPrefix)

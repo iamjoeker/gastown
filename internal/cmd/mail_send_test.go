@@ -139,15 +139,15 @@ func TestPickReplyTo(t *testing.T) {
 // registration exercises the distinction.
 func setSendFlags(t *testing.T, args ...string) {
 	t.Helper()
-	prevBody, prevStdin, prevAllowEmpty := mailBody, mailStdin, mailAllowEmpty
+	prevBody, prevStdin, prevAllowEmpty, prevHuman := mailBody, mailStdin, mailAllowEmpty, mailSendHuman
 	changed := map[string]bool{}
-	for _, name := range []string{"message", "body", "stdin", "allow-empty"} {
+	for _, name := range []string{"message", "body", "stdin", "allow-empty", "human"} {
 		if f := mailSendCmd.Flags().Lookup(name); f != nil {
 			changed[name] = f.Changed
 		}
 	}
 	t.Cleanup(func() {
-		mailBody, mailStdin, mailAllowEmpty = prevBody, prevStdin, prevAllowEmpty
+		mailBody, mailStdin, mailAllowEmpty, mailSendHuman = prevBody, prevStdin, prevAllowEmpty, prevHuman
 		for name, was := range changed {
 			if f := mailSendCmd.Flags().Lookup(name); f != nil {
 				f.Changed = was
@@ -310,4 +310,39 @@ func TestRunMailSendRefusesEmptyBody(t *testing.T) {
 			t.Errorf("error %q is not the empty--m refusal", err.Error())
 		}
 	})
+}
+
+// TestMailSendHumanFlag reproduces gt-b8p1/hq-79f59: "gt mail send --human"
+// was documented (gt mail directory, several formulas) as the way to reach
+// the human operator, but no such flag was registered — cobra parsed the
+// leading-dash token as an unknown flag before the positional address
+// argument was ever consulted, and the command failed at exactly the moment
+// an agent needs to escalate to a human and no other agent can help.
+func TestMailSendHumanFlag(t *testing.T) {
+	// The bug's own signature: ParseFlags must not error on --human. Before
+	// the fix this failed with "unknown flag: --human" here, not later in
+	// runMailSend, so a caller never even reached address resolution.
+	setSendFlags(t, "--human", "-s", "canary", "-m", "body")
+
+	if !mailSendHuman {
+		t.Fatal("mailSendHuman = false after parsing --human, want true")
+	}
+
+	// Drive the real send path with no positional address and no --to: the
+	// only way this can get past "address required" is if the --human branch
+	// supplied one. detachFromTown makes the resolved address fail later, at
+	// workspace lookup, rather than actually delivering mail — so success
+	// here is specifically evidence that --human resolved an address, not
+	// that a message was sent.
+	detachFromTown(t)
+	err := runMailSend(mailSendCmd, nil)
+	if err == nil {
+		t.Fatal("runMailSend with --human and no workspace returned nil, want a workspace error")
+	}
+	if strings.Contains(err.Error(), "address required") {
+		t.Errorf("error %q is the missing-address refusal — --human did not resolve an address", err.Error())
+	}
+	if !strings.Contains(err.Error(), "not in a Gas Town workspace") {
+		t.Errorf("error %q is not the expected workspace failure (--human may not have reached address resolution)", err.Error())
+	}
 }

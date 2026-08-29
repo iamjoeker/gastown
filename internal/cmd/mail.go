@@ -20,6 +20,7 @@ var (
 	mailTo            string // --to flag (alternative to positional arg)
 	mailFrom          string // --from flag (override sender, for relay/bridge use)
 	mailSendSelf      bool
+	mailSendHuman     bool // --human flag (send to the human operator/overseer)
 	mailCC            []string // CC recipients
 	mailInboxJSON     bool
 	mailReadJSON      bool
@@ -145,6 +146,7 @@ Examples:
   gt mail send greenplace/Toast -s "Urgent" -m "Help!" --urgent
   gt mail send mayor/ -s "Re: Status" -m "Done" --reply-to msg-abc123
   gt mail send --self -s "Handoff" -m "Context for next session"
+  gt mail send --human -s "ESCALATION: need a decision" -m "..."
   gt mail send greenplace/Toast -s "Update" -m "Progress report" --cc overseer
   gt mail send list:oncall -s "Alert" -m "System down"
 
@@ -519,6 +521,16 @@ func init() {
 	mailSendCmd.Flags().StringVar(&mailTo, "to", "", "Recipient address (alternative to positional argument)")
 	mailSendCmd.Flags().StringVar(&mailFrom, "from", "", "Override sender address (for relay/bridge use)")
 	mailSendCmd.Flags().BoolVar(&mailSendSelf, "self", false, "Send to self (auto-detect from cwd)")
+	// gt-b8p1/hq-79f59: "--human" was documented (gt mail directory, several
+	// formulas) as a well-known recipient address, but cobra parses any
+	// leading-dash token as a flag before it ever reaches the positional
+	// address argument — so "gt mail send --human ..." has always failed with
+	// "unknown flag: --human", at exactly the moment an agent needs to reach
+	// a human and no other agent can help. Registering it as a real flag,
+	// resolving to the same @overseer route "gt mail send @overseer" already
+	// uses, makes the documented invocation actually work instead of fixing
+	// only the documentation.
+	mailSendCmd.Flags().BoolVar(&mailSendHuman, "human", false, "Send to the human operator (overseer)")
 	mailSendCmd.Flags().StringArrayVar(&mailCC, "cc", nil, "CC recipients (can be used multiple times)")
 	_ = mailSendCmd.MarkFlagRequired("subject") // cobra flags: error only at runtime if missing
 
