@@ -2803,12 +2803,17 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 			discovery.Error = fmt.Errorf("updating wisp state: %w", err)
 		}
 
-		// Nudge refinery to check merge queue (no permanent mail needed).
+		// Nudge refinery to check merge queue (no permanent mail needed). This is
+		// genuinely non-fatal — the wisp is already merge-requested, so the
+		// refinery's own patrol cycle will pick it up regardless. Do NOT assign
+		// this to discovery.Error: that field gates clearCompletionMetadata below,
+		// and leaving it set here reprocesses this same completion (including
+		// re-notifying the Mayor) on every subsequent patrol cycle until the nudge
+		// happens to succeed, flooding the Mayor with duplicate SLOT_OPEN mail
+		// (gt-wlzi).
 		townRoot, _ := workspace.Find(workDir)
 		if nudgeErr := eff.nudgeRefinery(townRoot, rigName); nudgeErr != nil {
-			if discovery.Error == nil {
-				discovery.Error = fmt.Errorf("nudging refinery: %w (non-fatal)", nudgeErr)
-			}
+			fmt.Fprintf(os.Stderr, "witness: nudging refinery for %s failed (non-fatal): %v\n", payload.PolecatName, nudgeErr)
 		}
 
 		discovery.Action = fmt.Sprintf("merge-ready-nudged (MR=%s, wisp=%s)", payload.MRID, wispID)
