@@ -313,10 +313,18 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Cleanup event files if requested
+	// Cleanup event files if requested. A failed removal here is exactly how a
+	// channel leaks replays: the event survives on disk and the next await on
+	// this channel reports it again, indistinguishable from a genuine new
+	// event (gt-pk86). Surface it instead of swallowing it.
 	if awaitEventCleanup && result.Reason == "event" {
 		for _, ef := range result.Events {
-			_ = os.Remove(ef.Path)
+			if rmErr := os.Remove(ef.Path); rmErr != nil && !os.IsNotExist(rmErr) {
+				if !awaitEventQuiet {
+					fmt.Printf("%s Failed to clean up event %s: %v (will be redelivered)\n",
+						style.Dim.Render("⚠"), ef.Path, rmErr)
+				}
+			}
 		}
 	}
 

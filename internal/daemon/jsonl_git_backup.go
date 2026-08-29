@@ -209,8 +209,20 @@ func (d *Daemon) syncJsonlGitBackup() {
 
 // supplementalTables lists non-issues tables to include in JSONL backup.
 // These contain structural data (dependencies, labels, config) that would be
-// lost if we only backed up the issues table. Wisp tables are excluded — they
-// contain high-volume ephemeral data handled by the Reaper Dog.
+// lost if we only backed up the issues table.
+//
+// "wisps" is included even though the Reaper Dog also archives wisps to
+// ~/.gt/wisp-archive: the Reaper only writes a record at PURGE time, so a
+// live, not-yet-purged wisp — including an in-progress merge-request or
+// unread mail — has zero durability until it happens to be purged. wisps
+// are excluded from dolt_ignore's tracked history AND, before this, from
+// every periodic backup, so a crash or corruption between purges was
+// unrecoverable by construction (gt-026z, mirrors hq-del4).
+//
+// wisp_events is deliberately NOT included here: it is far higher volume
+// than wisps (order of magnitude more rows) and is the audit trail, not
+// the live record — losing it loses "why", not "what". It is covered on a
+// slower cadence by the dolt-archive plugin instead.
 var supplementalTables = []string{
 	"comments",
 	"config",
@@ -218,6 +230,7 @@ var supplementalTables = []string{
 	"events",
 	"labels",
 	"metadata",
+	"wisps",
 }
 
 // exportDatabaseToJsonl exports the issues table (with optional scrub) and all
@@ -226,7 +239,14 @@ var supplementalTables = []string{
 // Issues go to {db}/issues.jsonl (scrubbed). Other tables go to {db}/{table}.jsonl.
 // Also writes a legacy {db}.jsonl (symlink to {db}/issues.jsonl) for backward compat.
 //
-// Returns the total number of records exported across all tables.
+// Returns the number of issues records exported — NOT the total across all
+// tables. Spike detection (verifyExportCounts) and post-filter recounting
+// (recountAfterFilter) both compare this value against issues.jsonl's line
+// count in the previous commit, so it must stay issues-only: a supplemental
+// table folded into this total would compare apples to oranges, and for
+// "wisps" specifically — which can outnumber issues by 10-100x — that
+// mismatch would read as a false spike on the very first export and halt
+// the backup this change exists to fix (gt-026z).
 func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) (int, error) {
 	if !validDBName.MatchString(db) {
 		return 0, fmt.Errorf("invalid database name: %q", db)
@@ -238,8 +258,6 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 		return 0, fmt.Errorf("creating dir %s: %w", dbDir, err)
 	}
 
-	total := 0
-
 	// 1. Export issues table (with scrub filter).
 	var query string
 	if scrub {
@@ -247,13 +265,14 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 	} else {
 		query = "SELECT * FROM `" + db + "`.issues ORDER BY id"
 	}
-	n, err := d.exportTableToJsonl("issues", query, dbDir, dataDir)
+	issuesCount, err := d.exportTableToJsonl("issues", query, dbDir, dataDir)
 	if err != nil {
 		return 0, fmt.Errorf("issues: %w", err)
 	}
-	total += n
 
-	// 2. Export supplemental tables (no scrub, full export).
+	// 2. Export supplemental tables (no scrub, full export). Their counts are
+	// logged but deliberately not folded into the returned total — see above.
+	supplementalTotal := 0
 	for _, table := range supplementalTables {
 		tQuery := fmt.Sprintf("SELECT * FROM `%s`.`%s` ORDER BY 1", db, table)
 		tn, err := d.exportTableToJsonl(table, tQuery, dbDir, dataDir)
@@ -262,11 +281,12 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 			d.logger.Printf("jsonl_git_backup: %s/%s: export failed (non-fatal): %v", db, table, err)
 			continue
 		}
-		total += tn
+		supplementalTotal += tn
 	}
 
-	d.logger.Printf("jsonl_git_backup: %s: exported %d records across %d tables", db, total, 1+len(supplementalTables))
-	return total, nil
+	d.logger.Printf("jsonl_git_backup: %s: exported %d issues + %d supplemental records across %d tables",
+		db, issuesCount, supplementalTotal, 1+len(supplementalTables))
+	return issuesCount, nil
 }
 
 // exportTableToJsonl runs a query and writes the result as JSONL to {dir}/{table}.jsonl.

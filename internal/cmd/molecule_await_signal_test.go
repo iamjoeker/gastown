@@ -1038,6 +1038,56 @@ func TestWaitForEventsFile_EventJustBeforeDeadlineStillWakes(t *testing.T) {
 	}
 }
 
+// TestWaitForEventsFile_SurvivesFileRotation is the regression test for
+// gt-kztl / hq-n50ue: KRC's hourly auto-prune replaces .events.jsonl with a
+// new inode via os.Rename (internal/krc/krc.go). An fd opened before that
+// rename only ever sees EOF afterward — indistinguishable from a quiet town
+// — so a wait spanning the rename used to go deaf for its remainder. This
+// reproduces the rename mid-wait and asserts an event written to the NEW
+// inode afterward still wakes the watcher.
+func TestWaitForEventsFile_SurvivesFileRotation(t *testing.T) {
+	eventsPath := newEventsFile(t)
+
+	go func() {
+		// Simulate KRC's prune: write the (empty, in this case) retained set
+		// to a temp file and atomically rename it over the events file,
+		// exactly as krc.go's pruneFile does. This swaps the inode out from
+		// under any already-open reader.
+		time.Sleep(150 * time.Millisecond)
+		tmpPath := eventsPath + ".tmp"
+		if err := os.WriteFile(tmpPath, nil, 0644); err != nil {
+			t.Errorf("writing tmp prune file: %v", err)
+			return
+		}
+		if err := os.Rename(tmpPath, eventsPath); err != nil {
+			t.Errorf("renaming over events file: %v", err)
+			return
+		}
+
+		// Now append to the NEW inode, past the poll interval so the rotation
+		// is detected on its own tick, not folded into the same drain as the
+		// write below.
+		time.Sleep(3 * awaitSignalPollInterval)
+		appendEvents(t, eventsPath, evtGastownSling)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gastown")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Fatalf("reason = %q, want %q: the event landed on the post-rotation inode "+
+			"but a tailer still holding the old fd would see only EOF and time out",
+			result.Reason, "signal")
+	}
+	if !strings.Contains(result.Signal, "gt-p54t") {
+		t.Errorf("Signal = %q, want the gastown sling", result.Signal)
+	}
+}
+
 func TestResolveAwaitSignalRig(t *testing.T) {
 	oldRig, oldAll := awaitSignalRig, awaitSignalAllRigs
 	t.Cleanup(func() {

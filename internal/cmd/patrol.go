@@ -222,8 +222,12 @@ func queryPatrolDigests(b *beads.Beads, targetDate time.Time) ([]PatrolCycleEntr
 	titleMatches := 0
 
 	for _, issue := range issues {
-		// Must be a patrol digest (title starts with "Digest: mol-")
-		if !strings.HasPrefix(issue.Title, "Digest: mol-") {
+		// Must be a patrol digest. createMoleculeDigest (molecule_lifecycle.go)
+		// titles these "Digest: <moleculeID>", and moleculeID is a wisp ID like
+		// "gt-wisp-3i6l" — never "mol-<role>-patrol" — so a "Digest: mol-"
+		// prefix filter matched real digests never, the same zero-rows failure
+		// this function's own doc comment describes fixing (gt-5jin).
+		if !strings.HasPrefix(issue.Title, "Digest: ") {
 			continue
 		}
 		titleMatches++
@@ -258,7 +262,7 @@ func queryPatrolDigests(b *beads.Beads, targetDate time.Time) ([]PatrolCycleEntr
 
 	if patrolDigestVerbose {
 		fmt.Fprintf(os.Stderr, "[patrol] %d wisps matched title prefix %q, %d matched date %s\n",
-			titleMatches, "Digest: mol-", len(patrolDigests), targetDay)
+			titleMatches, "Digest: ", len(patrolDigests), targetDay)
 	}
 
 	return patrolDigests, nil

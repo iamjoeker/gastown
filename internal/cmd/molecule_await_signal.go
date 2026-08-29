@@ -522,13 +522,25 @@ func waitForActivitySignal(ctx context.Context, townRoot, watchRig string) (*Awa
 // Lines for events confined to other rigs are counted and skipped rather than
 // returned; see internal/events/scope.go for what "confined" means and for the
 // fail-open rules that keep cross-rig mail and town-scoped events waking.
+//
+// The events file is rotated out from under long-running tailers: KRC's
+// hourly auto-prune (internal/krc/krc.go) rewrites the retained lines into a
+// temp file and os.Rename()s it over eventsPath. That rename swaps the
+// directory entry to a new inode; an fd opened before the rename keeps
+// reading the old, now-unlinked inode, which sees no further writes and only
+// ever returns EOF — indistinguishable from a genuinely quiet town. A wait
+// that spans the rename goes deaf for its entire remainder, missing every
+// event after it (root-caused in hq-n50ue: 10 of 10 observed misses fell in
+// a window spanning the hourly prune). rotated/reopen below detect the swap
+// and re-subscribe to the new inode so only the rename's own instant is at risk,
+// not the rest of the wait.
 func waitForEventsFile(ctx context.Context, eventsPath, watchRig string) (*AwaitSignalResult, error) {
 
 	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening events file %s: %w", eventsPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Seek to end — we only want new events, not historical ones
 	if _, err := f.Seek(0, 2); err != nil {
@@ -553,6 +565,48 @@ func waitForEventsFile(ctx context.Context, eventsPath, watchRig string) (*Await
 	var partial strings.Builder
 	suppressed := 0
 
+	// rotated reports whether the path now names a different inode than the
+	// fd currently held open — i.e. something replaced the file via rename
+	// rather than appending to it in place.
+	rotated := func() bool {
+		pathInfo, statErr := os.Stat(eventsPath)
+		if statErr != nil {
+			// Missing/unreadable at this instant: treat as not-yet-rotated
+			// rather than erroring the whole wait over a transient stat.
+			return false
+		}
+		fdInfo, fdErr := f.Stat()
+		if fdErr != nil {
+			return false
+		}
+		return !os.SameFile(pathInfo, fdInfo)
+	}
+
+	// reopen re-subscribes to the current inode at eventsPath, discarding the
+	// stale fd and any unterminated fragment held against it (a partial line
+	// from the old inode can never be completed by writes to the new one).
+	// Seeking to end mirrors the initial subscribe: we already evaluated
+	// everything read from the old inode, so only what lands after the
+	// reopen is new. This can still miss lines written into the old inode
+	// after our last read but before the rename picked them up (KRC's own
+	// read-then-rename is not atomic either), but that window is the
+	// rename's instant, not the rest of the wait.
+	reopen := func() error {
+		newF, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
+		if err != nil {
+			return fmt.Errorf("reopening rotated events file: %w", err)
+		}
+		if _, err := newF.Seek(0, 2); err != nil {
+			_ = newF.Close()
+			return fmt.Errorf("seeking to end of reopened events file: %w", err)
+		}
+		_ = f.Close()
+		f = newF
+		reader = bufio.NewReader(f)
+		partial.Reset()
+		return nil
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -576,6 +630,11 @@ func waitForEventsFile(ctx context.Context, eventsPath, watchRig string) (*Await
 				Suppressed: suppressed,
 			}, nil
 		case <-ticker.C:
+			if rotated() {
+				if err := reopen(); err != nil {
+					return nil, err
+				}
+			}
 			res, err := drainEventLines(reader, &partial, watchRig, &suppressed)
 			if err != nil {
 				return nil, err

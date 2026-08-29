@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/git"
 )
 
 func TestRoutedIssueBeadsUsesTownRoutesForCustomPrefix(t *testing.T) {
@@ -127,6 +129,45 @@ func TestClosedSourceIssueRefusal(t *testing.T) {
 	}
 }
 
+func TestNoOpMRRefusal(t *testing.T) {
+	tests := []struct {
+		name       string
+		landedErr  error
+		wantRefuse bool
+	}{
+		{"already landed (proof found)", nil, true},
+		{"not landed (real work)", git.ErrCommitNotLanded, false},
+		{"unprovable fails open", git.ErrMergeProofUnprovable, false},
+		{"other error fails open", errors.New("offline"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refusal := noOpMRRefusal("main", "abc123", tt.landedErr)
+			if (refusal != "") != tt.wantRefuse {
+				t.Fatalf("noOpMRRefusal = %q, want refusal=%v", refusal, tt.wantRefuse)
+			}
+			if tt.wantRefuse && !strings.Contains(refusal, "main") {
+				t.Fatalf("refusal %q does not name the target", refusal)
+			}
+		})
+	}
+}
+
+func TestValidateNonEmptyMRSourceExplainsRecovery(t *testing.T) {
+	if err := validateNonEmptyMRSource("main", "abc123", git.ErrCommitNotLanded); err != nil {
+		t.Fatalf("validateNonEmptyMRSource with real work = %v, want nil", err)
+	}
+	err := validateNonEmptyMRSource("main", "abc123", nil)
+	if err == nil {
+		t.Fatal("validateNonEmptyMRSource for already-landed commit = nil, want refusal")
+	}
+	for _, want := range []string{"already on main", "no-op", "--allow-noop"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
 func TestValidateOpenSourceIssueForMRExplainsRecovery(t *testing.T) {
 	if err := validateOpenSourceIssueForMR("bd-6jp", &beads.Issue{ID: "bd-6jp", Status: "open"}); err != nil {
 		t.Fatalf("validateOpenSourceIssueForMR on open issue = %v, want nil", err)
@@ -183,6 +224,56 @@ func TestRunMqSubmitAllowClosedIssueOverride(t *testing.T) {
 	mqSubmitAllowClosedIssue = true
 	if err := runMqSubmit(nil, nil); err != nil {
 		t.Fatalf("runMqSubmit with --allow-closed-issue: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, currentBeadsDir, "create --json")
+}
+
+func TestRunMqSubmitRefusesNoOpMR(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepoNoOp(t, workDir)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_RIG", "")
+	t.Chdir(workDir)
+
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitNoCleanup = true
+	err := runMqSubmit(nil, nil)
+	if err == nil {
+		t.Fatal("runMqSubmit for a branch with no new work succeeded, want refusal")
+	}
+	if !strings.Contains(err.Error(), "there is no new work to merge") {
+		t.Fatalf("error %q does not explain the no-op merge", err.Error())
+	}
+	if !strings.Contains(err.Error(), "--allow-noop") {
+		t.Fatalf("error %q missing operator override hint", err.Error())
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
+}
+
+func TestRunMqSubmitAllowNoOpOverride(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepoNoOp(t, workDir)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_RIG", "")
+	t.Chdir(workDir)
+
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitNoCleanup = true
+	mqSubmitAllowNoOp = true
+	if err := runMqSubmit(nil, nil); err != nil {
+		t.Fatalf("runMqSubmit with --allow-noop: %v", err)
 	}
 
 	log := readSubmitSourceBDLog(t, logPath)
@@ -421,6 +512,30 @@ func setupRoutedSubmitGitRepo(t *testing.T, workDir string, pushBranch bool) str
 	return branch
 }
 
+// setupRoutedSubmitGitRepoNoOp mirrors setupRoutedSubmitGitRepo but the
+// returned branch carries no work beyond main: it is branched and pushed
+// with zero new commits, so its tip is exactly origin/main's tip. Exercises
+// the gt-2fgq no-op-MR gate.
+func setupRoutedSubmitGitRepoNoOp(t *testing.T, workDir string) string {
+	t.Helper()
+	remote := t.TempDir()
+	runGitForMQSubmitTest(t, remote, "init", "--bare")
+	runGitForMQSubmitTest(t, workDir, "init")
+	runGitForMQSubmitTest(t, workDir, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, workDir, "config", "user.name", "Test User")
+	runGitForMQSubmitTest(t, workDir, "remote", "add", "origin", remote)
+	writeMQSubmitTestFile(t, workDir, ".gitignore", ".beads/\n.runtime/\n")
+	writeMQSubmitTestFile(t, workDir, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, workDir, "add", ".gitignore", "file.txt")
+	runGitForMQSubmitTest(t, workDir, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, workDir, "branch", "-M", "main")
+	runGitForMQSubmitTest(t, workDir, "push", "-u", "origin", "main")
+	branch := "feature/no-new-work"
+	runGitForMQSubmitTest(t, workDir, "checkout", "-b", branch)
+	runGitForMQSubmitTest(t, workDir, "push", "origin", branch)
+	return branch
+}
+
 func installSubmitSourceBDStub(t *testing.T, currentBeadsDir, ownerBeadsDir string, ownerMissing bool) {
 	t.Helper()
 	installSubmitSourceBDStubWithOwnerJSON(t, currentBeadsDir, ownerBeadsDir, ownerMissing,
@@ -567,15 +682,18 @@ func resetMqSubmitFlagsForTest(t *testing.T) {
 	oldPriority := mqSubmitPriority
 	oldNoCleanup, oldSkipDeps, oldResubmit := mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit
 	oldAllowClosed := mqSubmitAllowClosedIssue
+	oldAllowNoOp := mqSubmitAllowNoOp
 	mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = "", "", ""
 	mqSubmitPriority = -1
 	mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = false, false, false
 	mqSubmitAllowClosedIssue = false
+	mqSubmitAllowNoOp = false
 	t.Cleanup(func() {
 		mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = oldBranch, oldIssue, oldEpic
 		mqSubmitPriority = oldPriority
 		mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = oldNoCleanup, oldSkipDeps, oldResubmit
 		mqSubmitAllowClosedIssue = oldAllowClosed
+		mqSubmitAllowNoOp = oldAllowNoOp
 	})
 }
 

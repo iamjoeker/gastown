@@ -109,6 +109,45 @@ func validateOpenSourceIssueForMR(issueID string, issue *beads.Issue) error {
 		refusal, issueID)
 }
 
+// noOpMRRefusal explains why no merge request may be created for commitSHA
+// against target, given the outcome of asking whether that content already
+// reached target (git.Git.VerifyCommitLandedOnPushTarget).
+//
+// gt-2fgq: a polecat respawned onto a branch whose commit content had already
+// landed on target — the fix shipped elsewhere, or the branch was rebased
+// away from real work — and submitted anyway. The refinery merges a no-op MR
+// silently, so like gt-7qm's closed-issue gate, the precondition belongs at
+// the producer.
+//
+// landedErr is nil when the landing check found proof the content is already
+// on target: that is the failure case here. A non-nil landedErr means either
+// real new work was found (git.ErrCommitNotLanded) or the question could not
+// be answered (git.ErrMergeProofUnprovable, offline remote, etc.) — both fail
+// open, mirroring close.go's verifyMergeLandingClaim: absence of proof is not
+// proof of absence, and refusing here would block submits that have nothing
+// to do with the defect being guarded against.
+func noOpMRRefusal(target, commitSHA string, landedErr error) string {
+	if landedErr != nil {
+		return ""
+	}
+	return fmt.Sprintf("commit %s is already on %s (by sha or by content) — there is no new work to merge",
+		shortSHA(commitSHA), target)
+}
+
+// validateNonEmptyMRSource is the erroring form of noOpMRRefusal, for callers
+// that abort rather than create an MR that carries no work.
+func validateNonEmptyMRSource(target, commitSHA string, landedErr error) error {
+	refusal := noOpMRRefusal(target, commitSHA, landedErr)
+	if refusal == "" {
+		return nil
+	}
+	return fmt.Errorf("%s.\n"+
+		"Merging this branch would be a no-op: %s already carries everything it has.\n"+
+		"If real work remains, rebase onto the latest %s and verify your changes are present.\n"+
+		"Operator override (use only when this check is wrong): --allow-noop",
+		refusal, target, target)
+}
+
 func validateMergeRequestSource(mr *beads.Issue, expectedIssueID string, expectedIssue *beads.Issue) error {
 	if mr == nil {
 		return fmt.Errorf("merge request is missing")

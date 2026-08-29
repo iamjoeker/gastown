@@ -275,6 +275,17 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		// gt-2fgq: refuse to create an MR whose commit content already landed
+		// on the target — a polecat redoing already-merged work. Only
+		// checkable when we resolved a commit sha above; --branch-only dedup
+		// (no sha) can't answer this and isn't blocked.
+		if !mqSubmitAllowNoOp && commitSHA != "" {
+			_, landedErr := g.VerifyCommitLandedOnPushTarget("origin", target, commitSHA)
+			if err := validateNonEmptyMRSource(target, commitSHA, landedErr); err != nil {
+				return err
+			}
+		}
+
 		// Create MR bead (ephemeral wisp - will be cleaned up after merge)
 		mrIssue, err = bd.Create(beads.CreateOptions{
 			Title:       title,

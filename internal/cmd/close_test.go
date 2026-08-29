@@ -3,7 +3,9 @@ package cmd
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -299,6 +301,84 @@ func TestCloseBeadDir_ChangeDirWins(t *testing.T) {
 	if got := closeBeadDir("", nil); got != "" {
 		t.Errorf("closeBeadDir() with no inputs = %q, want empty", got)
 	}
+}
+
+func TestExtractReasonValue(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no reason", []string{"gt-abc"}, ""},
+		{"separate value", []string{"gt-abc", "--reason", "Fixed: done"}, "Fixed: done"},
+		{"= form", []string{"gt-abc", "--reason=Fixed: done"}, "Fixed: done"},
+		{"short flag", []string{"-r", "Merged in abc123", "gt-abc"}, "Merged in abc123"},
+		{"comment alias", []string{"--comment", "no-changes: n/a", "gt-abc"}, "no-changes: n/a"},
+		{"last occurrence wins", []string{"--reason", "first", "gt-abc", "--reason", "second"}, "second"},
+		{"empty args", []string{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractReasonValue(tt.args); got != tt.want {
+				t.Errorf("extractReasonValue(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+// gt-20la: `bd close <id> --reason "Fixed: ..."` (or "Merged in <sha>") has no
+// guard requiring the claim be true. This sets up an origin remote and a
+// clone, closes with a landing-claiming reason once while HEAD matches
+// origin/main (must pass) and once with an extra local-only commit (must be
+// refused) — the exact shape of the incident: a fix that only ever existed on
+// the polecat's own branch.
+func TestVerifyMergeLandingClaim(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	t.Run("not a git repo does not block", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := verifyMergeLandingClaim(dir, "Fixed: done"); err != nil {
+			t.Errorf("verifyMergeLandingClaim() = %v, want nil (fails open outside a git repo)", err)
+		}
+	})
+
+	origin := t.TempDir()
+	runGit(t, origin, "init", "--bare", "-b", "main")
+
+	clone := t.TempDir()
+	runGit(t, clone, "clone", origin, ".")
+	runGit(t, clone, "config", "user.email", "test@example.com")
+	runGit(t, clone, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(clone, "f.txt"), []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, clone, "add", "f.txt")
+	runGit(t, clone, "commit", "-m", "initial")
+	runGit(t, clone, "push", "origin", "main")
+
+	t.Run("HEAD landed on origin/main is not blocked", func(t *testing.T) {
+		if err := verifyMergeLandingClaim(clone, "Fixed: done"); err != nil {
+			t.Errorf("verifyMergeLandingClaim() = %v, want nil (HEAD is on origin/main)", err)
+		}
+	})
+
+	if err := os.WriteFile(filepath.Join(clone, "f.txt"), []byte("v2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, clone, "add", "f.txt")
+	runGit(t, clone, "commit", "-m", "unpushed fix, never queued")
+
+	t.Run("HEAD ahead of origin/main is blocked", func(t *testing.T) {
+		err := verifyMergeLandingClaim(clone, "Fixed: the thing")
+		if err == nil {
+			t.Fatal("verifyMergeLandingClaim() = nil, want an error — HEAD never reached origin/main")
+		}
+		if !strings.Contains(err.Error(), "not on origin/main") {
+			t.Errorf("error = %v, want it to name origin/main", err)
+		}
+	})
 }
 
 func TestChildBeadUnmarshal(t *testing.T) {
