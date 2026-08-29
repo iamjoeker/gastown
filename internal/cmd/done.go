@@ -1178,7 +1178,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// the ledger guard need it (gt-r5p).
 			branchPushedWithWork := false
 			if branch != defaultBranch {
-				pushed, unpushed, pushErr := g.BranchPushedToRemote(branch, "origin")
+				// BranchPushedAsItself, not BranchPushedToRemote: the latter falls
+				// back to comparing HEAD against origin/main when the feature branch
+				// has no remote ref, which a zero-commit polecat sitting at
+				// origin/main's tip trivially satisfies (gt-znrt).
+				pushed, unpushed, pushErr := g.BranchPushedAsItself(branch, "origin")
 				branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
 			}
 
@@ -1282,6 +1286,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						IssueID:              issueID,
 						IsPolecat:            os.Getenv("GT_POLECAT") != "",
 						IsNonCodeTask:        isNoMergeTask,
+						ReportOnly:           doneCleanupStatus == "clean" && !isNoMergeTask,
 						BranchPushedWithWork: branchPushedWithWork,
 						SkipVerify:           doneSkipVerify,
 						WorkLandedOnTarget:   superseded.Landed,

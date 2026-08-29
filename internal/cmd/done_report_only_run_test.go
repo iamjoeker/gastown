@@ -66,8 +66,17 @@ func TestRunDoneStillRefusesForkBackedCloseWithoutTheReportOnlyFlag(t *testing.T
 	if err == nil {
 		t.Fatal("runDone closed a fork-backed code bead with no work, no landed commit, and no report-only flag")
 	}
-	if !strings.Contains(err.Error(), "fork/upstream mode") {
-		t.Errorf("refusal %q no longer names the fork/upstream condition it turns on", err.Error())
+	// gt-znrt: the zero-commit guard now fires here directly, rather than
+	// falling through to the fork/upstream-mode message. It used to reach
+	// there only because branchPushedWithWork was miscomputed true (the
+	// origin/main fallback in BranchPushedToRemote); fixing that means this
+	// case is caught by the earlier, more general "no work" refusal instead.
+	// The outcome — refused, no close — is unchanged; only which guard names
+	// itself in the message.
+	for _, want := range []string{"no commits on branch ahead of", "no evidence the work landed", "Do NOT close the bead by hand"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q is missing %q", err.Error(), want)
+		}
 	}
 	if log := readSubmitSourceBDLog(t, logPath); strings.Contains(log, "close bd-source") {
 		t.Errorf("a refused completion must not close the bead:\n%s", log)

@@ -4177,6 +4177,36 @@ func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error
 	return status.Preserved, status.UnpreservedPatchCount, nil
 }
 
+// BranchPushedAsItself reports whether localBranch itself exists on remote and
+// carries HEAD, using only refs/heads/<localBranch> on the push target as
+// evidence. Unlike BranchPushedToRemote, it never falls back to comparing HEAD
+// against the remote default branch: that fallback answers "is HEAD preserved
+// somewhere", which a polecat sitting at origin/main's tip with zero commits of
+// its own trivially satisfies, even though its feature branch was never pushed
+// (gt-znrt). Callers that need proof this specific branch carries this agent's
+// work — not merely that HEAD is durable — should use this instead.
+func (g *Git) BranchPushedAsItself(localBranch, remote string) (bool, int, error) {
+	if localBranch == "" || localBranch == "HEAD" {
+		return false, 0, fmt.Errorf("no local branch to check")
+	}
+	remoteSHA, err := g.PushRemoteBranchTip(remote, localBranch)
+	if err != nil || remoteSHA == "" {
+		return false, 0, err
+	}
+	contains, err := g.refContainsHead(remoteSHA)
+	if err != nil {
+		return false, 0, err
+	}
+	if contains {
+		return true, 0, nil
+	}
+	unpushed, err := g.countCommitsAhead(remoteSHA)
+	if err != nil {
+		return false, 0, err
+	}
+	return false, unpushed, nil
+}
+
 // PrunedBranch represents a local branch that was pruned (or would be pruned in dry-run).
 type PrunedBranch struct {
 	Name   string // Branch name (e.g., "polecat/rictus-mkb0vq9f")
