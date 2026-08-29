@@ -593,6 +593,13 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 
 		archive := reaperArchiver()
 		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalArchived, totalProtected, totalClosed, totalOpen int
+		// allAnomalies collects anomalies from every step (scan, reap, purge,
+		// auto-close), not just scan's. The formula's report step requires an
+		// Anomalies field summarizing the whole cycle — a report that only ever
+		// surfaces scan-time anomalies drops the ones reap/purge/auto-close find
+		// (dangling refs, dolt commit failures, archive stalls) the same way the
+		// prose-driven Dog report did in hq-2u0.
+		var allAnomalies []reaper.Anomaly
 
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
@@ -629,6 +636,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			for _, a := range scanResult.Anomalies {
 				fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
 			}
+			allAnomalies = append(allAnomalies, scanResult.Anomalies...)
 
 			// Reap
 			reapResult, err := reaper.Reap(db, dbName, maxAge, reaperDryRun)
@@ -638,6 +646,10 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 				totalReaped += reapResult.Reaped
 				totalMoleculeSteps += reapResult.MoleculeStepsClosed
 				totalOpen += reapResult.OpenRemain
+				for _, a := range reapResult.Anomalies {
+					fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
+				}
+				allAnomalies = append(allAnomalies, reapResult.Anomalies...)
 			}
 
 			// Purge
@@ -649,6 +661,10 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 				totalMailPurged += purgeResult.MailPurged
 				totalArchived += purgeResult.WispsArchived
 				totalProtected += purgeResult.WispsProtected
+				for _, a := range purgeResult.Anomalies {
+					fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
+				}
+				allAnomalies = append(allAnomalies, purgeResult.Anomalies...)
 			}
 
 			// Auto-close
@@ -661,6 +677,10 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 						entry.ID, entry.Title, entry.AgeDays, entry.Database)
 				}
 				totalClosed += closeResult.Closed
+				for _, a := range closeResult.Anomalies {
+					fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
+				}
+				allAnomalies = append(allAnomalies, closeResult.Anomalies...)
 			}
 
 			// Acked mail: delivery-acked gt:message beads never read, exempt
@@ -679,27 +699,54 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			db.Close()
 		}
 
-		// Report
+		// Convoy check (formula step 5): close convoys whose tracked beads are
+		// all closed. Town-level, not per-database, so it runs once after the
+		// database loop rather than inside it.
+		totalConvoysClosed := 0
+		if townBeads, err := getTownBeadsDir(); err != nil {
+			fmt.Printf("convoy check: %v\n", err)
+		} else if closed, err := checkAndCloseCompletedConvoys(townBeads, reaperDryRun); err != nil {
+			fmt.Printf("convoy check: %v\n", err)
+		} else {
+			totalConvoysClosed = len(closed)
+		}
+
+		// Report. All required fields below are printed unconditionally
+		// (including Anomalies and Convoys closed, even when zero) so this
+		// fallback report can't degrade into a partial one the way the
+		// prose-driven Dog report did in hq-2u0 — a silent cycle must be
+		// indistinguishable from a clean one only by its VALUES, never by a
+		// missing field.
 		prefix := ""
 		if reaperDryRun {
 			prefix = "[DRY RUN] "
 		}
 		fmt.Printf("\n%sReaper cycle complete:\n", prefix)
-		fmt.Printf("  Databases: %d\n", len(databases))
-		fmt.Printf("  Reaped:    %d", totalReaped)
+		fmt.Printf("  Databases scanned:      %d\n", len(databases))
+		fmt.Printf("  Wisps reaped:           %d", totalReaped)
 		if totalMoleculeSteps > 0 {
 			fmt.Printf(" (+%d closed-molecule steps)", totalMoleculeSteps)
 		}
 		fmt.Println()
-		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
+		fmt.Printf("  Wisps purged:           %d\n", totalPurged)
+		fmt.Printf("  Mail purged:            %d\n", totalMailPurged)
 		if totalArchived > 0 && archive != nil {
-			fmt.Printf("  Archived:  %d wisps → %s\n", totalArchived, archive.Location())
+			fmt.Printf("  Archived:               %d wisps → %s\n", totalArchived, archive.Location())
 		}
 		if totalProtected > 0 {
-			fmt.Printf("  Protected: %d wisps (pinned, or protected label with no archive)\n", totalProtected)
+			fmt.Printf("  Protected:              %d wisps (pinned, or protected label with no archive)\n", totalProtected)
 		}
-		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
-		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)
+		fmt.Printf("  Issues auto-closed:     %d\n", totalClosed)
+		fmt.Printf("  Convoys closed:         %d\n", totalConvoysClosed)
+		fmt.Printf("  Open wisps remaining:   %d\n", totalOpen)
+		if len(allAnomalies) == 0 {
+			fmt.Printf("  Anomalies:              none\n")
+		} else {
+			fmt.Printf("  Anomalies:              %d\n", len(allAnomalies))
+			for _, a := range allAnomalies {
+				fmt.Printf("    - %s\n", a.Message)
+			}
+		}
 
 		return nil
 	},
