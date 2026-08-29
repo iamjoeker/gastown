@@ -34,6 +34,11 @@ type noMRCloseContext struct {
 	// IsNonCodeTask is true when the bead carries no_merge or review_only —
 	// audits, reviews, research. Zero commits is expected for these.
 	IsNonCodeTask bool
+	// ReportOnly is true for --cleanup-status=clean — a report-only completion
+	// (audit, review) whose findings are the deliverable and which, like
+	// IsNonCodeTask, has no commits by design (gt-ewip). Distinct from
+	// IsNonCodeTask because it is a flag on the completion, not the bead.
+	ReportOnly bool
 	// BranchPushedWithWork is true when real commits exist on the pushed
 	// feature branch. The branch can be zero commits ahead of base while still
 	// carrying work if base advanced after the push (GH#wd7).
@@ -67,6 +72,9 @@ func noMRCloseRefusal(c noMRCloseContext) string {
 	if c.SkipVerify {
 		return fmt.Sprintf("--skip-verify is an audit-only escape hatch for non-code closes; %s is a code bead "+
 			"(no no_merge/review_only flag), so its completion must be verified against a real pushed commit", c.IssueID)
+	}
+	if c.ReportOnly {
+		return ""
 	}
 	if c.IsPolecat && !c.BranchPushedWithWork && !c.WorkLandedOnTarget {
 		return fmt.Sprintf("cannot close code bead %s with no work: no commits ahead of base and no commits on the pushed branch. "+

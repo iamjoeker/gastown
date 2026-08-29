@@ -125,8 +125,12 @@ func TestRunDoneRefusesForkBackedCloseWhenNothingLanded(t *testing.T) {
 	if err == nil {
 		t.Fatal("runDone closed a fork-backed code bead with no work and nothing on the target")
 	}
+	// gt-znrt: this now surfaces as the general zero-commit "no work" refusal
+	// rather than the fork/upstream-mode message — see the sibling assertion
+	// in done_report_only_run_test.go for why. The refusal still fires and
+	// still names the checked evidence and the safe next steps.
 	for _, want := range []string{
-		"fork/upstream mode",
+		"no commits on branch ahead of",
 		"no evidence the work landed",
 		"Do NOT close the bead by hand",
 	} {
@@ -162,6 +166,36 @@ func TestRunDoneRecordsTheLandingCommitOnSupersededClose(t *testing.T) {
 	}
 	if strings.Contains(log, "Completed with no code changes") {
 		t.Errorf("close still uses the generic no-code-changes reason, which names no evidence:\n%s", log)
+	}
+}
+
+// gt-znrt: the non-fork counterpart of TestRunDoneRefusesForkBackedCloseWhenNothingLanded.
+// Same zero-commits-ahead branch, same absence of any landing commit naming the
+// bead, but no upstream remote — the configuration branchPushedWithWork used to
+// get wrong. BranchPushedToRemote falls back to comparing HEAD against
+// origin/main when the feature branch has no remote ref of its own; on this
+// path HEAD *is* origin/main (the polecat never pushed), so that fallback
+// reported the branch as "pushed with work" and let the close through on
+// somebody else's commit — the exact gt-y20 shape the ledger guard exists to
+// prevent. The fix requires proof this branch itself was pushed, so the close
+// must be refused here exactly as it is on the fork-backed sibling test.
+func TestRunDoneRefusesNonForkCloseWhenNothingLandedAndBranchNeverPushed(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupSupersededGitRepo(t, workDir, false, false)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetDoneFlagsForTest(t)
+	primeSupersededDoneEnv(t, workDir, routedSourceTestTownRoot(workDir))
+
+	err := runDone(nil, nil)
+	if err == nil {
+		t.Fatal("runDone closed a non-fork code bead with no work and nothing on the target, using origin/main as false proof of a push")
+	}
+	if !strings.Contains(err.Error(), "no commits on branch ahead of") {
+		t.Errorf("refusal %q does not name the zero-commit reason", err.Error())
+	}
+	if log := readSubmitSourceBDLog(t, logPath); strings.Contains(log, "close bd-source") {
+		t.Errorf("a refused completion must not close the bead, recording origin/main's tip as this polecat's work:\n%s", log)
 	}
 }
 
