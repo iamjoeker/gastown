@@ -49,3 +49,44 @@ func TestCloseReasonDischargesMergeQueue(t *testing.T) {
 		})
 	}
 }
+
+func TestCloseReasonClaimsMergeLanding(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   bool
+	}{
+		// The refinery's own canonical form (internal/refinery/work_bead_close.go).
+		{"merged in sha", "Merged in 678fc9a65", true},
+		{"merged in MR id", "Merged in gt-wisp-dvns2", true},
+		{"fixed with explanation", "Fixed: corrected the off-by-one", true},
+		{"fix without colon", "fix applied upstream", true},
+		{"case is not the discriminator", "FIXED: done", true},
+
+		// The gt-20la incident's shape, verbatim-ish: a polecat's own words for
+		// closing a bead whose branch never reached the queue.
+		{"fixed and merged", "fixed and merged", true},
+
+		// A colon far enough into prose is not read as a declared category —
+		// same rule as CloseReasonDischargesMergeQueue.
+		{"a colon far into prose", "I re-ran the suite and it stayed green: fixed", false},
+
+		// "no-changes" and its siblings are the opposite claim — nothing landed
+		// because nothing was needed — and must never trip this guard.
+		{"no-changes", "no-changes: bead already fixed on main", false},
+		{"duplicate", "duplicate: same bug as bd-8ob", false},
+
+		{"empty", "", false},
+		{"whitespace", "   ", false},
+		{"bare Closed", "Closed", false},
+		{"unrelated category", "routing probe", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CloseReasonClaimsMergeLanding(tt.reason); got != tt.want {
+				t.Fatalf("CloseReasonClaimsMergeLanding(%q) = %v, want %v", tt.reason, got, tt.want)
+			}
+		})
+	}
+}
