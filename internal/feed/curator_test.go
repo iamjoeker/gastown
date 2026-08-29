@@ -372,6 +372,22 @@ func TestCurator_GeneratesSummary(t *testing.T) {
 			},
 			expected: "gastown/witness handed off to fresh session",
 		},
+		{
+			event: &events.Event{
+				Type:    events.TypePark,
+				Actor:   "mayor",
+				Payload: map[string]interface{}{"rig": "gastown"},
+			},
+			expected: "mayor parked rig gastown",
+		},
+		{
+			event: &events.Event{
+				Type:    events.TypeUnpark,
+				Actor:   "mayor",
+				Payload: map[string]interface{}{"rig": "gastown"},
+			},
+			expected: "mayor unparked rig gastown",
+		},
 	}
 
 	for _, tc := range tests {

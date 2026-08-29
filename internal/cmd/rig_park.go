@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -127,6 +128,10 @@ func parkOneRig(rigName string) error {
 		return fmt.Errorf("setting parked status: %w", err)
 	}
 
+	// Emit a feed event so a legitimate operator pause is distinguishable
+	// from an unexplained state change (mirrors hq-qq5).
+	_ = events.LogFeed(events.TypePark, detectActor(), events.ParkPayload(rigName, stoppedAgents))
+
 	// Output
 	fmt.Printf("%s Rig %s parked (local only)\n", style.Success.Render("✓"), rigName)
 	for _, msg := range stoppedAgents {
@@ -168,6 +173,10 @@ func unparkOneRig(rigName string) error {
 	if err := wispCfg.Unset(RigStatusKey); err != nil {
 		return fmt.Errorf("clearing parked status: %w", err)
 	}
+
+	// Emit a feed event so a legitimate operator pause is distinguishable
+	// from an unexplained state change (mirrors hq-qq5).
+	_ = events.LogFeed(events.TypeUnpark, detectActor(), events.ParkPayload(rigName, nil))
 
 	fmt.Printf("%s Rig %s unparked\n", style.Success.Render("✓"), rigName)
 	fmt.Printf("  Daemon can now auto-restart agents\n")
