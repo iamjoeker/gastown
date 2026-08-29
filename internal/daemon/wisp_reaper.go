@@ -3,6 +3,7 @@ package daemon
 import (
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -246,11 +247,32 @@ func (d *Daemon) reapWisps() {
 		d.reapWispsInline(config, maxAge, deleteAge, staleAge, mailAge, mol)
 		return
 	}
-
-	d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
 }
 
+// reaperMolRootRe extracts the dispatched molecule's root wisp id from
+// `gt sling`'s stdout ("... Formula wisp created: gt-wisp-xxxx"). Dispatch
+// itself never waits for or reads back the Dog's own report — see the
+// gt-154h comment below — so this id, logged at dispatch time, is the only
+// durable trace this function contributes if the Dog's session dies before
+// it reaches the formula's report step.
+var reaperMolRootRe = regexp.MustCompile(`Formula wisp created:\s*(\S+)`)
+
 // dispatchReaperDog dispatches the mol-dog-reaper formula to a Dog via gt sling.
+//
+// This only confirms that gt sling successfully POURED the molecule and
+// assigned a Dog — it does not wait for, or ever read back, the result of the
+// Dog actually executing it. All durable accounting of what the cycle did
+// (reaped=/purged=/archived= counts, the equivalent of the inline path's
+// summary line in reapWispsInline) depends entirely on the Dog completing the
+// formula's "report" step and running `bd close <reaper-wisp-id>
+// --reason-file <path>` itself (gt-0gxt) — nothing here verifies that
+// happened. If the Dog's session dies, times out, or skips that step, the
+// cycle's counts are gone with no fallback: this function returns before any
+// of that work runs, so it has nothing to log about the outcome. Logging the
+// dispatched molecule id is the one thing this function CAN do unconditionally,
+// so an operator investigating a silent cycle has a `gt mol status`/`gt mol
+// attachment` target to check even when the Dog's own report never landed
+// (gt-154h, mirrors hq-rwr9f).
 func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 	args := []string{"sling", constants.MolDogReaper, "deacon/dogs"}
 	for k, v := range vars {
@@ -263,8 +285,16 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 	// while stripping stale bd target selectors and derived Beads endpoint aliases.
 	cmd.Env = bdMutationRoutingEnv(d.config.TownRoot)
 	util.SetDetachedProcessGroup(cmd)
-	if err := cmd.Run(); err != nil {
+	output, err := cmd.CombinedOutput()
+	if err != nil {
 		return fmt.Errorf("gt sling: %w", err)
+	}
+	if d.logger != nil {
+		if m := reaperMolRootRe.FindSubmatch(output); m != nil {
+			d.logger.Printf("wisp_reaper: dispatched to Dog, molecule=%s", string(m[1]))
+		} else {
+			d.logger.Printf("wisp_reaper: dispatched to Dog (could not parse molecule id from sling output)")
+		}
 	}
 	return nil
 }

@@ -216,6 +216,39 @@ func TestDispatchReaperDogUsesDogPoolSling(t *testing.T) {
 	}
 }
 
+// TestDispatchReaperDogLogsMolecule is the gt-154h regression: dispatch never
+// waits for the Dog to run the formula, so if the Dog's session dies before it
+// reaches the report step (bd close --reason-file, gt-0gxt), the dispatched
+// molecule id logged here is the only durable trace an operator has to
+// investigate with (mirrors hq-rwr9f).
+func TestDispatchReaperDogLogsMolecule(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock")
+	}
+
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	fakeGT := filepath.Join(binDir, "gt")
+	script := "#!/bin/sh\necho '✓ Formula wisp created: gt-wisp-abc123'\n"
+	if err := os.WriteFile(fakeGT, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	logBuf := &bytes.Buffer{}
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		gtPath: fakeGT,
+		logger: log.New(logBuf, "", 0),
+	}
+	if err := d.dispatchReaperDog(map[string]string{"max_age": "1h"}); err != nil {
+		t.Fatalf("dispatchReaperDog() error = %v", err)
+	}
+
+	if got := logBuf.String(); !strings.Contains(got, "molecule=gt-wisp-abc123") {
+		t.Fatalf("dispatch did not log the dispatched molecule id, got log:\n%s", got)
+	}
+}
+
 func TestDoltServerHostIgnoresStaleBeadsHost(t *testing.T) {
 	t.Setenv("GT_DOLT_HOST", "")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")
