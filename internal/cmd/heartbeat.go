@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -101,7 +102,14 @@ func syncDeaconHeartbeatStores(townRoot, action string) error {
 	} else {
 		err = deacon.Touch(townRoot)
 	}
-	deaconAgentBeadHeartbeatSync(townRoot)
+	// The agent-bead label write is best-effort (liveness is already recorded
+	// in the other two stores), but a silently discarded error here is exactly
+	// what let `gt heartbeat`/`gt deacon heartbeat` print "Heartbeat updated"
+	// while the label watchers actually read stayed frozen (gt-oefn, mirrors
+	// hq-97l7). Surface it instead of swallowing it.
+	if beadErr := deaconAgentBeadHeartbeatSync(townRoot); beadErr != nil {
+		style.PrintWarning("could not stamp deacon agent-bead heartbeat: %v", beadErr)
+	}
 	return err
 }
 
@@ -110,15 +118,16 @@ func syncDeaconHeartbeatStores(townRoot, action string) error {
 // second-order monitoring. Normally await-signal maintains it, but a Deacon
 // session that never reaches await-signal (handoffs, long patrols, session
 // limits) leaves it stale for hours and triggers false stuck escalations
-// (hq-qxl9). Best-effort: failures are silent, liveness is already recorded
-// in the other two stores.
-func syncDeaconAgentBeadHeartbeat(townRoot string) {
+// (hq-qxl9). The write itself is best-effort — callers do not fail the
+// command over it — but the error is returned rather than discarded so a
+// caller can at least warn instead of reporting unconditional success.
+func syncDeaconAgentBeadHeartbeat(townRoot string) error {
 	agentBead := beads.DeaconBeadIDTown()
 	beadsDir := beads.ResolveBeadsDir(townRoot)
 
 	labels, err := getAllAgentLabels(agentBead, beadsDir)
 	if err != nil {
-		return
+		return fmt.Errorf("reading agent bead labels: %w", err)
 	}
 	for _, label := range labels {
 		epochStr, ok := strings.CutPrefix(label, "heartbeat:")
@@ -127,9 +136,9 @@ func syncDeaconAgentBeadHeartbeat(townRoot string) {
 		}
 		if epoch, err := strconv.ParseInt(epochStr, 10, 64); err == nil {
 			if time.Since(time.Unix(epoch, 0)) < deaconBeadHeartbeatSyncThreshold {
-				return
+				return nil
 			}
 		}
 	}
-	_ = updateAgentHeartbeat(agentBead, beadsDir)
+	return updateAgentHeartbeat(agentBead, beadsDir)
 }
