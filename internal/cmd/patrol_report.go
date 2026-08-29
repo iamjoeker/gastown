@@ -158,8 +158,18 @@ func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(P
 	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
 	fmt.Println(style.Dim.Render("  Root-only wisp: steps are read inline from " + cfg.PatrolMolName +
 		" at prime time, so `bd mol current` reports 0/0. Run `" + cli.Name() + " prime` for the checklist."))
-	if cfg.RoleName == "deacon" {
+	switch cfg.RoleName {
+	case "deacon":
 		stampDeaconHeartbeatOnReport(cfg.BeadsDir, summary)
+	case "witness", "refinery":
+		// gt patrol report is the one action every witness/refinery cycle
+		// takes, but until now only the Deacon's build of this command
+		// stamped a heartbeat here. Witnesses and refineries that close a
+		// cycle and go straight into more work without reaching
+		// await-signal never stamp at all, so their heartbeat:EPOCH label
+		// freezes while they are demonstrably alive (hq-nqwb). Stamp it
+		// here too, on the same action every cycle takes unconditionally.
+		stampAgentHeartbeatOnReport(cfg.RoleName, cfg.Assignee)
 	}
 	return nil
 }
@@ -180,6 +190,38 @@ func stampDeaconHeartbeatOnReport(townRoot, summary string) {
 	}
 	if err := syncDeaconHeartbeatStores(townRoot, action); err != nil {
 		style.PrintWarning("could not stamp deacon heartbeat: %v", err)
+	}
+}
+
+// resolveAgentHeartbeatBead and updateAgentHeartbeatFn are indirections over
+// resolveAgentBead/updateAgentHeartbeat so tests can stamp without shelling
+// out to bd.
+var (
+	resolveAgentHeartbeatBead = resolveAgentBead
+	updateAgentHeartbeatFn    = updateAgentHeartbeat
+)
+
+// stampAgentHeartbeatOnReport stamps the heartbeat:EPOCH label on the
+// witness/refinery's own agent bead. Best-effort: a stamping failure must
+// never block the report/spawn chain that every patrol cycle depends on.
+func stampAgentHeartbeatOnReport(roleName, assignee string) {
+	rig, _, ok := strings.Cut(assignee, "/")
+	if !ok || rig == "" {
+		style.PrintWarning("not stamping %s heartbeat: could not parse rig from assignee %q", roleName, assignee)
+		return
+	}
+
+	match, err := resolveAgentHeartbeatBead(roleName, rig)
+	if err != nil {
+		style.PrintWarning("not stamping %s heartbeat: resolving agent bead: %v", roleName, err)
+		return
+	}
+	if match == nil {
+		style.PrintWarning("not stamping %s heartbeat: no agent bead found for %s/%s", roleName, rig, roleName)
+		return
+	}
+	if err := updateAgentHeartbeatFn(match.ID, match.BeadsDir); err != nil {
+		style.PrintWarning("could not stamp %s heartbeat: %v", roleName, err)
 	}
 }
 

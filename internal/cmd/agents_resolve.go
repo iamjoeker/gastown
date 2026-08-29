@@ -72,28 +72,7 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("--role is required")
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("getting working directory: %w", err)
-	}
-	currentBeadsDir, err := resolveAgentTrackingBeadsDir()
-	if err != nil {
-		return err
-	}
-
-	candidates, err := findAgentBeadCandidates(cwd, currentBeadsDir)
-	if err != nil {
-		return err
-	}
-
-	var matches []agentBeadCandidate
-	for _, candidate := range candidates {
-		if agentBeadMatches(candidate.Issue, role, rig) {
-			matches = append(matches, candidate)
-		}
-	}
-
-	match, err := pickBestAgentBead(matches)
+	match, err := resolveAgentBead(role, rig)
 	if err != nil {
 		return err
 	}
@@ -122,6 +101,36 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 
 	fmt.Fprintln(cmd.OutOrStdout(), match.ID)
 	return nil
+}
+
+// resolveAgentBead resolves the active agent bead for a role/rig pair,
+// searching the current rig database and the town database across both
+// durable issues and ephemeral wisps. Returns nil (no error) when no match
+// is found. Shared by `gt agents resolve` and any caller that needs to
+// stamp or read the bead for the role it is currently running as.
+func resolveAgentBead(role, rig string) (*agentBeadCandidate, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("getting working directory: %w", err)
+	}
+	currentBeadsDir, err := resolveAgentTrackingBeadsDir()
+	if err != nil {
+		return nil, err
+	}
+
+	candidates, err := findAgentBeadCandidates(cwd, currentBeadsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var matches []agentBeadCandidate
+	for _, candidate := range candidates {
+		if agentBeadMatches(candidate.Issue, role, rig) {
+			matches = append(matches, candidate)
+		}
+	}
+
+	return pickBestAgentBead(matches)
 }
 
 func findAgentBeadCandidates(cwd, currentBeadsDir string) ([]agentBeadCandidate, error) {

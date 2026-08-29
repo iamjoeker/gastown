@@ -838,18 +838,31 @@ DOCKED rigs are intentionally offline (Mayor or human docked them). Do NOT:
 A docked rig is NOT broken. It is off on purpose. Skip it entirely.
 
 **IMPORTANT: Idle Town Protocol**
-Before sending health check nudges, check if the town is idle:
+Before sending health check nudges, check if the town is idle. `in_progress`
+does double duty in this town: it also marks beads an agent parked
+IN_PROGRESS to protect them from the closed-wisp purge, with no way to
+express "held pending an external decision" separately (hq-nqwb). A bead
+that cannot move without a human ruling is not active work, and polling it
+every cycle burns the polled agent's turn on a byte-identical answer without
+learning anything a slow poll would not.
 ```bash
-# Check for active work
-bd list --status=in_progress --limit=5
+# Check for active work, then subtract anything that's blocked and can't move
+bd list --status=in_progress --limit=5 --json
+bd blocked --json
 ```
+Cross-reference the two: an in_progress bead that also appears in `bd
+blocked` is parked, not active — exclude it. Only bd IDs present in the
+first list and absent from the second count as active work.
 
-If NO active work (empty result or only patrol molecules):
+If NO active work remains after excluding blocked beads (empty result or
+only patrol molecules):
 - **Skip HEALTH_CHECK nudges** - don't disturb idle agents
 - Just verify sessions exist via status commands
 - The town should be silent when healthy and idle
+- This includes a town where the only in_progress bead is blocked pending a
+  human ruling — polling it again will not change its state
 
-If ACTIVE work exists:
+If ACTIVE (in_progress AND not blocked) work exists:
 - Proceed with health check nudges below
 
 **ZFC Principle**: You (Claude) make the judgment call about what is "stuck" or "unresponsive" - there are no hardcoded thresholds in Go. Read the signals, consider context, and decide.

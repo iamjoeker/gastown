@@ -75,3 +75,77 @@ func TestStampDeaconHeartbeatOnReport_SkipsOnCorruptPauseFile(t *testing.T) {
 		t.Fatalf("agent bead syncs = %d, want 0", syncs)
 	}
 }
+
+// gt-h9yh: gt patrol report only stamped the heartbeat for the Deacon role.
+// A witness or refinery that closes a cycle and goes straight into more
+// work without reaching await-signal never stamped at all, so its
+// heartbeat:EPOCH label froze while it was demonstrably alive.
+func TestStampAgentHeartbeatOnReport_WitnessStampsResolvedBead(t *testing.T) {
+	oldResolve := resolveAgentHeartbeatBead
+	oldUpdate := updateAgentHeartbeatFn
+	t.Cleanup(func() {
+		resolveAgentHeartbeatBead = oldResolve
+		updateAgentHeartbeatFn = oldUpdate
+	})
+
+	var gotRole, gotRig string
+	resolveAgentHeartbeatBead = func(role, rig string) (*agentBeadCandidate, error) {
+		gotRole, gotRig = role, rig
+		return &agentBeadCandidate{ID: "gt-witness-institute", BeadsDir: "/beads"}, nil
+	}
+	var stamped, stampedDir string
+	updateAgentHeartbeatFn = func(agentBead, beadsDir string) error {
+		stamped, stampedDir = agentBead, beadsDir
+		return nil
+	}
+
+	stampAgentHeartbeatOnReport("witness", "institute/witness")
+
+	if gotRole != "witness" || gotRig != "institute" {
+		t.Fatalf("resolveAgentHeartbeatBead(role=%q, rig=%q), want (witness, institute)", gotRole, gotRig)
+	}
+	if stamped != "gt-witness-institute" || stampedDir != "/beads" {
+		t.Fatalf("updateAgentHeartbeatFn(%q, %q), want (gt-witness-institute, /beads)", stamped, stampedDir)
+	}
+}
+
+func TestStampAgentHeartbeatOnReport_NoMatchDoesNotPanic(t *testing.T) {
+	oldResolve := resolveAgentHeartbeatBead
+	oldUpdate := updateAgentHeartbeatFn
+	t.Cleanup(func() {
+		resolveAgentHeartbeatBead = oldResolve
+		updateAgentHeartbeatFn = oldUpdate
+	})
+
+	resolveAgentHeartbeatBead = func(role, rig string) (*agentBeadCandidate, error) {
+		return nil, nil
+	}
+	calls := 0
+	updateAgentHeartbeatFn = func(agentBead, beadsDir string) error {
+		calls++
+		return nil
+	}
+
+	stampAgentHeartbeatOnReport("refinery", "institute/refinery")
+
+	if calls != 0 {
+		t.Fatalf("updateAgentHeartbeatFn calls = %d, want 0 when no agent bead resolves", calls)
+	}
+}
+
+func TestStampAgentHeartbeatOnReport_UnparsableAssigneeDoesNotPanic(t *testing.T) {
+	oldResolve := resolveAgentHeartbeatBead
+	t.Cleanup(func() { resolveAgentHeartbeatBead = oldResolve })
+
+	calls := 0
+	resolveAgentHeartbeatBead = func(role, rig string) (*agentBeadCandidate, error) {
+		calls++
+		return nil, nil
+	}
+
+	stampAgentHeartbeatOnReport("witness", "no-slash-here")
+
+	if calls != 0 {
+		t.Fatalf("resolveAgentHeartbeatBead calls = %d, want 0 when assignee has no rig prefix", calls)
+	}
+}
