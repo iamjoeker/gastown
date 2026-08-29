@@ -533,6 +533,18 @@ func (c *Curator) generateSummary(event *events.Event) string {
 		// reuse (gt-ibtb).
 		return events.PoolReuseSummary(event.Type, event.Payload)
 
+	case events.TypePark:
+		if rig, ok := event.Payload["rig"].(string); ok {
+			return fmt.Sprintf("%s parked rig %s", event.Actor, rig)
+		}
+		return fmt.Sprintf("%s parked a rig", event.Actor)
+
+	case events.TypeUnpark:
+		if rig, ok := event.Payload["rig"].(string); ok {
+			return fmt.Sprintf("%s unparked rig %s", event.Actor, rig)
+		}
+		return fmt.Sprintf("%s unparked a rig", event.Actor)
+
 	case events.TypeMassDeath:
 		count, _ := event.Payload["count"].(float64) // JSON numbers are float64
 		possibleCause, _ := event.Payload["possible_cause"].(string)

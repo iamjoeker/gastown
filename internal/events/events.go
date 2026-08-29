@@ -46,6 +46,8 @@ const (
 	TypeNudge   = "nudge"
 	TypeBoot    = "boot"
 	TypeHalt    = "halt"
+	TypePark    = "park"
+	TypeUnpark  = "unpark"
 
 	// TypePoolReuseRefused records that `gt sling` considered the idle polecat
 	// pool and reused NOTHING, with the per-candidate reasons. The success path
@@ -470,6 +472,19 @@ func KillPayload(rig, target, reason string) map[string]interface{} {
 func HaltPayload(services []string) map[string]interface{} {
 	return map[string]interface{}{
 		"services": services,
+	}
+}
+
+// ParkPayload creates a payload for park/unpark events. stoppedAgents lists
+// what was stopped as part of parking (e.g. "Witness stopped"); it is empty
+// on unpark. Recording actor and rig here is what lets a reader of the feed
+// tell a deliberate operator pause from an unexplained state change, instead
+// of having to trust that whoever noticed the change happened to also read a
+// report about it (mirrors hq-qq5).
+func ParkPayload(rig string, stoppedAgents []string) map[string]interface{} {
+	return map[string]interface{}{
+		"rig":            rig,
+		"stopped_agents": stoppedAgents,
 	}
 }
 

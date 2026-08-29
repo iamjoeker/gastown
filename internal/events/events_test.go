@@ -96,6 +96,34 @@ func TestBootPayload(t *testing.T) {
 	}
 }
 
+func TestParkPayload(t *testing.T) {
+	p := ParkPayload("gastown", []string{"Witness stopped", "Refinery stopped"})
+	if p["rig"] != "gastown" {
+		t.Errorf("rig = %v, want gastown", p["rig"])
+	}
+	stopped, ok := p["stopped_agents"].([]string)
+	if !ok {
+		t.Fatal("stopped_agents is not []string")
+	}
+	if len(stopped) != 2 {
+		t.Errorf("stopped_agents has %d items, want 2", len(stopped))
+	}
+}
+
+func TestParkPayload_NoStoppedAgents(t *testing.T) {
+	p := ParkPayload("gastown", nil)
+	if p["rig"] != "gastown" {
+		t.Errorf("rig = %v, want gastown", p["rig"])
+	}
+	stopped, ok := p["stopped_agents"].([]string)
+	if !ok {
+		t.Fatal("stopped_agents is not []string")
+	}
+	if len(stopped) != 0 {
+		t.Errorf("stopped_agents has %d items, want 0", len(stopped))
+	}
+}
+
 func TestMergePayload_WithReason(t *testing.T) {
 	p := MergePayload("mr-1", "alpha", "polecat/alpha", "conflict")
 	if p["mr"] != "mr-1" {
