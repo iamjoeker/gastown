@@ -279,29 +279,29 @@ func TestCalculateWorkerWorkStatus_DefaultThresholds(t *testing.T) {
 		name       string
 		age        time.Duration
 		issueID    string
-		workerName string
+		isRefinery bool
 		want       string
 	}{
-		{"refinery always working", 1 * time.Hour, "gt-123", "refinery", "working"},
-		{"refinery working even without issue", 0, "", "refinery", "working"},
-		{"no issue means idle", 0, "", "dag", "idle"},
-		{"no issue means idle even if active", 1 * time.Second, "", "nux", "idle"},
-		{"very recent is working", 1 * time.Second, "gt-123", "dag", "working"},
-		{"just under stale is working", stale - 1*time.Second, "gt-123", "dag", "working"},
-		{"at stale boundary is stale", stale, "gt-123", "dag", "stale"},
-		{"between stale and stuck is stale", 15 * time.Minute, "gt-123", "dag", "stale"},
-		{"just under stuck is stale", stuck - 1*time.Second, "gt-123", "dag", "stale"},
-		{"at stuck boundary is stuck", stuck, "gt-123", "dag", "stuck"},
-		{"well past stuck is stuck", 2 * time.Hour, "gt-123", "dag", "stuck"},
-		{"zero age with issue is working", 0, "gt-456", "nux", "working"},
+		{"refinery always working", 1 * time.Hour, "gt-123", true, "working"},
+		{"refinery working even without issue", 0, "", true, "working"},
+		{"no issue means idle", 0, "", false, "idle"},
+		{"no issue means idle even if active", 1 * time.Second, "", false, "idle"},
+		{"very recent is working", 1 * time.Second, "gt-123", false, "working"},
+		{"just under stale is working", stale - 1*time.Second, "gt-123", false, "working"},
+		{"at stale boundary is stale", stale, "gt-123", false, "stale"},
+		{"between stale and stuck is stale", 15 * time.Minute, "gt-123", false, "stale"},
+		{"just under stuck is stale", stuck - 1*time.Second, "gt-123", false, "stale"},
+		{"at stuck boundary is stuck", stuck, "gt-123", false, "stuck"},
+		{"well past stuck is stuck", 2 * time.Hour, "gt-123", false, "stuck"},
+		{"zero age with issue is working", 0, "gt-456", false, "working"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := calculateWorkerWorkStatus(tt.age, tt.issueID, tt.workerName, stale, stuck)
+			got := calculateWorkerWorkStatus(tt.age, tt.issueID, tt.isRefinery, stale, stuck)
 			if got != tt.want {
-				t.Errorf("calculateWorkerWorkStatus(%v, %q, %q, %v, %v) = %q, want %q",
-					tt.age, tt.issueID, tt.workerName, stale, stuck, got, tt.want)
+				t.Errorf("calculateWorkerWorkStatus(%v, %q, %v, %v, %v) = %q, want %q",
+					tt.age, tt.issueID, tt.isRefinery, stale, stuck, got, tt.want)
 			}
 		})
 	}
@@ -326,9 +326,9 @@ func TestCalculateWorkerWorkStatus_CustomThresholds(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := calculateWorkerWorkStatus(tt.age, tt.issueID, "dag", stale, stuck)
+			got := calculateWorkerWorkStatus(tt.age, tt.issueID, false, stale, stuck)
 			if got != tt.want {
-				t.Errorf("calculateWorkerWorkStatus(%v, %q, dag, %v, %v) = %q, want %q",
+				t.Errorf("calculateWorkerWorkStatus(%v, %q, false, %v, %v) = %q, want %q",
 					tt.age, tt.issueID, stale, stuck, got, tt.want)
 			}
 		})
@@ -340,12 +340,12 @@ func TestCalculateWorkerWorkStatus_LargeThresholds(t *testing.T) {
 	stale := 24 * time.Hour
 	stuck := 48 * time.Hour
 
-	got := calculateWorkerWorkStatus(12*time.Hour, "gt-1", "dag", stale, stuck)
+	got := calculateWorkerWorkStatus(12*time.Hour, "gt-1", false, stale, stuck)
 	if got != "working" {
 		t.Errorf("12h with 24h stale threshold should be working, got %q", got)
 	}
 
-	got = calculateWorkerWorkStatus(36*time.Hour, "gt-1", "dag", stale, stuck)
+	got = calculateWorkerWorkStatus(36*time.Hour, "gt-1", false, stale, stuck)
 	if got != "stale" {
 		t.Errorf("36h with 24h/48h thresholds should be stale, got %q", got)
 	}
@@ -353,7 +353,7 @@ func TestCalculateWorkerWorkStatus_LargeThresholds(t *testing.T) {
 
 func TestCalculateWorkerWorkStatus_ZeroThresholds(t *testing.T) {
 	// Zero thresholds: everything with an issue should be stuck
-	got := calculateWorkerWorkStatus(0, "gt-1", "dag", 0, 0)
+	got := calculateWorkerWorkStatus(0, "gt-1", false, 0, 0)
 	if got != "stuck" {
 		t.Errorf("0 age with 0/0 thresholds should be stuck, got %q", got)
 	}
