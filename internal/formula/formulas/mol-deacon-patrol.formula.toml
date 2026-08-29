@@ -845,14 +845,29 @@ express "held pending an external decision" separately (hq-nqwb). A bead
 that cannot move without a human ruling is not active work, and polling it
 every cycle burns the polled agent's turn on a byte-identical answer without
 learning anything a slow poll would not.
+
+**Two independent blind spots make this probe false-CLEAN if you use `bd
+list` from the deacon's own cwd (gt-90ew, mirrors hq-eqf2):** `bd list`
+does not query the wisps table, and every merge-request bead is a wisp — a
+live MR under review reads as "no active work" with no error. Separately,
+MR beads live in each RIG's own db, not the town/hq db this patrol runs
+from — a query with no `-C <rig-path>` sees zero rig work even after
+switching to a wisp-aware command. Fixing either alone still yields a false
+clean; both are required together.
 ```bash
-# Check for active work, then subtract anything that's blocked and can't move
-bd list --status=in_progress --limit=5 --json
-bd blocked --json
+# Check for active work, then subtract anything that's blocked and can't move.
+# Use `bd query` (not `bd list`) so wisps — including MR beads — are counted,
+# and run it once per rig (`-C <rig-path>`) since rig work is invisible from
+# the town/hq context.
+for rig_path in $(gt rig list --json | jq -r '.[].path'); do
+  bd query 'status=in_progress' -n 0 --json -C "$rig_path"
+  bd blocked --json -C "$rig_path"
+done
 ```
-Cross-reference the two: an in_progress bead that also appears in `bd
-blocked` is parked, not active — exclude it. Only bd IDs present in the
-first list and absent from the second count as active work.
+Cross-reference the two per rig: an in_progress bead that also appears in
+`bd blocked` for that rig is parked, not active — exclude it. Only bd IDs
+present in the in_progress list and absent from the blocked list for the
+same rig count as active work.
 
 If NO active work remains after excluding blocked beads (empty result or
 only patrol molecules):
