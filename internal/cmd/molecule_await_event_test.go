@@ -705,3 +705,82 @@ func TestEventFileStruct(t *testing.T) {
 		t.Errorf("type = %v, want MQ_SUBMIT", parsed["type"])
 	}
 }
+
+// TestAwaitEventCleanupPreventsRedelivery reproduces the gt-pk86 report: a
+// refinery-style caller awaits with --cleanup, receives an event, and a
+// second await on the same channel must NOT see that event again. Without
+// --cleanup actually deleting the file, the event is redelivered on every
+// subsequent await, which is exactly what was observed live (42 events
+// repeatedly redelivered despite the channel being genuinely empty).
+func TestAwaitEventCleanupPreventsRedelivery(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	t.Chdir(root)
+
+	channelDir := filepath.Join(root, "events", "testrig", "refinery")
+	if err := os.MkdirAll(channelDir, 0755); err != nil {
+		t.Fatalf("mkdir channel dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(channelDir, "001.event"),
+		[]byte(`{"type":"MQ_SUBMIT","channel":"refinery","payload":{}}`), 0644); err != nil {
+		t.Fatalf("write event file: %v", err)
+	}
+
+	oldChannel, oldTimeout, oldRig := awaitEventChannel, awaitEventTimeout, awaitEventRig
+	oldCleanup, oldQuiet, oldAgentBead := awaitEventCleanup, awaitEventQuiet, awaitEventAgentBead
+	oldBackoffBase, oldBackoffMax := awaitEventBackoffBase, awaitEventBackoffMax
+	oldJSON := moleculeJSON
+	t.Cleanup(func() {
+		awaitEventChannel, awaitEventTimeout, awaitEventRig = oldChannel, oldTimeout, oldRig
+		awaitEventCleanup, awaitEventQuiet, awaitEventAgentBead = oldCleanup, oldQuiet, oldAgentBead
+		awaitEventBackoffBase, awaitEventBackoffMax = oldBackoffBase, oldBackoffMax
+		moleculeJSON = oldJSON
+	})
+
+	awaitEventChannel = "refinery"
+	awaitEventRig = "testrig"
+	awaitEventQuiet = true
+	awaitEventAgentBead = ""
+	awaitEventCleanup = true
+	awaitEventBackoffBase = ""
+	awaitEventBackoffMax = ""
+	moleculeJSON = false
+
+	// First await: the pre-existing event must be found immediately.
+	awaitEventTimeout = "1s"
+	if err := runMoleculeAwaitEvent(nil, nil); err != nil {
+		t.Fatalf("first runMoleculeAwaitEvent: %v", err)
+	}
+
+	entries, err := os.ReadDir(channelDir)
+	if err != nil {
+		t.Fatalf("read channel dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".event") {
+			t.Fatalf("--cleanup left event file behind: %s", e.Name())
+		}
+	}
+
+	// Second await, short timeout: with the event actually cleaned up, this
+	// must time out rather than redeliver the same event.
+	awaitEventTimeout = "200ms"
+	if err := runMoleculeAwaitEvent(nil, nil); err != nil {
+		t.Fatalf("second runMoleculeAwaitEvent: %v", err)
+	}
+
+	entries, err = os.ReadDir(channelDir)
+	if err != nil {
+		t.Fatalf("read channel dir after second await: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".event") {
+			t.Fatalf("event file %s reappeared after cleanup — redelivery bug", e.Name())
+		}
+	}
+}
