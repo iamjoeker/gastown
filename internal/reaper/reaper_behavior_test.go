@@ -1522,6 +1522,53 @@ func TestAutoCloseSparesOpenEscalations(t *testing.T) {
 	}
 }
 
+// TestAutoCloseSparesStandingWatchProse is the acceptance test for gt-7kzo,
+// mirroring hq-pl6c8: dn-fhw was an accepted "STANDING WATCH OBLIGATION" whose
+// permanence was declared only in its title/description prose, carried no
+// labels at all, and was closed by AutoClose with "stale:auto-closed by
+// reaper" — the exact mechanism the bead existed to defeat.
+//
+// Both watch-marker beads are stale by the same margin as the control and
+// carry NO protective label — the only thing that can save them is the text
+// match itself. The title-only and description-only cases are both covered
+// because dn-fhw's own report showed the marker in both places and a fix
+// keyed on just one field would still have missed half the shape.
+func TestAutoCloseSparesStandingWatchProse(t *testing.T) {
+	f := newFixture(t, "autoclose_standing_watch")
+	stale := time.Now().UTC().Add(-30 * 24 * time.Hour)
+
+	f.insertIssues(t,
+		issueRow{id: "keep-watch-title", title: "Standing watch: reap regression", priority: 2, updatedAt: stale},
+		issueRow{id: "keep-watch-desc", priority: 2, updatedAt: stale,
+			description: "STANDING WATCH OBLIGATION accepted by duly_noted/witness from hq deacon."},
+		// NEGATIVE CONTROL: same age, same priority, no marker anywhere.
+		issueRow{id: "close-control", priority: 2, updatedAt: stale},
+	)
+
+	scan, err := Scan(f.db, f.dbName, staleAge, purgeAge, purgeAge, staleAge)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.StaleCandidates != 1 {
+		t.Errorf("Scan.StaleCandidates = %d, want 1 (close-control) — scan and AutoClose must "+
+			"exempt the same set, or the Dog reads a count the sweep will not act on",
+			scan.StaleCandidates)
+	}
+
+	result, err := AutoClose(f.db, f.dbName, staleAge, false)
+	if err != nil {
+		t.Fatalf("AutoClose: %v", err)
+	}
+	if got := closedEntryIDs(result); !reflect.DeepEqual(got, []string{"close-control"}) {
+		t.Errorf("ClosedEntries = %v, want [close-control] — a standing-watch bead was closed "+
+			"despite declaring its permanence in prose", got)
+	}
+	if got := f.closedIssueIDs(t); !reflect.DeepEqual(got, []string{"close-control"}) {
+		t.Errorf("closed issues = %v, want [close-control] — an AutoClose that closed nothing "+
+			"would satisfy the exemption assertion for the wrong reason", got)
+	}
+}
+
 // TestStrandedMoleculeProbeBehaviour runs the stranded-molecule probe's real SQL
 // against a real engine. It is the acceptance test for gt-id8x.
 //

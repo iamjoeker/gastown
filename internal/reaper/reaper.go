@@ -547,6 +547,45 @@ var AutoCloseExemptLabels = []string{
 	"gt:standing-orders", "gt:keep", "gt:role", "gt:rig", "gt:agent", "gt:message", "gt:escalation",
 }
 
+// StandingWatchMarkers lists the phrases that declare a bead's permanence in
+// PROSE rather than via a label the guard above actually reads.
+//
+// Mirrors hq-pl6c8: dn-fhw was an accepted "STANDING WATCH OBLIGATION" — its
+// title said "Standing watch" and its description opened "STANDING WATCH
+// OBLIGATION accepted by ..." — but it carried no labels at all, so
+// AutoClose's label exclusion never saw it and closed it with
+// "stale:auto-closed by reaper", precisely the failure the bead existed to
+// prevent. A --persistent flag or a protected label would have worked; text
+// declaring the obligation does not reach a label-keyed guard no matter how
+// carefully it is worded.
+//
+// hq-pl6c8 recommended enforcement read the same surface the declaration is
+// written on (its option b) over depending on an operator to remember to
+// apply gt:keep at acceptance (its option a, the same manual-convention
+// failure mode as an inverted preserve-then-gc flag). This is that fix.
+var StandingWatchMarkers = []string{"standing watch"}
+
+// standingWatchExcludeSQL returns a WHERE fragment excluding issues whose
+// title or description contains any StandingWatchMarkers phrase,
+// case-insensitively. alias is the issues table alias in the surrounding
+// query ("i" in AutoClose and Scan's stale-candidate queries).
+//
+// AutoClose and Scan must render this identically, the same way they already
+// must render AutoCloseExemptLabels identically (gt-jbn) — a divergence here
+// would repeat that class of bug: Scan reporting a candidate AutoClose would
+// never actually close, or the reverse.
+func standingWatchExcludeSQL(alias string) string {
+	var conds []string
+	for _, marker := range StandingWatchMarkers {
+		escaped := strings.ReplaceAll(strings.ToLower(marker), "'", "''")
+		conds = append(conds,
+			fmt.Sprintf("LOWER(%s.title) LIKE '%%%s%%'", alias, escaped),
+			fmt.Sprintf("LOWER(COALESCE(%s.description, '')) LIKE '%%%s%%'", alias, escaped),
+		)
+	}
+	return "NOT (" + strings.Join(conds, " OR ") + ")"
+}
+
 // sqlLabelList renders labels as a SQL IN(...) body: 'a', 'b', 'c'.
 //
 // The labels are compile-time constants from the lists above, never user input.
@@ -866,7 +905,8 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 			INNER JOIN issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
-		)`
+		)
+		AND ` + standingWatchExcludeSQL("i")
 	if err := db.QueryRowContext(ctx, staleQuery, now.Add(-staleIssueAge)).Scan(&result.StaleCandidates); err != nil {
 		if !isTableNotFound(err) {
 			return nil, fmt.Errorf("count stale candidates: %w", err)
@@ -1696,7 +1736,8 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
-		)`, dbName, sqlLabelList(AutoCloseExemptLabels), dbName, dbName, dbName, dbName)
+		)
+		AND %s`, dbName, sqlLabelList(AutoCloseExemptLabels), dbName, dbName, dbName, dbName, standingWatchExcludeSQL("i"))
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
 	// which is not valid MySQL (Error 1093) and fragile in Dolt (dolthub/dolt#10600).
