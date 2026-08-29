@@ -61,6 +61,33 @@ func CloseReasonDischargesMergeQueue(reason string) bool {
 	return token != "" && mergeQueueDischargingCloseReasons[token]
 }
 
+// mergeLandingClaimingCloseReasons are the leading close-reason tokens that
+// assert a bead's fix is already on the target branch — either landed
+// directly ("Fixed: ...") or via the merge queue ("Merged in <sha>").
+//
+// gt-20la: a polecat closed a bead with exactly this kind of reason while the
+// fix commit still lived only on the polecat's own branch — never submitted
+// to the merge queue, never reached main. A close reason making this claim is
+// evidence a caller should verify against git before letting the close stand,
+// which is what CloseReasonClaimsMergeLanding exists to flag.
+var mergeLandingClaimingCloseReasons = map[string]bool{
+	"fixed":  true,
+	"fix":    true,
+	"merged": true,
+}
+
+// CloseReasonClaimsMergeLanding reports whether a close reason's leading
+// token asserts the bead's fix is already on the target branch.
+//
+// It matches on the LEADING TOKEN only, for the same reason
+// CloseReasonDischargesMergeQueue does: "Fixed the merge conflict detector" is
+// prose about a fix, not a claim that THIS bead's work has landed, and a bare
+// substring match would flag it anyway.
+func CloseReasonClaimsMergeLanding(reason string) bool {
+	token := closeReasonToken(reason)
+	return token != "" && mergeLandingClaimingCloseReasons[token]
+}
+
 // closeReasonToken extracts the declared category from a close reason: the text
 // before the first colon when there is one close to the front, otherwise the
 // first word. Spaces and underscores inside the token are normalised to hyphens
