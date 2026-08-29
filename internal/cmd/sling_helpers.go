@@ -834,12 +834,22 @@ func detectCloneRoot() (string, error) {
 }
 
 // detectActor returns the current agent's actor string for event logging.
+//
+// GetRole() succeeds with Role == RoleUnknown (not an error) whenever cwd is
+// the town root and GT_ROLE is unset — exactly the daemon's own environment
+// when it shells out to `gt scheduler run` (GT_DAEMON=1, cwd=townRoot). That
+// made every daemon-triggered sling/scheduler_dispatch event carry the same
+// actor="unknown" as a genuine attribution failure, so the feed could not
+// tell "the daemon did this" from "we don't know who did this" (gt-8oqt).
 func detectActor() string {
 	roleInfo, err := GetRole()
-	if err != nil {
-		return "unknown"
+	if err == nil && roleInfo.Role != RoleUnknown {
+		return roleInfo.ActorString()
 	}
-	return roleInfo.ActorString()
+	if isDaemonDispatch() {
+		return "daemon"
+	}
+	return "unknown"
 }
 
 // agentIDToBeadID converts an agent ID to its corresponding agent bead ID.

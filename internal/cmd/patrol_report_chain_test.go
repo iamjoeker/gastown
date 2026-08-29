@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -114,5 +115,73 @@ esac`
 	}
 	if !strings.Contains(calls, "close hq-wisp-root") {
 		t.Errorf("patrol root was not closed; calls:\n%s", calls)
+	}
+}
+
+// TestReportPatrolCycleEmitsFeedEvents is the hq-iija regression: a completed
+// patrol cycle used to leave no trace in the feed at all, so a consumer that
+// infers idleness from feed silence (Boot's triage) could not tell a healthy,
+// silent patrol from a dead one and false-woke it. `gt patrol report` is the
+// one action every patrol cycle takes, so it must be the one that makes the
+// cycle visible.
+func TestReportPatrolCycleEmitsFeedEvents(t *testing.T) {
+	body := `
+case "$cmd" in
+  list) echo '[]' ;;
+  query)
+    case "$all" in
+      *'parent="hq-wisp-root"'*) echo '[]' ;;
+      *'status="hooked"'*)
+        echo '[{"id":"hq-wisp-root","title":"mol-deacon-patrol cycle","status":"hooked","assignee":"deacon","ephemeral":true}]'
+        ;;
+      *) echo '[]' ;;
+    esac
+    ;;
+  close|update)
+    for arg in "$@"; do
+      case "$arg" in --*) continue ;; esac
+      echo "$cmd $arg" >> "$closes_log"
+    done
+    if [ "$cmd" = close ]; then mark_closed "$@"; fi
+    ;;
+esac`
+
+	townRoot, _ := newDescendantStubTown(t, body)
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	spawn := func(PatrolConfig) (string, error) { return "hq-wisp-next", nil }
+	cfg := PatrolConfig{
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "deacon",
+		Beads:         beads.New(townRoot),
+	}
+
+	if err := reportPatrolCycle(cfg, "all clear", "heartbeat:OK", spawn); err != nil {
+		t.Fatalf("reportPatrolCycle: %v", err)
+	}
+
+	eventsData, err := os.ReadFile(".events.jsonl")
+	if err != nil {
+		t.Fatalf("read events file: %v", err)
+	}
+	events := string(eventsData)
+	if !strings.Contains(events, `"type":"patrol_complete"`) {
+		t.Errorf("no patrol_complete event; events:\n%s", events)
+	}
+	if !strings.Contains(events, `"type":"patrol_started"`) {
+		t.Errorf("no patrol_started event; events:\n%s", events)
+	}
+	if !strings.Contains(events, `"actor":"deacon"`) {
+		t.Errorf("patrol events not attributed to deacon; events:\n%s", events)
 	}
 }
