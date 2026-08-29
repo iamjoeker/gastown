@@ -7,8 +7,10 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/session"
 )
 
@@ -464,5 +466,48 @@ func TestNudgeWitnessTestHookReportsDelivery(t *testing.T) {
 	}
 	if !strings.Contains(string(logBytes), "nudge:gt-witness:") {
 		t.Errorf("nudge log = %q, want it to name the gt-witness session", string(logBytes))
+	}
+}
+
+// TestDetectActorDaemonDispatch verifies that detectActor() distinguishes a
+// daemon-triggered dispatch (GT_DAEMON=1, no GT_ROLE, cwd=town root — the
+// exact environment `gt scheduler run` runs in when shelled out by the
+// daemon) from a genuine attribution failure. Both used to collapse to the
+// same "unknown" actor, which made a legitimate system-triggered event
+// indistinguishable from one the feed could not attribute at all (gt-8oqt).
+func TestDetectActorDaemonDispatch(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	townConfig := &config.TownConfig{
+		Type:      "town",
+		Version:   config.CurrentTownVersion,
+		Name:      "test-town",
+		CreatedAt: time.Now(),
+	}
+	if err := config.SaveTownConfig(filepath.Join(mayorDir, "town.json"), townConfig); err != nil {
+		t.Fatalf("save town.json: %v", err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	t.Setenv(EnvGTRole, "")
+	t.Setenv("GT_DAEMON", "")
+	if got := detectActor(); got != "unknown" {
+		t.Errorf("detectActor() at town root without GT_DAEMON = %q, want %q", got, "unknown")
+	}
+
+	t.Setenv("GT_DAEMON", "1")
+	if got := detectActor(); got != "daemon" {
+		t.Errorf("detectActor() at town root with GT_DAEMON=1 = %q, want %q", got, "daemon")
 	}
 }

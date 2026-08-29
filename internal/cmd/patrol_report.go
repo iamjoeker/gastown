@@ -10,6 +10,7 @@ import (
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -136,6 +137,17 @@ func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(P
 		}
 
 		fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
+
+		// A completed patrol cycle previously left no trace in the feed at
+		// all, so a consumer that infers idleness from feed silence (e.g.
+		// Boot's triage) cannot tell a healthy, silent patrol from a dead
+		// one and false-wakes it (hq-iija). This is the one action every
+		// patrol cycle takes, so it is the right place to make the cycle
+		// visible.
+		_ = events.LogFeed(events.TypePatrolComplete, patrolActor(cfg), map[string]interface{}{
+			"message": fmt.Sprintf("%s completed patrol: %s", cfg.RoleName, summary),
+			"role":    cfg.RoleName,
+		})
 	} else {
 		// No open root to close — usually because closing the final step
 		// auto-closed the root out from under us. That is not a reason to
@@ -156,6 +168,11 @@ func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(P
 	}
 
 	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
+	patrolStartedPayload := map[string]interface{}{"role": cfg.RoleName}
+	if rig := patrolRig(cfg); rig != "" {
+		patrolStartedPayload["rig"] = rig
+	}
+	_ = events.LogFeed(events.TypePatrolStarted, patrolActor(cfg), patrolStartedPayload)
 	fmt.Println(style.Dim.Render("  Root-only wisp: steps are read inline from " + cfg.PatrolMolName +
 		" at prime time, so `bd mol current` reports 0/0. Run `" + cli.Name() + " prime` for the checklist."))
 	switch cfg.RoleName {
@@ -172,6 +189,26 @@ func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(P
 		stampAgentHeartbeatOnReport(cfg.RoleName, cfg.Assignee)
 	}
 	return nil
+}
+
+// patrolActor returns the event-log actor string for a patrol cycle. It
+// mirrors RoleInfo.ActorString()'s bare form ("deacon", "gastown/witness")
+// rather than cfg.Assignee's trailing-slash bead-addressing form.
+func patrolActor(cfg PatrolConfig) string {
+	return strings.TrimSuffix(cfg.Assignee, "/")
+}
+
+// patrolRig returns the rig a patrol cycle belongs to, or "" for the
+// town-scoped deacon.
+func patrolRig(cfg PatrolConfig) string {
+	if cfg.RoleName == "deacon" {
+		return ""
+	}
+	rig, _, ok := strings.Cut(cfg.Assignee, "/")
+	if !ok {
+		return ""
+	}
+	return rig
 }
 
 func stampDeaconHeartbeatOnReport(townRoot, summary string) {

@@ -46,6 +46,7 @@ var townIdentitySegments = map[string]bool{
 	"mayor":   true,
 	"deacon":  true,
 	"boot":    true,
+	"daemon":  true,
 	"gt":      true,
 	"town":    true,
 	"hq":      true,
