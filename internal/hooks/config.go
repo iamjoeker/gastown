@@ -465,10 +465,31 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
-		// Refinery roles: patrol-formula-guard (same as witness).
-		// Refineries also run patrols and must use wisps, not persistent molecules.
+		// Refinery roles: patrol-formula-guard (same as witness), plus
+		// auto-cycle session on context compaction (gt-q6t5).
+		//
+		// Refinery sessions run unattended for an entire patrol shift with no
+		// self-compaction step of their own — unlike crew, they never had a
+		// PreCompact override, so PreCompact fell through to the base default
+		// (gt prime --hook), which re-primes but does not replace the session.
+		// Context then climbed silently to 80-98% over a shift, eventually
+		// parking at an empty/stuck prompt indistinguishable from healthy
+		// "running" status until a human restarted it (observed 3x in one
+		// night). Give refinery the same fix crew already has: PreCompact
+		// replaces the session instead of compacting it in place.
 		"refinery": {
 			UserPromptSubmit: []HookEntry{{Matcher: ""}},
+			PreCompact: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: gtCommand("gt handoff --cycle --reason compaction"),
+						},
+					},
+				},
+			},
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*bd mol pour*patrol*)",

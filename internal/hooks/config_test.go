@@ -651,6 +651,23 @@ func TestComputeExpectedNoBase(t *testing.T) {
 	if len(refinery.PreToolUse) < 4 {
 		t.Errorf("expected refinery to have at least 4 PreToolUse hooks from DefaultOverrides (patrol-formula-guard), got %d", len(refinery.PreToolUse))
 	}
+	// Refinery has a built-in PreCompact override (gt-q6t5), same mechanism as crew:
+	// auto-cycle the session on context compaction instead of compacting in place.
+	if len(refinery.PreCompact) == 0 {
+		t.Error("expected refinery to have PreCompact hook from DefaultOverrides (gt-q6t5)")
+	} else {
+		found := false
+		for _, entry := range refinery.PreCompact {
+			for _, h := range entry.Hooks {
+				if strings.Contains(h.Command, "handoff --cycle --reason compaction") {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Error("expected refinery PreCompact hook to run gt handoff --cycle --reason compaction")
+		}
+	}
 	if len(refinery.SessionStart) != len(defaultBase.SessionStart) {
 		t.Error("expected refinery to inherit SessionStart from DefaultBase")
 	}
