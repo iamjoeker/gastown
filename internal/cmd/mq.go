@@ -29,6 +29,10 @@ var (
 	// mqSubmitAllowClosedIssue is an operator escape for the gt-7qm gate, for
 	// when the source issue's close was itself the mistake.
 	mqSubmitAllowClosedIssue bool
+	// mqSubmitAllowNoOp is an operator escape for the gt-2fgq gate, for when
+	// the already-landed check is wrong (e.g. an unrelated commit landed with
+	// coincidentally identical content).
+	mqSubmitAllowNoOp bool
 
 	// Retry flags
 	mqRetryNow bool
@@ -421,6 +425,7 @@ func init() {
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitSkipDeps, "skip-deps", false, "Skip molecule step dependency check")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitResubmit, "resubmit", false, "Resubmit after a fix (skips dependency check)")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitAllowClosedIssue, "allow-closed-issue", false, "Create the MR even though the source issue is closed (operator override)")
+	mqSubmitCmd.Flags().BoolVar(&mqSubmitAllowNoOp, "allow-noop", false, "Create the MR even though its commit already landed on the target branch (operator override)")
 
 	// Retry flags
 	mqRetryCmd.Flags().BoolVar(&mqRetryNow, "now", false, "Immediately process instead of waiting for refinery loop")
