@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1088,5 +1090,95 @@ func TestHandoffMailTypeIsSafeToCloseOnRead(t *testing.T) {
 	}
 	if !mail.TypeHandoff.SafeToCloseOnRead() {
 		t.Error("TypeHandoff.SafeToCloseOnRead() = false; handoff context is consumed by being read")
+	}
+}
+
+// TestCleanupMoleculeOnHandoffCreatesDigest guards gt-5jin. Patrol formulas
+// end a cycle via `gt handoff`, not `gt mol squash` — cleanupMoleculeOnHandoff
+// is the code path actually exercised on every patrol cycle. Before this fix,
+// it detached and force-closed the molecule without ever creating a "Digest:"
+// bead, so `gt patrol digest` found zero rows on any date regardless of how
+// many patrol cycles ran: nothing in the real lifecycle ever created one for
+// it to find, even after that command's own query bug was fixed (gt-1r3t).
+func TestCleanupMoleculeOnHandoffCreatesDigest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script bd stub not supported on Windows")
+	}
+
+	townRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "locks"), 0755); err != nil {
+		t.Fatalf("mkdir .beads/locks: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	createLog := filepath.Join(townRoot, "creates.log")
+	bdScript := fmt.Sprintf(`#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+cmd="$1"; shift
+case "$cmd" in
+  list)
+    if echo "$*" | grep -q "status=pinned"; then
+      echo '[{"id":"gt-handoff-1","title":"refinery Handoff","status":"pinned","description":"attached_molecule: gt-wisp-patrol1"}]'
+    else
+      echo '[]'
+    fi
+    ;;
+  show)
+    echo '[{"id":"gt-handoff-1","title":"refinery Handoff","status":"pinned","description":"attached_molecule: gt-wisp-patrol1"}]'
+    ;;
+  update)
+    exit 0
+    ;;
+  create)
+    echo "$*" >> "%s"
+    echo '{"id":"gt-digest-1"}'
+    ;;
+  close)
+    exit 0
+    ;;
+esac
+exit 0
+`, createLog)
+
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "refinery")
+	t.Setenv("GT_POLECAT", "")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("GT_RIG", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("BEADS_DIR", "")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	cleanupMoleculeOnHandoff()
+
+	createsBytes, err := os.ReadFile(createLog)
+	if err != nil {
+		t.Fatalf("no create calls logged (creates.log not found): bd create was never called, so no digest was made")
+	}
+	creates := string(createsBytes)
+	if !strings.Contains(creates, "Digest: gt-wisp-patrol1") {
+		t.Errorf("cleanupMoleculeOnHandoff did not create a digest bead for gt-wisp-patrol1.\nCreate calls: %s", creates)
 	}
 }
