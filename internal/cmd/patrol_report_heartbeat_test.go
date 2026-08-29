@@ -12,7 +12,7 @@ func TestStampDeaconHeartbeatOnReport_StampsAllStores(t *testing.T) {
 	townRoot := t.TempDir()
 	syncs := 0
 	oldSync := deaconAgentBeadHeartbeatSync
-	deaconAgentBeadHeartbeatSync = func(string) { syncs++ }
+	deaconAgentBeadHeartbeatSync = func(string) error { syncs++; return nil }
 	t.Cleanup(func() { deaconAgentBeadHeartbeatSync = oldSync })
 
 	stampDeaconHeartbeatOnReport(townRoot, "all clear")
@@ -36,7 +36,7 @@ func TestStampDeaconHeartbeatOnReport_SkipsWhenPaused(t *testing.T) {
 	townRoot := t.TempDir()
 	syncs := 0
 	oldSync := deaconAgentBeadHeartbeatSync
-	deaconAgentBeadHeartbeatSync = func(string) { syncs++ }
+	deaconAgentBeadHeartbeatSync = func(string) error { syncs++; return nil }
 	t.Cleanup(func() { deaconAgentBeadHeartbeatSync = oldSync })
 	if err := deacon.Pause(townRoot, "maintenance", "test"); err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestStampDeaconHeartbeatOnReport_SkipsOnCorruptPauseFile(t *testing.T) {
 	townRoot := t.TempDir()
 	syncs := 0
 	oldSync := deaconAgentBeadHeartbeatSync
-	deaconAgentBeadHeartbeatSync = func(string) { syncs++ }
+	deaconAgentBeadHeartbeatSync = func(string) error { syncs++; return nil }
 	t.Cleanup(func() { deaconAgentBeadHeartbeatSync = oldSync })
 	pauseFile := deacon.GetPauseFile(townRoot)
 	if err := os.MkdirAll(filepath.Dir(pauseFile), 0755); err != nil {
