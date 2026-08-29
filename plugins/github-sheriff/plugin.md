@@ -59,12 +59,18 @@ The `-z` arm matters as much as the exit status: a `gh` that exits 0 while
 returning no login has not demonstrated anything, and treating exit 0 alone as
 proof is the defect being fixed.
 
-Detect the repo from the rig's git remote. Fall back to explicit config if
-detection fails:
+Detect the repo from the rig's git remote. On fork-backed rigs, `origin` is
+the fork used for pushes, and the canonical repo lives on the `upstream`
+remote — prefer it so PRs are read from upstream, not the fork (gt-ca4j).
+Fall back to `origin` when no `upstream` remote is configured, and to
+explicit config if detection fails entirely:
 
 ```bash
-REPO=$(git -C "$GT_RIG_ROOT" remote get-url origin 2>/dev/null \
-  | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+REPO_URL=$(git -C "$GT_RIG_ROOT" remote get-url upstream 2>/dev/null)
+if [ -z "$REPO_URL" ]; then
+  REPO_URL=$(git -C "$GT_RIG_ROOT" remote get-url origin 2>/dev/null)
+fi
+REPO=$(echo "$REPO_URL" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
 
 if [ -z "$REPO" ]; then
   echo "SKIP: could not detect GitHub repo from rig remote"
