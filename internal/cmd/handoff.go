@@ -1665,6 +1665,16 @@ func cleanupMoleculeOnHandoff() {
 		fmt.Fprintf(os.Stderr, "handoff: closed %d molecule step(s) for %s\n", n, molID)
 	}
 
+	// Create a digest bead, same as `gt mol squash` (gt-5jin). Patrol formulas
+	// end a cycle via `gt handoff`, not `gt mol squash` — without this, this
+	// path (the one actually exercised on every patrol cycle) never left a
+	// digest for `gt patrol digest` to aggregate, even after that command's
+	// own query was fixed (gt-1r3t).
+	progress, _ := getMoleculeProgressInfo(b, molID)
+	if _, err := createMoleculeDigest(b, molID, agentID, "", progress); err != nil {
+		fmt.Fprintf(os.Stderr, "handoff: warning: creating digest for %s: %v\n", molID, err)
+	}
+
 	// Detach molecule with audit trail
 	if _, err := b.DetachMoleculeWithAudit(handoffBead.ID, beads.DetachOptions{
 		Operation: "squash",

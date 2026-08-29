@@ -278,6 +278,42 @@ func TestQueryPatrolDigestsFindsEphemeralWisps(t *testing.T) {
 	}
 }
 
+// TestQueryPatrolDigestsFindsRealWispTitledDigests reproduces gt-5jin.
+// createMoleculeDigest (molecule_lifecycle.go) titles digests
+// "Digest: <moleculeID>", and in production moleculeID is a wisp ID like
+// "gt-wisp-3i6l" — never "mol-<role>-patrol". A "Digest: mol-" prefix filter
+// matches the synthetic titles the other tests in this file use, but never
+// matches a real digest, so `gt patrol digest` found zero rows on every date
+// even after gt-1r3t fixed the table/label bug above.
+func TestQueryPatrolDigestsFindsRealWispTitledDigests(t *testing.T) {
+	requireBd(t)
+	_, b := setupPatrolTestDB(t)
+
+	issue, err := b.Create(beads.CreateOptions{
+		Title:     "Digest: gt-wisp-3i6l",
+		Labels:    []string{"gt:task"},
+		Priority:  4,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create ephemeral digest wisp: %v", err)
+	}
+	if err := b.CloseWithReason("test digest", issue.ID); err != nil {
+		t.Fatalf("close digest wisp: %v", err)
+	}
+
+	cycles, err := queryPatrolDigests(b, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("queryPatrolDigests: %v", err)
+	}
+	if len(cycles) != 1 {
+		t.Fatalf("queryPatrolDigests found %d cycles, want 1 (real-shaped digest wisp %s was not found)", len(cycles), issue.ID)
+	}
+	if cycles[0].ID != issue.ID {
+		t.Errorf("cycles[0].ID = %q, want %q", cycles[0].ID, issue.ID)
+	}
+}
+
 // TestQueryPatrolDigestsIgnoresOtherDates verifies the date filter still
 // excludes digests created on a different day, so the fix does not turn into
 // "aggregate everything ever" once the table/label bug is corrected.

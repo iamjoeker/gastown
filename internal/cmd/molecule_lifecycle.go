@@ -247,73 +247,13 @@ func runMoleculeSquash(cmd *cobra.Command, args []string) (retErr error) {
 	// Patrol molecules (deacon, witness, refinery) run frequently and their
 	// digests pollute the database with thousands of low-value beads.
 	if !moleculeNoDigest {
-		// Get progress info for the digest
 		progress, _ := getMoleculeProgressInfo(b, moleculeID)
-
-		// Create a digest issue
-		digestTitle := fmt.Sprintf("Digest: %s", moleculeID)
-		digestDesc := fmt.Sprintf(`Squashed molecule execution.
-
-molecule: %s
-agent: %s
-squashed_at: %s
-`, moleculeID, target, time.Now().UTC().Format(time.RFC3339))
-
-		if moleculeSummary != "" {
-			digestDesc += fmt.Sprintf("\n## Summary\n%s\n", moleculeSummary)
-		}
-
 		if progress != nil {
 			doneSteps = progress.DoneSteps
 			totalSteps = progress.TotalSteps
-			digestDesc += fmt.Sprintf(`
-## Execution Summary
-- Steps: %d/%d completed
-- Status: %s
-`, progress.DoneSteps, progress.TotalSteps, func() string {
-				if progress.Complete {
-					return "complete"
-				}
-				return "partial"
-			}())
 		}
-
-		// Create the digest bead (ephemeral to avoid git pollution)
-		// Per-cycle digests are aggregated daily by 'gt patrol digest'
-		digestIssue, err := b.Create(beads.CreateOptions{
-			Title:       digestTitle,
-			Description: digestDesc,
-			Labels:      []string{"gt:task"},
-			Priority:    4, // P4 - backlog priority for digests
-			Actor:       target,
-			Ephemeral:   true, // Don't export to JSONL - daily aggregation handles permanent record
-			// DELIBERATELY NO WispType (gt-fqd5). A per-cycle digest reads like
-			// compaction's "patrol" bucket, but that bucket's TTL is 24h and
-			// these digests are closed on creation, so classifying them would
-			// make gt compact delete each one 24h later — while the aggregation
-			// that consumes them, `gt patrol digest --yesterday`, reads digests
-			// that are 24-48h old by the time it runs. The typed version
-			// destroys its own input.
-			//
-			// Since gt-ktvs an untyped wisp is skipped entirely, so leaving this
-			// empty is what keeps the digests alive for aggregation.
-		})
-		if err != nil {
+		if _, err := createMoleculeDigest(b, moleculeID, target, moleculeSummary, progress); err != nil {
 			return fmt.Errorf("creating digest: %w", err)
-		}
-
-		// Add the digest label (non-fatal: digest works without label)
-		_ = b.Update(digestIssue.ID, beads.UpdateOptions{
-			AddLabels: []string{"digest"},
-		})
-
-		// Close the digest immediately
-		closedStatus := "closed"
-		err = b.Update(digestIssue.ID, beads.UpdateOptions{
-			Status: &closedStatus,
-		})
-		if err != nil {
-			style.PrintWarning("Created digest but couldn't close it: %v", err)
 		}
 	}
 
@@ -366,6 +306,83 @@ squashed_at: %s
 	}
 
 	return nil
+}
+
+// createMoleculeDigest creates and closes an ephemeral "Digest: <moleculeID>"
+// bead recording one molecule's execution. It is shared by `gt mol squash`
+// and cleanupMoleculeOnHandoff so that BOTH the CLI squash path and the
+// ordinary end-of-cycle `gt handoff` path (which patrol formulas actually
+// use to end a cycle, per mol-refinery-patrol.formula.toml) leave a digest
+// behind. Before this was shared, only the CLI path created digests, and
+// nothing in the patrol lifecycle ever invoked it — `gt patrol digest`
+// queried real data correctly (gt-1r3t) but found zero rows because zero
+// digests existed to find (gt-5jin).
+//
+// summary and progress may be empty/nil; both are optional context.
+func createMoleculeDigest(b *beads.Beads, moleculeID, actor, summary string, progress *MoleculeProgressInfo) (string, error) {
+	digestTitle := fmt.Sprintf("Digest: %s", moleculeID)
+	digestDesc := fmt.Sprintf(`Squashed molecule execution.
+
+molecule: %s
+agent: %s
+squashed_at: %s
+`, moleculeID, actor, time.Now().UTC().Format(time.RFC3339))
+
+	if summary != "" {
+		digestDesc += fmt.Sprintf("\n## Summary\n%s\n", summary)
+	}
+
+	if progress != nil {
+		digestDesc += fmt.Sprintf(`
+## Execution Summary
+- Steps: %d/%d completed
+- Status: %s
+`, progress.DoneSteps, progress.TotalSteps, func() string {
+			if progress.Complete {
+				return "complete"
+			}
+			return "partial"
+		}())
+	}
+
+	// Create the digest bead (ephemeral to avoid git pollution)
+	// Per-cycle digests are aggregated daily by 'gt patrol digest'
+	digestIssue, err := b.Create(beads.CreateOptions{
+		Title:       digestTitle,
+		Description: digestDesc,
+		Labels:      []string{"gt:task"},
+		Priority:    4, // P4 - backlog priority for digests
+		Actor:       actor,
+		Ephemeral:   true, // Don't export to JSONL - daily aggregation handles permanent record
+		// DELIBERATELY NO WispType (gt-fqd5). A per-cycle digest reads like
+		// compaction's "patrol" bucket, but that bucket's TTL is 24h and
+		// these digests are closed on creation, so classifying them would
+		// make gt compact delete each one 24h later — while the aggregation
+		// that consumes them, `gt patrol digest --yesterday`, reads digests
+		// that are 24-48h old by the time it runs. The typed version
+		// destroys its own input.
+		//
+		// Since gt-ktvs an untyped wisp is skipped entirely, so leaving this
+		// empty is what keeps the digests alive for aggregation.
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// Add the digest label (non-fatal: digest works without label)
+	_ = b.Update(digestIssue.ID, beads.UpdateOptions{
+		AddLabels: []string{"digest"},
+	})
+
+	// Close the digest immediately
+	closedStatus := "closed"
+	if err := b.Update(digestIssue.ID, beads.UpdateOptions{
+		Status: &closedStatus,
+	}); err != nil {
+		style.PrintWarning("Created digest but couldn't close it: %v", err)
+	}
+
+	return digestIssue.ID, nil
 }
 
 // closeDescendantsPassLimit bounds the repeated close passes

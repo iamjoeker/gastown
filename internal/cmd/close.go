@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,8 @@ import (
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/convoy"
+	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/workspace"
 
 	"github.com/spf13/cobra"
@@ -78,6 +81,18 @@ func runClose(cmd *cobra.Command, args []string) error {
 			convertedArgs[i] = "--reason=" + strings.TrimPrefix(arg, "--comment=")
 		} else {
 			convertedArgs[i] = arg
+		}
+	}
+
+	// gt-20la: a close reason claiming the fix landed ("Fixed: ...", "Merged in
+	// <sha>") is a factual claim, not a formality — and bd close has no guard
+	// requiring it be true. Verify it against git before letting the close
+	// through; a claim that doesn't hold up is refused rather than silently
+	// accepted.
+	if reason := extractReasonValue(convertedArgs); reason != "" && polecat.CloseReasonClaimsMergeLanding(reason) {
+		dir := closeBeadDir(changeDir, extractBeadIDs(convertedArgs))
+		if err := verifyMergeLandingClaim(dir, reason); err != nil {
+			return err
 		}
 	}
 
@@ -348,6 +363,82 @@ func extractBeadIDs(args []string) []string {
 		ids = append(ids, arg)
 	}
 	return ids
+}
+
+// extractReasonValue returns the value of --reason/-r/--comment (the last
+// occurrence wins, matching pflag), or "" when none is present. It looks for
+// the flags directly, the same way extractBeadIDs does, since
+// DisableFlagParsing means nothing has parsed args for us yet.
+func extractReasonValue(args []string) string {
+	reason := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch {
+		case (name == "--reason" || name == "-r" || name == "--comment") && hasValue:
+			reason = value
+		case arg == "--reason" || arg == "-r" || arg == "--comment":
+			if i+1 < len(args) {
+				reason = args[i+1]
+				i++
+			}
+		}
+	}
+	return reason
+}
+
+// verifyMergeLandingClaim checks a close reason that claims a bead's fix has
+// landed ("Fixed: ...", "Merged in <sha>") against the git repository at dir,
+// refusing the close when the claim does not hold.
+//
+// It verifies the CURRENT HEAD of dir against that repo's remote default
+// branch — the shape of gt-20la, where the polecat closing the bead was
+// sitting in the very worktree whose branch never reached the queue. It is
+// not a general proof for every way a close reason could lie (a reason citing
+// a specific sha not checked out here is not verified), only the one this
+// bead reports and the one dir gives us the means to check.
+//
+// It fails OPEN: when dir is not a git repository, when it has no
+// resolvable HEAD, or when the landing question cannot be answered (offline,
+// unreachable remote, detached ref), the close proceeds unblocked. This
+// mirrors git.ErrMergeProofUnprovable's documented contract — absence of
+// proof is not proof of absence, and refusing here would block a great many
+// closes that have nothing to do with the defect being guarded against.
+func verifyMergeLandingClaim(dir, reason string) error {
+	if dir == "" {
+		dir = "."
+	}
+	g := git.NewGit(dir)
+	if !g.IsRepo() {
+		return nil
+	}
+	head, err := g.Rev("HEAD")
+	if err != nil || strings.TrimSpace(head) == "" {
+		return nil
+	}
+	target := g.RemoteDefaultBranch()
+	if target == "" {
+		return nil
+	}
+
+	proof, err := g.VerifyCommitLandedOnPushTarget("origin", target, head)
+	if err == nil {
+		_ = proof
+		return nil
+	}
+	if errors.Is(err, git.ErrCommitNotLanded) {
+		short := strings.TrimSpace(head)
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		return fmt.Errorf(
+			"close reason claims the fix landed (%q), but HEAD (%s) is not on origin/%s: %w\n"+
+				"If this work isn't in the merge queue yet, submit it with `gt done` instead of closing the bead directly.",
+			reason, short, target, err)
+	}
+	// ErrMergeProofUnprovable or any other verification failure: the question
+	// couldn't be answered, which says nothing about whether the claim is true.
+	return nil
 }
 
 // checkConvoyCompletion checks if any closed issues are tracked by convoys

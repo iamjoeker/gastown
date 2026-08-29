@@ -12,6 +12,25 @@ import (
 	"testing"
 )
 
+// TestSupplementalTables_IncludesWisps pins the fix for gt-026z (mirrors
+// hq-del4): wisps — which hold merge-request and mail records — must be
+// exported by the default JSONL backup patrol, not just by the lower-cadence
+// dolt-archive plugin. Without this, live (not-yet-purged) wisps had zero
+// durability: excluded from Dolt's commit history via dolt_ignore AND from
+// every periodic backup.
+func TestSupplementalTables_IncludesWisps(t *testing.T) {
+	found := false
+	for _, table := range supplementalTables {
+		if table == "wisps" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("supplementalTables must include \"wisps\" — MR beads and agent mail live there and have no other backup path (gt-026z)")
+	}
+}
+
 func TestGitChildEnv_ForwardsExisting(t *testing.T) {
 	t.Setenv("HOME", "/tmp/fake-home")
 	t.Setenv("USER", "fakeuser")
