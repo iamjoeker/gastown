@@ -454,7 +454,9 @@ func (bm *BeadsMessage) ParseLabels() {
 	bm.deliveryAckedAt = nil
 
 	for _, label := range bm.Labels {
-		if strings.HasPrefix(label, "from:") {
+		if label == "gt:pinned" {
+			bm.Pinned = true
+		} else if strings.HasPrefix(label, "from:") {
 			bm.sender = strings.TrimPrefix(label, "from:")
 		} else if strings.HasPrefix(label, "thread:") {
 			bm.threadID = strings.TrimPrefix(label, "thread:")
@@ -541,6 +543,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		ThreadID:        bm.threadID,
 		ReplyTo:         bm.replyTo,
 		Wisp:            bm.Wisp,
+		Pinned:          bm.Pinned,
 		CC:              ccAddrs,
 		Queue:           bm.queue,
 		Channel:         bm.channel,
