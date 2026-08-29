@@ -187,6 +187,11 @@ log "Wisp table export: $WISP_EXPORTED succeeded, $WISP_EXPORT_FAILED failed"
 # --- Step 2: Git commit and push ---------------------------------------------
 
 GIT_PUSHED=false
+GIT_CONFIGURED=false
+
+if [[ -d "$BACKUP_REPO/.git" ]]; then
+  GIT_CONFIGURED=true
+fi
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -245,6 +250,7 @@ fi
 
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
+DOLT_REMOTES_CONFIGURED=0
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
@@ -263,6 +269,7 @@ if ! $SKIP_DOLT_PUSH; then
       log "  $DB: no remotes configured, skipping"
       continue
     fi
+    DOLT_REMOTES_CONFIGURED=$((DOLT_REMOTES_CONFIGURED + 1))
 
     log "  $DB: pushing to remotes..."
     cd "$DB_DIR"
@@ -286,16 +293,39 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
+# No offsite layer exists at all when neither the git backup repo nor any
+# Dolt remote is configured. Local JSONL export succeeding is not offsite
+# protection — a machine loss destroys it along with the live databases.
+# Only flag this when both layers were eligible to run (neither was
+# explicitly skipped via flag); an explicit --skip-git/--skip-dolt-push
+# invocation is not a surprise finding.
+NO_OFFSITE_LAYER=false
+if ! $SKIP_GIT && ! $SKIP_DOLT_PUSH && ! $GIT_CONFIGURED && [[ "$DOLT_REMOTES_CONFIGURED" -eq 0 ]]; then
+  NO_OFFSITE_LAYER=true
+fi
+
 SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), wisps=$WISP_EXPORTED/$((WISP_EXPORTED + WISP_EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED))"
+if $NO_OFFSITE_LAYER; then
+  SUMMARY="$SUMMARY, offsite=NONE CONFIGURED"
+fi
 log "$SUMMARY"
 
 RESULT="success"
 if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$WISP_EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
   RESULT="warning"
 fi
+if $NO_OFFSITE_LAYER; then
+  RESULT="failure"
+fi
 
 gt plugin record-run --plugin dolt-archive --result "$RESULT" \
   --title "$SUMMARY" --description "$SUMMARY" >/dev/null 2>&1 || true
+
+if $NO_OFFSITE_LAYER; then
+  gt escalate "dolt-archive: no offsite backup layer configured — JSONL export succeeded but git push and dolt push are both unconfigured" \
+    -s critical \
+    --reason "Neither a git backup repo ($BACKUP_REPO) nor any Dolt remote is configured. Local JSONL export is not offsite protection: it lives on the same disk as the databases it copies. Production data currently has no protection against machine loss." 2>/dev/null || true
+fi
 
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
   gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
