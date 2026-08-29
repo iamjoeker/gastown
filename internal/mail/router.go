@@ -245,6 +245,9 @@ func messageIdentityLabels(msg *Message) []string {
 	if msg.Type == TypeEscalation {
 		labels = append(labels, "gt:escalation")
 	}
+	if msg.Pinned {
+		labels = append(labels, "gt:pinned")
+	}
 	return labels
 }
 

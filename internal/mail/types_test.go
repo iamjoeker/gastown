@@ -894,6 +894,39 @@ func TestToMessage_DeliveryStatePendingOnPartialAck(t *testing.T) {
 	}
 }
 
+func TestToMessage_PinnedLabelRoundTrips(t *testing.T) {
+	// gt-ho6r: msg.Pinned must survive the label write (messageIdentityLabels)
+	// and read (ParseLabels -> ToMessage) round trip.
+	labels := messageIdentityLabels(&Message{From: "mayor/", Type: TypeNotification, Pinned: true})
+	found := false
+	for _, l := range labels {
+		if l == "gt:pinned" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("messageIdentityLabels(Pinned: true) did not include gt:pinned, got %v", labels)
+	}
+
+	bm := BeadsMessage{
+		ID:       "hq-test",
+		Title:    "Test",
+		Assignee: "gastown/Toast",
+		Labels:   labels,
+	}
+	msg := bm.ToMessage()
+	if !msg.Pinned {
+		t.Fatalf("Message.Pinned = false, want true after round trip through labels %v", labels)
+	}
+
+	// Unpinned messages must not carry the label or read back as pinned.
+	unpinnedLabels := messageIdentityLabels(&Message{From: "mayor/", Type: TypeNotification})
+	bm2 := BeadsMessage{ID: "hq-test2", Assignee: "gastown/Toast", Labels: unpinnedLabels}
+	if msg2 := bm2.ToMessage(); msg2.Pinned {
+		t.Fatalf("Message.Pinned = true for unpinned send, labels=%v", unpinnedLabels)
+	}
+}
+
 func TestSuppressNotifyNotSerialized(t *testing.T) {
 	msg := NewMessage("mayor/", "gastown/Toast", "Test", "Body")
 	msg.SuppressNotify = true
