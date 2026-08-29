@@ -506,10 +506,21 @@ var ProtectedWispLabels = []string{"gt:merge-request", "gt:escalation"}
 // Purge protection alone does not cover this: the record survives as a row and
 // vanishes from the queue anyway (gt-nhp).
 //
-// gt:merge-request is NOT here. Its wisps are closed by the merge queue's own
-// lifecycle and gt-nmg's fix deliberately scoped MR protection to deletion;
-// changing when MR wisps close is a merge-queue decision, not this one.
-var ReapProtectedWispLabels = []string{"gt:escalation"}
+// gt:merge-request is here for the same reason (gt-ojk1, mirroring hq-lrfm).
+// It was deliberately left out when this list was written, on the reasoning
+// that "MR wisps are closed by the merge queue's own lifecycle, and gt-nmg's
+// fix scoped MR protection to deletion" — but that reasoning assumed something
+// always closes a stalled MR before reap gets to it. An MR waiting on a human
+// decision is precisely the counterexample: nothing in the merge queue's own
+// lifecycle closes it, so once it crosses max_age (1h by default) with no
+// update, reap closes it by age exactly like any other idle wisp. `gt mq list`
+// filters on status=="open" (isMergeRequestReadyForSelection), so the closed MR
+// vanishes from the queue view immediately. The pinned+label protection
+// gt-nmg added keeps the ROW alive — it gets archived, not deleted — so the
+// record is durable, but a durable record that is invisible to the only
+// surface an operator reads is not auditable, and an MR is exactly the
+// artifact that needs to be both while a human decision is pending.
+var ReapProtectedWispLabels = []string{"gt:escalation", "gt:merge-request"}
 
 // AutoCloseExemptLabels lists labels whose OPEN issues staleness auto-close must
 // never touch.
