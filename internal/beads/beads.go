@@ -1349,7 +1349,14 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	queryExpr := strings.Join(clauses, " AND ")
 	args := []string{"query", "--json", queryExpr}
 
-	if opts.Status == "all" {
+	// "bd query" excludes closed issues by default ("-a/--all: Include closed
+	// issues"), regardless of an explicit status=... clause in the expression
+	// — the clause only narrows rows bd query would otherwise have shown, it
+	// doesn't override the default exclusion. Without --all here,
+	// List(Status: "closed", Ephemeral: true) silently returns zero rows even
+	// when matching closed wisps exist. Other statuses (open, hooked, ...)
+	// aren't affected by the default exclusion, so only "closed" needs this.
+	if opts.Status == "all" || opts.Status == "closed" {
 		args = append(args, "--all")
 	}
 	if opts.Limit > 0 {
