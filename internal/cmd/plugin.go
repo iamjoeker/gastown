@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -522,8 +524,10 @@ func runPluginRun(cmd *cobra.Command, args []string) error {
 		}
 		if !gateOpen {
 			fmt.Printf("%s %s (use --force to override)\n", style.Warning.Render("Gate closed:"), gateReason)
+		} else if p.HasRunScript {
+			fmt.Printf("%s Would execute %s\n", style.Success.Render("Gate open:"), filepath.Join(p.Path, "run.sh"))
 		} else {
-			fmt.Printf("%s Would execute plugin instructions\n", style.Success.Render("Gate open:"))
+			fmt.Printf("%s Would print instructions for agent execution (no run.sh — nothing would be recorded)\n", style.Success.Render("Gate open:"))
 		}
 		return nil
 	}
@@ -534,32 +538,72 @@ func runPluginRun(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Execute the plugin
-	// For manual runs, we print the instructions for the agent/user to execute
-	// Automatic execution via dogs is handled by gt-n08ix.2
 	fmt.Printf("%s Running plugin: %s\n", style.Success.Render("●"), p.Name)
 	if pluginRunForce && !gateOpen {
 		fmt.Printf("  %s\n", style.Dim.Render("(gate bypassed with --force)"))
 	}
 	fmt.Println()
-	fmt.Printf("%s\n", style.Bold.Render("Instructions:"))
-	fmt.Println(p.Instructions)
 
-	// Record the run
-	recorder := plugin.NewRecorder(townRoot)
-	beadID, err := recorder.RecordRun(plugin.PluginRunRecord{
-		PluginName: p.Name,
-		RigName:    p.RigName,
-		Result:     plugin.ResultSuccess, // Manual runs are marked success
-		Body:       "Manual run via gt plugin run",
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to record run: %v\n", err)
-	} else {
-		fmt.Printf("\n%s Recorded run: %s\n", style.Dim.Render("●"), beadID)
+	if !p.HasRunScript {
+		// This plugin has no run.sh — its instructions require an agent to
+		// interpret and act on them (the same path a dispatched dog follows).
+		// Printing them here is not execution. Recording result:success for
+		// work that never ran is the exact false-receipt bug this replaces
+		// (gt-6eis / hq-lh3j), so no receipt is written on this path.
+		fmt.Printf("%s\n", style.Bold.Render("Instructions:"))
+		fmt.Println(p.Instructions)
+		fmt.Printf("\n%s No run.sh for this plugin — the instructions above require an agent to execute.\n", style.Warning.Render("⚠"))
+		fmt.Printf("  Nothing was run and no receipt was recorded. After carrying out the instructions,\n")
+		fmt.Printf("  record the outcome yourself:\n")
+		fmt.Printf("    gt plugin record-run --plugin %s --result <success|failure>\n", p.Name)
+		return nil
 	}
 
+	// Execute the plugin's run.sh directly, matching the help text ("Run if
+	// gate allows") and the same script a dispatched dog would run.
+	result, runErr := executePluginScript(p)
+
+	recorder := plugin.NewRecorder(townRoot)
+	beadID, recErr := recorder.RecordRun(plugin.PluginRunRecord{
+		PluginName: p.Name,
+		RigName:    p.RigName,
+		Result:     result,
+		Body:       "Manual run via gt plugin run",
+	})
+	if recErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to record run: %v\n", recErr)
+	} else {
+		fmt.Printf("\n%s Recorded run: %s (result:%s)\n", style.Dim.Render("●"), beadID, result)
+	}
+
+	if runErr != nil {
+		return fmt.Errorf("plugin %s: %w", p.Name, runErr)
+	}
 	return nil
+}
+
+// executePluginScript runs a plugin's run.sh directly, streaming its output
+// to the terminal, and reports the RunResult observed from its actual exit
+// code — never an assumed success. Mirrors the "cd <path> && bash run.sh"
+// invocation dispatched to a dog for HasRunScript plugins.
+func executePluginScript(p *plugin.Plugin) (plugin.RunResult, error) {
+	timeout := 5 * time.Minute
+	if p.Execution != nil && p.Execution.Timeout != "" {
+		timeout = config.ParseDurationOrDefault(p.Execution.Timeout, timeout)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "run.sh") //nolint:gosec // G204: script path is from a discovered plugin directory, not user input
+	cmd.Dir = p.Path
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return plugin.ResultFailure, fmt.Errorf("run.sh: %w", err)
+	}
+	return plugin.ResultSuccess, nil
 }
 
 func runPluginSync(cmd *cobra.Command, args []string) error {
