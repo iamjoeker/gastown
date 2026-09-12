@@ -74,6 +74,15 @@ type TownStatus struct {
 	Agents   []AgentRuntime `json:"agents"`             // Global agents (Mayor, Deacon)
 	Rigs     []RigStatus    `json:"rigs"`
 	Summary  StatusSum      `json:"summary"`
+
+	// TmuxQueryError is set when the tmux session list could not be read, even
+	// after a retry. When non-empty, every agent's Running field below was
+	// computed against an empty session set and must not be read as "agent
+	// confirmed down" — it means "session state unknown". A stale or failed
+	// query previously produced exactly the same false "Running: false" shape
+	// as a real outage, which is how the Mayor and Deacon were once reported
+	// stopped while both were alive and working (gt-dkzh).
+	TmuxQueryError string `json:"tmux_query_error,omitempty"`
 }
 
 // ServiceInfo represents a background service status.
@@ -654,7 +663,20 @@ func gatherStatus() (TownStatus, error) {
 	// zombie sessions (tmux alive, agent dead) from showing as running.
 	// See: gt-bd6i3
 	allSessions := make(map[string]bool)
-	if sessions, err := t.ListSessions(); err == nil {
+	sessions, sessionsErr := t.ListSessions()
+	if sessionsErr != nil {
+		// tmux queries can fail transiently (busy server, socket race); one
+		// retry absorbs that without letting a blip masquerade as an outage.
+		sessions, sessionsErr = t.ListSessions()
+	}
+	var tmuxQueryError string
+	if sessionsErr != nil {
+		// Do NOT fall through into the loop below with an empty session set:
+		// that previously made every agent's Running field read as false
+		// (map lookups on an empty map), indistinguishable from every agent
+		// actually being down. See gt-dkzh.
+		tmuxQueryError = fmt.Sprintf("tmux session query failed, agent running-state is unknown (not confirmed down): %v", sessionsErr)
+	} else {
 		var sessionMu sync.Mutex
 		var sessionWg sync.WaitGroup
 		for _, s := range sessions {
@@ -797,11 +819,12 @@ func gatherStatus() (TownStatus, error) {
 
 	// Build status - parallel fetch global agents and rigs
 	status := TownStatus{
-		Name:     townConfig.Name,
-		Location: townRoot,
-		Overseer: overseerInfo,
-		DND:      detectCurrentDNDStatus(townRoot),
-		Rigs:     make([]RigStatus, len(rigs)),
+		Name:           townConfig.Name,
+		Location:       townRoot,
+		Overseer:       overseerInfo,
+		DND:            detectCurrentDNDStatus(townRoot),
+		Rigs:           make([]RigStatus, len(rigs)),
+		TmuxQueryError: tmuxQueryError,
 	}
 
 	// Daemon status
@@ -995,6 +1018,13 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 
 	// E-stop banner (if active)
 	addEstopToStatus(status.Location)
+
+	// tmux query failure: every agent's Running below is unconfirmed, not
+	// confirmed down. Surface this before the agent list so it can't be
+	// misread as a real outage.
+	if status.TmuxQueryError != "" {
+		fmt.Fprintf(w, "⚠️  %s %s\n\n", style.Bold.Render("Warning:"), status.TmuxQueryError)
+	}
 
 	// Overseer info
 	if status.Overseer != nil {

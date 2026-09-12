@@ -207,6 +207,49 @@ func TestOutputStatusText_IncludesDNDSection(t *testing.T) {
 	}
 }
 
+// A failed tmux session query previously left allSessions empty with no
+// signal, so every agent's Running field read as false — indistinguishable
+// from a real outage. This is what let a transient tmux query failure be
+// escalated as "Mayor and Deacon sessions stopped" (gt-dkzh). The warning
+// must render so a reader (human or agent) can't mistake "unknown" for
+// "confirmed down".
+func TestOutputStatusText_SurfacesTmuxQueryError(t *testing.T) {
+	status := TownStatus{
+		Name:           "gt",
+		Location:       "/tmp/gt",
+		TmuxQueryError: "tmux session query failed, agent running-state is unknown (not confirmed down): boom",
+		Agents: []AgentRuntime{
+			{Name: "mayor", Running: false},
+			{Name: "deacon", Running: false},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := outputStatusText(&buf, status); err != nil {
+		t.Fatalf("outputStatusText error: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Warning:") || !strings.Contains(out, "tmux session query failed") {
+		t.Fatalf("expected tmux query error warning in status output, got: %q", out)
+	}
+}
+
+func TestOutputStatusText_NoWarningWhenTmuxQueryOK(t *testing.T) {
+	status := TownStatus{
+		Name:     "gt",
+		Location: "/tmp/gt",
+	}
+
+	var buf bytes.Buffer
+	if err := outputStatusText(&buf, status); err != nil {
+		t.Fatalf("outputStatusText error: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "Warning:") {
+		t.Fatalf("did not expect a warning in status output, got: %q", out)
+	}
+}
+
 func TestRunStatusWatch_RejectsZeroInterval(t *testing.T) {
 	oldInterval := statusInterval
 	oldWatch := statusWatch
