@@ -131,11 +131,11 @@ func (e scanEffects) nudgeRefinery(townRoot, rigName string) error {
 	return effNudgeRefinery(townRoot, rigName)
 }
 
-func (e scanEffects) notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
+func (e scanEffects) notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) error {
 	if e.dryRun {
-		return
+		return nil
 	}
-	effNotifyMayorSlotOpen(workDir, rigName, polecatName, exitType)
+	return effNotifyMayorSlotOpen(workDir, rigName, polecatName, exitType)
 }
 
 // bdReadOnlySubcommands are the bd subcommands a detection sweep needs in order

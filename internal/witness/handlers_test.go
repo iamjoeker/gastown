@@ -2484,7 +2484,7 @@ func TestProcessDiscoveredCompletion_RefineryNudgeFailureDoesNotBlockRetryGate(t
 	}
 	effUpdateCleanupWispState = func(*BdCli, string, string, string) error { return nil }
 	effNudgeRefinery = func(string, string) error { return fmt.Errorf("refinery session busy") }
-	effNotifyMayorSlotOpen = func(string, string, string, string) { notifyCount++ }
+	effNotifyMayorSlotOpen = func(string, string, string, string) error { notifyCount++; return nil }
 
 	payload := &PolecatDonePayload{
 		PolecatName: "nux",

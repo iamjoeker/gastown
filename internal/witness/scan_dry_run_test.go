@@ -57,7 +57,7 @@ func swapScanEffectPrimitives(t *testing.T) map[string]int {
 	}
 	effClearCompletionMetadata = func(*BdCli, string, string) error { fired["clearCompletionMetadata"]++; return nil }
 	effNudgeRefinery = func(string, string) error { fired["nudgeRefinery"]++; return nil }
-	effNotifyMayorSlotOpen = func(string, string, string, string) { fired["notifyMayorSlotOpen"]++ }
+	effNotifyMayorSlotOpen = func(string, string, string, string) error { fired["notifyMayorSlotOpen"]++; return nil }
 	effCloseBead = func(*BdCli, string, string, string) { fired["closeBead"]++ }
 	effNudgeSession = func(*tmux.Tmux, string, string) error { fired["nudgeSession"]++; return nil }
 	effDismissStartupDialogs = func(*tmux.Tmux, string) error { fired["dismissStartupDialogs"]++; return nil }

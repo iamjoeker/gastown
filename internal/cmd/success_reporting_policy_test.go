@@ -112,16 +112,13 @@ var knownVoidDeliveryReporters = []string{
 	// returns a NotifyReport, and `gt mq reject --notify` prints what actually
 	// happened instead of "Worker notified via mail" from the flag alone.
 
-	// The two below were found BY this rule rather than by the gt-9tpw sweep, and
-	// are the sharpest instances in the list: notifyMayorSchedulerOpen tries a
-	// channel event, then a tmux nudge, then `gt mail send`, and discards the
-	// failure of all three. Its whole purpose is telling the Mayor there is free
-	// scheduler capacity, so a silent total failure stalls dispatch with nothing
-	// anywhere saying so. Deferred, not dismissed: notifyMayorSlotOpen has 11 call
-	// sites and deciding what each should do with a delivery failure is the work
-	// these deserve, which is more than this bead can carry. Filed as gt-sm80.
-	"internal/witness.notifyMayorSchedulerOpen",
-	"internal/witness.notifyMayorSlotOpen",
+	// internal/witness.notifyMayorSchedulerOpen and notifyMayorSlotOpen converted
+	// in gt-sm80: both now return an error when every delivery channel (channel
+	// event, tmux nudge, mail fallback) fails. Their 4 production call sites do
+	// not fold the failure into discovery.Error/result.Error — doing so would
+	// reprocess the same completion and re-notify on every retry (gt-wlzi) — so
+	// each logs to stderr instead; HandlePolecatDone/HandlePolecatDoneFromBead
+	// also append it to their Action string so it is visible in the result.
 }
 
 // TestDeliveryReportersReturnTheirFailure is the gt-9tpw class guardrail.
