@@ -9,9 +9,37 @@ import (
 
 	"github.com/spf13/cobra"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/holds"
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// WispGCHoldScope is the `gt hold` scope that gates `gt reaper purge`. It is
+// the durable equivalent of doctor's RigWispGCOptInEnv: that env var only
+// gates the agent-invoked `gt doctor --fix` path, while mol-dog-reaper's
+// purge step runs unattended every ~30min via the daemon, which never has
+// the env var set and never reads a mail thread. A `gt hold add "wisp gc"
+// <reason>` is the one signal both paths can see.
+const WispGCHoldScope = "wisp gc"
+
+// activeWispGCHold returns the first active hold whose scope is "wisp gc"
+// (case-insensitive), or nil if none is set. A load error is returned rather
+// than treated as "no hold" — an unreadable registry must not silently
+// re-enable purging.
+func activeWispGCHold(townRoot string) (*holds.Hold, error) {
+	reg, err := holds.Load(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range reg.Active() {
+		if strings.EqualFold(strings.TrimSpace(h.Scope), WispGCHoldScope) {
+			hCopy := h
+			return &hCopy, nil
+		}
+	}
+	return nil, nil
+}
 
 var (
 	reaperDB          string
@@ -384,6 +412,15 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 			return fmt.Errorf("invalid --mail-age: %w", err)
 		}
 
+		if townRoot, err := workspace.FindFromCwdOrError(); err == nil {
+			if h, err := activeWispGCHold(townRoot); err != nil {
+				return fmt.Errorf("checking wisp-gc hold: %w", err)
+			} else if h != nil {
+				return fmt.Errorf("declined to purge wisps: hold %s is active (%s): %s; release it with `gt hold release %s` before purging",
+					h.ID, WispGCHoldScope, h.Reason, h.ID)
+			}
+		}
+
 		archive := reaperArchiver()
 		databases := reaperDatabaseNames()
 
@@ -591,6 +628,19 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
+		// wispGCHoldReason, when non-empty, means the purge step is skipped this
+		// cycle: either an active "wisp gc" hold, or a hold-registry read error
+		// (treated as held, not as "no hold" — an unreadable registry must not
+		// silently re-enable purging).
+		var wispGCHoldReason string
+		if townRoot, err := workspace.FindFromCwdOrError(); err == nil {
+			if h, err := activeWispGCHold(townRoot); err != nil {
+				wispGCHoldReason = fmt.Sprintf("could not check wisp-gc hold: %v", err)
+			} else if h != nil {
+				wispGCHoldReason = fmt.Sprintf("hold %s is active: %s", h.ID, h.Reason)
+			}
+		}
+
 		archive := reaperArchiver()
 		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalArchived, totalProtected, totalClosed, totalOpen int
 		// allAnomalies collects anomalies from every step (scan, reap, purge,
@@ -653,18 +703,22 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			}
 
 			// Purge
-			purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun, reaper.WithArchive(archive))
-			if err != nil {
-				fmt.Printf("%s: purge error: %v\n", dbName, err)
+			if wispGCHoldReason != "" {
+				fmt.Printf("%s: purge skipped (%s)\n", dbName, wispGCHoldReason)
 			} else {
-				totalPurged += purgeResult.WispsPurged
-				totalMailPurged += purgeResult.MailPurged
-				totalArchived += purgeResult.WispsArchived
-				totalProtected += purgeResult.WispsProtected
-				for _, a := range purgeResult.Anomalies {
-					fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
+				purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun, reaper.WithArchive(archive))
+				if err != nil {
+					fmt.Printf("%s: purge error: %v\n", dbName, err)
+				} else {
+					totalPurged += purgeResult.WispsPurged
+					totalMailPurged += purgeResult.MailPurged
+					totalArchived += purgeResult.WispsArchived
+					totalProtected += purgeResult.WispsProtected
+					for _, a := range purgeResult.Anomalies {
+						fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
+					}
+					allAnomalies = append(allAnomalies, purgeResult.Anomalies...)
 				}
-				allAnomalies = append(allAnomalies, purgeResult.Anomalies...)
 			}
 
 			// Auto-close

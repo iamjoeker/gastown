@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/holds"
 )
 
 func TestReaperDatabaseNamesTrimsConfiguredList(t *testing.T) {
@@ -79,5 +81,75 @@ func TestDefaultReaperEndpointUsesTownConfig(t *testing.T) {
 	host, port := defaultReaperEndpoint()
 	if host != "127.0.0.2" || port != 5507 {
 		t.Fatalf("defaultReaperEndpoint() = %s:%d, want 127.0.0.2:5507", host, port)
+	}
+}
+
+func newTownRoot(t *testing.T) string {
+	t.Helper()
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test-town"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return townRoot
+}
+
+func TestActiveWispGCHoldNoneSet(t *testing.T) {
+	townRoot := newTownRoot(t)
+	h, err := activeWispGCHold(townRoot)
+	if err != nil {
+		t.Fatalf("activeWispGCHold() error = %v", err)
+	}
+	if h != nil {
+		t.Fatalf("activeWispGCHold() = %+v, want nil (no holds registry exists)", h)
+	}
+}
+
+func TestActiveWispGCHoldMatchesScopeCaseInsensitively(t *testing.T) {
+	townRoot := newTownRoot(t)
+
+	reg, err := holds.Load(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	added := reg.Add("Wisp GC", "", "cost review pending", "", "mayor")
+	if err := holds.Save(townRoot, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := activeWispGCHold(townRoot)
+	if err != nil {
+		t.Fatalf("activeWispGCHold() error = %v", err)
+	}
+	if h == nil || h.ID != added.ID {
+		t.Fatalf("activeWispGCHold() = %+v, want hold %s", h, added.ID)
+	}
+}
+
+func TestActiveWispGCHoldIgnoresOtherScopesAndReleasedHolds(t *testing.T) {
+	townRoot := newTownRoot(t)
+
+	reg, err := holds.Load(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.Add("polecat dispatch", "", "unrelated hold", "", "mayor")
+	released := reg.Add(WispGCHoldScope, "", "old hold, already released", "", "mayor")
+	if err := reg.Release(released.ID, "mayor", "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := holds.Save(townRoot, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := activeWispGCHold(townRoot)
+	if err != nil {
+		t.Fatalf("activeWispGCHold() error = %v", err)
+	}
+	if h != nil {
+		t.Fatalf("activeWispGCHold() = %+v, want nil (only an unrelated and a released hold exist)", h)
 	}
 }
