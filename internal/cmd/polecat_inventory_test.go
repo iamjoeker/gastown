@@ -747,6 +747,39 @@ func TestPolecatSummaryIssueRankPrefersActiveWork(t *testing.T) {
 	}
 }
 
+// TestBuildPolecatInventoryItemStalledOnDeadSessionWithStaleAgentState pins
+// the gt-fbfn fixture: a polecat whose work bead was already closed (e.g.
+// post-merge) so there is no active work issue, whose session has died, and
+// whose agent_state was never advanced to "done" because the session died
+// before gt done could run. `gt polecat list` classified this as STALLED via
+// this evidence path; `gt polecat status` (Manager.loadFromBeads) classified
+// it as IDLE because its fallback branch only recognizes agent_state=="done"
+// and never cross-checks session liveness once no issue is assigned. The fix
+// makes `gt polecat status` reuse this same classifier, so this fixture is
+// now the single source of truth for both surfaces.
+func TestBuildPolecatInventoryItemStalledOnDeadSessionWithStaleAgentState(t *testing.T) {
+	setupPolecatTestRegistry(t)
+
+	fields := &beads.AgentFields{AgentState: string(beads.AgentStateWorking)}
+	// No live tmux session for this polecat, and no assigned work issue
+	// (activeWork is nil, as it is once the source bead is closed).
+	item := buildPolecatInventoryItem("gastown", "ace", fields, nil, polecatSessionSet{}, nil)
+
+	if item.State != polecat.StateStalled {
+		t.Fatalf("state = %q, want stalled (item=%+v)", item.State, item)
+	}
+
+	state := effectivePolecatState(PolecatListItem{
+		State:                item.State,
+		Issue:                item.Issue,
+		SessionRunning:       item.SessionRunning,
+		CountsTowardCapacity: item.Disposition.CountsTowardCapacity,
+	})
+	if state != polecat.StateStalled {
+		t.Fatalf("effectivePolecatState = %q, want stalled", state)
+	}
+}
+
 func TestPolecatNameFromAssignee(t *testing.T) {
 	tests := []struct {
 		assignee string

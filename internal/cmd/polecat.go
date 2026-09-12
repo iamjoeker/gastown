@@ -955,6 +955,18 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Recompute State using the same inventory classifier `gt polecat list`
+	// uses, rather than Manager.Get's independent loadFromBeads derivation.
+	// The two used to disagree on exactly the polecats loadFromBeads cannot
+	// see active work for (e.g. a released hook after merge, dead session):
+	// list called this stalled, status called it idle (gt-fbfn).
+	if state, issue, ok := polecatInventoryState(r, rigName, polecatName); ok {
+		p.State = state
+		if issue != "" {
+			p.Issue = issue
+		}
+	}
+
 	// JSON output
 	if polecatStatusJSON {
 		status := PolecatStatus{
