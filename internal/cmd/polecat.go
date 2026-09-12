@@ -1491,6 +1491,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			}
 			if activeMRAssessment.Pending {
 				input.ActiveMRBlocker = activeMRAssessment.Reason
+				input.ActiveMRStale = activeMRAssessment.Stale
 				// Proven-open, not merely not-ruled-out: Stale covers the
 				// missing/terminal MR, and an unverified or errored lookup never
 				// sets MRStatus at all (gt-mkpm).

@@ -130,6 +130,24 @@ const (
 	// long as the MR is in flight, which is exactly the window a witness is most
 	// likely to be looking in (gt-9f67).
 	WorkstateReasonStalledPendingMR = "stalled-session-pending-mr"
+
+	// WorkstateReasonActiveMRStale means the referenced MR itself is already
+	// terminal (closed/merged/rejected) but AssessActiveMR still returned
+	// Pending — because the source issue isn't provably terminal yet, or
+	// RequireGitSafe demanded direct git evidence that hasn't cleared. It is
+	// its own reason, distinct from WorkstateReasonActiveMROpen, because the
+	// two claims are opposites: "open" says the MR is still in flight, and a
+	// reader trusts that over a blocker string it never parses. Reusing it for
+	// a closed MR produced a record that argued with itself in one field —
+	// reason=active-mr-open beside a blocker reading
+	// "active_mr=X status=closed ... git_state=unsafe" for gastown/crater,
+	// whose MR (gt-wisp-twzu) had been closed for hours (gt-ev4k).
+	WorkstateReasonActiveMRStale = "active-mr-stale"
+
+	// WorkstateReasonActiveMROpen means AssessActiveMR (or a cheaper caller
+	// that only knows the MR is open) found the referenced merge request
+	// genuinely still in flight.
+	WorkstateReasonActiveMROpen = "active-mr-open"
 )
 
 // SessionPresence is what a direct `tmux has-session` on the polecat's session
@@ -386,12 +404,22 @@ type WorkstateInput struct {
 	ActiveWorkCountsTowardCapacity bool
 	ActiveMR                       string
 	ActiveMRBlocker                string
-	MQCheckRequired                bool
-	HasSubmittableWork             bool
-	MQNotRequired                  bool
-	AssignedBeadTerminal           bool
-	MRSubmitted                    bool
-	MQLookupFailed                 bool
+
+	// ActiveMRStale records that ActiveMRBlocker was built from an
+	// ActiveMRAssessment whose Stale field was true — the referenced MR is
+	// already closed/merged/rejected, and Pending survived only because the
+	// source issue or direct git state hadn't cleared yet. It exists so the
+	// reason string can say "stale" instead of "open" for exactly this case;
+	// see WorkstateReasonActiveMRStale. Left false by every caller that builds
+	// ActiveMRBlocker from a genuinely open MR (or without an assessment at
+	// all), which keeps their behavior unchanged (gt-ev4k).
+	ActiveMRStale        bool
+	MQCheckRequired      bool
+	HasSubmittableWork   bool
+	MQNotRequired        bool
+	AssignedBeadTerminal bool
+	MRSubmitted          bool
+	MQLookupFailed       bool
 
 	// SourceCloseDischargesMQ records that the polecat's source bead was closed
 	// with an explicit terminal category — duplicate, no-changes, superseded —
@@ -717,9 +745,13 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	stalledUnderPendingMR := in.ActiveMRBlocker != "" && sessionAbsentHoldingWork(in)
 
 	if in.ActiveMRBlocker != "" && !in.PushFailed && !in.MRFailed && !stalledUnderPendingMR && (in.State == StateDone || in.State == StateHandedOff) {
+		reason := WorkstateReasonActiveMROpen
+		if in.ActiveMRStale {
+			reason = WorkstateReasonActiveMRStale
+		}
 		d := WorkstateDisposition{
 			Verdict:     WorkstateVerdictPendingMR,
-			Reason:      "active-mr-open",
+			Reason:      reason,
 			ReuseStatus: ReuseStatusPROpen,
 			Blockers:    []string{in.ActiveMRBlocker},
 		}
@@ -865,7 +897,11 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	}
 	activeMRBlocks := in.ActiveMRBlocker != ""
 	if activeMRBlocks {
-		block("active-mr-open", in.ActiveMRBlocker, false)
+		reason := WorkstateReasonActiveMROpen
+		if in.ActiveMRStale {
+			reason = WorkstateReasonActiveMRStale
+		}
+		block(reason, in.ActiveMRBlocker, false)
 	}
 	// A deliberate pause is the LOWEST-priority blocker, so it is not fed through
 	// block() with the rest: work at risk outranks it, an open MR outranks it,
