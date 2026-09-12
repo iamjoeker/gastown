@@ -3798,16 +3798,19 @@ func hasLoggedOutIndicator(line string) bool {
 //
 // One thing not established: the excerpt above is three contiguous lines lifted
 // from an incident report, not a full-height capture, so where the composer sits
-// relative to the marker is unverified. The scan therefore reuses the busy
-// scan's region — anchor, everything below, and turnBusyLookback non-empty lines
-// above — rather than assuming the marker is strictly below the composer.
+// relative to the marker is unverified. The scan therefore reuses the same
+// status-region shape as the busy scan — anchor, everything below, and
+// authWallLookback non-empty lines above — rather than assuming the marker is
+// strictly below the composer. The lookback is wider than the busy scan's
+// (see authWallLookback) because a TUI tip line can sit between the marker and
+// the composer, consuming a rung (gt-dxcb).
 func loggedOutFromLines(lines []string, promptPrefix string) bool {
 	lines = trimTrailingBlankLines(lines)
 	anchor := statusAnchor(lines, promptPrefix)
 	if anchor < 0 {
 		return false
 	}
-	return indicatorNearAnchor(lines, anchor, hasLoggedOutIndicator)
+	return indicatorNearAnchor(lines, anchor, authWallLookback, hasLoggedOutIndicator)
 }
 
 // IsLoggedOut reports whether a session's pane shows positive evidence that the

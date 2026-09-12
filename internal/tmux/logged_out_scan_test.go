@@ -38,16 +38,34 @@ func TestLoggedOutFromLines(t *testing.T) {
 			// transcript are the ones investigating this very defect. A false
 			// positive here parks a healthy polecat on a verdict whose only
 			// remedy is a person at a browser.
+			// Placed five non-empty rungs above the anchor — one past
+			// authWallLookback (4) — the same margin liveness.go's own
+			// contamination control uses for the activity marker, and for the
+			// same reason: the bound must hold real transcript prose out even
+			// after gt-dxcb widened the window to reach a TUI tip line.
 			name: "auth wall quoted in transcript prose is not evidence",
 			lines: []string{
 				"  The pane read 'Not logged in · Run /login', which is why the",
 				"  restart could not have fixed it — see gt-acb1.",
 				"",
+				"  Filed as gt-dxcb once the pattern repeated.",
 				plainSpinnerIdle,
 				"",
 				plainBox, plainPrompt, plainBox, plainFooterIdle,
 			},
 			want: false,
+		},
+		{
+			// gt-dxcb: a TUI tip line sitting between the marker and the
+			// composer used to consume the one spare rung turnBusyLookback (2)
+			// allowed, hiding the marker. authWallLookback (4) reaches past it.
+			name: "a tip line between the auth wall and the composer is still found",
+			lines: []string{
+				"● Login expired · Please run /login",
+				liveTipLine,
+				plainBox, plainPrompt, plainBox, plainFooterIdle,
+			},
+			want: true,
 		},
 		{
 			name: "auth wall far above the composer is out of the status region",
@@ -127,9 +145,14 @@ func requireNaiveScanSeesAuthWall(t *testing.T, lines []string) {
 func TestLoggedOutScanIsBoundedNotBlind(t *testing.T) {
 	t.Parallel()
 
+	// The marker sits five non-empty rungs above the anchor — one past
+	// authWallLookback (4) — so widening the window for gt-dxcb's tip-line
+	// case does not also reopen this contamination path.
 	contaminated := []string{
 		"  The pane read 'Not logged in · Run /login' — see gt-acb1.",
 		"",
+		"  which is why the restart alone would not have fixed it.",
+		"  Filed as gt-dxcb once the pattern repeated.",
 		plainSpinnerIdle,
 		"",
 		plainBox, plainPrompt, plainBox, plainFooterIdle,
