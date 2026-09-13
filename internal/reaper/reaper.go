@@ -1967,6 +1967,155 @@ func AutoCloseAckedMail(db *sql.DB, dbName string, staleAge time.Duration, dryRu
 	return result, nil
 }
 
+// PatrolStepTitles is the closed vocabulary of machine-generated per-cycle step
+// bead titles produced by mol-witness-patrol / mol-deacon-patrol formulas. Each
+// one is semantically complete the moment its single cycle step finishes
+// (minutes), not weeks, so they must not wait on AutoClose's 30-day default —
+// but they also must not be matched by anything looser than an exact title,
+// since a substring/prefix match would risk catching real, human-filed work
+// that happens to share a word (hq-0s3n2).
+var PatrolStepTitles = []string{
+	"Loop or exit for respawn",
+	"Check own context limit",
+	"End-of-cycle inbox hygiene",
+	"Check if active swarm is complete",
+	"Sweep for unmerged polecat branches",
+	"Inspect all active polecats",
+	"Check timer gates for expiration",
+	"Check refinery, mayor, and deacon health",
+	"Process pending cleanup wisps",
+	"Resolve external dependencies",
+	"Detect cleanup needs",
+	"Dispatch molecules with resolved gates",
+	"Aggregate daily costs [DISABLED]",
+	"Compact expired wisps",
+	"Clean up orphaned claude subagent processes",
+	"Detect zombie polecats (NO KILL AUTHORITY)",
+	"Check for stuck dogs",
+	"Mid-cycle heartbeat refresh",
+	"Rotate logs and prune state",
+	"Send compaction digest report",
+}
+
+// AutoClosePatrolSteps closes machine-generated patrol-step issues (see
+// PatrolStepTitles) past patrolStepStaleAge, regardless of priority.
+//
+// AutoClose deliberately excludes P0/P1 (line ~1714) because a real P1 bug
+// should never auto-close just for sitting untouched — but that same
+// exclusion is why the patrol-step backlog cannot self-heal: these beads are
+// created at P1/P2 by the patrol formulas and their owning cycle typically
+// finishes within minutes. This is a separate, narrowly-scoped path keyed on
+// an exact title match instead of priority, so it can carry its own much
+// shorter staleness window without weakening the P0/P1 protection AutoClose
+// gives real work (hq-0s3n2).
+func AutoClosePatrolSteps(db *sql.DB, dbName string, patrolStepStaleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
+	defer cancel()
+
+	staleCutoff := time.Now().UTC().Add(-patrolStepStaleAge)
+	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
+
+	titlePlaceholders := make([]string, len(PatrolStepTitles))
+	titleArgs := make([]interface{}, len(PatrolStepTitles))
+	for i, t := range PatrolStepTitles {
+		titlePlaceholders[i] = "?"
+		titleArgs[i] = t
+	}
+
+	selectQuery := fmt.Sprintf(`
+		SELECT i.id, i.title, i.updated_at FROM `+"`%s`"+`.issues i
+		WHERE i.status IN ('open', 'in_progress')
+		AND i.updated_at < ?
+		AND i.title IN (%s)`, dbName, strings.Join(titlePlaceholders, ","))
+
+	args := append([]interface{}{staleCutoff}, titleArgs...)
+	rows, err := db.QueryContext(ctx, selectQuery, args...)
+	if err != nil {
+		if isTableNotFound(err) {
+			return result, nil // issues not on this server
+		}
+		return nil, fmt.Errorf("select stale patrol steps: %w", err)
+	}
+	type candidate struct {
+		id        string
+		title     string
+		updatedAt time.Time
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.title, &c.updatedAt); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan stale patrol step id: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+
+	now := time.Now().UTC()
+	ids := make([]string, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.id
+		result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
+			ID:       c.id,
+			Title:    c.title,
+			AgeDays:  int(now.Sub(c.updatedAt).Hours() / 24),
+			Database: dbName,
+		})
+	}
+
+	if dryRun {
+		result.Closed = len(ids)
+		return result, nil
+	}
+
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	session, err := beginWriteSession(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	defer session.release()
+
+	placeholders := make([]string, len(ids))
+	idArgs := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		idArgs[i] = id
+	}
+	updateQuery := fmt.Sprintf(
+		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW(), close_reason = 'stale:patrol-step auto-closed by reaper' WHERE id IN (%s)",
+		dbName, strings.Join(placeholders, ","))
+	if _, err := session.conn.ExecContext(ctx, updateQuery, idArgs...); err != nil {
+		return nil, fmt.Errorf("auto-close patrol steps: %w", err)
+	}
+
+	if err := session.commit(ctx); err != nil {
+		// release rolls the UPDATE back, so nothing was closed.
+		result.ClosedEntries = nil
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "sql_commit_failed",
+			Message: fmt.Sprintf("sql commit after patrol-step auto-close failed, closures rolled back: %v", err),
+		})
+		return result, nil
+	}
+	result.Closed = len(ids)
+
+	commitMsg := fmt.Sprintf("reaper: auto-close %d stale patrol-step issues in %s", len(ids), dbName)
+	if _, err := session.conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if !isNothingToCommit(err) {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after patrol-step auto-close failed: %v", err),
+			})
+		}
+	}
+
+	return result, nil
+}
+
 // batchDeleteRows deletes rows from a primary table and its auxiliary tables in
 // batches. It takes a sqlRunner rather than a *sql.DB so callers can hand it the
 // connection they pinned for the write sequence — every batch must run on the

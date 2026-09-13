@@ -42,21 +42,22 @@ func activeWispGCHold(townRoot string) (*holds.Hold, error) {
 }
 
 var (
-	reaperDB          string
-	reaperHost        string
-	reaperPort        int
-	reaperMaxAge      string
-	reaperPurgeAge    string
-	reaperMailAge     string
-	reaperStaleAge    string
-	reaperDBDelay     string
-	reaperDryRun      bool
-	reaperJSON        bool
-	reaperArchiveDir  string
-	reaperNoArchive   bool
-	reaperArchiveID   string
-	reaperArchiveGrep string
-	reaperArchiveLmt  int
+	reaperDB                 string
+	reaperHost               string
+	reaperPort               int
+	reaperMaxAge             string
+	reaperPurgeAge           string
+	reaperMailAge            string
+	reaperStaleAge           string
+	reaperPatrolStepStaleAge string
+	reaperDBDelay            string
+	reaperDryRun             bool
+	reaperJSON               bool
+	reaperArchiveDir         string
+	reaperNoArchive          bool
+	reaperArchiveID          string
+	reaperArchiveGrep        string
+	reaperArchiveLmt         int
 )
 
 // reaperArchiver resolves the archive purge exports protected wisps to before
@@ -524,6 +525,10 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 		if err != nil {
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
+		patrolStepStaleAge, err := time.ParseDuration(reaperPatrolStepStaleAge)
+		if err != nil {
+			return fmt.Errorf("invalid --patrol-step-stale-age: %w", err)
+		}
 
 		databases := reaperDatabaseNames()
 
@@ -563,12 +568,22 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 			// Acked mail: delivery-acked gt:message beads never read, exempt
 			// from the sweep above by AutoCloseExemptLabels (gt-ljun).
 			ackedResult, err := reaper.AutoCloseAckedMail(db, dbName, staleAge, reaperDryRun)
-			db.Close()
 			if err != nil {
+				db.Close()
 				fmt.Fprintf(os.Stderr, "%s: auto-close acked mail error: %v\n", dbName, err)
 				continue
 			}
 			results = append(results, ackedResult)
+
+			// Patrol-step beads: exempt from AutoClose's P0/P1 exclusion above,
+			// so they need their own short-window pass (hq-0s3n2).
+			patrolResult, err := reaper.AutoClosePatrolSteps(db, dbName, patrolStepStaleAge, reaperDryRun)
+			db.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: auto-close patrol steps error: %v\n", dbName, err)
+				continue
+			}
+			results = append(results, patrolResult)
 		}
 
 		if reaperJSON {
@@ -626,6 +641,10 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		staleAge, err := time.ParseDuration(reaperStaleAge)
 		if err != nil {
 			return fmt.Errorf("invalid --stale-age: %w", err)
+		}
+		patrolStepStaleAge, err := time.ParseDuration(reaperPatrolStepStaleAge)
+		if err != nil {
+			return fmt.Errorf("invalid --patrol-step-stale-age: %w", err)
 		}
 
 		// wispGCHoldReason, when non-empty, means the purge step is skipped this
@@ -748,6 +767,19 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 						entry.ID, entry.Title, entry.AgeDays, entry.Database)
 				}
 				totalClosed += ackedMailResult.Closed
+			}
+
+			// Patrol-step beads: exempt from AutoClose's P0/P1 exclusion above,
+			// so they need their own short-window pass (hq-0s3n2).
+			patrolResult, err := reaper.AutoClosePatrolSteps(db, dbName, patrolStepStaleAge, reaperDryRun)
+			if err != nil {
+				fmt.Printf("%s: auto-close patrol steps error: %v\n", dbName, err)
+			} else {
+				for _, entry := range patrolResult.ClosedEntries {
+					fmt.Printf("  %s %s (%dd stale, db:%s, patrol step)\n",
+						entry.ID, entry.Title, entry.AgeDays, entry.Database)
+				}
+				totalClosed += patrolResult.Closed
 			}
 
 			db.Close()
@@ -968,6 +1000,9 @@ func init() {
 	}
 	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperAutoCloseCmd, reaperRunCmd} {
 		cmd.Flags().StringVar(&reaperStaleAge, "stale-age", "720h", "Max issue staleness before auto-close (30d)")
+	}
+	for _, cmd := range []*cobra.Command{reaperAutoCloseCmd, reaperRunCmd} {
+		cmd.Flags().StringVar(&reaperPatrolStepStaleAge, "patrol-step-stale-age", "1h", "Max age for machine-generated patrol-step issues before auto-close, regardless of priority")
 	}
 
 	// Retention flags (gt-6xwt). --archive-dir is shared with the read command
