@@ -118,6 +118,57 @@ esac`
 	}
 }
 
+// TestReportPatrolCycleRejectsUnknownStepLabels is the gt-lt98h regression.
+//
+// An ad-hoc summary like "zombie:OK,stall:OK,completion:OK" used to be
+// accepted silently: none of its labels matched mol-deacon-patrol's own step
+// IDs, every real step audited as SKIP, and the command still closed the
+// cycle and spawned the next one at RC=0. That let a patrol loop drift onto
+// ad-hoc commands indefinitely while the tracked cycle looked "stuck" on any
+// dashboard. The command must now reject unmatched labels before touching
+// any bead, leaving the current cycle open instead of faking completion.
+func TestReportPatrolCycleRejectsUnknownStepLabels(t *testing.T) {
+	body := `
+case "$cmd" in
+  list|query) echo '[]' ;;
+  close|update)
+    echo "unexpected $cmd call" >> "$closes_log"
+    ;;
+esac`
+
+	townRoot, closesLog := newDescendantStubTown(t, body)
+
+	spawned := 0
+	spawn := func(PatrolConfig) (string, error) {
+		spawned++
+		return "hq-wisp-next", nil
+	}
+
+	cfg := PatrolConfig{
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "deacon",
+		Beads:         beads.New(townRoot),
+	}
+
+	err := reportPatrolCycle(cfg, "Patrol", "zombie:OK,stall:OK,completion:OK", spawn)
+	if err == nil {
+		t.Fatal("reportPatrolCycle: expected error for unmatched step labels, got nil")
+	}
+	for _, want := range []string{"zombie", "stall", "completion"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name unmatched label %q", err.Error(), want)
+		}
+	}
+	if spawned != 0 {
+		t.Errorf("spawn calls = %d, want 0 — a rejected report must not start a next cycle", spawned)
+	}
+	if got := readClosedIDs(t, closesLog); len(got) != 0 {
+		t.Errorf("unexpected close/update calls on a rejected report: %v", got)
+	}
+}
+
 // TestReportPatrolCycleEmitsFeedEvents is the hq-iija regression: a completed
 // patrol cycle used to leave no trace in the feed at all, so a consumer that
 // infers idleness from feed silence (Boot's triage) could not tell a healthy,

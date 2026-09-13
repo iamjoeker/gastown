@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -94,6 +95,18 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 // open) and starts the next one via spawn. Split out from runPatrolReport so
 // the close/spawn sequencing is testable without role detection.
 func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(PatrolConfig) (string, error)) error {
+	// Reject ad-hoc --steps labels that don't match the formula's own step
+	// IDs before touching any bead. An ad-hoc summary like
+	// "zombie:OK,stall:OK,completion:OK" used to be accepted silently: every
+	// real formula step showed SKIP in the audit, but the command still
+	// closed the cycle and exited 0, so the drift away from the tracked
+	// checklist was invisible on any dashboard (gt-lt98h). Failing fast here
+	// means the current cycle stays open until the agent reports against the
+	// real steps, instead of a fake "complete" cycle hiding the drift.
+	if err := validateStepLabels(cfg.PatrolMolName, stepsFlag); err != nil {
+		return err
+	}
+
 	// Find the active patrol
 	patrolID, _, hasPatrol, findErr := findActivePatrol(cfg)
 	if findErr != nil {
@@ -314,6 +327,52 @@ func buildStepAudit(formulaName string, stepsFlag string) string {
 	}
 
 	return fmt.Sprintf("Steps: %s (%d/%d)", strings.Join(parts, " | "), okCount, len(allStepIDs))
+}
+
+// validateStepLabels rejects a --steps flag whose labels don't match any of
+// the formula's own canonical step IDs. A formula that can't be loaded or
+// parsed is not validated — buildStepAudit already degrades to "unvalidated"
+// in that case, and refusing the report over a formula-lookup problem would
+// block the cycle for a reason unrelated to what the caller reported.
+func validateStepLabels(formulaName, stepsFlag string) error {
+	if strings.TrimSpace(stepsFlag) == "" {
+		return nil
+	}
+
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		return nil
+	}
+	f, err := formula.Parse(content)
+	if err != nil {
+		return nil
+	}
+
+	allStepIDs := f.GetAllIDs()
+	if len(allStepIDs) == 0 {
+		return nil
+	}
+	valid := make(map[string]bool, len(allStepIDs))
+	for _, id := range allStepIDs {
+		valid[id] = true
+	}
+
+	reported := parseStepResults(stepsFlag)
+	var unknown []string
+	for label := range reported {
+		if !valid[label] {
+			unknown = append(unknown, label)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+
+	return fmt.Errorf("--steps has label(s) not in %s's own steps: %s\n"+
+		"valid step ids: %s\n"+
+		"step through the formula's checklist instead of an ad-hoc summary",
+		formulaName, strings.Join(unknown, ", "), strings.Join(allStepIDs, ", "))
 }
 
 // parseStepResults parses a comma-separated string of step:STATUS pairs.
