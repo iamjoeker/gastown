@@ -141,6 +141,22 @@ func raiseEscalation(req escalationRequest) (*escalationOutcome, error) {
 			style.PrintWarning("failed to annotate escalation mail for %s: %v", target, err)
 			continue
 		}
+		// FindLatestIssueByTitleAndAssignee matches by exact title+assignee with
+		// no status filter, picking whichever match has the newest CreatedAt —
+		// it can hand back a bead that already belongs to a DIFFERENT
+		// escalation (a subject collision, or a stale bead that outlived the
+		// mail it originally named). Labeling that bead "escalation:<issue.ID>"
+		// on top of its existing link would give it two escalation: labels;
+		// EscalationRecordID resolves to whichever one iterates first, so
+		// closing THIS escalation could then also close the OTHER one's
+		// delivered copy — the "closing one escalation closed a different one"
+		// failure (gt-f6yv).
+		if existing := beads.EscalationRecordID(mailIssue); existing != "" && existing != mailIssue.ID && existing != issue.ID {
+			status.Warning = fmt.Sprintf("mail lookup for %s resolved to %s, which is already linked to escalation %s; not cross-linking it to this one", target, mailIssue.ID, existing)
+			statuses = append(statuses, status)
+			style.PrintWarning("escalation mail for %s resolved to a bead already tied to escalation %s; skipping annotation to avoid cross-linking", target, existing)
+			continue
+		}
 		status.BeadID = mailIssue.ID
 
 		addLabels := []string{
