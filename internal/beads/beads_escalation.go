@@ -451,6 +451,14 @@ func (b *Beads) AckEscalation(id, ackedBy string) error {
 		return err
 	}
 
+	// A closed record is a resolved escalation: acking it anyway rewrote its
+	// description and labels while reporting success, which is how the mayor
+	// came to ack a closed escalation believing it live and record a stale
+	// pointer to it (gt-f6yv). Closing is meant to be the terminal state.
+	if record != nil && strings.EqualFold(record.Status, "closed") {
+		return fmt.Errorf("escalation %s is already closed and cannot be acknowledged; if it was closed in error, re-open the underlying issue rather than acking the closed escalation", recordID)
+	}
+
 	if record != nil {
 		// Parse existing fields
 		fields := ParseEscalationFields(record.Description)

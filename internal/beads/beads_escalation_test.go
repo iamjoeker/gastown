@@ -1034,6 +1034,31 @@ func TestAckEscalation_LabelsDeliveredCopies(t *testing.T) {
 	}
 }
 
+// Acking an already-closed escalation used to succeed silently, rewriting its
+// description and labels as if it were still live. That is how an operator
+// came to ack a closed escalation believing it live and record a stale
+// pointer to it (gt-f6yv) — closing is meant to be terminal.
+func TestAckEscalation_RefusesAlreadyClosedRecord(t *testing.T) {
+	stub := newEscalationStub(t)
+	record := escalationRecord("hq-wisp-r1")
+	record.Status = "closed"
+	stub.bead(record)
+
+	b := New(t.TempDir())
+	err := b.AckEscalation("hq-wisp-r1", "mayor/")
+	if err == nil {
+		t.Fatal("AckEscalation on a closed record should error, got nil")
+	}
+	if !strings.Contains(err.Error(), "already closed") {
+		t.Errorf("error should say the escalation is already closed, got: %v", err)
+	}
+	for _, line := range stub.writes() {
+		if strings.HasPrefix(line, "update hq-wisp-r1") {
+			t.Errorf("closed record must not be written to, got: %q", line)
+		}
+	}
+}
+
 // Copies stranded by pre-fix closes must drop out of the queue with no
 // migration — but only on positive evidence that the record is closed, and the
 // ones dropped must be handed back rather than lost (gt-f0b3).

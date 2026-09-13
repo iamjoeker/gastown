@@ -36,6 +36,32 @@ func TestGetNextSeverity(t *testing.T) {
 	}
 }
 
+func TestRejectUnknownEscalationVerb(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr bool
+	}{
+		{"update plus bead-shaped id errors", []string{"update", "hq-abc123"}, true},
+		{"cancel plus bead-shaped id errors", []string{"cancel", "hq-wisp-g4v"}, true},
+		{"delete plus bead-shaped id errors", []string{"delete", "gt-f6yv"}, true},
+		{"known verb without an id-shaped arg is a real description", []string{"update", "the", "runbook"}, false},
+		{"id-shaped arg without a known verb is a real description", []string{"Dolt", "hq-abc123"}, false},
+		{"ordinary description is untouched", []string{"Build", "failing", "on", "main"}, false},
+		{"single word is untouched", []string{"update"}, false},
+		{"case-insensitive verb still matches", []string{"UPDATE", "hq-abc123"}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := rejectUnknownEscalationVerb(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("rejectUnknownEscalationVerb(%v) error = %v, wantErr %v", tt.args, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestExtractMailTargetsFromActions(t *testing.T) {
 	tests := []struct {
 		name    string

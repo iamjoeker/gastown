@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -38,6 +39,10 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Require at least a description when creating an escalation
 	if len(args) == 0 {
 		return cmd.Help()
+	}
+
+	if err := rejectUnknownEscalationVerb(args); err != nil {
+		return err
 	}
 
 	description := strings.Join(args, " ")
@@ -225,6 +230,50 @@ type escalationBeadCreator interface {
 // satisfied by it: creating a second bead would double every critical, high and
 // medium escalation in `gt escalate list` and in the Mayor's queue. mailStatuses
 // must therefore be the statuses collected from the mail loop.
+// escalationVerbHints maps words someone would plausibly type as a
+// subcommand against an escalation ID to the command that actually exists.
+// `gt escalate` has no `create`/`update` subcommand: any word cobra does not
+// recognize (list, ack, close, stale, show) falls through to runEscalate's
+// RunE and is silently treated as the start of a NEW escalation's
+// description. `gt escalate update hq-abc123` therefore files a second,
+// unrelated escalation titled "update hq-abc123" instead of erroring, and the
+// stray record is easy to mistake for the one the operator meant to touch
+// (gt-f6yv). This guard catches the shape of that mistake — a known
+// lifecycle verb immediately followed by what looks like the ID it was meant
+// to act on — without rejecting descriptions that legitimately start with
+// one of these words but aren't followed by an ID.
+var escalationVerbHints = map[string]string{
+	"update":  "gt escalate ack <id>' to acknowledge it, or 'gt escalate close <id> --reason ...",
+	"edit":    "gt escalate close <id> --reason ...' and re-file if it needs to change",
+	"modify":  "gt escalate close <id> --reason ...' and re-file if it needs to change",
+	"cancel":  "gt escalate close <id> --reason ...",
+	"delete":  "gt escalate close <id> --reason ...",
+	"remove":  "gt escalate close <id> --reason ...",
+	"resolve": "gt escalate close <id> --reason ...",
+}
+
+// escalationIDShape matches the bead-ID-like tokens escalations are
+// addressed by (e.g. "hq-abc123", "gt-wisp-g4v"): a lowercase-led prefix,
+// a dash, and an alphanumeric/dash tail. It deliberately mirrors
+// beadIDLine's token shape (compact_report.go) rather than importing it, to
+// avoid coupling this input guard to that output-scraping regex.
+var escalationIDShape = regexp.MustCompile(`^[a-z][a-z0-9]*-[a-z0-9-]+$`)
+
+// rejectUnknownEscalationVerb returns an error when args looks like a typo'd
+// or guessed subcommand (a known lifecycle verb followed by something
+// shaped like an escalation ID) rather than an actual description.
+func rejectUnknownEscalationVerb(args []string) error {
+	if len(args) < 2 {
+		return nil
+	}
+	hint, isVerb := escalationVerbHints[strings.ToLower(args[0])]
+	if !isVerb || !escalationIDShape.MatchString(args[1]) {
+		return nil
+	}
+	return fmt.Errorf("'%s' is not a 'gt escalate' subcommand — the rest of the line was about to become a NEW escalation titled %q rather than act on %s. "+
+		"Use '%s", args[0], strings.Join(args, " "), args[1], hint)
+}
+
 func deliverEscalationBead(bd escalationBeadCreator, actions []string, mailStatuses []deliveryStatus, recordID, severity, title, body string) *deliveryStatus {
 	if !slices.Contains(actions, escalationBeadAction) {
 		return nil
