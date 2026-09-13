@@ -557,23 +557,36 @@ worktrees. It does NOT delete them. See the warning below before changing that.
 
 ```bash
 # For each dog directory. GT_ROOT, not ~/gt — see warning below.
+# Session liveness comes from `gt dog list --json`'s session_running field,
+# not a hand-built "dog-$DOG" string — that reconstruction is what drifted
+# from the real hq-dog-<name> tmux naming scheme in the first place (gt-mm4e).
 DEAD_WORKTREES=0
-for dogdir in "${GT_ROOT:?GT_ROOT must be set}"/deacon/dogs/*/; do
-  [ -d "$dogdir" ] || continue
-  DOG=$(basename "$dogdir")
-  # Check if dog has a live tmux session
-  if ! tmux has-session -t "dog-$DOG" 2>/dev/null; then
-    # Dog session is dead - check for leftover worktree dirs
-    for rigrepo in "$dogdir"*/; do
-      [ -d "$rigrepo/.git" ] || continue
-      git -C "$rigrepo" worktree list 2>/dev/null
-      echo "Dead dog worktree: $DOG/$(basename "$rigrepo") (session dead)"
-      DEAD_WORKTREES=$((DEAD_WORKTREES + 1))
-    done
-  fi
-done
+DOG_LIST_JSON=$(gt dog list --json 2>&1)
+if [ $? -ne 0 ]; then
+  echo "SKIPPING dead-dog-worktree check: gt dog list --json failed: $DOG_LIST_JSON"
+else
+  LIVE_DOGS=$(jq -r '.[] | select(.session_running) | .name' <<<"$DOG_LIST_JSON")
+  for dogdir in "${GT_ROOT:?GT_ROOT must be set}"/deacon/dogs/*/; do
+    [ -d "$dogdir" ] || continue
+    DOG=$(basename "$dogdir")
+    # Check if dog has a live tmux session (via gt, not a reconstructed name)
+    if ! grep -qx "$DOG" <<<"$LIVE_DOGS"; then
+      # Dog session is dead - check for leftover worktree dirs
+      for rigrepo in "$dogdir"*/; do
+        [ -d "$rigrepo/.git" ] || continue
+        git -C "$rigrepo" worktree list 2>/dev/null
+        echo "Dead dog worktree: $DOG/$(basename "$rigrepo") (session dead)"
+        DEAD_WORKTREES=$((DEAD_WORKTREES + 1))
+      done
+    fi
+  done
+fi
 echo "dead_worktrees=$DEAD_WORKTREES (reported, NOT pruned)"
 ```
+
+If `gt dog list --json` fails, the step is skipped entirely — an unreadable
+liveness probe must never be read as "every dog is dead" (the same failure
+shape as the session-name bug it replaces, via a different mechanism).
 
 If `dead_worktrees` is non-zero, REPORT the count in the patrol digest and, if it
 stays non-zero across several patrols, escalate. Do not delete.
