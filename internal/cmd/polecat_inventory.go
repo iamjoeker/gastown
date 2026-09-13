@@ -7,6 +7,8 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 const polecatSessionKeySep = "\x00"
@@ -219,6 +221,38 @@ func (i *polecatBranchMRIndex) openMRFor(branch string) string {
 		return ""
 	}
 	return i.openMR[branch]
+}
+
+// polecatInventoryState answers `gt polecat status`'s state/issue question
+// using the same classifier `gt polecat list` uses (buildPolecatInventoryItem
+// plus effectivePolecatState), instead of Manager.Get's independent
+// loadFromBeads derivation. The two disagreed on exactly the polecats
+// loadFromBeads cannot see active work for — e.g. a hook already released
+// after merge, with a dead session — where list called it stalled and
+// status called it idle (gt-fbfn). ok is false when the rig's tmux session
+// listing could not be read; callers should keep whatever state they already
+// had in that case rather than report a guess.
+func polecatInventoryState(r *rig.Rig, rigName, polecatName string) (state polecat.State, issue string, ok bool) {
+	t := tmux.NewTmux()
+	sessionNames, err := t.ListSessions()
+	if err != nil {
+		return "", "", false
+	}
+	sessions := newPolecatSessionSet(sessionNames)
+
+	bd := beads.New(r.Path)
+	_, fields, _ := bd.GetAgentBead(polecatBeadIDForRig(r, rigName, polecatName))
+	activeWork, _ := listActivePolecatWorkByName(bd, rigName)
+	mrIndex, _ := newPolecatBranchMRIndex(bd)
+
+	item := buildPolecatInventoryItem(rigName, polecatName, fields, activeWork[polecatName], sessions, mrIndex)
+	state = effectivePolecatState(PolecatListItem{
+		State:                item.State,
+		Issue:                item.Issue,
+		SessionRunning:       item.SessionRunning,
+		CountsTowardCapacity: item.Disposition.CountsTowardCapacity,
+	})
+	return state, item.Issue, true
 }
 
 func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet, mrIndex *polecatBranchMRIndex) polecatInventoryItem {
