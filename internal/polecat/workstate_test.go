@@ -202,6 +202,14 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open"},
 		},
 		{
+			// Same stale-vs-open distinction as the StateDone case above, but
+			// through the general block() tail rather than the early PendingMR
+			// return -- both sites hardcoded "active-mr-open" before gt-ev4k.
+			name: "stale active mr through the general blocker tail reports stale",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, ActiveMR: "gt-mr-closed", ActiveMRBlocker: "active_mr=gt-mr-closed status=closed source_issue=gt-x git_state=unsafe", ActiveMRStale: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-stale", ReuseStatus: "idle-pr-open"},
+		},
+		{
 			name: "open active mr does not hide cleanup blocker",
 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnpushed, ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open"},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "cleanup-has_unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"cleanup_status=has_unpushed", "active_mr=gt-mr-open status=open"}},
@@ -210,6 +218,16 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			name: "done active mr remains pending mr",
 			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open"},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
+		},
+		{
+			// gt-ev4k: gastown/crater. The MR (gt-wisp-twzu) was already closed,
+			// but AssessActiveMR's own blocker string said so plainly
+			// ("status=closed ... git_state=unsafe") while the reason here still
+			// hardcoded "active-mr-open" -- a record arguing with itself in one
+			// field. ActiveMRStale lets the caller distinguish the two.
+			name: "stale active mr reports stale, not open",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, ActiveMR: "gt-wisp-twzu", ActiveMRBlocker: "active_mr=gt-wisp-twzu status=closed source_issue=gt-xm6w git_state=unsafe", ActiveMRStale: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-stale", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-wisp-twzu status=closed source_issue=gt-xm6w git_state=unsafe"}},
 		},
 		{
 			name: "done without mr and clean cleanup is reusable and safe",

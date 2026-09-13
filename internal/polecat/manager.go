@@ -2579,6 +2579,7 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		assessment := AssessActiveMR(m.agentBeads(), ActiveMRInput{ActiveMR: activeMR, SourceIssueHint: sourceHint, RequireGitSafe: true, GitSafe: gitSafe})
 		if assessment.Pending {
 			input.ActiveMRBlocker = assessment.Reason
+			input.ActiveMRStale = assessment.Stale
 		}
 		activeMRSafe = !assessment.Pending
 		if assessment.SourceTerminal {

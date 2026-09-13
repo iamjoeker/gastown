@@ -361,6 +361,7 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		})
 		if assessment.Pending {
 			input.ActiveMRBlocker = assessment.Reason
+			input.ActiveMRStale = assessment.Stale
 			openMRProven = !assessment.Stale && assessment.MRStatus != ""
 		}
 	}

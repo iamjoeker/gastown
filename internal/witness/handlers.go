@@ -1134,6 +1134,7 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		assessment := polecat.AssessActiveMR(bd, polecat.ActiveMRInput{ActiveMR: fields.ActiveMR, SourceIssueHint: sourceHint, RequireGitSafe: true, GitSafe: gitSafe})
 		if assessment.Pending {
 			input.ActiveMRBlocker = assessment.Reason
+			input.ActiveMRStale = assessment.Stale
 		}
 		activeMRSafe = !assessment.Pending
 		if assessment.SourceTerminal {
