@@ -138,7 +138,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 22
+version = 23
 
 [vars]
 [vars.wisp_type]
@@ -988,16 +988,20 @@ gt escalate -s CRITICAL "Dolt server is down"
 ```
 
 **Commit bloat (commits > 50k in any DB):**
-The compactor dog (`mol-dog-compactor`) may have failed. Dispatch a compactor:
+The compactor-dog plugin may have failed to run or fallen behind. Dispatch it:
 ```bash
-gt dog dispatch --formula mol-dog-compactor --var db=<db_name>
+gt dog dispatch --plugin compactor-dog
 ```
-If no idle dogs, log for next cycle.
+`gt dog dispatch` has no `--formula` flag and dogs are dispatched by plugin
+name, not by formula — `mol-dog-compactor` is not a dispatch target. The
+plugin monitors commit growth across all production DBs itself, so there is
+no per-database `--var` to pass either (dispatch takes no `--var` flag at
+all). If no idle dogs, log for next cycle.
 
 **Stale backups:**
-The backup dog (`mol-dog-backup`) may have failed. Dispatch a backup:
+The dolt-backup plugin may have failed. Dispatch it:
 ```bash
-gt dog dispatch --formula mol-dog-backup
+gt dog dispatch --plugin dolt-backup
 ```
 
 **Zombie processes:**
@@ -1019,6 +1023,14 @@ step earlier in the patrol, so just note any remaining items.
 
 **If everything is healthy:**
 Log `Dolt health: OK` and move on.
+
+**"OK" means the health check itself passed, not that the remediation
+commands above were exercised.** When every signal is green, none of the
+dispatch/kill/cleanup branches ran this cycle — a broken remediation path
+(wrong flag, dead plugin, etc.) stays invisible until Dolt is actually
+unhealthy and the path is load-bearing. Do not read a run of green cycles as
+proof those branches work; they need their own dry-run or integration test
+against a simulated unhealthy Dolt (gt-bg1w).
 
 **Exit criteria:** Health check run, alerts handled or escalated."""
 
@@ -1563,11 +1575,10 @@ needs = ["patrol-cleanup"]
 description = """
 Check own context limit.
 
-The Deacon runs in a Claude session with finite context. Check if approaching the limit:
-
-```bash
-gt context --usage
-```
+The Deacon runs in a Claude session with finite context. There is no `gt`
+command that reports this (no `gt context` subcommand exists) — self-assess
+in one sentence based on conversation length and how much you're recalling
+from earlier in the session.
 
 If context is high (>80%), prepare for handoff:
 - Summarize current state
