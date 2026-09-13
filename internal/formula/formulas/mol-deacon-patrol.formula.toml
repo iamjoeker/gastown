@@ -975,7 +975,10 @@ gt health --json
 Parse the JSON output (HealthReport schema):
 - `server`: running, pid, port, latency_ms, connections, disk_usage_human
 - `databases[]`: name, issues, open_issues, wisps, open_wisps, commits
-- `backups`: dolt_stale, dolt_freshness, jsonl_stale, jsonl_freshness
+- `backups`: dolt_status, dolt_stale, dolt_freshness, jsonl_status, jsonl_stale, jsonl_freshness
+  (`dolt_status`/`jsonl_status` is one of "fresh", "stale", "unconfigured" — "unconfigured"
+  means no backup exists at all and is DISTINCT from "fresh"; `dolt_stale`/`jsonl_stale` is
+  also true when unconfigured, so a naive bool check never misreads absence as health)
 - `processes`: zombie_count, zombie_pids
 - `orphans[]`: name, size
 - `pollution[]`: database, id, title, pattern
@@ -987,8 +990,10 @@ Parse the JSON output (HealthReport schema):
 | `server.running == false` | — | Dolt server is down (CRITICAL) |
 | `server.latency_ms > 5000` | 5 s | Server may be overloaded |
 | `databases[].commits > 50000` | 50 k | Compactor dog may have stalled |
-| `backups.dolt_stale == true` | >30 min | Backup dog may have failed |
-| `backups.jsonl_stale == true` | >30 min | JSONL backup may have failed |
+| `backups.dolt_status == "unconfigured"` | — | No Dolt backup exists at all (do NOT dispatch a backup dog for this — see below) |
+| `backups.jsonl_status == "unconfigured"` | — | No JSONL backup exists at all (do NOT dispatch a backup dog for this — see below) |
+| `backups.dolt_status == "stale"` (`dolt_stale == true`) | >30 min | Backup dog may have failed |
+| `backups.jsonl_status == "stale"` (`jsonl_stale == true`) | >30 min | JSONL backup may have failed |
 | `processes.zombie_count > 0` | any | Zombie Dolt servers detected |
 | `orphans` non-empty | any | Orphan databases accumulating |
 | `pollution` non-empty | any | Test pollution in production DBs |
@@ -1011,8 +1016,16 @@ plugin monitors commit growth across all production DBs itself, so there is
 no per-database `--var` to pass either (dispatch takes no `--var` flag at
 all). If no idle dogs, log for next cycle.
 
-**Stale backups:**
-The dolt-backup plugin may have failed. Dispatch it:
+**Unconfigured backups (dolt_status or jsonl_status == "unconfigured"):**
+No backup of this type exists at all — this is not a plugin failure, since
+there is nothing for the plugin to have failed to refresh. Whether to
+configure backups is a human decision, not something to trigger
+automatically. Log it and, if not already surfaced, notify the overseer once
+per patrol cycle (do not dispatch the dolt-backup plugin for this case).
+
+**Stale backups (dolt_status or jsonl_status == "stale"):**
+A backup exists but is older than 30 minutes. The dolt-backup plugin may have
+failed. Dispatch it:
 ```bash
 gt dog dispatch --plugin dolt-backup
 ```

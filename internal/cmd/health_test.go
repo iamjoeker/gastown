@@ -56,3 +56,51 @@ func TestProductionDatabasesReflectsReferencedRigs(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckBackupHealthReportsUnconfiguredNotFresh guards against gt-zdvg: a
+// town with no backups at all must never report dolt_stale/jsonl_stale as
+// false, since that reads as "backups are fresh" when no backup exists.
+func TestCheckBackupHealthReportsUnconfiguredNotFresh(t *testing.T) {
+	townRoot := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+
+	bh := checkBackupHealth(townRoot)
+
+	if bh.DoltStatus != BackupStatusUnconfigured {
+		t.Errorf("DoltStatus = %q, want %q", bh.DoltStatus, BackupStatusUnconfigured)
+	}
+	if !bh.DoltStale {
+		t.Errorf("DoltStale = false for a town with no backups; must never read as fresh")
+	}
+	if bh.JSONLStatus != BackupStatusUnconfigured {
+		t.Errorf("JSONLStatus = %q, want %q", bh.JSONLStatus, BackupStatusUnconfigured)
+	}
+	if !bh.JSONLStale {
+		t.Errorf("JSONLStale = false for a town with no backups; must never read as fresh")
+	}
+}
+
+// TestCheckBackupHealthReportsFreshWhenRecent guards against the fix
+// over-correcting: a genuinely fresh backup must still report as fresh, not
+// as unconfigured or stale.
+func TestCheckBackupHealthReportsFreshWhenRecent(t *testing.T) {
+	townRoot := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+
+	backupDir := filepath.Join(townRoot, ".dolt-backup")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "snapshot.sql"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	bh := checkBackupHealth(townRoot)
+
+	if bh.DoltStatus != BackupStatusFresh {
+		t.Errorf("DoltStatus = %q, want %q", bh.DoltStatus, BackupStatusFresh)
+	}
+	if bh.DoltStale {
+		t.Errorf("DoltStale = true for a backup written moments ago")
+	}
+}

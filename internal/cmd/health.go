@@ -64,13 +64,24 @@ type PollutionRecord struct {
 	Pattern  string `json:"pattern"`
 }
 
+// BackupStatus values for BackupHealth.DoltStatus / JSONLStatus.
+// "unconfigured" means no backup exists at all — distinct from "fresh" or
+// "stale", and MUST NOT be reported as healthy (dolt_stale/jsonl_stale=false).
+const (
+	BackupStatusFresh        = "fresh"
+	BackupStatusStale        = "stale"
+	BackupStatusUnconfigured = "unconfigured"
+)
+
 type BackupHealth struct {
-	DoltFreshness  string `json:"dolt_freshness,omitempty"`
-	DoltAgeSeconds int    `json:"dolt_age_seconds,omitempty"`
-	DoltStale      bool   `json:"dolt_stale"`
-	JSONLFreshness string `json:"jsonl_freshness,omitempty"`
-	JSONLAgeSeconds int   `json:"jsonl_age_seconds,omitempty"`
-	JSONLStale     bool   `json:"jsonl_stale"`
+	DoltStatus      string `json:"dolt_status"`
+	DoltFreshness   string `json:"dolt_freshness,omitempty"`
+	DoltAgeSeconds  int    `json:"dolt_age_seconds,omitempty"`
+	DoltStale       bool   `json:"dolt_stale"`
+	JSONLStatus     string `json:"jsonl_status"`
+	JSONLFreshness  string `json:"jsonl_freshness,omitempty"`
+	JSONLAgeSeconds int    `json:"jsonl_age_seconds,omitempty"`
+	JSONLStale      bool   `json:"jsonl_stale"`
 }
 
 type ProcessHealth struct {
@@ -296,7 +307,14 @@ func checkPollution(townRoot string, port int) []PollutionRecord {
 }
 
 func checkBackupHealth(townRoot string) *BackupHealth {
-	bh := &BackupHealth{}
+	// Absence of a backup MUST NOT be reported as fresh: default to
+	// unconfigured/stale until a real backup is found, never to healthy.
+	bh := &BackupHealth{
+		DoltStatus:  BackupStatusUnconfigured,
+		DoltStale:   true,
+		JSONLStatus: BackupStatusUnconfigured,
+		JSONLStale:  true,
+	}
 
 	// Dolt filesystem backup freshness.
 	backupDir := filepath.Join(townRoot, ".dolt-backup")
@@ -307,6 +325,11 @@ func checkBackupHealth(townRoot string) *BackupHealth {
 			bh.DoltAgeSeconds = int(age.Seconds())
 			bh.DoltFreshness = age.Round(time.Second).String()
 			bh.DoltStale = age > 30*time.Minute
+			if bh.DoltStale {
+				bh.DoltStatus = BackupStatusStale
+			} else {
+				bh.DoltStatus = BackupStatusFresh
+			}
 		}
 	}
 
@@ -326,6 +349,11 @@ func checkBackupHealth(townRoot string) *BackupHealth {
 					bh.JSONLAgeSeconds = int(age.Seconds())
 					bh.JSONLFreshness = age.Round(time.Second).String()
 					bh.JSONLStale = age > 30*time.Minute
+					if bh.JSONLStale {
+						bh.JSONLStatus = BackupStatusStale
+					} else {
+						bh.JSONLStatus = BackupStatusFresh
+					}
 				}
 			}
 		}
@@ -400,23 +428,23 @@ func printHealthReport(r *HealthReport) {
 
 	// 4. Backups
 	fmt.Printf("\n%s Backups\n", style.Bold.Render("●"))
-	if r.Backups.DoltFreshness != "" {
+	if r.Backups.DoltStatus == BackupStatusUnconfigured {
+		fmt.Printf("  %s Dolt filesystem: NOT CONFIGURED (no backups exist)\n", style.Bold.Render("!"))
+	} else {
 		icon := style.Bold.Render("✓")
 		if r.Backups.DoltStale {
 			icon = style.Bold.Render("!")
 		}
 		fmt.Printf("  %s Dolt filesystem: %s ago\n", icon, r.Backups.DoltFreshness)
-	} else {
-		fmt.Printf("  %s Dolt filesystem: not found\n", style.Dim.Render("○"))
 	}
-	if r.Backups.JSONLFreshness != "" {
+	if r.Backups.JSONLStatus == BackupStatusUnconfigured {
+		fmt.Printf("  %s JSONL git: NOT CONFIGURED (no backups exist)\n", style.Bold.Render("!"))
+	} else {
 		icon := style.Bold.Render("✓")
 		if r.Backups.JSONLStale {
 			icon = style.Bold.Render("!")
 		}
 		fmt.Printf("  %s JSONL git: %s ago\n", icon, r.Backups.JSONLFreshness)
-	} else {
-		fmt.Printf("  %s JSONL git: not found\n", style.Dim.Render("○"))
 	}
 
 	// 5. Processes
