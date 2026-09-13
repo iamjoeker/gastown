@@ -1967,83 +1967,53 @@ func AutoCloseAckedMail(db *sql.DB, dbName string, staleAge time.Duration, dryRu
 	return result, nil
 }
 
-// PatrolStepTitles is the closed vocabulary of machine-generated per-cycle step
-// bead titles produced by mol-witness-patrol / mol-deacon-patrol formulas. Each
-// one is semantically complete the moment its single cycle step finishes
-// (minutes), not weeks, so they must not wait on AutoClose's 30-day default —
-// but they also must not be matched by anything looser than an exact title,
-// since a substring/prefix match would risk catching real, human-filed work
-// that happens to share a word (hq-0s3n2).
-var PatrolStepTitles = []string{
-	"Loop or exit for respawn",
-	"Check own context limit",
-	"End-of-cycle inbox hygiene",
-	"Check if active swarm is complete",
-	"Sweep for unmerged polecat branches",
-	"Inspect all active polecats",
-	"Check timer gates for expiration",
-	"Check refinery, mayor, and deacon health",
-	"Process pending cleanup wisps",
-	"Resolve external dependencies",
-	"Detect cleanup needs",
-	"Dispatch molecules with resolved gates",
-	"Aggregate daily costs [DISABLED]",
-	"Compact expired wisps",
-	"Clean up orphaned claude subagent processes",
-	"Detect zombie polecats (NO KILL AUTHORITY)",
-	"Check for stuck dogs",
-	"Mid-cycle heartbeat refresh",
-	"Rotate logs and prune state",
-	"Send compaction digest report",
-	// mol-deacon-patrol (26-step) vocabulary — a second, distinct step-name
-	// family discovered live after the mol-witness-patrol-only list above
-	// left ~2100 of these open in gastown (hq-0s3n2 follow-up).
-	"Aggregate daily patrol digests",
-	"Detect abandoned work",
-	"Maintain dog pool",
-	"Execute registered plugins",
-	"Check Witness and Refinery health",
-	"Run Dolt data-plane health check",
-	"Fire notifications",
-	"Check convoy completion",
-	"Evaluate pending async gates",
-	"Detect and clean runtime test pollution",
-	"Handle callbacks from agents",
-	"Refresh heartbeat",
-}
-
-// AutoClosePatrolSteps closes machine-generated patrol-step issues (see
-// PatrolStepTitles) past patrolStepStaleAge, regardless of priority.
+// AutoClosePatrolSteps closes issues in candidateIDs (an explicit allow-list,
+// not a text/title guess) that are still open/in_progress and past
+// patrolStepStaleAge, regardless of priority.
 //
 // AutoClose deliberately excludes P0/P1 (line ~1714) because a real P1 bug
 // should never auto-close just for sitting untouched — but that same
 // exclusion is why the patrol-step backlog cannot self-heal: these beads are
 // created at P1/P2 by the patrol formulas and their owning cycle typically
-// finishes within minutes. This is a separate, narrowly-scoped path keyed on
-// an exact title match instead of priority, so it can carry its own much
-// shorter staleness window without weakening the P0/P1 protection AutoClose
-// gives real work (hq-0s3n2).
-func AutoClosePatrolSteps(db *sql.DB, dbName string, patrolStepStaleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
+// finishes within minutes.
+//
+// candidateIDs is deliberately NOT resolved here from a title or description
+// pattern: a bead's title is free text a formula author can reword at any
+// time, and (verified live) these step beads carry no `attached_formula` or
+// label either — so no per-bead field reliably says "I am a patrol step."
+// The one authoritative signal is structural and lives outside the bead
+// entirely: the town-level 'tracks' relation from a convoy titled
+// `mol-*-patrol: ...` (see internal/cmd/reaper.go's patrolStepCandidateIDs,
+// which walks that relation once per cycle and passes down only the IDs it
+// found). That keeps this function itself agnostic to wording, and correct
+// even if a new patrol formula or a reworded step is added later, since the
+// caller's convoy-title match only needs "mol-*-patrol" to hold, not any
+// step-level text (hq-0s3n2).
+func AutoClosePatrolSteps(db *sql.DB, dbName string, candidateIDs []string, patrolStepStaleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
 	staleCutoff := time.Now().UTC().Add(-patrolStepStaleAge)
 	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
 
-	titlePlaceholders := make([]string, len(PatrolStepTitles))
-	titleArgs := make([]interface{}, len(PatrolStepTitles))
-	for i, t := range PatrolStepTitles {
-		titlePlaceholders[i] = "?"
-		titleArgs[i] = t
+	if len(candidateIDs) == 0 {
+		return result, nil
+	}
+
+	idPlaceholders := make([]string, len(candidateIDs))
+	idArgsForSelect := make([]interface{}, len(candidateIDs))
+	for i, id := range candidateIDs {
+		idPlaceholders[i] = "?"
+		idArgsForSelect[i] = id
 	}
 
 	selectQuery := fmt.Sprintf(`
 		SELECT i.id, i.title, i.updated_at FROM `+"`%s`"+`.issues i
 		WHERE i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
-		AND i.title IN (%s)`, dbName, strings.Join(titlePlaceholders, ","))
+		AND i.id IN (%s)`, dbName, strings.Join(idPlaceholders, ","))
 
-	args := append([]interface{}{staleCutoff}, titleArgs...)
+	args := append([]interface{}{staleCutoff}, idArgsForSelect...)
 	rows, err := db.QueryContext(ctx, selectQuery, args...)
 	if err != nil {
 		if isTableNotFound(err) {

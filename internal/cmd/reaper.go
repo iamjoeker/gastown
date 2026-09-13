@@ -3,17 +3,68 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/holds"
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// roleOwnedPatrolConvoyTitle matches a convoy title of the form
+// "mol-<name>-patrol: ..." (e.g. "mol-witness-patrol: ...",
+// "mol-deacon-patrol: ..."). It intentionally matches on the FORMULA NAME
+// embedded in the convoy title, which is machine-generated and structural,
+// never on the free-text titles of the individual step beads a patrol cycle
+// tracks — those can be reworded by a formula author at any time with no
+// warning, which is exactly what made the first version of this cleanup
+// (an exact step-title vocabulary) wrong (hq-0s3n2 follow-up).
+var roleOwnedPatrolConvoyTitle = regexp.MustCompile(`^mol-[a-z0-9]+-patrol:`)
+
+// patrolStepCandidateIDsByDB resolves every issue ID tracked by a role-owned
+// patrol convoy (see roleOwnedPatrolConvoyTitle), grouped by the Dolt
+// database name that owns each ID's prefix. It walks the town-level 'tracks'
+// relation once — the only place this information is authoritative, since
+// individual step beads carry no label or field identifying them as patrol
+// steps. Convoys this can't read (a transient bd error) are skipped rather
+// than failing the whole sweep; a missed convoy just means its steps wait
+// for the next cycle.
+func patrolStepCandidateIDsByDB(townRoot, townBeads string) map[string][]string {
+	byDB := make(map[string][]string)
+
+	convoys, err := listConvoyIssues(townBeads, "", true)
+	if err != nil {
+		return byDB
+	}
+
+	for _, c := range convoys {
+		if !roleOwnedPatrolConvoyTitle.MatchString(c.Title) {
+			continue
+		}
+		trackedIDs, err := bdDepListRawIDs(townBeads, c.ID, "down", "tracks")
+		if err != nil {
+			continue
+		}
+		for _, id := range trackedIDs {
+			prefix := beads.ExtractPrefix(id)
+			if prefix == "" {
+				continue
+			}
+			dbName := beads.GetRigNameForPrefix(townRoot, prefix)
+			if dbName == "" {
+				dbName = "hq" // town-level prefix maps to the hq database
+			}
+			byDB[dbName] = append(byDB[dbName], id)
+		}
+	}
+	return byDB
+}
 
 // WispGCHoldScope is the `gt hold` scope that gates `gt reaper purge`. It is
 // the durable equivalent of doctor's RigWispGCOptInEnv: that env var only
@@ -532,6 +583,13 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 
 		databases := reaperDatabaseNames()
 
+		var patrolCandidatesByDB map[string][]string
+		if townRoot, err := findTownRoot(); err == nil {
+			if townBeads, err := getTownBeadsDir(); err == nil {
+				patrolCandidatesByDB = patrolStepCandidateIDsByDB(townRoot, townBeads)
+			}
+		}
+
 		var results []*reaper.AutoCloseResult
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
@@ -577,7 +635,7 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 
 			// Patrol-step beads: exempt from AutoClose's P0/P1 exclusion above,
 			// so they need their own short-window pass (hq-0s3n2).
-			patrolResult, err := reaper.AutoClosePatrolSteps(db, dbName, patrolStepStaleAge, reaperDryRun)
+			patrolResult, err := reaper.AutoClosePatrolSteps(db, dbName, patrolCandidatesByDB[dbName], patrolStepStaleAge, reaperDryRun)
 			db.Close()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: auto-close patrol steps error: %v\n", dbName, err)
@@ -625,6 +683,13 @@ This is the inline fallback for when Dog dispatch is unavailable.
 Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		databases := reaperDatabaseNames()
+
+		var patrolCandidatesByDB map[string][]string
+		if townRoot, err := findTownRoot(); err == nil {
+			if townBeads, err := getTownBeadsDir(); err == nil {
+				patrolCandidatesByDB = patrolStepCandidateIDsByDB(townRoot, townBeads)
+			}
+		}
 
 		maxAge, err := time.ParseDuration(reaperMaxAge)
 		if err != nil {
@@ -771,7 +836,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 
 			// Patrol-step beads: exempt from AutoClose's P0/P1 exclusion above,
 			// so they need their own short-window pass (hq-0s3n2).
-			patrolResult, err := reaper.AutoClosePatrolSteps(db, dbName, patrolStepStaleAge, reaperDryRun)
+			patrolResult, err := reaper.AutoClosePatrolSteps(db, dbName, patrolCandidatesByDB[dbName], patrolStepStaleAge, reaperDryRun)
 			if err != nil {
 				fmt.Printf("%s: auto-close patrol steps error: %v\n", dbName, err)
 			} else {
