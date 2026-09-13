@@ -1995,6 +1995,21 @@ var PatrolStepTitles = []string{
 	"Mid-cycle heartbeat refresh",
 	"Rotate logs and prune state",
 	"Send compaction digest report",
+	// mol-deacon-patrol (26-step) vocabulary — a second, distinct step-name
+	// family discovered live after the mol-witness-patrol-only list above
+	// left ~2100 of these open in gastown (hq-0s3n2 follow-up).
+	"Aggregate daily patrol digests",
+	"Detect abandoned work",
+	"Maintain dog pool",
+	"Execute registered plugins",
+	"Check Witness and Refinery health",
+	"Run Dolt data-plane health check",
+	"Fire notifications",
+	"Check convoy completion",
+	"Evaluate pending async gates",
+	"Detect and clean runtime test pollution",
+	"Handle callbacks from agents",
+	"Refresh heartbeat",
 }
 
 // AutoClosePatrolSteps closes machine-generated patrol-step issues (see
