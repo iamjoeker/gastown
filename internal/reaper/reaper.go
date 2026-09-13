@@ -488,9 +488,22 @@ func strandedMoleculeIDs(ctx context.Context, db *sql.DB, cutoff time.Time) ([]s
 // exactly the ones nobody acted on — the population escalation exists to
 // protect. See reapProtectWhere for the closing half of that.
 //
+// gt:message is here because mail is a primary source, not just traffic
+// (gt-4jam). Findings arrive by mail, get summarised into beads, and the bead
+// cites the mail wisp's id in its description or close-reason — the working
+// practice this town adopted specifically so claims stay checkable. Once a
+// closed mail wisp was purged with no archive, its id resolved to "no issue
+// found matching X", identical to a typo: a reader cannot tell an archived
+// citation from one that never existed. Concrete instance: hq-wisp-jga was
+// read, acted on and closed by the mayor, then purged; a later bead's claim
+// that cited it by id ("stated twice in hq-wisp-jga") became unverifiable
+// from the ledger, which is precisely the property citing a source is for.
+// Ephemeral (non-permanent) mail defaults to a wisp (see mail's subject-
+// prefix routing), so this is the label that actually governs most mail.
+//
 // Anything added here must be a type whose closed rows are evidence, not
 // residue. It is not a place to park beads that are merely inconvenient to lose.
-var ProtectedWispLabels = []string{"gt:merge-request", "gt:escalation"}
+var ProtectedWispLabels = []string{"gt:merge-request", "gt:escalation", "gt:message"}
 
 // ReapProtectedWispLabels lists labels whose OPEN wisps the age-based reap must
 // never close. It is a different question from ProtectedWispLabels, which is
