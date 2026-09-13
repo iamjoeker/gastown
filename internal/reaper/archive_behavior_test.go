@@ -66,6 +66,15 @@ func (a *recordingArchive) all() []ArchivedWisp {
 	return out
 }
 
+func (a *recordingArchive) byID(id string) (ArchivedWisp, bool) {
+	for _, rec := range a.all() {
+		if rec.ID == id {
+			return rec, true
+		}
+	}
+	return ArchivedWisp{}, false
+}
+
 func (a *recordingArchive) ids() []string {
 	var ids []string
 	for _, rec := range a.all() {
@@ -260,6 +269,62 @@ func TestPurgeArchivesProtectedWispsThenReleasesThem(t *testing.T) {
 			t.Errorf("record Events[%d] has no CreatedAt — an event with no time cannot be "+
 				"placed in a sequence, which is the only thing the list is for", i)
 		}
+	}
+}
+
+// TestPurgeArchivesClosedMailWispsBeforeDeleting is the acceptance test for
+// gt-4jam.
+//
+// A closed mail wisp purged with no record left an id that resolved to "no
+// issue found matching X" — indistinguishable from a typo, even though the
+// id was cited by another bead's close-reason or comments. This asserts mail
+// gets the same archive-then-release treatment gt-6xwt already gave merge
+// requests and escalations: the row is gone, but `gt reaper archive --id`
+// (ReadArchive) can still answer for it.
+func TestPurgeArchivesClosedMailWispsBeforeDeleting(t *testing.T) {
+	f := newFixture(t, "purge_archive_mail")
+	oldClose := time.Now().UTC().Add(-30 * 24 * time.Hour)
+
+	f.insertWisps(t,
+		wispRow{id: "hq-wisp-jga", title: "REFINEMENT: something", status: "closed",
+			createdAt: oldClose, closedAt: &oldClose, closeReason: "read and acted on",
+			labels: []string{"gt:message"}},
+		// Protected by pin AND type: never archived, never deleted, same as any
+		// other pinned wisp.
+		wispRow{id: "w-pinned-mail", status: "closed", createdAt: oldClose, closedAt: &oldClose,
+			pinned: boolPtr(true), labels: []string{"gt:message"}},
+	)
+
+	archive := &recordingArchive{dir: "test://archive"}
+	result, err := Purge(f.db, f.dbName, purgeAge, purgeAge, false, WithArchive(archive))
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if result.WispsProtected != 1 {
+		t.Errorf("WispsProtected = %d, want 1 (w-pinned-mail)", result.WispsProtected)
+	}
+
+	found := false
+	for _, id := range f.ids(t, "wisps") {
+		if id == "hq-wisp-jga" {
+			found = true
+		}
+	}
+	if found {
+		t.Error("hq-wisp-jga still in wisps table — closed mail must still be purged from the live table")
+	}
+
+	rec, ok := archive.byID("hq-wisp-jga")
+	if !ok {
+		t.Fatal("hq-wisp-jga was purged with no archive record — its id is now indistinguishable " +
+			"from one that never existed (gt-4jam)")
+	}
+	if rec.CloseReason != "read and acted on" {
+		t.Errorf("record CloseReason = %q, want %q", rec.CloseReason, "read and acted on")
+	}
+
+	if _, ok := archive.byID("w-pinned-mail"); ok {
+		t.Error("w-pinned-mail was archived — pinned rows must never be exported or deleted")
 	}
 }
 
