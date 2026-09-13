@@ -376,6 +376,35 @@ func isInGasTownWorkspace(pid int) bool {
 	return resolveTownRoot(pid) != ""
 }
 
+// ThisTownRoot returns the Gas Town workspace root this process is running
+// under, or "" if it cannot be determined. Multiple Gas Town instances can
+// share a host, each with its own tmux socket and agent processes; this is
+// used to scope orphan/zombie cleanup to processes started under THIS town,
+// never another town's.
+func ThisTownRoot() string {
+	root, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return ""
+	}
+	return root
+}
+
+// filterByTownRoot returns the subset of pids whose town matches thisRoot.
+// Used to keep cleanup from killing another Gas Town instance's processes
+// just because they showed up in a shared ps listing.
+func filterByTownRoot[T any](items []T, thisRoot string, townOf func(T) string) []T {
+	if thisRoot == "" {
+		return nil
+	}
+	var mine []T
+	for _, item := range items {
+		if townOf(item) == thisRoot {
+			mine = append(mine, item)
+		}
+	}
+	return mine
+}
+
 // isIDEClaudeProcess checks if a Claude process was spawned by an IDE extension
 // (VS Code, Cursor, etc.). IDE-launched Claude processes run with TTY "?" but
 // are legitimate — they're controlled by the IDE, not orphaned from dead sessions.
@@ -774,6 +803,14 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 		return nil, err
 	}
 
+	// Scope cleanup to this town: ps sees every Gas Town instance on the
+	// host, but each town's deacon must only kill its own zombies.
+	thisRoot := ThisTownRoot()
+	if thisRoot == "" {
+		return nil, fmt.Errorf("cannot determine this town's workspace root; refusing to clean up zombies")
+	}
+	zombies = filterByTownRoot(zombies, thisRoot, func(z ZombieProcess) string { return z.TownRoot })
+
 	state := loadZombieState()
 	now := time.Now()
 
@@ -874,6 +911,14 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Scope cleanup to this town: ps sees every Gas Town instance on the
+	// host, but each town's deacon must only kill its own orphans.
+	thisRoot := ThisTownRoot()
+	if thisRoot == "" {
+		return nil, fmt.Errorf("cannot determine this town's workspace root; refusing to clean up orphans")
+	}
+	orphans = filterByTownRoot(orphans, thisRoot, func(o OrphanedProcess) string { return o.TownRoot })
 
 	// Load previous state
 	state := loadOrphanState()
