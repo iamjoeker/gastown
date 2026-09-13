@@ -105,20 +105,22 @@ gt patrol report --summary "<cycle summary>" --steps "inbox:OK,cleanup:OK,..."
 
 The deacon is the town-wide daemon monitor. Key steps:
 
-1. **inbox-check** — Process callbacks from witnesses, refineries, polecats
-2. **trigger-pending-spawns** — Launch queued polecat spawns
-3. **gate-evaluation** — Check async gates (timer, dependency)
-4. **dispatch-gated-molecules** — Release molecules whose gates cleared
-5. **check-convoy-completion** — Track multi-rig coordinated work
-6. **health-scan** — Check Dolt health (`gt dolt status`), agent health
-7. **zombie-scan** — Find dead sessions, orphaned wisps
-8. **plugin-run** — Execute enabled plugins (backup, reaper, etc.)
-9. **dog-pool-maintenance** — Manage utility worker pool
-10. **orphan-check** — Find orphaned test databases (`gt dolt cleanup`)
-11. **session-gc** — Clean up dead session artifacts
-12. **patrol-cleanup** — Close completed wisps, update metrics
-13. **context-check** — Check context budget, handoff if needed
-14. **loop-or-exit** — Report and spawn next cycle
+1. **heartbeat** — Refresh liveness (`gt deacon heartbeat`). MUST run before any other step.
+2. **inbox-check** — Process callbacks from witnesses, refineries, polecats
+3. **trigger-pending-spawns** — Launch queued polecat spawns
+4. **gate-evaluation** — Check async gates (timer, dependency)
+5. **dispatch-gated-molecules** — Release molecules whose gates cleared
+6. **check-convoy-completion** — Track multi-rig coordinated work
+7. **heartbeat-mid** — Mid-cycle heartbeat refresh (prevents daemon kill during long patrols)
+8. **health-scan** — Check Dolt health (`gt dolt status`), agent health
+9. **zombie-scan** — Find dead sessions, orphaned wisps
+10. **plugin-run** — Execute enabled plugins (backup, reaper, etc.)
+11. **dog-pool-maintenance** — Manage utility worker pool
+12. **orphan-check** — Find orphaned test databases (`gt dolt cleanup`)
+13. **session-gc** — Clean up dead session artifacts
+14. **patrol-cleanup** — Close completed wisps, update metrics
+15. **context-check** — Check context budget, handoff if needed
+16. **loop-or-exit** — Report and spawn next cycle
 
 ## Refinery Patrol Steps
 
