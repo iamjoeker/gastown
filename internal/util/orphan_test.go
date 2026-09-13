@@ -530,3 +530,59 @@ func TestGetACPSessionPIDs_SkipsDeadPID(t *testing.T) {
 		t.Errorf("getACPSessionPIDs() = %v, want it to skip dead pid %d", got, dead)
 	}
 }
+
+// TestFilterByTownRoot_ScopesToOwnTown guards the multi-town-awareness
+// contract for cleanup: a deacon must never act on another Gas Town
+// instance's processes just because they showed up in a shared ps listing.
+func TestFilterByTownRoot_ScopesToOwnTown(t *testing.T) {
+	townA := "/gt/townA"
+	townB := "/gt/townB"
+
+	orphans := []OrphanedProcess{
+		{PID: 1, TownRoot: townA},
+		{PID: 2, TownRoot: townB},
+		{PID: 3, TownRoot: townA},
+		{PID: 4, TownRoot: ""},
+	}
+
+	got := filterByTownRoot(orphans, townA, func(o OrphanedProcess) string { return o.TownRoot })
+
+	if len(got) != 2 {
+		t.Fatalf("filterByTownRoot() returned %d items, want 2: %+v", len(got), got)
+	}
+	for _, o := range got {
+		if o.TownRoot != townA {
+			t.Errorf("filterByTownRoot() leaked a process from %q into town %q results", o.TownRoot, townA)
+		}
+	}
+
+	// An unknown "this town" root must not match anything, including
+	// orphans whose town could not be resolved (empty string).
+	if got := filterByTownRoot(orphans, "", func(o OrphanedProcess) string { return o.TownRoot }); got != nil {
+		t.Errorf("filterByTownRoot() with empty thisRoot = %+v, want nil", got)
+	}
+}
+
+// TestCleanupOrphanedClaudeProcesses_RefusesWithoutTownRoot verifies the
+// fail-closed behavior: if this process's own town root cannot be
+// determined, cleanup must refuse rather than risk treating every orphan
+// (including other towns') as fair game.
+func TestCleanupOrphanedClaudeProcesses_RefusesWithoutTownRoot(t *testing.T) {
+	// NOTE: Uses os.Chdir — no t.Parallel().
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	nonTown := realPath(t, t.TempDir())
+	if err := os.Chdir(nonTown); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_TOWN_ROOT", "")
+	t.Setenv("GT_ROOT", "")
+
+	if _, err := CleanupOrphanedClaudeProcesses(); err == nil {
+		t.Error("CleanupOrphanedClaudeProcesses() from outside any town = nil error, want a refusal")
+	}
+}

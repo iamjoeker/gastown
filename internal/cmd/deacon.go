@@ -1473,12 +1473,26 @@ func runDeaconCleanupOrphans(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("%s Found %d orphaned claude process(es)\n", style.Bold.Render("●"), len(orphans))
+	thisRoot := util.ThisTownRoot()
+	var mine, other int
+	for _, o := range orphans {
+		if o.TownRoot == thisRoot {
+			mine++
+		} else {
+			other++
+		}
+	}
+	fmt.Printf("%s Found %d orphaned claude process(es)", style.Bold.Render("●"), len(orphans))
+	if other > 0 {
+		fmt.Printf(" (%d belong to other towns, skipping)", other)
+	}
+	fmt.Println()
 
-	// Process them with signal escalation
+	// Process them with signal escalation. This is scoped internally to
+	// this town's own processes — other towns' orphans are left alone.
 	results, err := util.CleanupOrphanedClaudeProcesses()
 	if err != nil {
-		style.PrintWarning("cleanup had errors: %v", err)
+		style.PrintWarning("cleanup had errors (best-effort, continuing): %v", err)
 	}
 
 	// Report results
