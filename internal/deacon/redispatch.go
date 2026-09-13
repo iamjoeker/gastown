@@ -275,6 +275,19 @@ func Redispatch(townRoot, beadID, sourceRig string, maxAttempts int, cooldown ti
 		return result
 	}
 
+	// Role-owned patrol steps (mol-deacon-patrol, mol-witness-patrol, etc.)
+	// belong to that role's own patrol session, never the general polecat
+	// pool. Re-dispatching them via `gt sling <bead> <rig>` wraps them in
+	// mol-polecat-work and hands e.g. "gt deacon heartbeat" to a polecat,
+	// which has no business adopting the Deacon's identity (gt-spf25).
+	// Leaving the bead open (already done by ScanStaleHooks/unhookBead)
+	// lets the owning role's own patrol loop re-hook it on its next cycle.
+	if formula := getBeadAttachedFormulaForRedispatch(townRoot, beadID); isRoleOwnedPatrolFormula(formula) {
+		result.Action = "skipped"
+		result.Message = fmt.Sprintf("bead belongs to role-owned patrol formula %q — not eligible for general pool re-dispatch", formula)
+		return result
+	}
+
 	// Determine target rig
 	targetRig := sourceRig
 	if targetRig == "" {
@@ -372,6 +385,46 @@ func resolveRigFromBead(townRoot, beadID string) string {
 		return ""
 	}
 	return beads.GetRigNameForPrefix(townRoot, prefix)
+}
+
+// roleOwnedPatrolFormulaSuffix marks a formula as a role's own patrol loop
+// (mol-deacon-patrol, mol-witness-patrol, mol-refinery-patrol,
+// mol-pr-feedback-patrol, ...) rather than generic dispatchable work.
+// Patrol formulas are worked in-process by the owning role's own session
+// (see startDeaconSession); their materialized step beads must never be
+// slung to a rig's general polecat pool.
+const roleOwnedPatrolFormulaSuffix = "-patrol"
+
+// isRoleOwnedPatrolFormula reports whether formula is a role-owned patrol
+// molecule whose steps must stay reserved for that role's own session.
+func isRoleOwnedPatrolFormula(formula string) bool {
+	formula = strings.ToLower(strings.TrimSpace(formula))
+	if formula == "" {
+		return false
+	}
+	return strings.HasSuffix(formula, roleOwnedPatrolFormulaSuffix)
+}
+
+// getBeadAttachedFormulaForRedispatch returns the attached_formula field
+// from a bead's description, or "" if the bead has none or can't be read.
+func getBeadAttachedFormulaForRedispatch(townRoot, beadID string) string {
+	cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.ReadOnlyRouting, "show", beadID, "--json")
+
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var issues []beads.Issue
+	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
+		return ""
+	}
+
+	fields := beads.ParseAttachmentFields(&issues[0])
+	if fields == nil {
+		return ""
+	}
+	return fields.AttachedFormula
 }
 
 // getBeadStatusForRedispatch returns the current status of a bead.

@@ -33,6 +33,31 @@ func TestParseRecoveredBeadSubject(t *testing.T) {
 	}
 }
 
+func TestIsRoleOwnedPatrolFormula(t *testing.T) {
+	tests := []struct {
+		formula string
+		want    bool
+	}{
+		{"mol-deacon-patrol", true},
+		{"mol-witness-patrol", true},
+		{"mol-refinery-patrol", true},
+		{"mol-pr-feedback-patrol", true},
+		{"MOL-DEACON-PATROL", true},
+		{"  mol-deacon-patrol  ", true},
+		{"mol-polecat-work", false},
+		{"mol-review", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.formula, func(t *testing.T) {
+			if got := isRoleOwnedPatrolFormula(tt.formula); got != tt.want {
+				t.Errorf("isRoleOwnedPatrolFormula(%q) = %v, want %v", tt.formula, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRecoveredBeadBody(t *testing.T) {
 	tests := []struct {
 		name    string
