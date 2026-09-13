@@ -214,22 +214,16 @@ func TestActivityFromLines(t *testing.T) {
 			want:  ActivitySample{Captured: true, LoggedOut: true},
 		},
 		{
-			// A KNOWN NARROWNESS, pinned so it is a documented bound rather than
-			// a surprise. The auth-wall scan reuses loggedOutFromLines' window
-			// (two non-empty lines above the anchor) so that this sample and
-			// Tmux.IsLoggedOut can never disagree about the same pane — two
-			// surfaces giving different logged-out answers would be worse than
-			// either being narrow. The cost is that a TUI tip line between the
-			// marker and the composer hides it, and the sample reads parked.
-			//
-			// Parked is the safe direction (it prescribes a nudge or a restart,
-			// not a human at a browser) but it is still wrong. Filed as gt-dxcb;
-			// widening the window is a change to the auth-wall detector, not to
-			// this one, and it belongs in loggedOutFromLines so both surfaces
-			// move together.
-			name:  "a tip line between the auth wall and the composer hides it",
+			// Was a KNOWN NARROWNESS (gt-dxcb): the auth-wall scan reused
+			// turnBusyLookback (two non-empty lines above the anchor), and a TUI
+			// tip line between the marker and the composer consumed a rung,
+			// hiding the marker and reading the sample as parked instead of
+			// logged out. Fixed by widening to authWallLookback (shared with
+			// loggedOutFromLines, so this sample and Tmux.IsLoggedOut still
+			// cannot disagree about the same pane).
+			name:  "a tip line between the auth wall and the composer is still found",
 			lines: paneWith(plainFooterIdle, liveAuthWall, liveAuthWallRun, liveTipLine),
-			want:  ActivitySample{Captured: true},
+			want:  ActivitySample{Captured: true, LoggedOut: true},
 		},
 		{
 			name:  "in-flight command above the spinner",

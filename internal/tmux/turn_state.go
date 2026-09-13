@@ -90,6 +90,20 @@ const (
 	// surface keeps reporting it running.
 	turnBusyLookback = 2
 
+	// authWallLookback is how many non-empty lines above the anchor are
+	// searched for the auth-wall marker (loggedOutFromLines, and the LoggedOut
+	// field of activityFromLines in liveness.go, which deliberately shares this
+	// window rather than defining its own — see the comment there).
+	//
+	// It is wider than turnBusyLookback (2) for the same reason
+	// livenessActivityLookback is: a TUI tip line can sit between the marker
+	// and the composer, consuming a rung. "Not logged in · Run /login" three
+	// non-empty lines up plus a tip line pushes the marker to a fourth rung,
+	// which a lookback of 2 misses entirely (gt-dxcb). Matches
+	// livenessActivityLookback's measured bound (3, plus one rung of slack)
+	// rather than introducing a second number for the same layout gap.
+	authWallLookback = livenessActivityLookback
+
 	// turnComposerScanLines bounds how far back from the end of the pane the
 	// composer line is looked for. The prompt character can also appear in
 	// transcript output, so the search is both backwards (last match wins) and
@@ -216,25 +230,27 @@ func findComposerLine(lines []string, promptPrefix string) int {
 // detection falls back to the mode-status line, which sits in the same footer
 // region, when the composer is not on screen.
 func busyIndicatorNearAnchor(lines []string, anchor int) bool {
-	return indicatorNearAnchor(lines, anchor, hasBusyIndicator)
+	return indicatorNearAnchor(lines, anchor, turnBusyLookback, hasBusyIndicator)
 }
 
 // indicatorNearAnchor is the bounded status-region scan busyIndicatorNearAnchor
-// documents, with the marker test supplied by the caller.
+// documents, with the marker test and lookback window supplied by the caller.
 //
 // It is shared rather than copied because the BOUND, not the marker, is the part
 // that is hard to get right, and every status-bar marker this package scrapes
-// needs the same one. A second scan that reimplemented the window would be a
-// second chance to reach up into the transcript, which is where text that merely
-// looks like a status marker lives.
-func indicatorNearAnchor(lines []string, anchor int, match func(string) bool) bool {
+// needs the same shape of window. A second scan that reimplemented the window
+// would be a second chance to reach up into the transcript, which is where text
+// that merely looks like a status marker lives. The lookback itself varies by
+// marker (see turnBusyLookback vs authWallLookback), which is why it is a
+// parameter rather than baked in here.
+func indicatorNearAnchor(lines []string, anchor int, lookback int, match func(string) bool) bool {
 	for i := anchor; i < len(lines); i++ {
 		if match(lines[i]) {
 			return true
 		}
 	}
 	checked := 0
-	for i := anchor - 1; i >= 0 && checked < turnBusyLookback; i-- {
+	for i := anchor - 1; i >= 0 && checked < lookback; i-- {
 		line := lines[i]
 		if strings.TrimSpace(line) == "" {
 			continue

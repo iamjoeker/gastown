@@ -318,14 +318,13 @@ func activityFromLines(lines []string, promptPrefix string) ActivitySample {
 	}
 
 	s := ActivitySample{Captured: true}
-	// Deliberately the SAME window loggedOutFromLines uses, not the wider one
-	// the activity line needs. Two surfaces answering "is this agent logged
-	// out?" differently about the same pane would be worse than either being
-	// narrow, and this one has no claim to widen it that the other lacks. The
-	// narrowness is real — a TUI tip line between the marker and the composer
-	// hides it — and is filed as gt-dxcb against loggedOutFromLines, where a fix
-	// moves both.
-	s.LoggedOut = indicatorNearAnchor(lines, anchor, hasLoggedOutIndicator)
+	// Deliberately the SAME window loggedOutFromLines uses (authWallLookback),
+	// not turnBusyLookback. Two surfaces answering "is this agent logged out?"
+	// differently about the same pane would be worse than either being narrow,
+	// so this shares loggedOutFromLines' window rather than defining its own.
+	// Widened by gt-dxcb: a TUI tip line between the marker and the composer
+	// was consuming a rung that turnBusyLookback (2) couldn't spare.
+	s.LoggedOut = indicatorNearAnchor(lines, anchor, authWallLookback, hasLoggedOutIndicator)
 	s.CommandInFlight = linesAboveAnchor(lines, anchor, livenessCommandLookback, hasCommandInFlightMarker)
 
 	if line, ok := findActivityLine(lines, anchor); ok {
