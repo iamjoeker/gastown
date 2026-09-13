@@ -2240,7 +2240,7 @@ func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
 	var parts []string
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	// Check worker/polecat state
 	go func() {
@@ -2272,11 +2272,33 @@ func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
 		}
 	}()
 
+	// Check convoy state. Without this, closing or landing a convoy never
+	// changes the hash (worker status, hooks, and mail can all stay the
+	// same), so the SSE loop never fires dashboard-update — and the client's
+	// 30s poll fallback is itself disabled whenever SSE is connected
+	// (`every 30s [!window.sseConnected]` in convoy.html). The convoy panel
+	// then freezes at whatever it looked like when SSE connected, rendering
+	// a closed convoy as still STUCK indefinitely (gt-gv1mh).
+	go func() {
+		defer wg.Done()
+		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"convoy", "list", "--json"}); err == nil {
+			mu.Lock()
+			parts = append(parts, "convoy:"+out)
+			mu.Unlock()
+		}
+	}()
+
 	wg.Wait()
 
 	if len(parts) == 0 {
 		return ""
 	}
+
+	// The goroutines above append to parts in whatever order they finish, so
+	// two polls of an unchanged town can still hash differently on join order
+	// alone — a spurious "changed" signal that forces a redundant re-render.
+	// Sorting first makes the hash depend only on content.
+	sort.Strings(parts)
 
 	h256 := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return fmt.Sprintf("%x", h256[:8])
