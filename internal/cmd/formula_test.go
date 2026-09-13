@@ -14,6 +14,32 @@ import (
 	"github.com/steveyegge/gastown/internal/formula"
 )
 
+// TestIsRoleOwnedPatrolFormulaName verifies that `gt formula run` recognizes
+// role-owned patrol formulas by name so it can refuse to execute them (see
+// gt-feo92: running them through the generic workflow engine materializes a
+// real, never-closed bd issue per step instead of using the role's own
+// `gt patrol new` / root-only wisp path).
+func TestIsRoleOwnedPatrolFormulaName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{"mol-deacon-patrol", true},
+		{"mol-witness-patrol", true},
+		{"mol-refinery-patrol", true},
+		{"MOL-DEACON-PATROL", true},
+		{"  mol-witness-patrol  ", true},
+		{"mol-polecat-work", false},
+		{"shiny", false},
+		{"beads-release", false},
+		{"", false},
+	} {
+		if got := isRoleOwnedPatrolFormulaName(tc.name); got != tc.want {
+			t.Errorf("isRoleOwnedPatrolFormulaName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestAutoInferRig verifies the rig auto-selection logic used when --rig is
 // not provided and cwd-based detection finds nothing (e.g. Deacon at HQ level
 // on a non-default install where "gastown" rig does not exist).

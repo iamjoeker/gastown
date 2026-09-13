@@ -285,6 +285,20 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Using default formula: %s\n", style.Dim.Render("Note:"), formulaName)
 	}
 
+	// Role-owned patrol formulas (mol-deacon-patrol, mol-witness-patrol, ...)
+	// are executed in-process by the owning role's own session via
+	// `gt patrol new` (bd mol wisp create --root-only): their steps live in
+	// the wisp description, rendered inline at `gt prime`, and are never
+	// meant to become individual bd issues. Running them through the
+	// generic workflow engine instead materializes a real, permanently
+	// open, dependency-wired bd issue per step (id-wfs-*) that nothing ever
+	// closes, and dispatches them to the general polecat pool via `gt sling`
+	// with no owner-based filtering — misassigning role-identity work like
+	// `gt deacon heartbeat` to a polecat. See gt-feo92, gt-9y5s.
+	if isRoleOwnedPatrolFormulaName(formulaName) {
+		return fmt.Errorf("%q is a role-owned patrol formula and cannot be run with 'gt formula run'\n\nPatrol formulas are executed in-process by their owning role's own session.\nUse 'gt patrol new' from within that role's session instead", formulaName)
+	}
+
 	// Find the formula file
 	formulaPath, err := findFormulaFile(formulaName)
 	if err != nil {
@@ -318,6 +332,19 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  4. Sling to rig:   gt sling <mol-id> %s\n", targetRig)
 		return nil
 	}
+}
+
+// isRoleOwnedPatrolFormulaName reports whether formulaName names a role's
+// own patrol loop (mol-deacon-patrol, mol-witness-patrol, mol-refinery-patrol,
+// mol-pr-feedback-patrol, ...) rather than generic dispatchable work. Mirrors
+// isRoleOwnedPatrolFormula in internal/deacon/redispatch.go, which applies
+// the same rule on the recovery/re-dispatch path.
+func isRoleOwnedPatrolFormulaName(formulaName string) bool {
+	formulaName = strings.ToLower(strings.TrimSpace(formulaName))
+	if formulaName == "" {
+		return false
+	}
+	return strings.HasSuffix(formulaName, "-patrol")
 }
 
 // dryRunFormula shows what would happen without executing
