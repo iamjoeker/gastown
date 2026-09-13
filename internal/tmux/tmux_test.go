@@ -2556,6 +2556,46 @@ func TestGetSessionActivity_NonexistentSession(t *testing.T) {
 	}
 }
 
+// TestGetSessionActivity_AdvancesWhileDetached is the regression test called
+// for by gt-hwmq: tmux's own #{session_activity} only advances for the
+// client-attached session, so a detached session running a long command used
+// to report activity frozen at its creation time forever. GetSessionActivity
+// must not have that blind spot.
+func TestGetSessionActivity_AdvancesWhileDetached(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := fmt.Sprintf("gt-test-detached-activity-%d", os.Getpid())
+
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// Never attach to this session — it stays detached for the whole test,
+	// which is the exact condition every real agent session runs under.
+	before, err := tm.GetSessionActivity(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionActivity (before): %v", err)
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+
+	// Produce pane output without attaching a client — analogous to a
+	// long-running command in an agent session.
+	if _, err := tm.run("send-keys", "-t", sessionName, "echo tick", "Enter"); err != nil {
+		t.Fatalf("send-keys: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	after, err := tm.GetSessionActivity(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionActivity (after): %v", err)
+	}
+
+	if !after.After(before) {
+		t.Errorf("GetSessionActivity did not advance for a detached session with new output: before=%v after=%v", before, after)
+	}
+}
+
 func TestNewSessionSet(t *testing.T) {
 	// Test creating SessionSet from names
 	names := []string{"session-a", "session-b", "session-c"}

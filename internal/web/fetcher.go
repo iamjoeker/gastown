@@ -774,8 +774,10 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 	sessionName := session.PolecatSessionName(session.PrefixFor(rig), polecat)
 
 	// Query tmux for session activity
-	// Format: session_activity returns unix timestamp
-	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}",
+	// window_activity, not session_activity: session_activity only advances
+	// for the client-attached session, so every detached polecat/witness/
+	// refinery session reads as permanently idle (gt-hwmq).
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}",
 		"-f", fmt.Sprintf("#{==:#{session_name},%s}", sessionName))
 	if err != nil {
 		return nil
@@ -807,7 +809,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 	// List all tmux sessions matching gt-*-* pattern (polecat sessions)
 	// Format: gt-{rig}-{polecat}
-	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
 		return nil
 	}
@@ -1965,8 +1967,10 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 
 // FetchSessions returns active tmux sessions with role detection.
 func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
-	// List tmux sessions
-	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
+	// List tmux sessions. window_activity, not session_activity: the latter
+	// only advances for the client-attached session and reads every detached
+	// agent as idle-since-creation forever (gt-hwmq).
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{window_activity}")
 	if err != nil {
 		if tmuxServerAbsent(err) {
 			return nil, nil // No tmux server: there really are no sessions.
@@ -2111,8 +2115,11 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	// Get the actual mayor session name (e.g., "hq-mayor")
 	mayorSessionName := session.MayorSessionName()
 
-	// Check if mayor tmux session exists
-	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
+	// Check if mayor tmux session exists. window_activity, not
+	// session_activity: the latter only advances while the session is
+	// client-attached, so a detached-but-working Mayor would read as
+	// permanently idle (gt-hwmq).
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{window_activity}")
 	if err != nil {
 		if tmuxServerAbsent(err) {
 			return status, nil // No tmux server: the Mayor really is detached.

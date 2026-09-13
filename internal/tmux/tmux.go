@@ -2429,18 +2429,39 @@ func (t *Tmux) GetPanePID(target string) (string, error) {
 }
 
 // GetSessionActivity returns the last activity time for a session.
-// This is updated whenever there's any activity in the session (input/output).
+//
+// This reads #{window_activity} across every window in the session and
+// returns the most recent one, rather than tmux's own #{session_activity}.
+// session_activity only advances for the client-attached session (tmux
+// updates it from client input events); for every DETACHED session — which
+// is every polecat, witness, refinery, deacon and dog in the town — it stays
+// pinned at session-creation time forever, no matter how much output the
+// pane produces. window_activity is tracked per-window from pane output and
+// advances regardless of attachment (gt-hwmq).
 func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
-	out, err := t.run("display-message", "-t", session, "-p", "#{session_activity}")
+	out, err := t.run("list-windows", "-t", session, "-F", "#{window_activity}")
 	if err != nil {
 		return time.Time{}, err
 	}
 
-	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("parsing session activity: %w", err)
+	var latest int64
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		timestamp, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			continue
+		}
+		if timestamp > latest {
+			latest = timestamp
+		}
 	}
-	return time.Unix(timestamp, 0), nil
+	if latest == 0 {
+		return time.Time{}, fmt.Errorf("no window activity found for session %q", session)
+	}
+	return time.Unix(latest, 0), nil
 }
 
 // ZombieStatus describes the liveness state of a tmux agent session.
@@ -3838,7 +3859,11 @@ func (t *Tmux) IsLoggedOut(session string) bool {
 
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
-	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
+	// window_activity, not session_activity: the latter only advances for the
+	// client-attached session, so every detached polecat/witness/refinery
+	// session reports "Last Activity" pinned at session creation time forever
+	// (gt-hwmq).
+	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{window_activity}|#{session_last_attached}"
 	out, err := t.run("list-sessions", "-F", format, "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	if err != nil {
 		return nil, err
