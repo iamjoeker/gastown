@@ -897,12 +897,15 @@ func gatherStatus() (TownStatus, error) {
 		status.Agents = discoverGlobalAgents(townRoot, allSessions, allAgentBeads, allHookBeads, mailRouter, fast)
 	}()
 
-	// Process all rigs in parallel
+	// Process all rigs in parallel with bounded worker pool
 	rigActiveHooks := make([]int, len(rigs)) // Track hooks per rig for thread safety
+	rigSem := make(chan struct{}, 8)           // Semaphore to limit concurrent rig workers
 	for i, r := range rigs {
 		wg.Add(1)
 		go func(idx int, r *rig.Rig) {
 			defer wg.Done()
+			rigSem <- struct{}{}        // Acquire semaphore
+			defer func() { <-rigSem }() // Release semaphore
 
 			rs := RigStatus{
 				Name:         r.Name,
@@ -1658,6 +1661,7 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 
 	agents := make([]AgentRuntime, len(agentDefs))
 	var wg sync.WaitGroup
+	globalAgentSem := make(chan struct{}, 8) // Semaphore to limit concurrent global agent workers
 
 	for i, def := range agentDefs {
 		wg.Add(1)
@@ -1669,6 +1673,8 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 			beadID  string
 		}) {
 			defer wg.Done()
+			globalAgentSem <- struct{}{}        // Acquire semaphore
+			defer func() { <-globalAgentSem }() // Release semaphore
 
 			agent := AgentRuntime{
 				Name:    d.name,
@@ -1852,14 +1858,17 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 		return nil
 	}
 
-	// Fetch all agents in parallel
+	// Fetch all agents in parallel with bounded worker pool
 	agents := make([]AgentRuntime, len(defs))
 	var wg sync.WaitGroup
+	agentSem := make(chan struct{}, 8) // Semaphore to limit concurrent agent workers
 
 	for i, def := range defs {
 		wg.Add(1)
 		go func(idx int, d agentDef) {
 			defer wg.Done()
+			agentSem <- struct{}{}        // Acquire semaphore
+			defer func() { <-agentSem }() // Release semaphore
 
 			agent := AgentRuntime{
 				Name:    d.name,
