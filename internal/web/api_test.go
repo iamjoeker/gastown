@@ -1473,3 +1473,67 @@ func TestPaneCurrentCommandIsAgent(t *testing.T) {
 		}
 	}
 }
+
+// TestComputeDashboardHashReflectsConvoyChanges guards against the SSE
+// refresh loop going blind to convoy state: the client only falls back to
+// its own 30s poll when SSE is NOT connected (`every 30s
+// [!window.sseConnected]` in convoy.html), so if the hash never changes on a
+// convoy update, a closed convoy can render as STUCK indefinitely (gt-gv1mh).
+func TestComputeDashboardHashReflectsConvoyChanges(t *testing.T) {
+	binDir := t.TempDir()
+	gtPath := filepath.Join(binDir, "gt")
+	statePath := filepath.Join(binDir, "convoy-state")
+
+	if err := os.WriteFile(statePath, []byte("stuck"), 0o644); err != nil {
+		t.Fatalf("write initial state: %v", err)
+	}
+
+	gtScript := `#!/usr/bin/env sh
+set -eu
+case "$*" in
+  "status --json")
+    printf '{"agents":[]}\n'
+    ;;
+  "hooks list")
+    printf '\n'
+    ;;
+  "mail inbox")
+    printf '\n'
+    ;;
+  "convoy list --json")
+    cat "` + statePath + `"
+    ;;
+  *)
+    printf 'unexpected gt args: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	h := &APIHandler{
+		gtPath:            gtPath,
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 5 * time.Second,
+		maxRunTimeout:     10 * time.Second,
+		cmdSem:            make(chan struct{}, maxConcurrentCommands),
+	}
+
+	before := h.computeDashboardHash(context.Background())
+	if before == "" {
+		t.Fatal("computeDashboardHash returned empty hash with a working gt stub")
+	}
+
+	// Everything else (status, hooks, mail) is unchanged; only the convoy's
+	// own state moves, e.g. from open/stuck to closed.
+	if err := os.WriteFile(statePath, []byte("closed"), 0o644); err != nil {
+		t.Fatalf("write updated state: %v", err)
+	}
+
+	after := h.computeDashboardHash(context.Background())
+	if after == before {
+		t.Fatalf("computeDashboardHash did not change when convoy state changed: both %q", before)
+	}
+}
