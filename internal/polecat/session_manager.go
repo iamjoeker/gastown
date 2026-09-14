@@ -720,6 +720,29 @@ func (m *SessionManager) IsRunning(polecat string) (bool, error) {
 	return status == tmux.SessionHealthy, nil
 }
 
+// parseTmuxCreatedTime parses a tmux session creation timestamp into a time.Time.
+// The candidate formats carry no zone info: they're local wall-clock strings
+// (tmux's #{session_created} unix timestamp reformatted via time.Unix, which
+// uses time.Local). time.Parse would default to UTC and silently mislabel the
+// local time, inflating reported uptime by the machine's UTC offset (gt-jt5kw).
+// ParseInLocation anchors the string to loc (callers pass time.Local) instead.
+// Returns the zero Time if none of the formats match.
+func parseTmuxCreatedTime(s string, loc *time.Location) time.Time {
+	formats := []string{
+		"2006-01-02 15:04:05",
+		"Mon Jan 2 15:04:05 2006",
+		"Mon Jan _2 15:04:05 2006",
+		time.ANSIC,
+		time.UnixDate,
+	}
+	for _, format := range formats {
+		if t, err := time.ParseInLocation(format, s, loc); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // Status returns detailed status for a polecat session.
 func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
 	sessionID := m.SessionName(polecat)
@@ -749,19 +772,7 @@ func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
 	info.Windows = tmuxInfo.Windows
 
 	if tmuxInfo.Created != "" {
-		formats := []string{
-			"2006-01-02 15:04:05",
-			"Mon Jan 2 15:04:05 2006",
-			"Mon Jan _2 15:04:05 2006",
-			time.ANSIC,
-			time.UnixDate,
-		}
-		for _, format := range formats {
-			if t, err := time.Parse(format, tmuxInfo.Created); err == nil {
-				info.Created = t
-				break
-			}
-		}
+		info.Created = parseTmuxCreatedTime(tmuxInfo.Created, time.Local)
 	}
 
 	if tmuxInfo.Activity != "" {

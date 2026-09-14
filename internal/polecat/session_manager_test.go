@@ -94,6 +94,32 @@ func TestSessionName(t *testing.T) {
 	}
 }
 
+// TestParseTmuxCreatedTime_UsesGivenLocation guards against gt-jt5kw:
+// tmux hands back a local wall-clock string with no zone indicator, and
+// time.Parse (as opposed to time.ParseInLocation) defaults to UTC, silently
+// mislabeling the local time and inflating reported uptime by the machine's
+// UTC offset.
+func TestParseTmuxCreatedTime_UsesGivenLocation(t *testing.T) {
+	loc := time.FixedZone("CDT", -5*3600)
+	const created = "2026-08-15 23:12:13"
+
+	got := parseTmuxCreatedTime(created, loc)
+	if got.IsZero() {
+		t.Fatalf("parseTmuxCreatedTime(%q) returned zero time", created)
+	}
+
+	want := time.Date(2026, 8, 15, 23, 12, 13, 0, loc)
+	if !got.Equal(want) {
+		t.Errorf("parseTmuxCreatedTime(%q, CDT) = %v, want %v", created, got, want)
+	}
+
+	// The bug's symptom: computing uptime against a wall-clock-but-labeled-UTC
+	// time inflates it by the zone offset. Verify the offset is preserved.
+	if _, offset := got.Zone(); offset != -5*3600 {
+		t.Errorf("parsed time lost its zone offset: got %ds, want %ds", offset, -5*3600)
+	}
+}
+
 func TestSessionManagerPolecatDir(t *testing.T) {
 	r := &rig.Rig{
 		Name:     "gastown",
