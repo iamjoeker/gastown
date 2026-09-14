@@ -396,6 +396,27 @@ func TestReconcileCleanupStatusIfSafe(t *testing.T) {
 	}
 }
 
+// TestReconcileCleanupStatusIfSafe_DoneStateAllowed covers the population the
+// repair is aimed at: a polecat that ran `gt done` sits at p.State=StateDone
+// and agent_state=done for a long window before pool reuse — measured
+// 2026-08-18, ALL 26 reusable polecats were StateDone and ZERO were
+// StateIdle. Gating this reconcile on idle alone refused on exactly that
+// population (gt-rlnh).
+func TestReconcileCleanupStatusIfSafe_DoneStateAllowed(t *testing.T) {
+	previous := polecat.CleanupUnpushed
+	status := safeReconcileStatus(previous)
+	fields := &beads.AgentFields{AgentState: string(beads.AgentStateDone), CleanupStatus: string(previous)}
+	updater := &fakeCleanupUpdater{}
+	reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateDone}, fields, safeReconcileInput(previous))
+
+	if updater.calls != 1 {
+		t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 1 — done should not block the repair it is the target of", updater.calls)
+	}
+	if status.CleanupStatus != polecat.CleanupClean || !status.Reconciled {
+		t.Fatalf("status after reconcile = (%q, reconciled=%v), want clean true", status.CleanupStatus, status.Reconciled)
+	}
+}
+
 func TestReconcileCleanupStatusIfSafe_FailsClosed(t *testing.T) {
 	tests := []struct {
 		name    string

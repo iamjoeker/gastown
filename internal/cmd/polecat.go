@@ -2704,12 +2704,19 @@ func cleanupStatusReconcilePlan(status *RecoveryStatus, p *polecat.Polecat, fiel
 		out.Detail = "an earlier field reconcile on this run did not land; not compounding it"
 		return previous, out, false
 	}
-	if p.State != polecat.StateIdle {
-		out.Detail = "polecat_state=" + string(p.State) + " (reconcile requires an idle polecat)"
+	// A polecat that ran `gt done` sits at p.State=StateDone and
+	// agent_state=done for a long window before pool reuse — measured
+	// 2026-08-18, ALL 26 reusable polecats were StateDone and ZERO were
+	// StateIdle. Gating on idle alone refused on exactly the population and
+	// moment this repair is aimed at (gt-rlnh), so done counts as a resting
+	// state here too, matching StateEligibleForPoolReuse.
+	if !polecat.StateEligibleForPoolReuse(p.State) {
+		out.Detail = "polecat_state=" + string(p.State) + " (reconcile requires an idle or done polecat)"
 		return previous, out, false
 	}
-	if beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
-		out.Detail = "agent_state=" + orUnknownRecoveryField(fields.AgentState) + " (reconcile requires agent_state=idle)"
+	agentState := beads.AgentState(fields.AgentState)
+	if agentState != beads.AgentStateIdle && agentState != beads.AgentStateDone {
+		out.Detail = "agent_state=" + orUnknownRecoveryField(fields.AgentState) + " (reconcile requires agent_state=idle or done)"
 		return previous, out, false
 	}
 
