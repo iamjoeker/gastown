@@ -1432,13 +1432,13 @@ func (d *Daemon) ensureBootRunning() {
 		cmd := exec.Command(idleCheckBin)
 		cmd.Env = append(os.Environ(), fmt.Sprintf("PATH=%s:%s",
 			filepath.Join(d.config.TownRoot, "bin"), os.Getenv("PATH")))
-		if output, err := cmd.CombinedOutput(); err == nil {
+		if stdout, stderr, err := runSplitOutput(cmd); err == nil {
 			// Exit 0 = idle, use degraded triage (zero tokens)
 			d.runDegradedBootTriage(b)
 			return
 		} else {
 			// Exit 1 = needs waking, proceed to full Claude Boot
-			d.logger.Printf("Idle check: waking — %s", strings.TrimSpace(string(output)))
+			d.logger.Printf("Idle check: waking%s", formatSplitOutput(stdout, stderr))
 		}
 	}
 
@@ -1795,8 +1795,8 @@ func (d *Daemon) notifySlack(channel, priority, message string) {
 	//nolint:gosec // G204: args are constructed internally
 	cmd := exec.Command(notifyBin, "--channel", channel, "--priority", priority, message)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PATH=%s:%s", filepath.Join(d.config.TownRoot, "bin"), os.Getenv("PATH")))
-	if output, err := cmd.CombinedOutput(); err != nil {
-		d.logger.Printf("Stuck-agent-dog: gt-notify failed: %v (output: %s)", err, string(output))
+	if stdout, stderr, err := runSplitOutput(cmd); err != nil {
+		d.logger.Printf("Stuck-agent-dog: gt-notify failed: %v%s", err, formatSplitOutput(stdout, stderr))
 	}
 }
 

@@ -223,16 +223,16 @@ func (d *Daemon) testRigMainBranch(rigName, rigPath string, timeout time.Duratio
 	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", defaultBranch)
 	fetchCmd.Dir = bareRepoPath
 	util.SetDetachedProcessGroup(fetchCmd)
-	if output, err := fetchCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch failed: %v (%s)", err, strings.TrimSpace(string(output)))
+	if stdout, stderr, err := runSplitOutput(fetchCmd); err != nil {
+		return fmt.Errorf("git fetch failed: %v%s", err, formatSplitOutput(stdout, stderr))
 	}
 
 	// Create temporary worktree at origin/<default_branch>
 	addCmd := exec.CommandContext(ctx, "git", "worktree", "add", "--detach", worktreePath, "origin/"+defaultBranch)
 	addCmd.Dir = bareRepoPath
 	util.SetDetachedProcessGroup(addCmd)
-	if output, err := addCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git worktree add failed: %v (%s)", err, strings.TrimSpace(string(output)))
+	if stdout, stderr, err := runSplitOutput(addCmd); err != nil {
+		return fmt.Errorf("git worktree add failed: %v%s", err, formatSplitOutput(stdout, stderr))
 	}
 
 	// Always clean up the worktree
@@ -275,17 +275,24 @@ func (d *Daemon) runCommandOnWorktree(ctx context.Context, rigName, workDir, lab
 	cmd.Env = append(os.Environ(), "CI=true") // Signal test environment
 	util.SetDetachedProcessGroup(cmd)
 
-	output, err := cmd.CombinedOutput()
+	stdout, stderr, err := runSplitOutput(cmd)
 	if err != nil {
-		// Truncate output to last 50 lines for the error message
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		tail := lines
-		if len(tail) > 50 {
-			tail = tail[len(tail)-50:]
-		}
-		return fmt.Errorf("%s failed: %v\n%s", label, err, strings.Join(tail, "\n"))
+		// Truncate each stream to its last 50 lines for the error message
+		return fmt.Errorf("%s failed: %v%s", label, err, formatSplitOutput(tailLines(stdout, 50), tailLines(stderr, 50)))
 	}
 	return nil
+}
+
+// tailLines returns the last n lines of s, unchanged if it already has n or fewer.
+func tailLines(s string, n int) string {
+	if s == "" {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // contains checks if a string slice contains a value.

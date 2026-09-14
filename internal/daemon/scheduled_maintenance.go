@@ -219,15 +219,15 @@ func (d *Daemon) runScheduledMaintenance() {
 		"--threshold", strconv.Itoa(threshold))
 	cmd.Dir = d.config.TownRoot
 	util.SetDetachedProcessGroup(cmd)
-	output, err := cmd.CombinedOutput()
+	stdout, stderr, err := runSplitOutput(cmd)
 	if err != nil {
-		d.logger.Printf("scheduled_maintenance: gt maintain failed: %v\nOutput: %s", err, string(output))
+		d.logger.Printf("scheduled_maintenance: gt maintain failed: %v%s", err, formatSplitOutput(stdout, stderr))
 		d.escalate("scheduled_maintenance", fmt.Sprintf("gt maintain --force failed: %v", err))
 	} else {
 		d.logger.Printf("scheduled_maintenance: gt maintain completed successfully")
-		if len(output) > 0 {
-			// Log last few lines of output
-			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		if stdout != "" {
+			// Log last few lines of stdout
+			lines := strings.Split(stdout, "\n")
 			tail := lines
 			if len(tail) > 5 {
 				tail = tail[len(tail)-5:]
@@ -235,6 +235,9 @@ func (d *Daemon) runScheduledMaintenance() {
 			for _, line := range tail {
 				d.logger.Printf("scheduled_maintenance: %s", line)
 			}
+		}
+		if stderr != "" {
+			d.logger.Printf("scheduled_maintenance: stderr: %s", stderr)
 		}
 	}
 

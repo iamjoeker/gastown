@@ -804,9 +804,9 @@ func (d *Daemon) closeMessage(id string) error {
 	cmd.Env = os.Environ() // Inherit PATH to find gt executable
 	util.SetDetachedProcessGroup(cmd)
 
-	output, err := cmd.CombinedOutput()
+	stdout, stderr, err := runSplitOutput(cmd)
 	if err != nil {
-		return fmt.Errorf("gt mail delete %s: %v (output: %s)", id, err, string(output))
+		return fmt.Errorf("gt mail delete %s: %v%s", id, err, formatSplitOutput(stdout, stderr))
 	}
 	d.logger.Printf("Deleted lifecycle message: %s", id)
 	return nil

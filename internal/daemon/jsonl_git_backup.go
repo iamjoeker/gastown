@@ -567,9 +567,9 @@ func (d *Daemon) escalateE(source, message string) error {
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
 	util.SetDetachedProcessGroup(cmd)
-	output, err := cmd.CombinedOutput()
+	stdout, stderr, err := runSplitOutput(cmd)
 	if err != nil {
-		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("%w%s", err, formatSplitOutput(stdout, stderr))
 	}
 	return nil
 }

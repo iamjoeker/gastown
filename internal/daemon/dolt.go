@@ -1302,16 +1302,16 @@ func (m *DoltServerManager) checkWriteHealthLocked() error {
 	)
 	cmd := m.buildDoltSQLCmd(ctx, "-q", query)
 
-	output, err := cmd.CombinedOutput()
+	stdout, stderr, err := runSplitOutput(cmd)
 	if err != nil {
-		errMsg := strings.TrimSpace(string(output))
+		errMsg := strings.TrimSpace(stdout + " " + stderr)
 		if isReadOnlyError(errMsg) {
 			return fmt.Errorf("dolt server is in read-only mode: %s", errMsg)
 		}
 		// Non-read-only failures: log warning but don't fail health check.
 		// These could be transient issues (timeout, lock contention) that
 		// don't indicate a persistent read-only state.
-		m.logger("Warning: Dolt write probe failed (non-read-only): %v (%s)", err, errMsg)
+		m.logger("Warning: Dolt write probe failed (non-read-only): %v%s", err, formatSplitOutput(stdout, stderr))
 	}
 
 	return nil
