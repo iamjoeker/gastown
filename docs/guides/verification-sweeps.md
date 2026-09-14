@@ -166,6 +166,39 @@ trivially-passing test. It writes one dot-file and removes it.
 
 ---
 
+## Population, not just instrument
+
+The positive/negative pair above proves the sweep can see *within the tree it
+searched*. It proves nothing about whether that tree is the right one to
+search. Two probes that use different fields, different operators, or opposite
+directions of enumeration are still one measurement if they run against the
+same underlying population — this is exactly the gitignore-blindness defect
+this guide covers, generalized: the ignored subtree and the un-ignored subtree
+aren't two filesystems, they're one filesystem with a population split inside
+it, and a probe that only walks one half certifies nothing about the other.
+
+**Deletion, archival, compaction and rotation each create a second population
+that every live query is blind to by construction.** Before reporting an
+absence, name the population you enumerated *from*, and enumerate from a
+different one before calling it clean.
+
+Concrete instances in Gas Town:
+
+- **MR/merge records** — live rows (`gt mq list --status closed --json`)
+  UNION the reaper archive (`gt reaper archive --json`) UNION git history.
+  Cheap to check: archived MR records are few (tens, not thousands), and a
+  single missed one can flip a "no MR record" finding into a false positive.
+- **Wisps** — wisps are ephemeral and purged; the live wisp table is a
+  window, not the full population. A query that only reads live wisps and
+  finds nothing has enumerated one population, not proven absence across all
+  of them.
+
+A control that only exercises one population — however many different
+commands you run against it — cannot surface this. Run the same question
+against a second, independently-populated source before trusting a zero.
+
+---
+
 ## Reporting a census
 
 Any count you report from a sweep must carry the traversal that produced it.
