@@ -1902,7 +1902,7 @@ func DetectZombiePolecatsWithOptions(bd *BdCli, workDir, rigName string, router 
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromWorkDir(workDir)
 
 	// Load witness thresholds from config (fallback to compiled-in defaults).
 	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
@@ -2524,7 +2524,7 @@ func DetectStalledPolecatsWithOptions(workDir, rigName string, opts ScanOptions)
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromWorkDir(workDir)
 
 	// Load witness thresholds from config (fallback to compiled-in defaults).
 	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
@@ -2675,7 +2675,7 @@ func DiscoverCompletionsWithOptions(bd *BdCli, workDir, rigName string, router *
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromWorkDir(workDir)
 
 	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
@@ -3213,7 +3213,7 @@ func DetectOrphanedBeads(bd *BdCli, workDir, rigName string, router *mail.Router
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromWorkDir(workDir)
 
 	// Scan both in_progress and hooked beads — resetAbandonedBead handles both
 	// states, and orphaned beads can be stuck in either.
@@ -3351,7 +3351,7 @@ func DetectOrphanedMolecules(bd *BdCli, workDir, rigName string, router *mail.Ro
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromWorkDir(workDir)
 
 	// Step 1: List beads that could have attached molecules.
 	// Slung beads start as status=hooked; polecats may change them to in_progress.
