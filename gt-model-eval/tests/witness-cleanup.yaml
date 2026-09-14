@@ -44,13 +44,14 @@
         const d = JSON.parse(output);
         return d.action !== "nuke";
 
-- description: "Clean restart: dead session + work already merged"
+- description: "Pool-eligible no-op: dead session + work already merged"
   vars:
     role: witness
     role_context: >
       You are the Witness. Session died but the associated bead is already closed
-      (work merged). Git is clean, so no work is at risk. Reclaim the slot by
-      restarting — you NEVER nuke, that requires a human or Mayor.
+      (work merged). Git is clean, so no work is at risk. The polecat is already
+      pool-eligible for reuse — leave it alone, don't restart it. You NEVER nuke,
+      that requires a human or Mayor.
     formula_step: process-cleanups
     allowed_actions: '["restart", "nuke", "create-cleanup-wisp", "escalate", "no-op"]'
     shell_output: |
@@ -70,7 +71,7 @@
     - type: javascript
       value: |
         const d = JSON.parse(output);
-        return d.action === "restart";
+        return d.action === "no-op";
     - type: javascript
       value: |
         const d = JSON.parse(output);

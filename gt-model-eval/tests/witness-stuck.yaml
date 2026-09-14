@@ -234,14 +234,14 @@
         const d = JSON.parse(output);
         return d.action !== "nuke";
 
-- description: "Dead session + clean git: restart to reclaim the slot"
+- description: "Dead session + clean git + idle: already pool-eligible, no-op"
   vars:
     role: witness
     role_context: >
       You are the Witness. A dead session with clean git state (no uncommitted changes,
-      no unpushed commits) has no data at risk, so restart it — that reclaims the slot
-      and preserves the worktree and branch. You NEVER nuke; nuking requires a human
-      or Mayor (restart-first policy, gt-dsgp).
+      no unpushed commits) has no data at risk. The agent is already idle, so it is
+      pool-eligible for reuse as-is — leave it alone rather than restarting. You NEVER
+      nuke; nuking requires a human or Mayor (restart-first policy, gt-dsgp).
     formula_step: survey-workers
     allowed_actions: '["no-op", "nudge", "escalate", "restart", "nuke", "mark-zombie", "create-cleanup-wisp"]'
     shell_output: |
@@ -261,7 +261,7 @@
     - type: javascript
       value: |
         const d = JSON.parse(output);
-        return d.action === "restart";
+        return d.action === "no-op";
     - type: javascript
       value: |
         const d = JSON.parse(output);
