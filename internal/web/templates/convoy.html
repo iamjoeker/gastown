@@ -491,7 +491,7 @@
             <div class="panel" id="activity-panel">
                 <div class="panel-header">
                     <h2>📜 Activity</h2>
-                    <span class="count">{{if .ActivityUnavailable}}?{{else}}{{len .Activity}}{{end}}</span>
+                    <span class="count" id="activity-count">{{if .ActivityUnavailable}}?{{else}}{{len .Activity}}{{if .ActivityTruncated}}+{{end}}{{end}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
@@ -526,6 +526,9 @@
                         <p>This is NOT "no recent activity" — the dashboard could not read the event log.</p>
                     </div>
                     {{else if .Activity}}
+                    {{if .ActivityTruncated}}
+                    <p class="truncation-notice">⚠️ Showing the most recent {{len .Activity}} events — the count is a floor, not the town's whole history</p>
+                    {{end}}
                     <div class="tl-timeline" id="activity-timeline">
                         {{range .Activity}}
                         <div class="tl-entry {{activityTypeClass .Category}}" data-category="{{.Category}}" data-rig="{{.Rig}}" data-agent="{{.Actor}}" data-type="{{.Type}}" data-ts="{{.RawTimestamp}}">

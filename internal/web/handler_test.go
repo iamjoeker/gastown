@@ -73,10 +73,11 @@ type MockConvoyFetcher struct {
 	// no rows and a failed store from reading as "no store answered at all":
 	// Unreadable() is the "?" render, and a truncation test needs the panel to
 	// be readable so the "+" render is the one under test.
-	IssuesReadStores []string
-	HooksReadStores  []string
-	Activity         []ActivityRow
-	ActivityError    error
+	IssuesReadStores  []string
+	HooksReadStores   []string
+	Activity          []ActivityRow
+	ActivityTruncated bool
+	ActivityError     error
 	// Error is the convoy fetch's error.
 	Error error
 }
@@ -143,8 +144,8 @@ func (m *MockConvoyFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 	}, m.IssuesError
 }
 
-func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
-	return m.Activity, m.ActivityError
+func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, bool, error) {
+	return m.Activity, m.ActivityTruncated, m.ActivityError
 }
 
 func TestConvoyHandler_RendersTemplate(t *testing.T) {
@@ -1434,8 +1435,8 @@ func (m *MockConvoyFetcherWithErrors) FetchIssues() (StoreResult[IssueRow], erro
 	return StoreResult[IssueRow]{}, nil
 }
 
-func (m *MockConvoyFetcherWithErrors) FetchActivity() ([]ActivityRow, error) {
-	return nil, nil
+func (m *MockConvoyFetcherWithErrors) FetchActivity() ([]ActivityRow, bool, error) {
+	return nil, false, nil
 }
 
 // TestConvoyHandler_TemplateErrorReturns500 verifies that template execution errors
@@ -1641,7 +1642,7 @@ func (m *CountingMockFetcher) FetchMayor() (*MayorStatus, error) { return m.inne
 func (m *CountingMockFetcher) FetchIssues() (StoreResult[IssueRow], error) {
 	return m.inner.FetchIssues()
 }
-func (m *CountingMockFetcher) FetchActivity() ([]ActivityRow, error) {
+func (m *CountingMockFetcher) FetchActivity() ([]ActivityRow, bool, error) {
 	return m.inner.FetchActivity()
 }
 
@@ -2296,6 +2297,31 @@ func TestConvoyHandler_MailCountSaysWhenItIsCapped(t *testing.T) {
 	body = renderDashboard(t, &MockConvoyFetcher{Convoys: []ConvoyRow{}, Mail: short})
 	if !strings.Contains(body, fmt.Sprintf(`id="mail-count">%d<`, mailFetchLimit-1)) {
 		t.Error("a mail query that came back short of the cap is a complete answer")
+	}
+}
+
+// TestConvoyHandler_ActivityCountSaysWhenItIsCapped is the Activity panel's
+// version of TestConvoyHandler_MailCountSaysWhenItIsCapped (gt-t3cgz).
+// FetchActivity windows the event log to its most recent activityFetchLimit
+// lines, and until this fix that cap had no visible marker: a log with more
+// history than the window rendered identically to one with none.
+func TestConvoyHandler_ActivityCountSaysWhenItIsCapped(t *testing.T) {
+	rows := []ActivityRow{{Type: "sling", Summary: "did a thing"}}
+
+	body := renderDashboard(t, &MockConvoyFetcher{Convoys: []ConvoyRow{}, Activity: rows, ActivityTruncated: true})
+	if !strings.Contains(body, `id="activity-count">1+<`) {
+		t.Error("an activity read that filled its window must render as a floor")
+	}
+	if !strings.Contains(body, "the count is a floor") {
+		t.Error("the activity panel should say the list is the most recent slice, not the town's whole history")
+	}
+
+	body = renderDashboard(t, &MockConvoyFetcher{Convoys: []ConvoyRow{}, Activity: rows, ActivityTruncated: false})
+	if !strings.Contains(body, `id="activity-count">1<`) {
+		t.Error("an activity read that came back short of the window is a complete answer")
+	}
+	if strings.Contains(body, "the count is a floor") {
+		t.Error("an untruncated activity read must not carry the floor caveat")
 	}
 }
 

@@ -123,9 +123,13 @@ type ConvoyData struct {
 	// ActivityUnavailable holds the reason the event log could not be read, or
 	// "" when it was read (including when it does not exist yet).
 	ActivityUnavailable string
-	Summary             *DashboardSummary
-	Expand              string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken           string // Token for CSRF protection on POST requests
+	// ActivityTruncated is true when the event log held more lines than the
+	// timeline window (activityFetchLimit) could show, mirroring MailTruncated:
+	// the cap is deliberate, but the count it produces is a floor, not a total.
+	ActivityTruncated bool
+	Summary           *DashboardSummary
+	Expand            string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken         string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
