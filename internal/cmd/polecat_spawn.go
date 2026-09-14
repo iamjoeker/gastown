@@ -179,10 +179,28 @@ func recordPoolReuseRefusalStreaks(townRoot, rigName string, polecatMgr *polecat
 		if selfResolvingReuseRefusalReasons[reason] {
 			continue
 		}
-		if count >= poolReuseRefusalEscalationThreshold {
+		if shouldEscalatePoolReuseRefusal(count) {
 			escalatePoolReuseRefusal(townRoot, rigName, c.Name, reason, count)
 		}
 	}
+}
+
+// shouldEscalatePoolReuseRefusal reports whether a refusal streak count should
+// fire a new escalation. It fires only on the EXACT crossing of the threshold,
+// not on every count above it (hq-phk5p).
+//
+// The fingerprint dedup in raiseEscalation only suppresses while a matching
+// escalation is OPEN (ListEscalationsByFingerprint filters to open records),
+// so an operator closing the escalation once its cause is understood — the
+// natural reading of the notification text, "to close: gt escalate close" —
+// re-arms the very next refusal into a brand-new escalation. `>=` turned "one
+// notice per real streak" into "one notice per refusal for the rest of the
+// streak" the moment anyone closed instead of merely acking. Gating on `==`
+// means the notice fires once per streak regardless of ack-vs-close; the next
+// one waits for a real reset (a successful reuse, via ResetPoolReuseRefusal)
+// and a fresh climb back to the threshold.
+func shouldEscalatePoolReuseRefusal(count int) bool {
+	return count == poolReuseRefusalEscalationThreshold
 }
 
 // escalatePoolReuseRefusal makes a permanently-refused polecat loud instead of

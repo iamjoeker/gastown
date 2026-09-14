@@ -172,3 +172,22 @@ func TestAuditPoolReuseSummaryIsNotTheBareTypeName(t *testing.T) {
 		})
 	}
 }
+
+// TestShouldEscalatePoolReuseRefusalFiresOnceAndStopsAfterClose covers hq-phk5p:
+// closing an escalation clears the fingerprint dedup, so the gate itself must
+// not depend on that dedup to stay quiet for the rest of a streak.
+func TestShouldEscalatePoolReuseRefusalFiresOnceAndStopsAfterClose(t *testing.T) {
+	for count := 1; count < poolReuseRefusalEscalationThreshold; count++ {
+		if shouldEscalatePoolReuseRefusal(count) {
+			t.Fatalf("count=%d: should not escalate before the threshold (%d)", count, poolReuseRefusalEscalationThreshold)
+		}
+	}
+	if !shouldEscalatePoolReuseRefusal(poolReuseRefusalEscalationThreshold) {
+		t.Fatalf("count=%d: must escalate on the exact crossing", poolReuseRefusalEscalationThreshold)
+	}
+	for count := poolReuseRefusalEscalationThreshold + 1; count <= poolReuseRefusalEscalationThreshold+10; count++ {
+		if shouldEscalatePoolReuseRefusal(count) {
+			t.Fatalf("count=%d: should not re-fire past the threshold even though a real operator would have closed the prior escalation by now", count)
+		}
+	}
+}
