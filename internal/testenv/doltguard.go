@@ -123,6 +123,16 @@ func GuardProductionDolt() {
 			_ = os.Setenv(name, guarded)
 		}
 	}
+
+	// A `bd` subprocess a test invokes against a fixture town with no Dolt
+	// server configured does not just fail — by default it auto-starts a real,
+	// local Dolt server on the guarded port to serve that request, and that
+	// server outlives the test: nothing in the test process stops it. Every
+	// later test in the same binary then finds the guarded port genuinely
+	// reachable, which is exactly the "connection refused" this guard exists to
+	// promise (see GuardedDoltPort). Force auto-start off so a test that wants
+	// a real server still has to arrange one itself. (gt-o8bf)
+	_ = os.Setenv("BEADS_DOLT_AUTO_START", "0")
 }
 
 // WithoutDoltPortGuard clears the guarded port variables for the duration of
