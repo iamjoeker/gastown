@@ -85,16 +85,18 @@ func DatabaseCount(host string, port int) (int, []string, error) {
 	return len(databases), databases, nil
 }
 
-// ZombieResult holds the result of a zombie server scan.
-type ZombieResult struct {
+// OrphanedServerResult holds the result of an orphaned-dolt-server scan.
+type OrphanedServerResult struct {
 	Count int
 	PIDs  []int
 }
 
-// FindZombieServers scans for dolt sql-server processes not on any expected port.
+// FindOrphanedDoltServers scans for dolt sql-server processes not on any
+// expected port. These are live, running servers — not OS-level zombie
+// (Z-state/defunct) processes — but they are unexpected and worth flagging.
 // Uses lsof-based port discovery instead of pgrep/ps string matching (ZFC fix: gt-fj87).
-func FindZombieServers(expectedPorts []int) ZombieResult {
-	result := ZombieResult{}
+func FindOrphanedDoltServers(expectedPorts []int) OrphanedServerResult {
+	result := OrphanedServerResult{}
 
 	listeners := doltserver.FindAllDoltListeners()
 	if len(listeners) == 0 {
@@ -115,6 +117,57 @@ func FindZombieServers(expectedPorts []int) ZombieResult {
 	}
 
 	return result
+}
+
+// ZombieProcess is a genuine OS-level zombie (Z-state/defunct) process.
+type ZombieProcess struct {
+	PID  int
+	Comm string
+}
+
+// FindZombieProcesses scans /proc for processes whose kernel-reported state
+// is "Z" (zombie/defunct), per /proc/<pid>/stat. This is the actual
+// definition of a Unix zombie process, as distinct from an orphaned Dolt
+// server (see FindOrphanedDoltServers) which is a live, running process.
+func FindZombieProcesses() []ZombieProcess {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+
+	var zombies []ZombieProcess
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+
+		// Format: "pid (comm) state ...". comm may itself contain spaces or
+		// parens, so find the last ')' rather than splitting on whitespace.
+		s := string(data)
+		open := strings.IndexByte(s, '(')
+		closeParen := strings.LastIndexByte(s, ')')
+		if open < 0 || closeParen < 0 || closeParen < open {
+			continue
+		}
+		comm := s[open+1 : closeParen]
+
+		rest := strings.Fields(s[closeParen+1:])
+		if len(rest) < 1 {
+			continue
+		}
+
+		if rest[0] == "Z" {
+			zombies = append(zombies, ZombieProcess{PID: pid, Comm: comm})
+		}
+	}
+
+	return zombies
 }
 
 // BackupFreshness checks the age of the newest file in a directory.

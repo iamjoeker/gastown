@@ -85,8 +85,10 @@ type BackupHealth struct {
 }
 
 type ProcessHealth struct {
-	ZombieCount int   `json:"zombie_count"`
-	ZombiePIDs  []int `json:"zombie_pids,omitempty"`
+	OrphanedServerCount int   `json:"orphaned_server_count"`
+	OrphanedServerPIDs  []int `json:"orphaned_server_pids,omitempty"`
+	ZombieCount         int   `json:"zombie_count"`
+	ZombiePIDs          []int `json:"zombie_pids,omitempty"`
 }
 
 type OrphanDB struct {
@@ -104,7 +106,7 @@ Sections:
   2. Databases: per-DB counts of issues, wisps, commits
   3. Pollution: scan for known test/garbage patterns
   4. Backups: Dolt filesystem and JSONL git freshness
-  5. Processes: zombie dolt servers
+  5. Processes: orphaned dolt servers and genuine (Z-state) zombie processes
   6. Orphan DBs: databases not referenced by any rig
 
 Use --json for machine-readable output.`,
@@ -362,13 +364,27 @@ func checkBackupHealth(townRoot string) *BackupHealth {
 	return bh
 }
 
-// checkProcessHealth finds zombie Dolt servers (not on the expected port).
-// Uses lsof-based port discovery instead of pgrep/ps string matching (ZFC fix: gt-fj87).
+// checkProcessHealth finds orphaned Dolt servers (not on the expected port)
+// and genuine OS-level zombie (Z-state/defunct) processes. These are
+// distinct conditions: an orphaned server is a live, running process on the
+// wrong port, while a zombie process is dead and awaiting reap by its
+// parent. Conflating the two under one "zombie" label previously reported
+// live orphaned servers as zombies while missing real Z-state processes
+// entirely (gt-tw56).
 func checkProcessHealth(expectedPort int) *ProcessHealth {
-	result := health.FindZombieServers([]int{expectedPort})
+	orphans := health.FindOrphanedDoltServers([]int{expectedPort})
+	zombies := health.FindZombieProcesses()
+
+	zombiePIDs := make([]int, len(zombies))
+	for i, z := range zombies {
+		zombiePIDs[i] = z.PID
+	}
+
 	return &ProcessHealth{
-		ZombieCount: result.Count,
-		ZombiePIDs:  result.PIDs,
+		OrphanedServerCount: orphans.Count,
+		OrphanedServerPIDs:  orphans.PIDs,
+		ZombieCount:         len(zombies),
+		ZombiePIDs:          zombiePIDs,
 	}
 }
 
@@ -449,10 +465,16 @@ func printHealthReport(r *HealthReport) {
 
 	// 5. Processes
 	fmt.Printf("\n%s Processes\n", style.Bold.Render("●"))
+	if r.Processes.OrphanedServerCount == 0 {
+		fmt.Printf("  %s No orphaned dolt servers\n", style.Bold.Render("✓"))
+	} else {
+		fmt.Printf("  %s %d orphaned dolt server(s) (running off expected port): %v\n", style.Bold.Render("!"),
+			r.Processes.OrphanedServerCount, r.Processes.OrphanedServerPIDs)
+	}
 	if r.Processes.ZombieCount == 0 {
 		fmt.Printf("  %s No zombie processes\n", style.Bold.Render("✓"))
 	} else {
-		fmt.Printf("  %s %d zombie(s): %v\n", style.Bold.Render("!"),
+		fmt.Printf("  %s %d zombie process(es) (Z state): %v\n", style.Bold.Render("!"),
 			r.Processes.ZombieCount, r.Processes.ZombiePIDs)
 	}
 
