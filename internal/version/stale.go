@@ -95,14 +95,30 @@ func resolveCommitHash() string {
 //
 // It is only meaningful when i.IsStale; callers gate on that. A zero
 // CommitsBehind (count unknown) falls back to the "is stale" wording.
+//
+// When the compare commit was never refreshed against the remote (the
+// startup banner's case: it runs before every command and cannot afford a
+// fetch), the message says so. Without this, the banner's "main at …" reads
+// as a live answer when it is actually a local ref that only moves when
+// something fetches — it can sit unchanged for hours while real main moves,
+// while `gt stale` (which does refresh) reports a different, current value
+// in the same breath (gt-el0s). A refresh that was attempted and failed is
+// left unadorned: its staleness verdict was still proven via local-ancestry
+// containment, so the "never refreshed" caveat would misstate what happened.
 func (i *StaleBinaryInfo) Describe(subject string) string {
+	var msg string
 	if i.CommitsBehind > 0 {
-		return fmt.Sprintf("%s is %d commits behind %s (built from %s, %s at %s)",
+		msg = fmt.Sprintf("%s is %d commits behind %s (built from %s, %s at %s)",
 			subject, i.CommitsBehind, i.CompareRef,
 			ShortCommit(i.BinaryCommit), i.CompareRef, ShortCommit(i.RepoCommit))
+	} else {
+		msg = fmt.Sprintf("%s is stale (built from %s, %s at %s)",
+			subject, ShortCommit(i.BinaryCommit), i.CompareRef, ShortCommit(i.RepoCommit))
 	}
-	return fmt.Sprintf("%s is stale (built from %s, %s at %s)",
-		subject, ShortCommit(i.BinaryCommit), i.CompareRef, ShortCommit(i.RepoCommit))
+	if !i.Refreshed && i.RefreshError == "" {
+		msg += " — local reference, may lag; run 'gt stale' for the current comparison"
+	}
+	return msg
 }
 
 // ShortCommit returns first 12 characters of a hash.
