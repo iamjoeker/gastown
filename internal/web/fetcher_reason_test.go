@@ -215,7 +215,7 @@ func TestFetchActivity_EmptyFileIsNotConfusedWithAMissingOne(t *testing.T) {
 		t.Fatalf("write empty event log: %v", err)
 	}
 
-	rows, err := f.FetchActivity()
+	rows, _, err := f.FetchActivity()
 	if err != nil {
 		t.Fatalf("an empty event log is a quiet town, not a failure: %v", err)
 	}

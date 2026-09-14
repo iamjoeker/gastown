@@ -2406,20 +2406,29 @@ func (f *LiveConvoyFetcher) listIssueBeads(storeDir, status string, limit int) (
 	return beads, nil
 }
 
-// FetchActivity returns recent activity from the event log.
+// activityFetchLimit caps how many trailing lines of the event log the
+// timeline window considers. Like mailFetchLimit this cap is meant — the
+// panel shows recent activity, not the town's whole history — but a
+// deliberate cap is still a cap: whether the log held more lines than the
+// window can show is reported back as truncated so the count does not
+// render as a total it never was.
+const activityFetchLimit = 50
+
+// FetchActivity returns recent activity from the event log, and whether the
+// log held more lines than the timeline window could show.
 //
 // A missing log is a town that has not logged anything yet; an unreadable one
 // is a town whose history the dashboard cannot see. The split follows FetchDogs.
-func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
+func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, bool, error) {
 	eventsPath := filepath.Join(f.townRoot, ".events.jsonl")
 
 	// Read events file
 	data, err := os.ReadFile(eventsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // No events file yet — nothing has happened.
+			return nil, false, nil // No events file yet — nothing has happened.
 		}
-		return nil, fmt.Errorf("reading event log: %w", err)
+		return nil, false, fmt.Errorf("reading event log: %w", err)
 	}
 
 	// An empty log yields one empty line, which the loop below skips. There is no
@@ -2428,10 +2437,17 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 	// error" that never ran (gt-1jrl).
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
-	// Take last 50 events for richer timeline
+	// Truncation is decided on the raw line count, before the loop below drops
+	// audit-only and unparseable lines: a log with more lines than the window
+	// holds was truncated even if the surviving rows happen to number fewer
+	// than activityFetchLimit, and undercounting that would be the exact
+	// failure this fix exists to close.
+	truncated := len(lines) > activityFetchLimit
+
+	// Take last N events for richer timeline
 	start := 0
-	if len(lines) > 50 {
-		start = len(lines) - 50
+	if len(lines) > activityFetchLimit {
+		start = len(lines) - activityFetchLimit
 	}
 
 	var rows []ActivityRow
@@ -2477,7 +2493,7 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 		rows = append(rows, row)
 	}
 
-	return rows, nil
+	return rows, truncated, nil
 }
 
 // eventCategory classifies an event type into a filter category.
