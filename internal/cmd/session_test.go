@@ -11,6 +11,46 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
+// TestParseAddress covers gt-nkh9x: "rig/polecats/name" addresses (the form
+// used by mail, audit, and convoy) must resolve to the bare polecat name, not
+// "polecats/name" - otherwise the derived tmux session id ("gt-polecats/name")
+// never matches the actual session ("gt-name") and every liveness check
+// built on it reports running=false for a verifiably live session.
+func TestParseAddress(t *testing.T) {
+	tests := []struct {
+		name        string
+		addr        string
+		wantRig     string
+		wantPolecat string
+		wantErr     bool
+	}{
+		{name: "bare rig/name", addr: "gastown/fury", wantRig: "gastown", wantPolecat: "fury"},
+		{name: "polecats segment", addr: "gastown/polecats/fury", wantRig: "gastown", wantPolecat: "fury"},
+		{name: "legacy singular polecat segment", addr: "gastown/polecat/fury", wantRig: "gastown", wantPolecat: "fury"},
+		{name: "crew segment", addr: "gastown/crew/max", wantRig: "gastown", wantPolecat: "max"},
+		{name: "empty", addr: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rigName, polecatName, err := parseAddress(tt.addr)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseAddress(%q) = (%q, %q, nil), want error", tt.addr, rigName, polecatName)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAddress(%q) returned error: %v", tt.addr, err)
+			}
+			if rigName != tt.wantRig || polecatName != tt.wantPolecat {
+				t.Fatalf("parseAddress(%q) = (%q, %q), want (%q, %q)",
+					tt.addr, rigName, polecatName, tt.wantRig, tt.wantPolecat)
+			}
+		})
+	}
+}
+
 func TestSessionInfoJSONOutput(t *testing.T) {
 	info := &polecat.SessionInfo{
 		Polecat:   "alpha",

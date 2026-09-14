@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -251,9 +252,16 @@ func newSessionHealthReport(session string, status tmux.ZombieStatus, maxInactiv
 }
 
 // parseAddress parses "rig/polecat" format.
+// Also accepts the fuller "rig/polecats/name" (or "rig/crew/name") address
+// form used elsewhere in Gas Town (mail, audit, convoy) by normalizing
+// through mail.AddressToIdentity before splitting - otherwise the middle
+// "polecats/" segment ends up baked into polecatName, producing a tmux
+// session id ("gt-polecats/name") that never matches the actual session
+// ("gt-name") and every liveness check reports running=false.
 // If no "/" is present, attempts to infer rig from current directory.
 func parseAddress(addr string) (rigName, polecatName string, err error) {
-	parts := strings.SplitN(addr, "/", 2)
+	normalized := mail.AddressToIdentity(addr)
+	parts := strings.SplitN(normalized, "/", 2)
 	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 		return parts[0], parts[1], nil
 	}
