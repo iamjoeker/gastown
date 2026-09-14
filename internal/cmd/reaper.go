@@ -180,6 +180,20 @@ func reaperDatabaseNames() []string {
 	return databases
 }
 
+// reaperActiveMRClearer builds the beads client reaper.ClearDanglingMRActiveRefs
+// writes agent-bead active_mr clears through. Its own routing (see
+// beads.Beads.ForAgentBead) reaches the town's hq database regardless of
+// which rig root it is constructed from, so any resolvable town root works.
+// Returns nil when the town root can't be found — the sweep then just skips
+// the dangling active_mr pass rather than failing the whole reap.
+func reaperActiveMRClearer() reaper.ActiveMRClearer {
+	townRoot, err := findTownRoot()
+	if err != nil {
+		return nil
+	}
+	return beads.NewWithBeadsDir(townRoot, beads.ResolveBeadsDir(townRoot))
+}
+
 func defaultReaperEndpoint() (string, int) {
 	host := agentconfig.ResolveDoltHost("")
 	port := 0
@@ -384,6 +398,7 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 		}
 
 		databases := reaperDatabaseNames()
+		activeMRClearer := reaperActiveMRClearer()
 
 		var results []*reaper.ReapResult
 		for i, dbName := range databases {
@@ -411,12 +426,20 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 			}
 
 			result, err := reaper.Reap(db, dbName, maxAge, reaperDryRun)
-			db.Close()
 			if err != nil {
+				db.Close()
 				fmt.Fprintf(os.Stderr, "%s: reap error: %v\n", dbName, err)
 				continue
 			}
 			results = append(results, result)
+			if !reaperDryRun && activeMRClearer != nil {
+				if mrResult, err := reaper.ClearDanglingMRActiveRefs(db, dbName, activeMRClearer); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: dangling active_mr scan error: %v\n", dbName, err)
+				} else if mrResult.Cleared > 0 {
+					fmt.Printf("%s: cleared %d dangling active_mr reference(s) on closed MRs\n", dbName, mrResult.Cleared)
+				}
+			}
+			db.Close()
 		}
 
 		if reaperJSON {
@@ -773,6 +796,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		}
 
 		archive := reaperArchiver()
+		activeMRClearer := reaperActiveMRClearer()
 		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalArchived, totalProtected, totalTombstoned, totalClosed, totalOpen int
 		// allAnomalies collects anomalies from every step (scan, reap, purge,
 		// auto-close), not just scan's. The formula's report step requires an
@@ -831,6 +855,14 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 					fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
 				}
 				allAnomalies = append(allAnomalies, reapResult.Anomalies...)
+			}
+
+			if !reaperDryRun && activeMRClearer != nil {
+				if mrResult, err := reaper.ClearDanglingMRActiveRefs(db, dbName, activeMRClearer); err != nil {
+					fmt.Printf("%s: dangling active_mr scan error: %v\n", dbName, err)
+				} else if mrResult.Cleared > 0 {
+					fmt.Printf("%s: cleared %d dangling active_mr reference(s) on closed MRs\n", dbName, mrResult.Cleared)
+				}
 			}
 
 			// Purge

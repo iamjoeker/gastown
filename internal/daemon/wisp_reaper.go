@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -453,6 +454,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 	dryRun := config.DryRun
 	archive := d.wispArchive(config)
 	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalArchived, totalProtected, totalAutoClosed int
+	activeMRClearer := beads.NewWithBeadsDir(d.config.TownRoot, beads.ResolveBeadsDir(d.config.TownRoot))
 
 	// Step 2: Reap
 	reapErrors := 0
@@ -472,8 +474,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 			continue
 		}
 		result, err := reaper.Reap(db, dbName, maxAge, dryRun)
-		db.Close()
 		if err != nil {
+			db.Close()
 			d.logger.Printf("wisp_reaper: %s: reap error: %v", dbName, err)
 			reapErrors++
 			continue
@@ -488,6 +490,14 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, st
 			}
 			d.logger.Printf("%s, %d open remain", reapSummary, result.OpenRemain)
 		}
+		if !dryRun {
+			if mrResult, err := reaper.ClearDanglingMRActiveRefs(db, dbName, activeMRClearer); err != nil {
+				d.logger.Printf("wisp_reaper: %s: dangling active_mr scan error: %v", dbName, err)
+			} else if mrResult.Cleared > 0 {
+				d.logger.Printf("wisp_reaper: %s: cleared %d dangling active_mr reference(s) on closed MRs", dbName, mrResult.Cleared)
+			}
+		}
+		db.Close()
 	}
 	if reapErrors > 0 {
 		mol.failStep("reap", fmt.Sprintf("%d databases had reap errors", reapErrors))
