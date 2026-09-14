@@ -278,7 +278,10 @@ func TestGetProcessNamesRespectsRegistryOverride(t *testing.T) {
 }
 
 func TestResolveProcessNames(t *testing.T) {
-	t.Parallel()
+	// Cannot use t.Parallel — ResetRegistryForTesting/RegisterAgentForTesting
+	// mutate the package-level globalRegistry, which every other test reads
+	// through GetAgentPreset et al. Running this concurrently with other
+	// parallel tests corrupts their reads intermittently.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
@@ -1515,7 +1518,8 @@ func TestAllHookSupportingAgentsHaveHookFields(t *testing.T) {
 }
 
 func TestResolveACPConfig(t *testing.T) {
-	t.Parallel()
+	// Cannot use t.Parallel — ResetRegistryForTesting mutates the
+	// package-level globalRegistry that other tests read concurrently.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
@@ -1600,7 +1604,8 @@ func TestSupportsACPWithCustomAgent(t *testing.T) {
 }
 
 func TestGetACPCommand(t *testing.T) {
-	t.Parallel()
+	// Cannot use t.Parallel — ResetRegistryForTesting mutates the
+	// package-level globalRegistry that other tests read concurrently.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
