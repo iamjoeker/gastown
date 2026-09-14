@@ -1,38 +1,73 @@
-description = "Cross-cutting security concern. Applies security scanning before and after implementation steps."
+description = """
+Cross-cutting security concern: parallel security scanning of a change.
+
+Each aspect examines the change from a different security angle. Run this
+formula against implementation or submission diffs to catch vulnerabilities,
+hardcoded secrets, and vulnerable dependencies before merge.
+"""
 formula = "security-audit"
 type = "aspect"
 version = 1
 
-[[advice]]
-target = "implement"
-[advice.around]
+[[aspects]]
+id = "secrets-scan"
+title = "Secrets Scan"
+focus = "Hardcoded secrets and credentials"
+description = """
+Review new and changed code for secrets/credentials in scope.
 
-[[advice.around.after]]
-description = "Post-implementation security scan. Scan new code for vulnerabilities (SAST). Check for hardcoded secrets. Review for OWASP Top 10 issues."
-id = "{step.id}-security-postscan"
-title = "Security postscan for {step.id}"
+**Look for:**
+- Hardcoded API keys, tokens, or passwords
+- Credentials committed in config files or fixtures
+- Private keys or certificates checked into the repo
 
-[[advice.around.before]]
-description = "Pre-implementation security check. Review for secrets/credentials in scope. Check dependencies for known vulnerabilities."
-id = "{step.id}-security-prescan"
-title = "Security prescan for {step.id}"
+**Questions to answer:**
+- Would this leak a real secret if the diff were made public?
+- Are secrets loaded from environment/config rather than embedded?
+"""
 
-[[advice]]
-target = "submit"
-[advice.around]
+[[aspects]]
+id = "dependency-scan"
+title = "Dependency Scan"
+focus = "Known vulnerabilities in dependencies"
+description = """
+Check dependencies touched by this change for known vulnerabilities.
 
-[[advice.around.after]]
-description = "Post-submission security verification. Confirm no new vulnerabilities introduced."
-id = "{step.id}-security-postscan"
-title = "Security postscan for {step.id}"
+**Look for:**
+- New or upgraded dependencies with known CVEs
+- Pinned versions older than a known-fixed release
 
-[[advice.around.before]]
-description = "Pre-submission security check. Final vulnerability scan before merge."
-id = "{step.id}-security-prescan"
-title = "Security prescan for {step.id}"
+**Questions to answer:**
+- Does this change introduce or retain a vulnerable dependency?
+"""
 
-[[pointcuts]]
-glob = "implement"
+[[aspects]]
+id = "sast-scan"
+title = "Static Analysis Scan"
+focus = "Vulnerabilities and OWASP Top 10 issues in new code"
+description = """
+Scan new code for vulnerabilities (SAST). Review for OWASP Top 10 issues.
 
-[[pointcuts]]
-glob = "submit"
+**Look for:**
+- Injection vulnerabilities (SQL, XSS, command, LDAP)
+- Authentication/authorization bypasses
+- Insecure cryptographic usage
+- Path traversal, SSRF, deserialization vulnerabilities
+
+**Questions to answer:**
+- What can a malicious user do with this code?
+- Are there defense-in-depth gaps?
+"""
+
+[[aspects]]
+id = "pre-merge-verification"
+title = "Pre-Merge Security Verification"
+focus = "Final vulnerability confirmation before merge"
+description = """
+Final vulnerability scan before merge. Confirm no new vulnerabilities were
+introduced by the change as a whole.
+
+**Questions to answer:**
+- Do the findings from the other aspects block this merge?
+- Has anything changed since those aspects ran that needs a re-scan?
+"""

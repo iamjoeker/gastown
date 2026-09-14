@@ -9,11 +9,6 @@ import (
 // TestParseRealFormulas tests parsing all embedded formula files.
 // Composition formulas (extends/compose) are now also resolved and validated.
 func TestParseRealFormulas(t *testing.T) {
-	// Formulas that use aspect-oriented features not yet implemented.
-	skipFormulas := map[string]string{
-		"security-audit.formula.toml": "uses aspect-oriented features (advice/pointcuts)",
-	}
-
 	entries, err := fs.ReadDir(formulasFS, "formulas")
 	if err != nil {
 		t.Fatalf("reading embedded formulas: %v", err)
@@ -25,11 +20,6 @@ func TestParseRealFormulas(t *testing.T) {
 		}
 		name := entry.Name()
 		t.Run(name, func(t *testing.T) {
-			if reason, ok := skipFormulas[name]; ok {
-				t.Skipf("skipping: %s", reason)
-				return
-			}
-
 			data, err := formulasFS.ReadFile("formulas/" + name)
 			if err != nil {
 				t.Fatalf("reading formula: %v", err)
