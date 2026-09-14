@@ -540,3 +540,23 @@ func TestDogRaiseDispatchAlarms_SkipsResultsWithoutAlarms(t *testing.T) {
 		t.Errorf("raised %v, want none", raised)
 	}
 }
+
+// =============================================================================
+// Dispatch positional argument rejection (gt-xqybw)
+// =============================================================================
+
+// A bare positional dog name must be rejected rather than silently discarded
+// in favor of whatever dog happens to be idle.
+func TestDogDispatchRejectsPositionalArg(t *testing.T) {
+	if err := dogDispatchCmd.Args(dogDispatchCmd, []string{"charlie"}); err == nil {
+		t.Fatal("expected error for positional dog name, got nil")
+	} else if !strings.Contains(err.Error(), "--dog") {
+		t.Errorf("error should point users at --dog, got: %v", err)
+	}
+}
+
+func TestDogDispatchAllowsNoPositionalArgs(t *testing.T) {
+	if err := dogDispatchCmd.Args(dogDispatchCmd, []string{}); err != nil {
+		t.Errorf("expected no error with no positional args, got: %v", err)
+	}
+}

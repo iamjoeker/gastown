@@ -277,6 +277,12 @@ Examples:
   gt dog dispatch --plugin rebuild-gt --create
   gt dog dispatch --plugin rebuild-gt --dry-run
   gt dog dispatch --plugin rebuild-gt --json`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf("unexpected argument %q: target a dog with --dog, not a positional argument", args[0])
+		}
+		return nil
+	},
 	RunE: runDogDispatch,
 }
 
