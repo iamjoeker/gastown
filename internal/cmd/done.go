@@ -3233,16 +3233,21 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID string) error
 	// paused for resumption". Close them on DEFERRED so the convoy can advance.
 	isWorkflowStep := strings.Contains(hookedBeadID, "-wfs-")
 
-	if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
+	// BUG FIX (gt-6lok0): a polecat that determines "nothing to implement" and
+	// self-closes its hooked bead (bd close --reason="no-changes: ...") before
+	// calling gt done --status DEFERRED — the exact flow the polecat formula
+	// prescribes for report-only/no-changes outcomes — is not stuck: it finished
+	// its assignment cleanly. Without this flag, the exitType != ExitCompleted
+	// check below unconditionally lands it on agent_state=stuck, requiring a
+	// human/mayor to run `gt polecat clear-state` even though nothing is wrong.
+	sourceAlreadyClosedByPolecat := false
+
+	if hookedBeadID != "" {
 		// BUG FIX (gt-pftz): Close hooked bead unless already terminal (closed/tombstone).
 		// Previously checked hookedBead.Status == StatusHooked, but polecats update
 		// their work bead to in_progress during work. The exact-match check caused
 		// gt done to skip closing the bead, leaving it as unassigned open work after
 		// the hook was cleared — triggering infinite dispatch loops.
-		//
-		// DEFERRED exits preserve the bead: work is paused, not done. The bead
-		// stays open/in_progress so it can be resumed on the next session.
-		// Exception: workflow step beads (*-wfs-*) are always closed — see above.
 		hookBd, _, _ := routedIssueBeads(beadsPath, hookedBeadID)
 		if hookBd == nil {
 			hookBd = bd
@@ -3258,9 +3263,22 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID string) error
 			// invisible to it. Each dog run therefore leaked ~9 wisps that the next
 			// run had to reap, which is why the wisp count never converged.
 			//
-			// The bead is done, so only the molecule needs closing here.
+			// The bead is done, so only the molecule needs closing here. This check
+			// runs regardless of exit type/DEFERRED-preserves-work below (gt-6lok0):
+			// a polecat that self-closed its own bead as "no-changes" before calling
+			// `gt done --status DEFERRED` (the formula-prescribed report-only flow)
+			// already finished cleanly — it must not be treated as paused work.
 			if beads.IssueStatus(hookedBead.Status).IsTerminal() {
+				sourceAlreadyClosedByPolecat = true
 				closeAttachedWorkMolecule(hookBd, hookedBead)
+				goto doneStateUpdate
+			}
+
+			// DEFERRED exits preserve a still-open bead: work is paused, not done.
+			// The bead stays open/in_progress so it can be resumed on the next
+			// session. Exception: workflow step beads (*-wfs-*) are always closed
+			// on DEFERRED — see the comment above isWorkflowStep.
+			if exitType == ExitDeferred && !isWorkflowStep {
 				goto doneStateUpdate
 			}
 
@@ -3332,7 +3350,7 @@ doneStateUpdate:
 	// Completion metadata (exit_type, MR ID, branch) remains on the agent bead
 	// for audit purposes and anomaly detection by witness patrol.
 	doneState := string(beads.AgentStateDone)
-	if exitType != ExitCompleted {
+	if exitType != ExitCompleted && !sourceAlreadyClosedByPolecat {
 		doneState = "stuck"
 	}
 	// Use UpdateAgentState to sync both column and description (gt-ulom).
