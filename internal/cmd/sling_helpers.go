@@ -1470,8 +1470,36 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 	const maxRetries = 10
 	const baseBackoff = 500 * time.Millisecond
 	const maxBackoff = 30 * time.Second
+	// maxTotalRetryWait bounds the cumulative time this function will spend
+	// SLEEPING between attempts (gt-fwr1n). Without this cap, maxRetries=10 with
+	// exponential backoff up to maxBackoff=30s sums to ~120-150s of sleep alone,
+	// before accounting for the two `bd` subprocess calls (update + verify) made
+	// per attempt. This whole call happens while dispatchScheduledWork holds
+	// .runtime/scheduler-dispatch.lock, so a single stuck hook attempt was able
+	// to block ALL dispatch (every rig, every future daemon heartbeat) for up to
+	// the daemon's 5-minute hard timeout. Capping the sleep budget bounds the
+	// worst case without removing the retry's ability to ride out a genuinely
+	// transient Dolt hiccup.
+	const maxTotalRetryWait = 60 * time.Second
 	skipVerify := os.Getenv("GT_TEST_SKIP_HOOK_VERIFY") != ""
 
+	start := time.Now()
+	// budgetedSleep sleeps for backoff, but never past maxTotalRetryWait total
+	// elapsed since the first attempt. Returns false (do not retry further) once
+	// the budget is exhausted, so a congested Dolt/bd cannot pin this call — and
+	// the exclusive scheduler-dispatch.lock it runs under — for the full
+	// exponential-backoff worst case (gt-fwr1n).
+	budgetedSleep := func(backoff time.Duration) bool {
+		elapsed := time.Since(start)
+		if elapsed >= maxTotalRetryWait {
+			return false
+		}
+		if remaining := maxTotalRetryWait - elapsed; backoff > remaining {
+			backoff = remaining
+		}
+		time.Sleep(backoff)
+		return true
+	}
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		out, err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
@@ -1490,10 +1518,11 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 			if attempt < maxRetries {
 				backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
 				fmt.Printf("%s Hook attempt %d failed, retrying in %v...\n", style.Warning.Render("⚠"), attempt, backoff)
-				time.Sleep(backoff)
-				continue
+				if budgetedSleep(backoff) {
+					continue
+				}
 			}
-			return fmt.Errorf("hooking bead after %d attempts: %w", maxRetries, err)
+			return fmt.Errorf("hooking bead after %d attempts (retry budget %v): %w", attempt, maxTotalRetryWait, err)
 		}
 
 		if skipVerify {
@@ -1506,10 +1535,11 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 			if attempt < maxRetries {
 				backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
 				fmt.Printf("%s Hook verification failed, retrying in %v...\n", style.Warning.Render("⚠"), backoff)
-				time.Sleep(backoff)
-				continue
+				if budgetedSleep(backoff) {
+					continue
+				}
 			}
-			return fmt.Errorf("verifying hook after %d attempts: %w", maxRetries, lastErr)
+			return fmt.Errorf("verifying hook after %d attempts (retry budget %v): %w", attempt, maxTotalRetryWait, lastErr)
 		}
 
 		// Read back through beads.SameAgentAddress: the hook write and this
@@ -1522,10 +1552,11 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 			if attempt < maxRetries {
 				backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
 				fmt.Printf("%s %v, retrying in %v...\n", style.Warning.Render("⚠"), lastErr, backoff)
-				time.Sleep(backoff)
-				continue
+				if budgetedSleep(backoff) {
+					continue
+				}
 			}
-			return fmt.Errorf("hook failed after %d attempts: %w", maxRetries, lastErr)
+			return fmt.Errorf("hook failed after %d attempts (retry budget %v): %w", attempt, maxTotalRetryWait, lastErr)
 		}
 
 		break
