@@ -1093,13 +1093,25 @@ func TestHandoffMailTypeIsSafeToCloseOnRead(t *testing.T) {
 	}
 }
 
-// TestCleanupMoleculeOnHandoffCreatesDigest guards gt-5jin. Patrol formulas
-// end a cycle via `gt handoff`, not `gt mol squash` — cleanupMoleculeOnHandoff
-// is the code path actually exercised on every patrol cycle. Before this fix,
-// it detached and force-closed the molecule without ever creating a "Digest:"
-// bead, so `gt patrol digest` found zero rows on any date regardless of how
-// many patrol cycles ran: nothing in the real lifecycle ever created one for
-// it to find, even after that command's own query bug was fixed (gt-1r3t).
+// TestCleanupMoleculeOnHandoffCreatesDigest guards gt-hbkvi (and, before it,
+// gt-5jin). Patrol formulas end a cycle via `gt handoff`, not `gt mol
+// squash` — cleanupMoleculeOnHandoff is the code path actually exercised on
+// every patrol cycle.
+//
+// Before gt-hbkvi, this function looked up a "pinned Handoff" placeholder
+// bead via FindHandoffBead (status=pinned) and read an attached_molecule
+// field from it. That shape does not match production: patrol agents never
+// get a placeholder bead — the daemon hooks the molecule ROOT wisp directly
+// to the agent (status=hooked, issue_type=molecule; measured live: e.g.
+// "mol-witness-patrol" hooked to assignee "gastown/witness"). So
+// FindHandoffBead(role) never matched anything, cleanupMoleculeOnHandoff
+// silently no-opped on every patrol cycle, and zero "Digest: ..." beads
+// were ever created — `gt patrol digest` always found zero rows to
+// aggregate regardless of how many patrol cycles ran, even after that
+// command's own query bug was fixed (gt-1r3t).
+//
+// This test stubs the hooked bead as the molecule root itself (the
+// patrol-agent shape) and asserts a digest bead is created for it.
 func TestCleanupMoleculeOnHandoffCreatesDigest(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script bd stub not supported on Windows")
@@ -1126,14 +1138,17 @@ while [ "$1" = "--allow-stale" ]; do shift; done
 cmd="$1"; shift
 case "$cmd" in
   list)
-    if echo "$*" | grep -q "status=pinned"; then
-      echo '[{"id":"gt-handoff-1","title":"refinery Handoff","status":"pinned","description":"attached_molecule: gt-wisp-patrol1"}]'
-    else
+    echo '[]'
+    ;;
+  query)
+    if echo "$*" | grep -q "parent="; then
       echo '[]'
+    else
+      echo '[{"id":"gt-wisp-patrol1","title":"mol-refinery-patrol","status":"hooked","issue_type":"molecule"}]'
     fi
     ;;
   show)
-    echo '[{"id":"gt-handoff-1","title":"refinery Handoff","status":"pinned","description":"attached_molecule: gt-wisp-patrol1"}]'
+    echo '[{"id":"gt-wisp-patrol1","title":"mol-refinery-patrol","status":"hooked","issue_type":"molecule"}]'
     ;;
   update)
     exit 0

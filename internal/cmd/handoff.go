@@ -1643,22 +1643,32 @@ func cleanupMoleculeOnHandoff() {
 
 	b := beads.New(workDir)
 
-	// Extract the role name for FindHandoffBead
-	parts := strings.Split(agentID, "/")
-	role := parts[len(parts)-1]
-
-	handoffBead, err := b.FindHandoffBead(role)
-	if err != nil || handoffBead == nil {
+	// Find the agent's currently active work bead. This used to look up a
+	// "pinned Handoff" placeholder bead via FindHandoffBead (status=pinned)
+	// and read its attached_molecule field. In current practice, patrol
+	// agents (deacon, witness, refinery, dogs) never get such a placeholder
+	// — the daemon hooks the molecule ROOT wisp directly to the agent
+	// (status=hooked, issue_type=molecule), so FindHandoffBead never
+	// matched anything and this cleanup silently no-opped on every patrol
+	// cycle: zero "Digest: ..." beads were ever created, so `gt patrol
+	// digest` always found zero rows to aggregate (gt-hbkvi). Polecats are
+	// the other shape: their hooked bead is the work issue itself, carrying
+	// a separate attached_molecule pointer. Handle both.
+	hookedBeads, err := listAssignedActiveWork(b, agentID)
+	if err != nil || len(hookedBeads) == 0 {
 		return
 	}
+	hookedBead := hookedBeads[0]
 
-	// Check for attached molecule on the handoff bead
-	attachment := beads.ParseAttachmentFields(handoffBead)
-	if attachment == nil || attachment.AttachedMolecule == "" {
+	var molID string
+	if attachment := beads.ParseAttachmentFields(hookedBead); attachment != nil && attachment.AttachedMolecule != "" {
+		molID = attachment.AttachedMolecule
+	} else if hookedBead.Type == "molecule" {
+		molID = hookedBead.ID
+	}
+	if molID == "" {
 		return
 	}
-
-	molID := attachment.AttachedMolecule
 
 	// Close descendant steps (the leaked wisps)
 	if n := closeDescendants(b, molID); n > 0 {
@@ -1675,8 +1685,10 @@ func cleanupMoleculeOnHandoff() {
 		fmt.Fprintf(os.Stderr, "handoff: warning: creating digest for %s: %v\n", molID, err)
 	}
 
-	// Detach molecule with audit trail
-	if _, err := b.DetachMoleculeWithAudit(handoffBead.ID, beads.DetachOptions{
+	// Detach molecule with audit trail. A no-op when hookedBead IS the
+	// molecule root (patrol-agent shape) — DetachMoleculeWithAudit returns
+	// early when the bead carries no attachment fields to clear.
+	if _, err := b.DetachMoleculeWithAudit(hookedBead.ID, beads.DetachOptions{
 		Operation: "squash",
 		Reason:    "handoff: session cycling",
 	}); err != nil {
