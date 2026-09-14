@@ -652,6 +652,15 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return errors.New(refusal)
 	}
 
+	// Guard against dispatching role-owned patrol steps (deacon's/witness's own
+	// patrol-cycle content) to the general polecat pool (gt-pjuow). This is the
+	// shared choke point for `gt sling` — every exec-based caller (deacon's
+	// slingBead re-dispatch, the convoy manager's stranded-convoy feeder) routes
+	// through this CLI entry point.
+	if refusal := beads.RoleOwnedPatrolDispatchRefusal(beadID, info.Description); refusal != "" && !slingForce {
+		return errors.New(refusal)
+	}
+
 	// Guard against duplicate work: an open MR means this bead's branch is
 	// already queued to merge (gt-79li). Checked against slingForce here — the
 	// dead-agent auto-force below runs later and must not bypass this.

@@ -336,15 +336,12 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 
 // isRoleOwnedPatrolFormulaName reports whether formulaName names a role's
 // own patrol loop (mol-deacon-patrol, mol-witness-patrol, mol-refinery-patrol,
-// mol-pr-feedback-patrol, ...) rather than generic dispatchable work. Mirrors
-// isRoleOwnedPatrolFormula in internal/deacon/redispatch.go, which applies
-// the same rule on the recovery/re-dispatch path.
+// mol-pr-feedback-patrol, ...) rather than generic dispatchable work.
+//
+// Delegates to beads.IsRoleOwnedPatrolFormula, the single shared guard used
+// by every dispatch surface (gt-pjuow).
 func isRoleOwnedPatrolFormulaName(formulaName string) bool {
-	formulaName = strings.ToLower(strings.TrimSpace(formulaName))
-	if formulaName == "" {
-		return false
-	}
-	return strings.HasSuffix(formulaName, "-patrol")
+	return beads.IsRoleOwnedPatrolFormula(formulaName)
 }
 
 // dryRunFormula shows what would happen without executing

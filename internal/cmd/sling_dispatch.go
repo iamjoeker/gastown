@@ -178,6 +178,15 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		return result, errors.New(refusal)
 	}
 
+	// Guard against dispatching role-owned patrol steps (deacon's/witness's own
+	// patrol-cycle content) to the general polecat pool (gt-pjuow). This is the
+	// shared choke point for scheduler epic/convoy dispatch, capacity dispatch,
+	// and batch sling — every caller of executeSling.
+	if refusal := beads.RoleOwnedPatrolDispatchRefusal(params.BeadID, info.Description); refusal != "" && !explicitForce {
+		result.ErrMsg = "role-owned patrol step"
+		return result, errors.New(refusal)
+	}
+
 	if params.RigName != "" {
 		if err := verifyBeadExistsInTargetRigDatabase(params.BeadID, params.RigName, townRoot); err != nil {
 			result.ErrMsg = err.Error()

@@ -387,22 +387,14 @@ func resolveRigFromBead(townRoot, beadID string) string {
 	return beads.GetRigNameForPrefix(townRoot, prefix)
 }
 
-// roleOwnedPatrolFormulaSuffix marks a formula as a role's own patrol loop
-// (mol-deacon-patrol, mol-witness-patrol, mol-refinery-patrol,
-// mol-pr-feedback-patrol, ...) rather than generic dispatchable work.
-// Patrol formulas are worked in-process by the owning role's own session
-// (see startDeaconSession); their materialized step beads must never be
-// slung to a rig's general polecat pool.
-const roleOwnedPatrolFormulaSuffix = "-patrol"
-
 // isRoleOwnedPatrolFormula reports whether formula is a role-owned patrol
 // molecule whose steps must stay reserved for that role's own session.
+//
+// Delegates to beads.IsRoleOwnedPatrolFormula, the single shared guard used
+// by every dispatch surface (gt-pjuow) — this alias exists only so this
+// file's other call site doesn't need a second import-qualified name.
 func isRoleOwnedPatrolFormula(formula string) bool {
-	formula = strings.ToLower(strings.TrimSpace(formula))
-	if formula == "" {
-		return false
-	}
-	return strings.HasSuffix(formula, roleOwnedPatrolFormulaSuffix)
+	return beads.IsRoleOwnedPatrolFormula(formula)
 }
 
 // getBeadAttachedFormulaForRedispatch returns the attached_formula field
