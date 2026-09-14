@@ -996,6 +996,32 @@ func TestOutputAutonomousDirectiveForkRigAvoidsMergeQueueGuidance(t *testing.T) 
 	}
 }
 
+func TestOutputAutonomousDirectiveHQBeadUsesTownRootCd(t *testing.T) {
+	townRoot := t.TempDir()
+
+	output := captureStdout(t, func() {
+		outputAutonomousDirective(RoleContext{Role: RolePolecat, Rig: "myrig", TownRoot: townRoot, WorkDir: filepath.Join(townRoot, "myrig"), Polecat: "scout"}, &beads.Issue{ID: "hq-abcd", Title: "test"}, false)
+	})
+	want := "`(cd " + townRoot + " && bd show hq-abcd)`"
+	if !strings.Contains(output, want) {
+		t.Fatalf("expected directive to cd into town root for hq- bead, got:\n%s", output)
+	}
+}
+
+func TestOutputAutonomousDirectiveRigBeadUsesBareShow(t *testing.T) {
+	townRoot := t.TempDir()
+
+	output := captureStdout(t, func() {
+		outputAutonomousDirective(RoleContext{Role: RolePolecat, Rig: "myrig", TownRoot: townRoot, WorkDir: filepath.Join(townRoot, "myrig"), Polecat: "scout"}, &beads.Issue{ID: "gt-abcd", Title: "test"}, false)
+	})
+	if !strings.Contains(output, "`bd show gt-abcd`") {
+		t.Fatalf("expected directive to use bare bd show for rig-local bead, got:\n%s", output)
+	}
+	if strings.Contains(output, "cd "+townRoot) {
+		t.Fatalf("did not expect a cd into town root for a rig-local bead, got:\n%s", output)
+	}
+}
+
 func TestOutputMoleculeWorkflowForkRigOverridesFormulaMergeQueueReminder(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "myrig"), 0o755); err != nil {

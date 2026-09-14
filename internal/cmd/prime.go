@@ -917,6 +917,13 @@ func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMole
 		fmt.Println("2. This bead has an ATTACHED MOLECULE (formula workflow)")
 		fmt.Println("3. Work through molecule steps in order - see CURRENT STEP below")
 		fmt.Println("4. Close each step with `bd close <step-id>`, then check `bd mol current` for next step")
+	} else if strings.HasPrefix(hookedBead.ID, "hq-") && ctx.TownRoot != "" && ctx.TownRoot != ctx.WorkDir {
+		// hq-* beads live in the town-level database. .beads/routes.jsonl maps
+		// the hq- prefix with a path relative to cwd, so a bare `bd show`
+		// issued from a rig cwd resolves to the rig's own database and fails
+		// to find the bead even though it exists. (gt-0qolg)
+		fmt.Printf("2. Then IMMEDIATELY run: `(cd %s && bd show %s)`\n", ctx.TownRoot, hookedBead.ID)
+		fmt.Println("3. Begin execution - no waiting for user input")
 	} else {
 		fmt.Printf("2. Then IMMEDIATELY run: `bd show %s`\n", hookedBead.ID)
 		fmt.Println("3. Begin execution - no waiting for user input")
