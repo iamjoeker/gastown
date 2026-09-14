@@ -369,6 +369,9 @@ type RefineryStatusOutput struct {
 	Turn        string `json:"turn,omitempty"`
 	Session     string `json:"session,omitempty"`
 	QueueLength int    `json:"queue_length"`
+	// QueueError is set when the queue could not be read (e.g. the
+	// remote_migrate_gate hold). QueueLength is meaningless when this is set.
+	QueueError string `json:"queue_error,omitempty"`
 }
 
 func runRefineryStatus(cmd *cobra.Command, args []string) error {
@@ -393,7 +396,7 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get queue from beads
-	queue, _ := mgr.Queue()
+	queue, queueErr := mgr.Queue()
 	queueLen := len(queue)
 
 	// JSON output
@@ -403,6 +406,9 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 			RigName:     rigName,
 			Turn:        turn,
 			QueueLength: queueLen,
+		}
+		if queueErr != nil {
+			output.QueueError = queueErr.Error()
 		}
 		if sessionInfo != nil {
 			output.Session = sessionInfo.Name
@@ -427,7 +433,11 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  State: %s\n", style.Dim.Render("○ stopped"))
 	}
 
-	fmt.Printf("\n  Queue: %d pending\n", queueLen)
+	if queueErr != nil {
+		fmt.Printf("\n  Queue: %s\n", style.Dim.Render(fmt.Sprintf("unknown (gated: %v)", queueErr)))
+	} else {
+		fmt.Printf("\n  Queue: %d pending\n", queueLen)
+	}
 
 	return nil
 }
