@@ -71,6 +71,16 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("session %q not found", sessionName)
 	}
 
+	// Capture the session's identity (creation time) so a same-named
+	// replacement session doesn't fool the liveness check below. tmux
+	// session names are reused; #{session_created} is not, so a poller
+	// started against session N must exit when N dies even if a session
+	// with the same name comes back before the poller notices (gt-as32).
+	sessionCreatedAt, err := t.GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		return fmt.Errorf("reading session identity for %q: %w", sessionName, err)
+	}
+
 	// Resolve nudge options once at startup: if the target agent uses Escape
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
@@ -100,9 +110,14 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			return nil // graceful shutdown
 
 		case <-ticker.C:
-			// Check if session still exists.
+			// Check if session still exists, and that it's still the SAME
+			// session we started against. A name-only check would re-attach
+			// to a same-named replacement session forever (gt-as32).
 			if exists, _ := t.HasSession(sessionName); !exists {
 				return nil // session gone, exit
+			}
+			if created, err := t.GetSessionCreatedUnix(sessionName); err == nil && created != sessionCreatedAt {
+				return nil // session was replaced under the same name, exit
 			}
 
 			// Check if there are queued nudges.
