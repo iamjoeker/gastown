@@ -354,6 +354,37 @@ func TestSweepFlagsMissingBeadAsCheck(t *testing.T) {
 	}
 }
 
+// A CHECK row names the predicate that was inconclusive (gt-t3v9): a reader
+// who does not already know the patch-id asymmetry needs the row itself to
+// say that "not patch-identical" is expected after a rewriting rebase, not
+// evidence that anything is wrong.
+func TestSweepCheckNoteNamesTheInconclusivePredicate(t *testing.T) {
+	g := &fakeSweepGit{
+		refs: []git.RemoteRef{remoteRef("polecat/a/gt-aqk+aaa", "sha1")},
+		status: map[string]git.BranchPreservationStatus{
+			"polecat/a/gt-aqk+aaa": {Preserved: false, UnpreservedPatchCount: 2, ComparisonBase: "origin/main"},
+		},
+	}
+	bd := &fakeSweepBeads{
+		issues: map[string]*beads.Issue{"gt-aqk": {ID: "gt-aqk", Status: "closed"}},
+		mrs:    []*beads.Issue{mrBead("gt-wisp-0an54", "closed", "polecat/a/gt-aqk+aaa", "gt-aqk", "rejected")},
+	}
+	result, err := SweepUnmergedPolecatBranches(g, bd, BranchSweepOptions{Targets: []string{"origin/main"}})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	f := findingFor(t, result, "polecat/a/gt-aqk+aaa")
+	if f.Class != BranchSweepCheck {
+		t.Fatalf("class = %q, want check", f.Class)
+	}
+	if !strings.Contains(f.Note, "NOT patch-identical to origin/main") {
+		t.Fatalf("note %q does not name the comparison target", f.Note)
+	}
+	if !strings.Contains(f.Note, "rewriting rebase") || !strings.Contains(f.Note, "cannot distinguish superseded from stranded") {
+		t.Fatalf("note %q does not explain why the predicate is inconclusive", f.Note)
+	}
+}
+
 // A failed MR listing must be announced, because every "no MR" under it is
 // unmeasured rather than measured.
 func TestSweepMarksMRsUnmeasuredWhenListingFails(t *testing.T) {

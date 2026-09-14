@@ -763,7 +763,7 @@ func classifyBranch(
 	}
 
 	finding.Class = BranchSweepCheck
-	finding.Note = branchCheckNote(finding, mrsMeasured)
+	finding.Note = branchCheckNote(finding, mrsMeasured, status.ComparisonBase)
 	return finding, nil
 }
 
@@ -1036,7 +1036,15 @@ func branchStalledNote(f BranchSweepFinding, mrsMeasured bool) string {
 // "CHECK" is a request to look, not a verdict that work is lost — the sweep
 // cannot tell a prematurely closed bead from a correctly closed one whose
 // branch is redundant, and saying otherwise is how a detector gets ignored.
-func branchCheckNote(f BranchSweepFinding, mrsMeasured bool) string {
+//
+// It names the predicate that was inconclusive rather than leaving the reader
+// to infer it: this row is reached only because the branch is NOT
+// patch-identical to comparisonBase, and that inequality is expected after a
+// rewriting rebase — it cannot by itself distinguish superseded from
+// stranded. Patch-id equality is the reliable direction (BranchSweepLanded
+// above short-circuits on it); its absence is not evidence of loss, only of
+// "unproven", which is why this stays a CHECK instead of becoming a verdict.
+func branchCheckNote(f BranchSweepFinding, mrsMeasured bool, comparisonBase string) string {
 	var b strings.Builder
 	b.WriteString("bead ")
 	b.WriteString(f.IssueID)
@@ -1058,7 +1066,12 @@ func branchCheckNote(f BranchSweepFinding, mrsMeasured bool) string {
 			b.WriteString(")")
 		}
 	}
-	b.WriteString(" — check whether this was superseded or stranded")
+	b.WriteString("; branch is NOT patch-identical to ")
+	if comparisonBase == "" {
+		comparisonBase = "the target"
+	}
+	b.WriteString(comparisonBase)
+	b.WriteString(", which is expected after a rewriting rebase and therefore cannot distinguish superseded from stranded - verify by content")
 	return b.String()
 }
 
