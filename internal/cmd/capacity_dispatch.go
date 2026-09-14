@@ -224,6 +224,10 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 	successfulRigs := make(map[string]bool)
 	// Track polecat names from dispatch results, keyed by context bead ID.
 	polecatNames := make(map[string]string)
+	// Running count of items dispatched so far this cycle, used to update the
+	// scheduler state incrementally so `gt scheduler status` doesn't read as
+	// hung during a long-running cycle (gt-trn65).
+	dispatchedSoFar := 0
 	cycle := &capacity.DispatchCycle{
 		Validate: func(b capacity.PendingBead) error {
 			return validatePendingBeadForDispatch(townRoot, b, true)
@@ -247,7 +251,18 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		OnSuccess: func(b capacity.PendingBead) error {
 			// OnSuccess may be retried — only do the close here, no side effects.
 			// Route to the correct rig's beads dir (GH#3468).
-			return beadsForPendingContext(townRoot, b).CloseSlingContext(b.ID, "dispatched")
+			if err := beadsForPendingContext(townRoot, b).CloseSlingContext(b.ID, "dispatched"); err != nil {
+				return err
+			}
+			// Update runtime state per-item so a long-running cycle reports live
+			// progress instead of only updating after the whole cycle exits.
+			// Fresh-read to avoid clobbering a concurrent `gt scheduler pause`.
+			dispatchedSoFar++
+			if freshState, err := capacity.LoadState(townRoot); err == nil {
+				freshState.RecordDispatch(dispatchedSoFar)
+				_ = capacity.SaveState(townRoot, freshState)
+			}
+			return nil
 		},
 		OnFailure: func(b capacity.PendingBead, err error) {
 			var onSuccessErr *capacity.ErrOnSuccessFailed
@@ -297,18 +312,9 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		wakeRigAgents(rig)
 	}
 
-	// Update runtime state with fresh read to avoid clobbering concurrent pause.
-	if report.Dispatched > 0 {
-		freshState, err := capacity.LoadState(townRoot)
-		if err != nil {
-			fmt.Printf("%s Could not reload scheduler state: %v\n", style.Dim.Render("Warning:"), err)
-		} else {
-			freshState.RecordDispatch(report.Dispatched)
-			if err := capacity.SaveState(townRoot, freshState); err != nil {
-				fmt.Printf("%s Could not save scheduler state: %v\n", style.Dim.Render("Warning:"), err)
-			}
-		}
-	}
+	// Runtime state (last_dispatch_at/count) is now updated incrementally per
+	// item in OnSuccess above, so `gt scheduler status` reflects live progress
+	// during a long-running cycle instead of only after it exits (gt-trn65).
 
 	if report.Dispatched > 0 || report.Failed > 0 {
 		fmt.Printf("\n%s Dispatched %d, failed %d (reason: %s)\n",
