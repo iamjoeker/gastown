@@ -231,6 +231,54 @@ func TestSshKeepaliveEnvYieldsToAConfiguredSshCommand(t *testing.T) {
 	})
 }
 
+// TestRefspecFetchSSHKeepaliveEnvIsInstalledByDefault covers the free-standing
+// fetches in configureRefspec (gt-ooux): they run against a bare gitDir before
+// any *Git wraps the repo, so they can't call the (*Git) method above, but they
+// hit the exact same dead-TCP-connection shape gt-i9wz measured and deserve the
+// same defense.
+func TestRefspecFetchSSHKeepaliveEnvIsInstalledByDefault(t *testing.T) {
+	t.Setenv("GIT_SSH_COMMAND", "")
+	t.Setenv("GIT_SSH", "")
+	dir := initTestRepo(t)
+
+	env := refspecFetchSSHKeepaliveEnv(filepath.Join(dir, ".git"))
+	if len(env) != 1 {
+		t.Fatalf("refspecFetchSSHKeepaliveEnv() = %v, want exactly one GIT_SSH_COMMAND entry", env)
+	}
+	value := strings.TrimPrefix(env[0], "GIT_SSH_COMMAND=")
+	if value == env[0] {
+		t.Fatalf("refspecFetchSSHKeepaliveEnv() = %q, want a GIT_SSH_COMMAND= assignment", env[0])
+	}
+	for _, want := range []string{"ServerAliveInterval=15", "ServerAliveCountMax=4", "ConnectTimeout=10"} {
+		if !strings.Contains(value, want) {
+			t.Fatalf("GIT_SSH_COMMAND = %q, missing %s", value, want)
+		}
+	}
+}
+
+// TestRefspecFetchSSHKeepaliveEnvYieldsToAConfiguredSshCommand mirrors
+// TestSshKeepaliveEnvYieldsToAConfiguredSshCommand for the free function.
+func TestRefspecFetchSSHKeepaliveEnvYieldsToAConfiguredSshCommand(t *testing.T) {
+	t.Setenv("GIT_SSH", "")
+
+	t.Run("core.sshCommand", func(t *testing.T) {
+		t.Setenv("GIT_SSH_COMMAND", "")
+		dir := initTestRepo(t)
+		runGit(t, dir, "config", "core.sshCommand", "ssh -i /custom/key")
+		if env := refspecFetchSSHKeepaliveEnv(filepath.Join(dir, ".git")); env != nil {
+			t.Fatalf("refspecFetchSSHKeepaliveEnv() = %v with core.sshCommand set, want nil", env)
+		}
+	})
+
+	t.Run("GIT_SSH_COMMAND", func(t *testing.T) {
+		t.Setenv("GIT_SSH_COMMAND", "ssh -i /custom/key")
+		dir := initTestRepo(t)
+		if env := refspecFetchSSHKeepaliveEnv(filepath.Join(dir, ".git")); env != nil {
+			t.Fatalf("refspecFetchSSHKeepaliveEnv() = %v with GIT_SSH_COMMAND set, want nil", env)
+		}
+	})
+}
+
 // TestDeadlineErrorNamesTheSubcommand guards the message a wedged agent reads.
 //
 // The subcommand is taken before --git-dir is prepended: taken after, every

@@ -982,6 +982,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 		gitDir = filepath.Join(repoPath, ".git")
 	}
 	gitDir = filepath.Clean(gitDir)
+	keepaliveEnv := refspecFetchSSHKeepaliveEnv(gitDir)
 
 	var stderr bytes.Buffer
 	configCmd := exec.Command("git", "--git-dir", gitDir, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
@@ -1022,6 +1023,9 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 			// Fallback: if HEAD is detached, try fetching all (shouldn't happen for clones)
 			fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin")
 			util.SetDetachedProcessGroup(fetchCmd)
+			if len(keepaliveEnv) > 0 {
+				fetchCmd.Env = append(os.Environ(), keepaliveEnv...)
+			}
 			fetchCmd.Stderr = &stderr
 			if fetchErr := fetchCmd.Run(); fetchErr != nil {
 				return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
@@ -1034,6 +1038,9 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 
 		fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin", refspec)
 		util.SetDetachedProcessGroup(fetchCmd)
+		if len(keepaliveEnv) > 0 {
+			fetchCmd.Env = append(os.Environ(), keepaliveEnv...)
+		}
 		fetchCmd.Stderr = &stderr
 		if err := fetchCmd.Run(); err != nil {
 			return fmt.Errorf("fetching origin %s: %s", branch, strings.TrimSpace(stderr.String()))
@@ -1043,12 +1050,35 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 
 	fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "origin")
 	util.SetDetachedProcessGroup(fetchCmd)
+	if len(keepaliveEnv) > 0 {
+		fetchCmd.Env = append(os.Environ(), keepaliveEnv...)
+	}
 	fetchCmd.Stderr = &stderr
 	if err := fetchCmd.Run(); err != nil {
 		return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
 	}
 
 	return nil
+}
+
+// refspecFetchSSHKeepaliveEnv mirrors (*Git).sshKeepaliveEnv for the three
+// fetches in configureRefspec, which run against a bare gitDir before any
+// *Git wrapping that repo exists. It gives those fetches the same defense
+// against a dead-but-open TCP connection as runFetch, without adding a
+// deadline — see the fetchTimeout doc comment for why these three are left
+// unbounded on purpose (gt-ooux).
+func refspecFetchSSHKeepaliveEnv(gitDir string) []string {
+	if strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND")) != "" || strings.TrimSpace(os.Getenv("GIT_SSH")) != "" {
+		return nil
+	}
+	var out bytes.Buffer
+	cmd := exec.Command("git", "--git-dir", gitDir, "config", "--get", "core.sshCommand")
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
+		return nil
+	}
+	return []string{"GIT_SSH_COMMAND=" + sshKeepaliveCommand}
 }
 
 // CloneBareWithReference clones a bare repository using a local repo as an object reference.
