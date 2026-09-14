@@ -1773,16 +1773,7 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 	// the panel renders the town calmest at its worst moment (gt-z5h7, and the
 	// same shape as gt-edty and gt-qee3). Unioned by ID rather than switched
 	// between, so it stays correct if bd's default ever changes.
-	type escalationIssue struct {
-		ID          string   `json:"id"`
-		Title       string   `json:"title"`
-		CreatedAt   string   `json:"created_at"`
-		CreatedBy   string   `json:"created_by"`
-		Labels      []string `json:"labels"`
-		Description string   `json:"description"`
-	}
-
-	var issues []escalationIssue
+	var issues []*beads.Issue
 	seen := make(map[string]bool)
 	for _, pinnedFilter := range []string{"--no-pinned", "--pinned"} {
 		stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", pinnedFilter, "--json", "--limit=0")
@@ -1790,18 +1781,59 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 			return nil, fmt.Errorf("listing escalations (%s): %w", pinnedFilter, err)
 		}
 
-		var half []escalationIssue
+		var half []*beads.Issue
 		if err := json.Unmarshal(stdout.Bytes(), &half); err != nil {
 			return nil, fmt.Errorf("parsing escalations (%s): %w", pinnedFilter, err)
 		}
 		for _, issue := range half {
-			if seen[issue.ID] {
+			if issue == nil || seen[issue.ID] {
 				continue
 			}
 			seen[issue.ID] = true
 			issues = append(issues, issue)
 		}
 	}
+
+	// This query returns delivered copies (durable issues), not the escalation
+	// record (the ephemeral hq-wisp-* bead) — before gt-4xl a closed escalation
+	// stayed here exactly as it stayed in `gt escalate list`. gt-4xl taught
+	// beads.CloseEscalation to close both halves, and beads.ListEscalations to
+	// drop copies whose record is already closed, but this fetcher runs its own
+	// query and never applied the same check, so copies stranded by pre-gt-4xl
+	// closes kept showing on the dashboard (gt-x1g0). Reapply the same
+	// record-status check beads.partitionResolvedEscalations does, caching by
+	// record ID so a dashboard refresh with many copies of the same escalation
+	// costs one `bd show` per record, not one per copy.
+	//
+	// Fails open like the original: a record that cannot be read (reaped, or
+	// Dolt unreachable) keeps its copy listed. Hiding a live escalation is far
+	// worse than showing a resolved one.
+	closedRecord := make(map[string]bool)
+	kept := issues[:0]
+	for _, issue := range issues {
+		recordID := beads.EscalationRecordID(issue)
+		if recordID == "" || recordID == issue.ID {
+			kept = append(kept, issue)
+			continue
+		}
+
+		resolved, checked := closedRecord[recordID]
+		if !checked {
+			stdout, err := f.runBdCmd(f.townRoot, "show", recordID, "--json")
+			if err == nil {
+				var records []*beads.Issue
+				if json.Unmarshal(stdout.Bytes(), &records) == nil && len(records) > 0 && records[0] != nil {
+					resolved = strings.EqualFold(records[0].Status, "closed")
+				}
+			}
+			closedRecord[recordID] = resolved
+		}
+		if resolved {
+			continue
+		}
+		kept = append(kept, issue)
+	}
+	issues = kept
 
 	var rows []EscalationRow
 	for _, issue := range issues {

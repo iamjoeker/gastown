@@ -119,6 +119,44 @@ JSON
 	}
 }
 
+// gt-x1g0: a delivered copy whose escalation record has already been closed
+// must not render on the dashboard. FetchEscalations used to render whatever
+// `bd list --label=gt:escalation --status=open` returned without checking
+// whether the copy's linked record (the ephemeral hq-wisp-* bead) had already
+// been closed, so a copy stranded by a `gt escalate close <record-id>` stayed
+// on this panel exactly as it stayed in the raw `bd list` output.
+func TestFetchEscalations_DropsCopyWhoseRecordIsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	f := fakeBdFetcher(t, `#!/bin/sh
+if [ "$1" = "show" ]; then
+  echo '[{"id":"hq-record1","status":"closed"}]'
+  exit 0
+fi
+pinned=0
+for arg in "$@"; do
+  if [ "$arg" = "--pinned" ]; then pinned=1; fi
+done
+if [ "$pinned" = "1" ]; then
+  echo '[]'
+else
+  echo '[{"id":"hq-copy1","title":"Stale copy","created_by":"gastown/witness","labels":["gt:escalation","escalation:hq-record1"]}]'
+fi
+`)
+
+	rows, err := f.FetchEscalations()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID == "hq-copy1" {
+			t.Errorf("rows = %+v, want the copy of a closed record excluded", rows)
+		}
+	}
+}
+
 // The panel must show pinned escalations. `bd list --status=open` is silently
 // `--no-pinned` and offers no include-pinned flag, so a single default query
 // drops them — and pinning is what an operator does to an escalation to keep it
