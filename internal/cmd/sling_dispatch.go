@@ -6,12 +6,22 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 )
+
+// logDispatchStepTiming prints how long a single executeSling step took.
+// gt-fwr1n: dispatch/spawn intermittently hung 100s-300s under load with no
+// visibility into which of the 12 executeSling steps was responsible. This
+// runs on every dispatch (not just slow ones) so a hang's daemon.log shows
+// the last step to print — the one that never returned.
+func logDispatchStepTiming(step string, start time.Time) {
+	fmt.Printf("  %s dispatch step=%s elapsed=%s\n", style.Dim.Render("⏱"), step, time.Since(start).Round(time.Millisecond))
+}
 
 // SlingParams captures everything needed to sling one bead to a rig.
 // This is the serialization boundary for queue dispatch: at enqueue time,
@@ -129,7 +139,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	// 1. Get bead info + status check. Ownership follows the live row, so a bead
 	// moved across rigs is read from the store that actually holds it instead of
 	// the closed copy its id prefix names (gt-ad32).
+	resolveOwnerStart := time.Now()
 	owner, err := resolveBeadOwner(townRoot, params.BeadID)
+	logDispatchStepTiming("resolve_bead_owner", resolveOwnerStart)
 	if err != nil {
 		result.ErrMsg = err.Error()
 		return result, fmt.Errorf("could not get bead info: %w", err)
@@ -282,7 +294,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		// the --create flag for non-rig targets via resolveTarget.
 		Create: true,
 	}
+	spawnStart := time.Now()
 	spawnInfo, err := spawnPolecatForSling(params.RigName, spawnOpts)
+	logDispatchStepTiming("spawn_polecat", spawnStart)
 	if err != nil {
 		result.ErrMsg = err.Error()
 		return result, fmt.Errorf("failed to spawn polecat: %w", err)
@@ -307,7 +321,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		existingConvoy := isTrackedByConvoy(params.BeadID)
 		if existingConvoy == "" {
 			var err error
+			convoyStart := time.Now()
 			convoyID, err = createAutoConvoy(params.BeadID, info.Title, params.Owned, params.Merge, params.BaseBranch)
+			logDispatchStepTiming("create_auto_convoy", convoyStart)
 			if err != nil {
 				fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 			} else {
@@ -322,7 +338,10 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	formulaCooked := params.SkipCook
 	if params.FormulaName != "" && !formulaCooked {
 		workDir := beads.ResolveHookDir(townRoot, params.BeadID, hookWorkDir)
-		if err := CookFormula(params.FormulaName, workDir, townRoot); err != nil {
+		cookStart := time.Now()
+		cookErr := CookFormula(params.FormulaName, workDir, townRoot)
+		logDispatchStepTiming("cook_formula", cookStart)
+		if err := cookErr; err != nil {
 			if params.FormulaFailFatal {
 				// Rollback spawned polecat on fatal cook failure
 				rollbackSpawnedPolecat(params.BeadID, "Formula cook failed")
@@ -357,7 +376,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		allVars = append(allVars, priorAttemptVars(prior)...)
 		varsForAttachment = append([]string(nil), allVars...)
 		formulaVarsForAttachment = strings.Join(allVars, "\n")
+		instantiateStart := time.Now()
 		formulaResult, err := InstantiateFormulaOnBead(context.Background(), params.FormulaName, params.BeadID, info.Title, hookWorkDir, townRoot, true, allVars)
+		logDispatchStepTiming("instantiate_formula", instantiateStart)
 		if err != nil {
 			if params.FormulaFailFatal {
 				// Rollback spawned polecat on fatal formula failure
@@ -420,7 +441,10 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
-	if err := hookBeadWithRetryWithTownRootFn(beadToHook, targetAgent, hookDir, townRoot); err != nil {
+	hookStart := time.Now()
+	hookErr := hookBeadWithRetryWithTownRootFn(beadToHook, targetAgent, hookDir, townRoot)
+	logDispatchStepTiming("hook_bead_with_retry", hookStart)
+	if err := hookErr; err != nil {
 		// Clean up all partial sling state, including raw metadata stored before hook.
 		rollbackSpawnedPolecat(beadToHook, "Hook failed")
 		result.ErrMsg = "hook failed"
@@ -447,7 +471,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 
 	// 11. Start polecat session
+	startSessionStart := time.Now()
 	pane, err := spawnInfo.StartSession()
+	logDispatchStepTiming("start_polecat_session", startSessionStart)
 	if err != nil {
 		fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
 		rollbackSpawnedPolecat(beadToHook, "Session failed")
