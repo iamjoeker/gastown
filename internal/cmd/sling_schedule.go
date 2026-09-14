@@ -112,6 +112,19 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("bead %s is deferred (use --force to override)", beadID)
 	}
 
+	// Guard against dispatching role-owned patrol steps (deacon's/witness's own
+	// patrol-cycle content) to the general polecat pool (gt-pjuow). runSling
+	// (sling.go) and executeSling (sling_dispatch.go) have checked this since
+	// gt-pjuow, but deferred DISPATCH MODE routes around both: with
+	// scheduler.max_polecats > 0, `gt sling <bead> <rig>` lands here instead,
+	// and here the gate was missing — the same shape as gt-bel1/gt-ygb7/gt-s1id
+	// above. A deacon heartbeat-refresh step landed on a polecat's hook through
+	// exactly this gap (gt-o26h). Checked here, ahead of the formula
+	// auto-apply below, since attached_formula is a property of the bead alone.
+	if refusal := beads.RoleOwnedPatrolDispatchRefusal(beadID, info.Description); refusal != "" && !opts.Force {
+		return fmt.Errorf("%s", refusal)
+	}
+
 	if !opts.Force {
 		if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
 			return err
