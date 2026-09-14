@@ -405,6 +405,34 @@ func TestHealth_AutoClear_AgentDead(t *testing.T) {
 // Orphan sessions
 // =============================================================================
 
+// TestHealth_Idle_LiveSessionIsHealthy verifies that an idle dog with a live,
+// healthy session is NOT flagged: the session is the designed resting state
+// (persistent, waiting for the next dispatch), not a fault. Regression for
+// gt-pu877, where every idle dog with a session — including one that had just
+// run a verified plugin — was flagged as an orphan needing attention.
+func TestHealth_Idle_LiveSessionIsHealthy(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateIdle, LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionHealthy
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, false)
+
+	if r.NeedsAttention {
+		t.Error("idle dog with a healthy live session should not need attention")
+	}
+	if r.SessionStatus != "healthy" {
+		t.Errorf("session_status = %q, want 'healthy'", r.SessionStatus)
+	}
+}
+
 func TestHealth_Orphan_IdleWithSession(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
@@ -414,14 +442,14 @@ func TestHealth_Orphan_IdleWithSession(t *testing.T) {
 	})
 
 	mc := newMockChecker()
-	mc.sessionsAlive["hq-dog-alpha"] = true
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentDead
 	hc := NewHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, false)
 
 	if !r.NeedsAttention {
-		t.Error("orphan session should need attention")
+		t.Error("orphan session (agent dead) should need attention")
 	}
 	if r.SessionStatus != "orphan" {
 		t.Errorf("session_status = %q, want 'orphan'", r.SessionStatus)
@@ -437,7 +465,7 @@ func TestHealth_Orphan_AutoCleared(t *testing.T) {
 	})
 
 	mc := newMockChecker()
-	mc.sessionsAlive["hq-dog-alpha"] = true
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentDead
 	hc := NewHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")

@@ -181,21 +181,30 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 		}
 
 	case StateIdle:
-		// Check for orphan session.
-		has, _ := hc.checker.HasSession(session)
-		sessionAlive = has
-		if has {
+		// An idle dog with a live, healthy session is the designed resting
+		// state — the session is persistent and dispatch delivers work into
+		// it, so mere coexistence of idle+session is not a fault. Only a
+		// session whose agent process has actually died (a pane that outlived
+		// its occupant) is a real orphan. maxInactivity is 0 here: an idle
+		// dog is expected to have no tmux activity, so activity staleness
+		// must not factor into this verdict.
+		status := hc.checker.CheckSessionHealth(session, 0)
+		sessionAlive = status != tmux.SessionDead && status != tmux.AgentDead
+		switch status {
+		case tmux.SessionDead:
+			result.SessionStatus = "none"
+		case tmux.AgentDead:
 			result.SessionStatus = "orphan"
 			result.NeedsAttention = true
 			if autoClear {
 				_ = hc.checker.KillSession(session)
 				result.AutoCleared = true
-				result.Recommendation = "orphan auto-cleared (session killed)"
+				result.Recommendation = "orphan auto-cleared (agent dead, session killed)"
 			} else {
-				result.Recommendation = "orphan: dog idle but tmux session exists"
+				result.Recommendation = "orphan: dog idle but session outlived its agent"
 			}
-		} else {
-			result.SessionStatus = "none"
+		default: // SessionHealthy (or, in principle, AgentHung with maxInactivity=0)
+			result.SessionStatus = status.String()
 		}
 	}
 
