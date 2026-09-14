@@ -998,6 +998,38 @@
     var currentMessageFrom = null;
     var currentMailTab = 'inbox';
 
+    // The dashboard server has one fixed mail identity for its whole
+    // lifetime (whatever GT_ROLE/cwd it started with), which generally
+    // will NOT match whoever is viewing the dashboard (gt-0zvsv). Let the
+    // viewer say explicitly whose inbox to load; remember it per-browser.
+    var MAIL_IDENTITY_STORAGE_KEY = 'gt-dashboard-mail-identity';
+
+    function getMailIdentityOverride() {
+        try {
+            return (localStorage.getItem(MAIL_IDENTITY_STORAGE_KEY) || '').trim();
+        } catch (e) {
+            return '';
+        }
+    }
+
+    var mailIdentityInput = document.getElementById('mail-identity-input');
+    if (mailIdentityInput) {
+        try {
+            mailIdentityInput.value = getMailIdentityOverride();
+        } catch (e) {}
+
+        var mailIdentityDebounce = null;
+        mailIdentityInput.addEventListener('input', function() {
+            clearTimeout(mailIdentityDebounce);
+            mailIdentityDebounce = setTimeout(function() {
+                try {
+                    localStorage.setItem(MAIL_IDENTITY_STORAGE_KEY, mailIdentityInput.value.trim());
+                } catch (e) {}
+                loadMailInbox();
+            }, 400);
+        });
+    }
+
     // Mail tab switching
     document.querySelectorAll('.mail-tab').forEach(function(tab) {
         tab.addEventListener('click', function() {
@@ -1035,7 +1067,17 @@
 
         if (!loading || !threadsContainer) return;
 
-        fetch('/api/mail/threads')
+        loading.style.display = 'block';
+        threadsContainer.style.display = 'none';
+        if (empty) empty.style.display = 'none';
+
+        var url = '/api/mail/threads';
+        var address = getMailIdentityOverride();
+        if (address) {
+            url += '?address=' + encodeURIComponent(address);
+        }
+
+        fetch(url)
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 loading.style.display = 'none';

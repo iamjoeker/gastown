@@ -322,12 +322,27 @@ type MailThreadsResponse struct {
 	Total       int          `json:"total"`
 }
 
+// mailInboxArgs builds the "gt mail inbox" argv, honoring an explicit
+// ?address= override. Without it, "gt mail inbox" resolves identity from
+// the dashboard server process's own GT_ROLE/cwd (see gt-0zvsv) — a caller
+// viewing a different identity's mail must pass address explicitly.
+func mailInboxArgs(r *http.Request, jsonOut bool) []string {
+	args := []string{"mail", "inbox"}
+	if address := strings.TrimSpace(r.URL.Query().Get("address")); address != "" {
+		args = append(args, address)
+	}
+	if jsonOut {
+		args = append(args, "--json")
+	}
+	return args
+}
+
 // handleMailInbox returns the user's inbox.
 func (h *APIHandler) handleMailInbox(w http.ResponseWriter, r *http.Request) {
-	output, err := h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "inbox", "--json"})
+	output, err := h.runGtCommand(r.Context(), 10*time.Second, mailInboxArgs(r, true))
 	if err != nil {
 		// Try without --json flag
-		output, err = h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "inbox"})
+		output, err = h.runGtCommand(r.Context(), 10*time.Second, mailInboxArgs(r, false))
 		if err != nil {
 			h.sendError(w, "Failed to fetch inbox: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -373,10 +388,10 @@ func (h *APIHandler) handleMailInbox(w http.ResponseWriter, r *http.Request) {
 
 // handleMailThreads returns the inbox grouped by conversation threads.
 func (h *APIHandler) handleMailThreads(w http.ResponseWriter, r *http.Request) {
-	output, err := h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "inbox", "--json"})
+	output, err := h.runGtCommand(r.Context(), 10*time.Second, mailInboxArgs(r, true))
 	if err != nil {
 		// Fall back to text parsing
-		output, err = h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "inbox"})
+		output, err = h.runGtCommand(r.Context(), 10*time.Second, mailInboxArgs(r, false))
 		if err != nil {
 			h.sendError(w, "Failed to fetch inbox: "+err.Error(), http.StatusInternalServerError)
 			return

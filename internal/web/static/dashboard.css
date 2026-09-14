@@ -3319,6 +3319,28 @@
             border-color: var(--blue);
         }
 
+        /* Mail identity override (gt-0zvsv: inbox tab has no inherent
+           identity of its own — let the viewer say whose mail to load) */
+        .mail-identity-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 8px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .mail-identity-bar input {
+            flex: 1;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 3px 6px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+        }
+
         /* All mail table */
         .mail-all-table {
             width: 100%;

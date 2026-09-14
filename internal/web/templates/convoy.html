@@ -576,6 +576,10 @@
                 <div class="panel-body">
                     <!-- Inbox view (threaded conversations via API) -->
                     <div id="mail-list">
+                        <div class="mail-identity-bar">
+                            <label for="mail-identity-input" title="The Inbox tab shows this address's mail — it does not default to the address you happen to be viewing from.">Inbox for</label>
+                            <input type="text" id="mail-identity-input" placeholder="e.g. gastown/witness (default: dashboard's own identity)">
+                        </div>
                         <div class="loading-state" id="mail-loading">Loading inbox...</div>
                         <div id="mail-threads" style="display: none;"></div>
                         <div class="empty-state" id="mail-empty" style="display: none;">
