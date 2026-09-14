@@ -138,7 +138,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 23
+version = 24
 
 [vars]
 [vars.wisp_type]
@@ -1078,19 +1078,37 @@ The Witness is responsible for cleaning up polecats after they complete work.
 This step provides backup DETECTION in case the Witness fails to clean up.
 Detection only - Boot handles termination.
 
-**Zombie criteria:**
-- State: idle or done (no active work assigned)
+**Zombie criteria (polecat STATE, not OS process):**
+- State: `done` (no active work assigned — idle)
 - Session: not running (tmux session dead)
-- No hooked work (nothing pending for this polecat)
+- No hooked work (no `issue` on the polecat)
 - Last activity: older than 10 minutes
 
-**Run the zombie scan (DRY RUN ONLY):**
+**`gt deacon zombie-scan` cannot see these.** It scans OS processes for
+Claude/codex processes not owned by any tmux pane — a polecat that is
+registered, idle, and has no live process at all owns nothing for that scan
+to find, so it reads clean by construction even when polecats sit idle with
+`reuse: idle-recovery-needed` for hours. Query polecat STATE instead:
+
 ```bash
-gt deacon zombie-scan --dry-run
+for rig in $(gt rig list --json | jq -r '.[].name'); do
+  gt polecat list "$rig" --all --json | \
+    jq -r --arg rig "$rig" '.[] |
+      select(.state == "done" and .session_running == false and ((.issue // "") == "")) |
+      "\\($rig)/\\(.name)"'
+done
+```
+
+This lists every candidate (state=done, no session, no hooked work). For each
+candidate, confirm the 10-minute last-activity threshold before treating it
+as a zombie — a polecat that just finished cleanup is not one yet:
+
+```bash
+gt polecat status <rig>/<name> --json | jq -r '.last_activity'
+# Zombie only if this timestamp is more than 10 minutes old.
 ```
 
 **NEVER run:**
-- `gt deacon zombie-scan` (without --dry-run)
 - `tmux kill-session`
 - `gt polecat nuke`
 - Any command that terminates a session
