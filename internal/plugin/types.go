@@ -220,9 +220,14 @@ func (p *Plugin) FormatMailBody() string {
 				"Run this command EXACTLY. Do NOT interpret the plugin.md instructions.\n"+
 				"Do NOT write your own implementation. Just run the script and report the output.\n\n"+
 				"After completion:\n"+
-				"1. The script should record a plugin-run receipt. If it did not, run `gt plugin record-run --plugin %s --result <outcome> --title \"Plugin run: %s\"`.\n"+
+				"1. Check whether the script already recorded a receipt: `gt plugin history --plugin %s --limit 1`. "+
+				"Most run.sh scripts record on every exit path, so a receipt from this run is the common case — do NOT "+
+				"record a second one on top of it. Only if that history is empty or clearly stale, run "+
+				"`gt plugin record-run --plugin %s --result <success|failure|skipped> --title \"Plugin run: %s\"`, "+
+				"using exactly one of those three result values matching the script's actual exit status — never an "+
+				"invented word like \"completed\".\n"+
 				"2. Run `gt dog done` — this clears your work and auto-terminates the session. Run this even if recording fails.\n",
-			p.Name, p.Description, p.Path, p.Name, p.Name)
+			p.Name, p.Description, p.Path, p.Name, p.Name, p.Name)
 	}
 
 	var sb strings.Builder

@@ -708,8 +708,14 @@ func TestFormatMailBody_WithRunScript(t *testing.T) {
 	if !strings.Contains(body, "Do NOT interpret the plugin.md instructions") {
 		t.Error("expected mail body to warn against interpreting markdown")
 	}
-	if !strings.Contains(body, "gt plugin record-run --plugin test-plugin --result <outcome>") {
-		t.Error("expected mail body to use canonical plugin run recorder")
+	if !strings.Contains(body, "gt plugin record-run --plugin test-plugin --result <success|failure|skipped>") {
+		t.Error("expected mail body to use canonical plugin run recorder with a constrained result vocabulary")
+	}
+	// Must instruct the dog to check for an existing receipt before recording
+	// a fallback one, so a script that always self-records (e.g. rebuild-gt)
+	// never gets a second, dog-invented receipt on top of its own (gt-754mc).
+	if !strings.Contains(body, "gt plugin history --plugin test-plugin --limit 1") {
+		t.Error("expected mail body to instruct the dog to check history before recording a fallback receipt")
 	}
 	if strings.Contains(body, "bd create --ephemeral") {
 		t.Error("expected mail body to avoid raw ephemeral receipt creation")
