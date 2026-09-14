@@ -2405,9 +2405,19 @@ func StateEligibleForPoolReuse(s State) bool {
 // from a genuinely stuck polecat, so the consecutive-refusal escalation
 // (gt-83m4) fired on ordinary merge-queue backlog instead of only on states
 // that need a human (gt-818eo).
+//
+// StateWorking gets the same treatment (WorkstateReasonAgentWorking) for the
+// same reason: a polecat confirmed WORKING is refused every dispatch attempt
+// that races it while it is busy, and that refusal clears on its own once the
+// agent finishes — it is not distinguishable from a genuinely stuck polecat
+// under the generic reason, so it escalated on ordinary busy-polecat dispatch
+// races instead of only on states that need a human (gt-p9ryy).
 func stateNotEligibleReason(s State) string {
-	if s == StateHandedOff {
+	switch s {
+	case StateHandedOff:
 		return WorkstateReasonActiveMROpen
+	case StateWorking:
+		return WorkstateReasonAgentWorking
 	}
 	return "state-not-eligible"
 }

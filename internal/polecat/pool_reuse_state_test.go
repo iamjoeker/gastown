@@ -53,19 +53,25 @@ func TestStateEligibleForPoolReuseDecidesEligibilityNotSafety(t *testing.T) {
 	}
 }
 
-// TestStateNotEligibleReasonDistinguishesHandedOff covers gt-818eo:
-// StateHandedOff (session ended normally, work already sitting in an open MR)
-// is self-resolving, but StateEligibleForPoolReuse's binary result collapses
-// it into the same opaque "state-not-eligible" reason as a genuinely stuck
+// TestStateNotEligibleReasonDistinguishesHandedOff covers gt-818eo and
+// gt-p9ryy: StateHandedOff (session ended normally, work already sitting in
+// an open MR) and StateWorking (session actively holds work) are both
+// self-resolving, but StateEligibleForPoolReuse's binary result collapses
+// them into the same opaque "state-not-eligible" reason as a genuinely stuck
 // polecat. That opacity is what let the gt-83m4 consecutive-refusal
-// escalation fire on ordinary merge-queue backlog: nothing downstream could
-// tell the two apart without this reason naming StateHandedOff specifically.
+// escalation fire on ordinary merge-queue backlog and on ordinary busy-polecat
+// dispatch races: nothing downstream could tell them apart without these
+// reasons naming StateHandedOff and StateWorking specifically.
 func TestStateNotEligibleReasonDistinguishesHandedOff(t *testing.T) {
 	if got := stateNotEligibleReason(StateHandedOff); got != WorkstateReasonActiveMROpen {
 		t.Errorf("stateNotEligibleReason(StateHandedOff) = %q, want %q (self-resolving, must not read as generic)",
 			got, WorkstateReasonActiveMROpen)
 	}
-	for _, state := range []State{StateWorking, StateStalled, StateReviewNeeded, StateStuck, StateZombie} {
+	if got := stateNotEligibleReason(StateWorking); got != WorkstateReasonAgentWorking {
+		t.Errorf("stateNotEligibleReason(StateWorking) = %q, want %q (self-resolving, must not read as generic)",
+			got, WorkstateReasonAgentWorking)
+	}
+	for _, state := range []State{StateStalled, StateReviewNeeded, StateStuck, StateZombie} {
 		if got := stateNotEligibleReason(state); got != "state-not-eligible" {
 			t.Errorf("stateNotEligibleReason(%q) = %q, want the generic \"state-not-eligible\" (genuinely not self-resolving)",
 				state, got)
