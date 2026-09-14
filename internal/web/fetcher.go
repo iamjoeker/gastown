@@ -630,6 +630,19 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInf
 func (f *LiveConvoyFetcher) trackedIssueIDs(convoyID string) ([]string, error) {
 	ids, err := fetcherTrackedIssueIDs(f.townRoot, convoyID)
 	if err == nil {
+		if len(ids) > 0 {
+			return ids, nil
+		}
+		// The raw dep-table read succeeded but found nothing tracked. This is
+		// indistinguishable here from "genuinely empty" and "not indexed yet"
+		// (a freshly created convoy whose tracks row hasn't replicated to the
+		// query path). `bd show` reads the convoy's own dependencies array,
+		// which is populated at creation time, so fall back to it before
+		// reporting an empty convoy (gt-drvan; mirrors the CLI's
+		// bdShowTrackedDeps fallback in internal/cmd/convoy.go).
+		if shown, showErr := f.showTrackedDeps(convoyID); showErr == nil && len(shown) > 0 {
+			return shown, nil
+		}
 		return ids, nil
 	}
 
@@ -653,7 +666,46 @@ func (f *LiveConvoyFetcher) trackedIssueIDs(convoyID string) ([]string, error) {
 	for _, dep := range deps {
 		issueIDs = append(issueIDs, beads.ExtractIssueID(dep.ID))
 	}
+	if len(issueIDs) > 0 {
+		return issueIDs, nil
+	}
+	if shown, showErr := f.showTrackedDeps(convoyID); showErr == nil && len(shown) > 0 {
+		return shown, nil
+	}
 	return issueIDs, nil
+}
+
+// showTrackedDeps falls back to `bd show <convoyID> --json` and extracts
+// "tracks" dependency IDs from the convoy's own dependencies array. Used when
+// the dep-table reads above return an empty result rather than an error, to
+// distinguish "no tracked issues" from "not indexed yet" for a fresh convoy.
+func (f *LiveConvoyFetcher) showTrackedDeps(convoyID string) ([]string, error) {
+	stdout, err := f.runBdCmd(f.townRoot, "show", convoyID, "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []beads.Issue
+	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
+		return nil, fmt.Errorf("parsing show for %s: %w", convoyID, err)
+	}
+	if len(issues) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]bool)
+	var ids []string
+	for _, dep := range issues[0].Dependencies {
+		if dep.DependencyType != "tracks" {
+			continue
+		}
+		id := beads.ExtractIssueID(dep.ID)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
 // fetcherTrackedIssueIDs is the injection point for the dep-table read

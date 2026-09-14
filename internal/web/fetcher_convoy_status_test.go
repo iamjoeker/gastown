@@ -176,6 +176,34 @@ func TestTrackedIssueIDs_PrefersTheDepTable(t *testing.T) {
 	}
 }
 
+// TestTrackedIssueIDs_FallsBackToShowWhenDepTableIsEmpty covers a freshly
+// created convoy whose tracks row has not replicated to the dep-table read
+// yet: the read succeeds but returns nothing, which the CLI (bdShowTrackedDeps)
+// resolves by reading the convoy's own dependencies array via `bd show`. The
+// web panel used to trust the empty read and render "0/N completed" with no
+// tracked issues even though `gt convoy status` found the tracked bead
+// (gt-drvan).
+func TestTrackedIssueIDs_FallsBackToShowWhenDepTableIsEmpty(t *testing.T) {
+	originalIDs := fetcherTrackedIssueIDs
+	t.Cleanup(func() { fetcherTrackedIssueIDs = originalIDs })
+
+	fetcherTrackedIssueIDs = func(string, string) ([]string, error) {
+		return nil, nil
+	}
+
+	showJSON := `[{"id":"hq-cv-w4tvk","dependencies":[{"id":"gt-mbq4g","dependency_type":"tracks"}]}]`
+	dir := t.TempDir()
+	f := &LiveConvoyFetcher{townRoot: dir, cmdTimeout: 5 * time.Second, bdBin: fakeBd(t, showJSON, 0)}
+
+	ids, err := f.trackedIssueIDs("hq-cv-w4tvk")
+	if err != nil {
+		t.Fatalf("trackedIssueIDs() error = %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "gt-mbq4g" {
+		t.Fatalf("trackedIssueIDs() = %v, want [gt-mbq4g]", ids)
+	}
+}
+
 // TestTrackedIssueIDs_FallsBackToBd covers stores that are not Dolt-in-server
 // mode, where there is no server to query.
 func TestTrackedIssueIDs_FallsBackToBd(t *testing.T) {
