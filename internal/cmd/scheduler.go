@@ -124,6 +124,30 @@ type scheduledBeadInfo struct {
 	Status    string `json:"status"`
 	TargetRig string `json:"target_rig"`
 	Blocked   bool   `json:"blocked,omitempty"`
+	// NotReadyReason names WHY a scheduled bead is not ready to dispatch, so an
+	// operator watching `gt scheduler status`/`gt scheduler list` doesn't have
+	// to read source to distinguish "work bead not found" from "blocked on a
+	// dependency" from "blocked status unknown because a lookup query failed"
+	// (gt-2mfh4) — all three previously collapsed into the same bare Blocked
+	// bool. Empty when the bead is ready.
+	NotReadyReason string `json:"not_ready_reason,omitempty"`
+}
+
+// notReadyReason names why a scheduled work bead failed readiness, matching
+// the precedence in isScheduledWorkBeadReady. Returns "" when ready.
+func notReadyReason(found, blocked, blockedUnknown bool, status string) string {
+	switch {
+	case !found:
+		return "work bead not found"
+	case blocked:
+		return "blocked on a dependency"
+	case blockedUnknown:
+		return "blocked status unknown (bd blocked query failed)"
+	case status != "open":
+		return fmt.Sprintf("work bead status is %q, not open", status)
+	default:
+		return ""
+	}
 }
 
 func runSchedulerStatus(cmd *cobra.Command, args []string) error {
@@ -257,7 +281,11 @@ func runSchedulerList(cmd *cobra.Command, args []string) error {
 			if b.Blocked {
 				indicator = "⏸"
 			}
-			fmt.Printf("    %s %s: %s\n", indicator, b.ID, b.Title)
+			if b.Blocked && b.NotReadyReason != "" {
+				fmt.Printf("    %s %s: %s (%s)\n", indicator, b.ID, b.Title, b.NotReadyReason)
+			} else {
+				fmt.Printf("    %s %s: %s\n", indicator, b.ID, b.Title)
+			}
 		}
 		fmt.Println()
 	}
@@ -405,7 +433,7 @@ func listScheduledBeads(townRoot string) ([]scheduledBeadInfo, slingContextScanH
 func scheduledBeadInfosFromAssessments(assessments []scheduledContextAssessment) []scheduledBeadInfo {
 	var result []scheduledBeadInfo
 	for _, assessment := range assessments {
-		bead, ok := scheduledBeadInfoFromWork(assessment.context.issue.Title, assessment.fields, assessment.info, assessment.found, assessment.ready)
+		bead, ok := scheduledBeadInfoFromWork(assessment.context.issue.Title, assessment.fields, assessment.info, assessment.found, assessment.blocked, assessment.blockedUnknown, assessment.ready)
 		if !ok {
 			continue
 		}
@@ -415,7 +443,7 @@ func scheduledBeadInfosFromAssessments(assessments []scheduledContextAssessment)
 	return result
 }
 
-func scheduledBeadInfoFromWork(ctxTitle string, fields *capacity.SlingContextFields, info beadStatusInfo, found, ready bool) (scheduledBeadInfo, bool) {
+func scheduledBeadInfoFromWork(ctxTitle string, fields *capacity.SlingContextFields, info beadStatusInfo, found, blocked, blockedUnknown, ready bool) (scheduledBeadInfo, bool) {
 	if fields == nil {
 		return scheduledBeadInfo{}, false
 	}
@@ -428,12 +456,17 @@ func scheduledBeadInfoFromWork(ctxTitle string, fields *capacity.SlingContextFie
 			return scheduledBeadInfo{}, false
 		}
 	}
+	reason := ""
+	if !ready {
+		reason = notReadyReason(found, blocked, blockedUnknown, status)
+	}
 	return scheduledBeadInfo{
-		ID:        fields.WorkBeadID,
-		Title:     title,
-		Status:    status,
-		TargetRig: fields.TargetRig,
-		Blocked:   !ready,
+		ID:             fields.WorkBeadID,
+		Title:          title,
+		Status:         status,
+		TargetRig:      fields.TargetRig,
+		Blocked:        !ready,
+		NotReadyReason: reason,
 	}, true
 }
 

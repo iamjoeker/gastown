@@ -177,11 +177,11 @@ func TestBeadOwnedByRigUnknownBead(t *testing.T) {
 func TestSchedulerListDropsNonOpenWorkBeads(t *testing.T) {
 	fields := &capacity.SlingContextFields{WorkBeadID: "dn-cqu", TargetRig: "gastown"}
 	for _, status := range []string{"closed", "tombstone", string(beads.IssueStatusHooked)} {
-		if _, ok := scheduledBeadInfoFromWork("ctx", fields, beadStatusInfo{Status: status}, true, true); ok {
+		if _, ok := scheduledBeadInfoFromWork("ctx", fields, beadStatusInfo{Status: status}, true, false, false, true); ok {
 			t.Errorf("status %q is listed as scheduled; scheduleBead's no-op message assumes it is not", status)
 		}
 	}
-	if _, ok := scheduledBeadInfoFromWork("ctx", fields, beadStatusInfo{Status: "open"}, true, true); !ok {
+	if _, ok := scheduledBeadInfoFromWork("ctx", fields, beadStatusInfo{Status: "open"}, true, false, false, true); !ok {
 		t.Error("an open work bead must be listed as scheduled")
 	}
 }
