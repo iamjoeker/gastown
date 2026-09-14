@@ -139,12 +139,15 @@ const poolReuseRefusalEscalationThreshold = 5
 // (gt-818eo). A polecat handed off with an open MR is correctly refused every
 // dispatch until the refinery merges it — during a busy queue that easily
 // crosses poolReuseRefusalEscalationThreshold, and escalating on it pages the
-// mayor about a non-problem. Genuinely stuck reasons (agent-state-paused, a
-// generic state-not-eligible, git trouble) are not in this set and still
-// escalate.
+// mayor about a non-problem. A polecat confirmed WORKING is the same shape
+// (gt-p9ryy): it is correctly refused every dispatch that races it while
+// busy, and clears on its own once the agent finishes. Genuinely stuck
+// reasons (agent-state-paused, a generic state-not-eligible, git trouble) are
+// not in this set and still escalate.
 var selfResolvingReuseRefusalReasons = map[string]bool{
 	polecat.WorkstateReasonActiveMROpen:  true,
 	polecat.WorkstateReasonActiveMRStale: true,
+	polecat.WorkstateReasonAgentWorking:  true,
 }
 
 // recordPoolReuseRefusalStreaks persists the consecutive-refusal streak for

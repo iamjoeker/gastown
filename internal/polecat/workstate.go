@@ -182,6 +182,16 @@ const (
 	// genuinely still in flight.
 	WorkstateReasonActiveMROpen = "active-mr-open"
 
+	// WorkstateReasonAgentWorking means the reuse gate's cheap state check
+	// found the polecat in StateWorking — the bead-derived lifecycle state
+	// says it still holds active work, not that a pane was read. It is its
+	// own reason rather than the generic "state-not-eligible" for the same
+	// reason StateHandedOff got WorkstateReasonActiveMROpen in gt-818eo: a
+	// working polecat resolves on its own (to idle or done) once the agent
+	// finishes, so the consecutive-refusal escalation (gt-83m4) must not
+	// fire on it the way it fires on a genuinely stuck state (gt-p9ryy).
+	WorkstateReasonAgentWorking = "agent-working"
+
 	// WorkstateReasonSessionParkedMismatch means the bead's lifecycle state says
 	// working while the pane was read and positively classified
 	// tmux.LivenessParked — no turn in flight, no auth wall. See

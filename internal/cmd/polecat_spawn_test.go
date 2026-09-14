@@ -30,13 +30,18 @@ func TestEffectivePolecatDirCap(t *testing.T) {
 }
 
 // TestSelfResolvingReuseRefusalReasonsExcludesGenuineStuckStates covers
-// gt-818eo: the gt-83m4 consecutive-refusal escalation must skip reasons that
-// clear on their own once the merge queue drains (an open or stale MR left by
-// StateHandedOff), while still escalating reasons that mean an agent actually
-// needs a human — including the generic "state-not-eligible" a truly stuck
-// state now falls back to (see stateNotEligibleReason in internal/polecat).
+// gt-818eo and gt-p9ryy: the gt-83m4 consecutive-refusal escalation must skip
+// reasons that clear on their own once the merge queue drains (an open or
+// stale MR left by StateHandedOff) or once the agent finishes (StateWorking),
+// while still escalating reasons that mean an agent actually needs a human —
+// including the generic "state-not-eligible" a truly stuck state now falls
+// back to (see stateNotEligibleReason in internal/polecat).
 func TestSelfResolvingReuseRefusalReasonsExcludesGenuineStuckStates(t *testing.T) {
-	selfResolving := []string{polecat.WorkstateReasonActiveMROpen, polecat.WorkstateReasonActiveMRStale}
+	selfResolving := []string{
+		polecat.WorkstateReasonActiveMROpen,
+		polecat.WorkstateReasonActiveMRStale,
+		polecat.WorkstateReasonAgentWorking,
+	}
 	for _, reason := range selfResolving {
 		if !selfResolvingReuseRefusalReasons[reason] {
 			t.Errorf("selfResolvingReuseRefusalReasons[%q] = false, want true (self-resolving, must not escalate)", reason)
