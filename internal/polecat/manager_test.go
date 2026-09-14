@@ -22,6 +22,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // beadsPrefixCounter numbers the beads prefixes handed out by
@@ -249,11 +250,26 @@ esac
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// skipIfDiskSpaceCritical skips the test when path's filesystem is under the
+// same pressure that manager.go's AddWithOptions guards against. t.TempDir()
+// commonly lands on /tmp, a host-wide tmpfs shared by every concurrent test
+// run and agent scratchpad; when it fills, the guard fires for reasons that
+// have nothing to do with the diff under test, and a hard test failure reads
+// as a regression the next reader cannot reproduce (gt-skjd). Skipping with
+// an explicit reason keeps the gate honest instead of turning it red.
+func skipIfDiskSpaceCritical(t *testing.T, path string) {
+	t.Helper()
+	if level, msg, err := util.CheckDiskSpace(path); err == nil && level == util.DiskSpaceCritical {
+		t.Skipf("skipping: %s", msg)
+	}
+}
+
 func setupCanonicalBranchManagerTest(t *testing.T) (*Manager, string) {
 	t.Helper()
 	installMockBd(t)
 
 	root := t.TempDir()
+	skipIfDiskSpaceCritical(t, root)
 	mayorRig := filepath.Join(root, "mayor", "rig")
 	if err := os.MkdirAll(mayorRig, 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
