@@ -166,11 +166,18 @@ non-terminal, no MR in any state, and git-state **CLEAN**. A genuine zombie can
 have a clean tree. Nothing in this plugin reads git state, and
 `run_test.sh` pins both named cases by name.
 
-**Known gap, not closed here.** When a polecat's work lands under *another*
-polecat's branch (cross-branch conflict resolution — the ghoul case), no MR
-joins to its own hook bead and it still reads as a crash candidate. That costs a
-wasted restart; it does not orphan work. It is not worth reaching for the git
-clause to cover, for the reason above.
+**Ghoul case (gt-8qc7).** When a polecat's work lands under *another* polecat's
+branch (cross-branch conflict resolution — described as the normal path for
+resolving conflicts), no MR joins to its own hook bead: the commit that does
+the work rides in on somebody else's branch and somebody else's MR. The MR
+join above cannot see this. A third, independent check closes it: `gt mq
+reconcile <rig> --bead <hook-bead> --json` asks whether the target branch
+carries a commit naming the bead **under any branch**, reusing the same
+subject-token search `gt done` already trusts to let a polecat close a bead a
+sibling landed (`done_superseded.go`), including its revert handling. Checked
+only after both the MR join and the stranded-branch check have failed, so the
+extra fetch-and-search runs for the rare leftover candidate, not for every
+polecat every cycle.
 
 Both gates fail **towards detection**, never towards silence. An unreachable
 merge queue, or an unwritable state directory, degrades the affected gate and

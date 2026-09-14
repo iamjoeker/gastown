@@ -314,6 +314,42 @@ has_submitted_mr() {
   printf '%s' "$MR_SOURCE_ISSUES" | grep -Fxq -- "$rig|$bead"
 }
 
+# --- Ghoul detection (gt-8qc7) -------------------------------------------------
+# has_submitted_mr answers "is there an MR naming this hook bead as its
+# source_issue". A polecat whose work lands under ANOTHER polecat's branch
+# (cross-branch conflict resolution — described as the NORMAL path for
+# resolving conflicts) never produces such an MR: the commit that does the
+# work rides in on somebody else's branch and somebody else's MR. The bead
+# still reads as a crash candidate indefinitely, at the cost of a wasted
+# restart — it does not orphan work, which is why this is a separate, weaker
+# gate rather than folded into has_submitted_mr.
+#
+# `gt mq reconcile --bead` asks the question the MR join cannot: does the
+# target branch carry a commit naming this bead AT ALL, under any branch. It
+# reuses the same subject-token search `gt done` already trusts to let a
+# polecat close a bead a sibling landed (done_superseded.go), including its
+# revert handling — a revert names a bead exactly as the landing commit does
+# and means the opposite.
+#
+# Checked ONLY after has_submitted_mr and pushed_unsubmitted_branch have both
+# already failed: the extra fetch-and-search this triggers runs for the rare
+# leftover candidate, not for every polecat every cycle (gt-8qc7's own notes
+# flagged the full reconcile sweep as too heavy for that; --bead skips the
+# sweep entirely and checks only the one bead in question).
+has_landed_on_target() {
+  local rig="$1" bead="$2"
+  local json="" landed=""
+
+  [ -n "$bead" ] || return 1
+
+  if ! json=$(cd "$TOWN_ROOT" 2>/dev/null && gt mq reconcile "$rig" --bead "$bead" --json 2>/dev/null); then
+    log "NOTICE: gt mq reconcile $rig --bead $bead unavailable; cannot rule out the ghoul case for $bead"
+    return 1
+  fi
+  landed=$(printf '%s' "$json" | jq -r '.landed // false' 2>/dev/null || echo false)
+  [ "$landed" = "true" ]
+}
+
 # --- Stranded-branch detection (gt-j994, mirrors hq-o3xwk) --------------------
 # has_submitted_mr distinguishes "in the queue" from "not in the queue", but
 # reality has a third state the MQ join cannot see: pushed to the remote, with
@@ -509,6 +545,8 @@ confirm_current_polecat_outage() {
       if hook_restartable "$session" "$hook_bead" "$hook_status"; then
         if has_submitted_mr "$rig" "$hook_bead"; then
           log "  NOTICE: $session is post-submission (hook=$hook_bead has an MR); dropped from mass-death count"
+        elif has_landed_on_target "$rig" "$hook_bead"; then
+          log "  NOTICE: $session's hook=$hook_bead already landed on the target under another branch (ghoul case); dropped from mass-death count"
         else
           CONFIRMED_CRASHED+=("$session|$rig|$pcat|$hook_bead")
         fi
@@ -520,6 +558,8 @@ confirm_current_polecat_outage() {
       if hook_restartable "$session" "$hook_bead" "$hook_status"; then
         if has_submitted_mr "$rig" "$hook_bead"; then
           log "  NOTICE: $session is post-submission (hook=$hook_bead has an MR); dropped from mass-death count"
+        elif has_landed_on_target "$rig" "$hook_bead"; then
+          log "  NOTICE: $session's hook=$hook_bead already landed on the target under another branch (ghoul case); dropped from mass-death count"
         else
           CONFIRMED_STUCK+=("$session|$rig|$pcat|$hook_bead|agent_dead")
         fi
@@ -655,6 +695,9 @@ while IFS='|' read -r RIG PREFIX; do
           elif pushed_unsubmitted_branch "$PCAT_PATH" "$HOOK_BEAD"; then
             STRANDED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|$STRANDED_BRANCH|$STRANDED_WORKTREE")
             log "  STRANDED: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD, branch=$STRANDED_BRANCH pushed with no MR); submitting instead of restarting"
+          elif has_landed_on_target "$RIG" "$HOOK_BEAD"; then
+            POST_SUBMISSION=$((POST_SUBMISSION + 1))
+            log "  POST-SUBMISSION: $SESSION_NAME runtime dead but hook=$HOOK_BEAD already landed on the target under another branch (ghoul case); not restarting"
           else
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
@@ -682,6 +725,9 @@ while IFS='|' read -r RIG PREFIX; do
           elif pushed_unsubmitted_branch "$PCAT_PATH" "$HOOK_BEAD"; then
             STRANDED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|$STRANDED_BRANCH|$STRANDED_WORKTREE")
             log "  STRANDED: $SESSION_NAME (hook=$HOOK_BEAD, branch=$STRANDED_BRANCH pushed with no MR); submitting instead of restarting"
+          elif has_landed_on_target "$RIG" "$HOOK_BEAD"; then
+            POST_SUBMISSION=$((POST_SUBMISSION + 1))
+            log "  POST-SUBMISSION: $SESSION_NAME exited with hook=$HOOK_BEAD still open, but its work already landed on the target under another branch (ghoul case) — submitted, not crashed"
           elif crash_candidate_persisted "$RIG" "$PCAT_NAME" "$HOOK_BEAD"; then
             CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
             log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD, unchanged for ${CANDIDATE_AGE}s, no MR in any state)"

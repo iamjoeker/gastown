@@ -56,6 +56,7 @@ var (
 	mqReconcileTarget  string
 	mqReconcileNoFetch bool
 	mqReconcileLimit   int
+	mqReconcileBead    string
 )
 
 var mqReconcileCmd = &cobra.Command{
@@ -95,7 +96,14 @@ This command reports only. A commit naming a bead can be a partial fix by
 another bead's worker, so closing is a judgment call left to the reader:
 
   bd show <id>                     # read the bead against the listed commits
-  bd close <id> --reason "Merged in <sha>"`,
+  bd close <id> --reason "Merged in <sha>"
+
+--bead <id> skips the full sweep and checks only that one bead: does the
+target branch carry a commit naming it, under ANY branch? This answers a
+question the merge-queue join cannot: a polecat whose work landed by resolving
+a conflict on ANOTHER polecat's branch (the "ghoul" case, gt-8qc7) has no MR
+recording its own hook bead as source_issue, so the MQ join finds nothing even
+though the work is already on the target.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runMQReconcile,
 }
@@ -105,6 +113,7 @@ func init() {
 	mqReconcileCmd.Flags().StringVar(&mqReconcileTarget, "target", "", "Target branch to measure against (default: the rig's default branch)")
 	mqReconcileCmd.Flags().BoolVar(&mqReconcileNoFetch, "no-fetch", false, "Skip the fetch and measure against the clone as-is (results may be stale)")
 	mqReconcileCmd.Flags().IntVar(&mqReconcileLimit, "commit-limit", 5, "Maximum commits to report per bead")
+	mqReconcileCmd.Flags().StringVar(&mqReconcileBead, "bead", "", "Check only this bead against the target (skips the full sweep)")
 	mqCmd.AddCommand(mqReconcileCmd)
 }
 
@@ -362,6 +371,84 @@ func sweepLandedMRs(mrs []*beads.Issue, rigName, defaultTarget string, g mrLande
 	return findings, skips, scanned, nil
 }
 
+// beadLandedReport is the --bead single-bead answer: does the target branch,
+// under any branch, already carry this bead's work? Deliberately smaller than
+// reconcileReport — it skips the bead listing and the MR sweep entirely, so a
+// caller checking one crash candidate does not pay for a full-rig sweep.
+type beadLandedReport struct {
+	Rig     string          `json:"rig"`
+	Ref     string          `json:"ref"`
+	Fetched bool            `json:"fetched"`
+	Bead    string          `json:"bead"`
+	Landed  bool            `json:"landed"`
+	Reason  string          `json:"reason,omitempty"`
+	Commits []git.CommitRef `json:"commits"`
+}
+
+// runMQReconcileBead answers "is this bead's work already on the target, under
+// any branch" for one bead (gt-8qc7's ghoul case: a polecat whose work landed
+// by resolving a conflict on ANOTHER polecat's branch has no MR naming its own
+// hook bead as source_issue, so the MQ join alone cannot see it).
+//
+// Uses the same subject-token search and revert handling as `gt done`'s own
+// superseded-work check (done_superseded.go): a bead ID in a commit subject is
+// weaker than proof, and a revert names the bead exactly as the landing commit
+// does while meaning the opposite.
+func runMQReconcileBead(rigName, ref string, fetched bool, bead string, g mrLandedGit) error {
+	report := beadLandedReport{Rig: rigName, Ref: ref, Fetched: fetched, Bead: bead, Commits: []git.CommitRef{}}
+
+	commits, err := g.CommitsWithSubjectToken(ref, bead, mqReconcileLimit)
+	if err != nil {
+		return fmt.Errorf("reconcile: searching %s for %s: %w", ref, bead, err)
+	}
+
+	reverts := 0
+	for _, c := range commits {
+		if strings.TrimSpace(c.SHA) == "" {
+			continue
+		}
+		if isRevertSubject(c.Subject) {
+			reverts++
+			continue
+		}
+		report.Landed = true
+		report.Commits = []git.CommitRef{c}
+		break
+	}
+	if !report.Landed {
+		switch {
+		case reverts > 0:
+			report.Reason = fmt.Sprintf("every commit on %s naming %s is a revert (%d of them) — the work is not on the target", ref, bead, reverts)
+		default:
+			report.Reason = fmt.Sprintf("no commit reachable from %s names %s", ref, bead)
+		}
+	}
+
+	if mqReconcileJSON {
+		data, err := json.Marshal(report)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
+	}
+
+	if !report.Fetched {
+		fmt.Printf("⚠ --no-fetch: measured against this clone as-is; commits pushed since the last fetch are invisible\n")
+	}
+	if report.Landed {
+		commit := report.Commits[0]
+		sha := commit.SHA
+		if len(sha) > 8 {
+			sha = sha[:8]
+		}
+		fmt.Printf("LANDED: %s names a commit on %s: %s  %s  %s\n", bead, ref, sha, commit.Date, commit.Subject)
+	} else {
+		fmt.Printf("NOT FOUND: %s — %s\n", bead, report.Reason)
+	}
+	return nil
+}
+
 func shortReconcileSHA(sha string) string {
 	sha = strings.TrimSpace(sha)
 	if len(sha) > 8 {
@@ -411,6 +498,10 @@ func runMQReconcile(_ *cobra.Command, args []string) error {
 				"Fix the fetch, or pass --no-fetch to accept that risk explicitly", target, err)
 		}
 		report.Fetched = true
+	}
+
+	if bead := strings.TrimSpace(mqReconcileBead); bead != "" {
+		return runMQReconcileBead(rigName, report.Ref, report.Fetched, bead, rigGit)
 	}
 
 	bd := beads.New(r.BeadsPath())

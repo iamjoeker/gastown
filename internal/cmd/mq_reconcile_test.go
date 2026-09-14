@@ -654,3 +654,113 @@ func TestReconcileCleanRigCoversMRs(t *testing.T) {
 		t.Errorf("landed_mrs = %+v, want an empty list", decoded.LandedMRs)
 	}
 }
+
+// captureReconcileBeadOutput runs runMQReconcileBead and returns stdout,
+// mirroring captureReconcileOutput's pipe-and-restore pattern.
+func captureReconcileBeadOutput(t *testing.T, asJSON bool, rig, ref string, fetched bool, bead string, g mrLandedGit) string {
+	t.Helper()
+	oldJSON := mqReconcileJSON
+	oldLimit := mqReconcileLimit
+	mqReconcileJSON = asJSON
+	mqReconcileLimit = 5
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		os.Stdout = oldStdout
+		mqReconcileJSON = oldJSON
+		mqReconcileLimit = oldLimit
+	})
+
+	runErr := runMQReconcileBead(rig, ref, fetched, bead, g)
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stdout = oldStdout
+	mqReconcileJSON = oldJSON
+	mqReconcileLimit = oldLimit
+	if runErr != nil {
+		t.Fatalf("runMQReconcileBead: %v", runErr)
+	}
+	return buf.String()
+}
+
+// gt-8qc7: the ghoul case. A polecat's work lands under ANOTHER polecat's
+// branch (cross-branch conflict resolution), so no MR carries its own hook
+// bead as source_issue and the MQ join (has_submitted_mr) finds nothing. This
+// is the mechanism stuck-agent-dog needs to close that gap: does the target
+// carry a commit naming the bead at all, regardless of which branch it rode in
+// on. --bead is deliberately the single question, not the full sweep.
+func TestReconcileBeadFindsGhoulLanding(t *testing.T) {
+	g := &fakeLandedGit{commits: map[string][]git.CommitRef{
+		"gt-8qc7": {{SHA: "deadbeef01", Date: "2026-09-14", Subject: "fix: resolve conflict landing gt-8qc7 under polecat/other/branch"}},
+	}}
+
+	human := captureReconcileBeadOutput(t, false, "gastown", "origin/main", true, "gt-8qc7", g)
+	if !strings.Contains(human, "LANDED") || !strings.Contains(human, "deadbeef") {
+		t.Errorf("human output = %q, want LANDED with the commit sha", human)
+	}
+
+	jsonOut := captureReconcileBeadOutput(t, true, "gastown", "origin/main", true, "gt-8qc7", g)
+	var decoded beadLandedReport
+	if err := json.Unmarshal([]byte(jsonOut), &decoded); err != nil {
+		t.Fatalf("unmarshal %q: %v", jsonOut, err)
+	}
+	if !decoded.Landed {
+		t.Errorf("decoded.Landed = false, want true: %+v", decoded)
+	}
+	if len(decoded.Commits) != 1 || decoded.Commits[0].SHA != "deadbeef01" {
+		t.Errorf("decoded.Commits = %+v, want the landing commit", decoded.Commits)
+	}
+}
+
+// The named case a --bead check must NOT paper over: chrome@19:50, a real
+// zombie with a clean git tree and no work anywhere on the target. If --bead
+// reported this as landed, stuck-agent-dog would exclude the one true positive
+// in the dataset from CRASHED, exactly the false negative gt-0g5r's notes
+// warn against for any new discriminator.
+func TestReconcileBeadReportsNotFoundForGenuineZombie(t *testing.T) {
+	g := &fakeLandedGit{commits: map[string][]git.CommitRef{}}
+
+	human := captureReconcileBeadOutput(t, false, "gastown", "origin/main", true, "gt-zombie1", g)
+	if !strings.Contains(human, "NOT FOUND") {
+		t.Errorf("human output = %q, want NOT FOUND for a bead with no landing commit", human)
+	}
+
+	jsonOut := captureReconcileBeadOutput(t, true, "gastown", "origin/main", true, "gt-zombie1", g)
+	var decoded beadLandedReport
+	if err := json.Unmarshal([]byte(jsonOut), &decoded); err != nil {
+		t.Fatalf("unmarshal %q: %v", jsonOut, err)
+	}
+	if decoded.Landed {
+		t.Errorf("decoded.Landed = true, want false for a genuine zombie: %+v", decoded)
+	}
+	if decoded.Reason == "" {
+		t.Error("decoded.Reason is empty; a NOT FOUND result must say why")
+	}
+}
+
+// A revert names the bead exactly as the landing commit does, and means the
+// opposite — the same trap done_superseded.go's isRevertSubject exists to
+// dodge. A --bead check that treats a revert as evidence of landing would tell
+// stuck-agent-dog to stand down on a polecat whose work was just undone.
+func TestReconcileBeadIgnoresRevertOnlyCommits(t *testing.T) {
+	g := &fakeLandedGit{commits: map[string][]git.CommitRef{
+		"gt-8qc7": {{SHA: "abc12345", Subject: "Revert \"fix: gt-8qc7 landed under another branch\""}},
+	}}
+
+	jsonOut := captureReconcileBeadOutput(t, true, "gastown", "origin/main", true, "gt-8qc7", g)
+	var decoded beadLandedReport
+	if err := json.Unmarshal([]byte(jsonOut), &decoded); err != nil {
+		t.Fatalf("unmarshal %q: %v", jsonOut, err)
+	}
+	if decoded.Landed {
+		t.Errorf("decoded.Landed = true, want false when every matching commit is a revert: %+v", decoded)
+	}
+	if !strings.Contains(decoded.Reason, "revert") {
+		t.Errorf("decoded.Reason = %q, want it to name the revert", decoded.Reason)
+	}
+}
