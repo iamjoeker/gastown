@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/testenv"
 )
 
 // TestNew verifies the constructor.
@@ -2242,6 +2245,22 @@ func TestSearchOptions(t *testing.T) {
 func TestIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
+	}
+
+	// This test shells out to real `bd` commands, which need a live server to
+	// talk to. testenv.GuardProductionDolt (see TestMain) points every Dolt
+	// port variable at the dead GuardedDoltPort so nothing here can reach
+	// production Dolt on :3307 by accident — but that leaves no live server
+	// for `bd` to reach either, so it fails with "dolt circuit breaker is
+	// open" instead of exercising anything. Skip rather than give this test
+	// its own throwaway database: it exists to sanity-check the CLI wrapper
+	// against whatever real beads repo the developer is standing in, not to
+	// validate Dolt itself.
+	guarded := strconv.Itoa(testenv.GuardedDoltPort)
+	for _, name := range testenv.DoltPortEnvVars() {
+		if os.Getenv(name) == guarded {
+			t.Skipf("skipping integration test: %s is pointed at the dead guarded port (%s) by testenv.GuardProductionDolt; this test needs a live bd server, not production Dolt", name, guarded)
+		}
 	}
 
 	// Find a beads repo (use current directory if it has .beads)
