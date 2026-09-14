@@ -1542,15 +1542,26 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// Push submodule changes before direct push (gt-dzs)
 			pushSubmoduleChanges(g, baseRef)
 			directRefspec := branch + ":" + defaultBranch
+			directCommitSHA, _ := g.Rev("HEAD")
 			directPushErr := g.Push("origin", directRefspec, false)
 			if directPushErr != nil {
-				pushFailed = true
-				errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
-				doneErrors = append(doneErrors, errMsg)
-				style.PrintWarning("%s", errMsg)
-				goto notifyWitness
+				if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
+					pushFailed = true
+					errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
+					doneErrors = append(doneErrors, errMsg)
+					style.PrintWarning("%s", errMsg)
+					goto notifyWitness
+				}
+				// gt-myia: the push command failed, but the commit is already
+				// reachable from origin/<defaultBranch> — a prior gt done run
+				// already landed it, or defaultBranch moved ahead and merged it.
+				// A non-fast-forward here means main moved, not that this work is
+				// at risk; rebase-then-force is not the remedy on a direct-merge
+				// push, so nothing is retried. Fall through to the verification
+				// below, which will confirm the same thing and continue down the
+				// already-landed success path.
+				style.PrintWarning("direct push to %s reported failure (%v), but commit is already on origin/%s; treating as already landed", defaultBranch, directPushErr, defaultBranch)
 			}
-			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
 				// gt-290c: the push already landed, so the close is the only thing
 				// still withholdable. A lost annotation blocks it below.
@@ -1654,15 +1665,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			pushSubmoduleChanges(g, baseRef)
 			directRefspec := branch + ":" + defaultBranch
+			directCommitSHA, _ := g.Rev("HEAD")
 			directPushErr := g.Push("origin", directRefspec, false)
 			if directPushErr != nil {
-				pushFailed = true
-				errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
-				doneErrors = append(doneErrors, errMsg)
-				style.PrintWarning("%s", errMsg)
-				goto notifyWitness
+				if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
+					pushFailed = true
+					errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
+					doneErrors = append(doneErrors, errMsg)
+					style.PrintWarning("%s", errMsg)
+					goto notifyWitness
+				}
+				// gt-myia: same reasoning as the primary direct-merge path — the
+				// push command failed but the commit is already reachable from
+				// origin/<defaultBranch>, so treat it as already landed rather
+				// than retrying or force-pushing.
+				style.PrintWarning("direct push to %s reported failure (%v), but commit is already on origin/%s; treating as already landed", defaultBranch, directPushErr, defaultBranch)
 			}
-			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
 				// gt-290c: same as the primary direct-merge path — an unrecordable
 				// skip-verify close is withheld rather than performed silently.
