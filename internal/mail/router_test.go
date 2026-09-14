@@ -2490,3 +2490,28 @@ func TestMsgTypeLabelTracksTheMessage(t *testing.T) {
 		}
 	}
 }
+
+// TestEmptyMsgTypeDefaultsInsteadOfStampingBlank: ValidateMessageType only
+// runs for CLI-supplied input, so a Go caller that builds a Message literal
+// without a Type (as patrol_scan.go's POLECAT_DIED/ZOMBIE_DETECTED mail did)
+// reaches the label builders with Type == "". That must default the same way
+// ParseMessageType reads an unset value back, not stamp a bare "msg-type:"
+// that no reader can distinguish from a genuinely typed message (gt-c3tu).
+func TestEmptyMsgTypeDefaultsInsteadOfStampingBlank(t *testing.T) {
+	r := &Router{}
+	msg := &Message{From: "gastown/witness", To: "mayor/", Subject: "s", Body: "b"}
+
+	for name, labels := range map[string][]string{
+		"direct":   r.buildLabels(msg),
+		"queue":    queueLabels(msg, "q"),
+		"announce": announceLabels(msg, "a"),
+		"channel":  channelLabels(msg, "c"),
+	} {
+		if containsLabel(labels, "msg-type:") {
+			t.Errorf("%s path labels %v stamped a blank msg-type", name, labels)
+		}
+		if !containsLabel(labels, "msg-type:"+string(TypeNotification)) {
+			t.Errorf("%s path with unset Type wrote %v, want msg-type:%s", name, labels, TypeNotification)
+		}
+	}
+}

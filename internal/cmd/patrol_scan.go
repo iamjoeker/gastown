@@ -369,6 +369,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 		To:      fmt.Sprintf("%s/witness", rigName),
 		Subject: subject,
 		Body:    body,
+		Type:    mail.TypeNotification,
 	}
 	_ = router.Send(witMsg)
 
@@ -382,6 +383,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 		To:      "mayor/",
 		Subject: fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName),
 		Body:    mayorBody,
+		Type:    mail.TypeTask,
 	}
 	_ = router.Send(mayorMsg)
 }

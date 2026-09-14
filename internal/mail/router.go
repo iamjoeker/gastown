@@ -241,7 +241,16 @@ func (r *Router) ensureCustomTypes(beadsDir string) error {
 // the type (gt-do5c). Sharing the line is what stops a fourth writer from
 // making the same omission just as quietly.
 func messageIdentityLabels(msg *Message) []string {
-	labels := []string{"gt:message", "from:" + msg.From, "msg-type:" + string(msg.Type)}
+	// A Go caller that never sets Type bypasses ValidateMessageType (CLI-only),
+	// so an empty Type reaches here uncoerced. Default it the same way
+	// ParseMessageType reads an unset value back, rather than stamping a bare
+	// "msg-type:" label that no reader — including ParseMessageType itself —
+	// can distinguish from a genuinely typed message (gt-c3tu).
+	msgType := msg.Type
+	if msgType == "" {
+		msgType = TypeNotification
+	}
+	labels := []string{"gt:message", "from:" + msg.From, "msg-type:" + string(msgType)}
 	if msg.Type == TypeEscalation {
 		labels = append(labels, "gt:escalation")
 	}
