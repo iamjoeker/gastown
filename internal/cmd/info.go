@@ -59,7 +59,7 @@ Examples:
 			return
 		}
 
-		fmt.Printf("Gas Town v%s (%s)\n", Version, Build)
+		fmt.Printf("Gas Town v%s (%s)\n", strings.TrimPrefix(Version, "v"), Build)
 		if provenance == provenanceStamped {
 			if branch, ok := info["branch"].(string); ok {
 				fmt.Printf("  %s@%s\n", branch, version.ShortCommit(commit))
@@ -486,7 +486,7 @@ func showWhatsNew(jsonOutput bool) {
 	}
 
 	// Human-readable output
-	fmt.Printf("\nWhat's New in Gas Town (Current: v%s)\n", Version)
+	fmt.Printf("\nWhat's New in Gas Town (Current: v%s)\n", strings.TrimPrefix(Version, "v"))
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Println()
 
