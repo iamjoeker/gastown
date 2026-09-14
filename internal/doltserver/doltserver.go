@@ -1784,6 +1784,23 @@ func Start(townRoot string) error {
 	// bind the port. (fix: start-kills-unowned-port-holder)
 	if !running {
 		if squatterPID := findDoltServerOnPort(config.Port); squatterPID > 0 {
+			// A supervisor may own this process even though IsRunning didn't
+			// recognise it as this town's server (e.g. a unit started with
+			// different flags). Killing it is SIGKILL — an unclean exit, which
+			// revives the unit even under Restart=on-failure — and gt would then
+			// race the supervisor's restart for the port forever. Refuse and
+			// point at the supervisor's own stop command instead. (gt-wy1m)
+			if sup := DetectSupervisor(squatterPID); sup != nil {
+				return fmt.Errorf(`port %d is held by PID %d, owned by %s
+
+Killing it directly would SIGKILL the unit's main process — an unclean exit,
+which revives the unit even under Restart=on-failure. gt would then try to
+bind the port in the same second, racing the supervisor's restart forever.
+
+Stop it through the supervisor instead: %s
+Then retry: gt dolt start`,
+					config.Port, squatterPID, sup.Describe(), sup.StopCommand())
+			}
 			fmt.Fprintf(os.Stderr, "Warning: port %d held by unowned dolt process (PID %d) — killing before start\n", config.Port, squatterPID)
 			if proc, findErr := os.FindProcess(squatterPID); findErr == nil {
 				_ = proc.Kill()
