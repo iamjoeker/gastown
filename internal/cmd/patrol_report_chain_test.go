@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -52,6 +53,59 @@ esac`
 	}
 	if spawned != 1 {
 		t.Errorf("spawn calls = %d, want 1 — the chain must not stall when the root is already closed", spawned)
+	}
+	if got := readClosedIDs(t, closesLog); len(got) != 0 {
+		t.Errorf("unexpected close/update calls with no active patrol: %v", got)
+	}
+}
+
+// TestReportPatrolCycleEscalatesOnSpawnFailure is the gt-wthme regression.
+//
+// A failed spawn used to leave the role with no active patrol and no next
+// wisp on its hook — silent, and indistinguishable from ordinary idleness
+// except for the process's own exit code, which nothing may be watching.
+// The command must fire a loud escalation in addition to the nonzero exit.
+func TestReportPatrolCycleEscalatesOnSpawnFailure(t *testing.T) {
+	body := `
+case "$cmd" in
+  list|query) echo '[]' ;;
+  close|update)
+    echo "unexpected $cmd call" >> "$closes_log"
+    ;;
+esac`
+
+	townRoot, closesLog := newDescendantStubTown(t, body)
+
+	spawnErr := errors.New("boom: could not create wisp")
+	spawn := func(PatrolConfig) (string, error) {
+		return "", spawnErr
+	}
+
+	var escalated []string
+	old := patrolChainStallEscalator
+	patrolChainStallEscalator = func(msg string) error {
+		escalated = append(escalated, msg)
+		return nil
+	}
+	t.Cleanup(func() { patrolChainStallEscalator = old })
+
+	cfg := PatrolConfig{
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "deacon",
+		Beads:         beads.New(townRoot),
+	}
+
+	err := reportPatrolCycle(cfg, "all clear", "heartbeat:OK", spawn)
+	if err == nil {
+		t.Fatal("reportPatrolCycle: expected error when spawn fails, got nil")
+	}
+	if len(escalated) != 1 {
+		t.Fatalf("escalation calls = %d, want 1; got %v", len(escalated), escalated)
+	}
+	if !strings.Contains(escalated[0], "deacon") || !strings.Contains(escalated[0], spawnErr.Error()) {
+		t.Errorf("escalation message %q missing role or underlying error", escalated[0])
 	}
 	if got := readClosedIDs(t, closesLog); len(got) != 0 {
 		t.Errorf("unexpected close/update calls with no active patrol: %v", got)

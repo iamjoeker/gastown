@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 
@@ -177,6 +178,16 @@ func reportPatrolCycle(cfg PatrolConfig, summary, stepsFlag string, spawn func(P
 			fmt.Printf("New patrol: %s\n", newPatrolID)
 			return nil
 		}
+		// A failed spawn leaves the role with no active patrol AND no next
+		// wisp on its hook — indistinguishable from "idle, nothing to do"
+		// until someone notices the silence. The nonzero exit below only
+		// reaches whoever is watching this invocation's exit code; escalate
+		// too so the town-wide chain stall surfaces even when no one is
+		// watching (gt-wthme).
+		escMsg := fmt.Sprintf("%s patrol chain stalled: failed to start next cycle: %v", cfg.RoleName, err)
+		if escErr := patrolChainStallEscalator(escMsg); escErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: escalation also failed (%v) — escalate manually: gt escalate --severity high %q\n", escErr, escMsg)
+		}
 		return fmt.Errorf("starting next patrol cycle: %w", err)
 	}
 
@@ -241,6 +252,19 @@ func stampDeaconHeartbeatOnReport(townRoot, summary string) {
 	if err := syncDeaconHeartbeatStores(townRoot, action); err != nil {
 		style.PrintWarning("could not stamp deacon heartbeat: %v", err)
 	}
+}
+
+// patrolChainStallEscalator is an indirection over escalatePatrolChainStall
+// so tests can observe the escalation without shelling out to `gt escalate`.
+var patrolChainStallEscalator = escalatePatrolChainStall
+
+// escalatePatrolChainStall fires a HIGH-severity escalation via `gt
+// escalate`. Best-effort: mirrors dogEscalateBestEffort's shape, but at HIGH
+// severity because a failed spawn stalls the entire patrol chain, not just
+// one dog.
+func escalatePatrolChainStall(msg string) error {
+	cmd := exec.Command("gt", "escalate", "--severity", "high", msg)
+	return cmd.Run()
 }
 
 // resolveAgentHeartbeatBead and updateAgentHeartbeatFn are indirections over
