@@ -877,6 +877,17 @@ func runDeaconRestart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking session: %w", err)
 	}
 
+	// Self-invocation guard: if the Deacon runs this on itself, killing the
+	// session kills the calling gt process too, so execution never reaches
+	// the start half below. Fail loudly instead of silently no-op'ing
+	// (gt-7ey8k) — the caller must restart from outside the session, or
+	// let the daemon reap it on stale heartbeat.
+	if running && isInTmuxSession(sessionName) {
+		return fmt.Errorf("cannot restart Deacon session %q from inside itself: "+
+			"the kill would terminate this process before it can start a new session. "+
+			"Run 'gt deacon restart' from outside the Deacon session, or let the daemon reap a stale heartbeat", sessionName)
+	}
+
 	fmt.Println("Restarting Deacon...")
 
 	if running {
