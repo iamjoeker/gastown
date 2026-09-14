@@ -134,6 +134,19 @@ func poolReuseGateOutcome(rigName string, idlePolecat *polecat.Polecat, candidat
 // duplicates of the still-open escalation rather than filing a new one.
 const poolReuseRefusalEscalationThreshold = 5
 
+// selfResolvingReuseRefusalReasons are reuse-refusal reasons expected to clear
+// on their own once the merge queue drains, not because anyone intervened
+// (gt-818eo). A polecat handed off with an open MR is correctly refused every
+// dispatch until the refinery merges it — during a busy queue that easily
+// crosses poolReuseRefusalEscalationThreshold, and escalating on it pages the
+// mayor about a non-problem. Genuinely stuck reasons (agent-state-paused, a
+// generic state-not-eligible, git trouble) are not in this set and still
+// escalate.
+var selfResolvingReuseRefusalReasons = map[string]bool{
+	polecat.WorkstateReasonActiveMROpen:  true,
+	polecat.WorkstateReasonActiveMRStale: true,
+}
+
 // recordPoolReuseRefusalStreaks persists the consecutive-refusal streak for
 // every candidate the reuse gate turned down this sling, and escalates any
 // polecat now refused for the SAME reason on poolReuseRefusalEscalationThreshold
@@ -161,6 +174,9 @@ func recordPoolReuseRefusalStreaks(townRoot, rigName string, polecatMgr *polecat
 		count, err := polecatMgr.RecordPoolReuseRefusal(c.Name, reason)
 		if err != nil {
 			style.PrintWarning("could not record reuse-refusal streak for %s: %v", c.Name, err)
+			continue
+		}
+		if selfResolvingReuseRefusalReasons[reason] {
 			continue
 		}
 		if count >= poolReuseRefusalEscalationThreshold {

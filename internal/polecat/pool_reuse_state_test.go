@@ -52,3 +52,23 @@ func TestStateEligibleForPoolReuseDecidesEligibilityNotSafety(t *testing.T) {
 		}
 	}
 }
+
+// TestStateNotEligibleReasonDistinguishesHandedOff covers gt-818eo:
+// StateHandedOff (session ended normally, work already sitting in an open MR)
+// is self-resolving, but StateEligibleForPoolReuse's binary result collapses
+// it into the same opaque "state-not-eligible" reason as a genuinely stuck
+// polecat. That opacity is what let the gt-83m4 consecutive-refusal
+// escalation fire on ordinary merge-queue backlog: nothing downstream could
+// tell the two apart without this reason naming StateHandedOff specifically.
+func TestStateNotEligibleReasonDistinguishesHandedOff(t *testing.T) {
+	if got := stateNotEligibleReason(StateHandedOff); got != WorkstateReasonActiveMROpen {
+		t.Errorf("stateNotEligibleReason(StateHandedOff) = %q, want %q (self-resolving, must not read as generic)",
+			got, WorkstateReasonActiveMROpen)
+	}
+	for _, state := range []State{StateWorking, StateStalled, StateReviewNeeded, StateStuck, StateZombie} {
+		if got := stateNotEligibleReason(state); got != "state-not-eligible" {
+			t.Errorf("stateNotEligibleReason(%q) = %q, want the generic \"state-not-eligible\" (genuinely not self-resolving)",
+				state, got)
+		}
+	}
+}

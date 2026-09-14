@@ -2396,6 +2396,22 @@ func StateEligibleForPoolReuse(s State) bool {
 	return s == StateIdle || s == StateDone
 }
 
+// stateNotEligibleReason names why a state failed StateEligibleForPoolReuse.
+// StateHandedOff gets its own, more specific reason ("active-mr-open") rather
+// than the generic "state-not-eligible": it means the session ended normally
+// and an open MR for this polecat's branch is still in the merge queue — the
+// same self-resolving condition WorkstateDisposition reports for StateDone
+// (WorkstateReasonActiveMROpen). Left generic, that case was indistinguishable
+// from a genuinely stuck polecat, so the consecutive-refusal escalation
+// (gt-83m4) fired on ordinary merge-queue backlog instead of only on states
+// that need a human (gt-818eo).
+func stateNotEligibleReason(s State) string {
+	if s == StateHandedOff {
+		return WorkstateReasonActiveMROpen
+	}
+	return "state-not-eligible"
+}
+
 // PoolReuseCandidate records one polecat the reuse gate considered and the
 // verdict it got. It exists so the refusal can be written down: FindIdlePolecat
 // returns nil for "every candidate was rejected" and nil for "the pool is
@@ -2441,7 +2457,7 @@ func (m *Manager) FindIdlePolecatWithCandidates() (*Polecat, []PoolReuseCandidat
 	for _, p := range polecats {
 		c := PoolReuseCandidate{Name: p.Name, State: p.State, StateEligible: StateEligibleForPoolReuse(p.State)}
 		if !c.StateEligible {
-			c.Reason = "state-not-eligible"
+			c.Reason = stateNotEligibleReason(p.State)
 			candidates = append(candidates, c)
 			continue
 		}
