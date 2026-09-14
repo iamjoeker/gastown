@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -109,6 +110,7 @@ var (
 	reaperArchiveID          string
 	reaperArchiveGrep        string
 	reaperArchiveLmt         int
+	reaperTombstoneRetention string
 )
 
 // reaperArchiver resolves the archive purge exports protected wisps to before
@@ -144,6 +146,24 @@ func reaperArchiveLocation() string {
 	}
 	return reaper.DefaultArchiveDir()
 }
+
+// reaperTombstoneDir returns the directory purge writes tombstones to, or ""
+// to leave tombstoning off. It shares --archive-dir/--no-archive with the
+// protected-wisp archive (see the tombstone.go file comment for why), but is
+// computed from that shared LOCATION rather than from archive.Location() —
+// reaper.WithTombstoneDir takes a real path deliberately, not whatever string
+// an Archiver implementation happens to report.
+func reaperTombstoneDir(archive reaper.Archiver) string {
+	if archive == nil {
+		return ""
+	}
+	return filepath.Join(reaperArchiveLocation(), tombstoneDirName)
+}
+
+// tombstoneDirName must match reaper.tombstoneSubdir; duplicated because that
+// constant is unexported and this package only needs the literal for path
+// display and construction, not the write path itself.
+const tombstoneDirName = "tombstones"
 
 func reaperDatabaseNames() []string {
 	if reaperDB == "" {
@@ -501,7 +521,8 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				continue
 			}
 
-			result, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun, reaper.WithArchive(archive))
+			result, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun,
+				reaper.WithArchive(archive), reaper.WithTombstoneDir(reaperTombstoneDir(archive)))
 			db.Close()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: purge error: %v\n", dbName, err)
@@ -513,7 +534,7 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalWisps, totalMail, totalArchived, totalProtected int
+			var totalWisps, totalMail, totalArchived, totalProtected, totalTombstoned int
 			for _, r := range results {
 				prefix := ""
 				if r.DryRun {
@@ -535,6 +556,12 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				if r.WispsArchived > 0 && archive != nil {
 					fmt.Printf("  Archived (released): %d → %s\n", r.WispsArchived, archive.Location())
 				}
+				// Tombstones cover the OTHER half of the same deletion — the
+				// unprotected wisps that get no archive at all. Reported the
+				// same way: a count with a destination, not a bare number.
+				if r.WispsTombstoned > 0 && archive != nil {
+					fmt.Printf("  Tombstoned (unprotected): %d → %s\n", r.WispsTombstoned, reaperTombstoneDir(archive))
+				}
 				// Report the skip rather than just deleting fewer rows: without
 				// this a protected purge is indistinguishable from a quiet one.
 				if r.WispsProtected > 0 {
@@ -547,14 +574,34 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 				totalMail += r.MailPurged
 				totalArchived += r.WispsArchived
 				totalProtected += r.WispsProtected
+				totalTombstoned += r.WispsTombstoned
 			}
 			if len(results) > 1 {
 				prefix := ""
 				if reaperDryRun {
 					prefix = "[DRY RUN] "
 				}
-				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail, archived %d wisps, protected %d wisps\n",
-					prefix, len(results), totalWisps, totalMail, totalArchived, totalProtected)
+				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail, archived %d wisps, protected %d wisps, tombstoned %d wisps\n",
+					prefix, len(results), totalWisps, totalMail, totalArchived, totalProtected, totalTombstoned)
+			}
+		}
+
+		// Prune stale tombstone files. Independent of dry-run: pruning is a
+		// retention decision about records already committed to disk, not
+		// part of the purge itself, and the same host-wide directory would
+		// otherwise be pruned once per database in this loop for no benefit —
+		// so it runs once, here, after every database has had a chance to add
+		// to it.
+		if archive != nil && !reaperDryRun {
+			retention, err := time.ParseDuration(reaperTombstoneRetention)
+			if err != nil {
+				return fmt.Errorf("invalid --tombstone-retention: %w", err)
+			}
+			dir := reaperTombstoneDir(archive)
+			if removed, err := reaper.PruneTombstones(dir, retention, time.Now()); err != nil {
+				fmt.Fprintf(os.Stderr, "WARNING: tombstone prune failed: %v\n", err)
+			} else if removed > 0 && !reaperJSON {
+				fmt.Printf("Pruned %d stale tombstone file(s) older than %s from %s\n", removed, reaperTombstoneRetention, dir)
 			}
 		}
 		return nil
@@ -726,7 +773,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		}
 
 		archive := reaperArchiver()
-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalArchived, totalProtected, totalClosed, totalOpen int
+		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalArchived, totalProtected, totalTombstoned, totalClosed, totalOpen int
 		// allAnomalies collects anomalies from every step (scan, reap, purge,
 		// auto-close), not just scan's. The formula's report step requires an
 		// Anomalies field summarizing the whole cycle — a report that only ever
@@ -790,7 +837,8 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			if wispGCHoldReason != "" {
 				fmt.Printf("%s: purge skipped (%s)\n", dbName, wispGCHoldReason)
 			} else {
-				purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun, reaper.WithArchive(archive))
+				purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun,
+					reaper.WithArchive(archive), reaper.WithTombstoneDir(reaperTombstoneDir(archive)))
 				if err != nil {
 					fmt.Printf("%s: purge error: %v\n", dbName, err)
 				} else {
@@ -798,6 +846,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 					totalMailPurged += purgeResult.MailPurged
 					totalArchived += purgeResult.WispsArchived
 					totalProtected += purgeResult.WispsProtected
+					totalTombstoned += purgeResult.WispsTombstoned
 					for _, a := range purgeResult.Anomalies {
 						fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
 					}
@@ -887,6 +936,9 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		if totalProtected > 0 {
 			fmt.Printf("  Protected:              %d wisps (pinned, or protected label with no archive)\n", totalProtected)
 		}
+		if totalTombstoned > 0 && archive != nil {
+			fmt.Printf("  Tombstoned:             %d wisps → %s\n", totalTombstoned, reaperTombstoneDir(archive))
+		}
 		fmt.Printf("  Issues auto-closed:     %d\n", totalClosed)
 		fmt.Printf("  Convoys closed:         %d\n", totalConvoysClosed)
 		fmt.Printf("  Open wisps remaining:   %d\n", totalOpen)
@@ -896,6 +948,21 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			fmt.Printf("  Anomalies:              %d\n", len(allAnomalies))
 			for _, a := range allAnomalies {
 				fmt.Printf("    - %s\n", a.Message)
+			}
+		}
+
+		// See reaperPurgeCmd for why this runs once, here, rather than per
+		// database inside the loop above.
+		if archive != nil && !reaperDryRun {
+			retention, err := time.ParseDuration(reaperTombstoneRetention)
+			if err != nil {
+				return fmt.Errorf("invalid --tombstone-retention: %w", err)
+			}
+			dir := reaperTombstoneDir(archive)
+			if removed, err := reaper.PruneTombstones(dir, retention, time.Now()); err != nil {
+				fmt.Printf("WARNING: tombstone prune failed: %v\n", err)
+			} else if removed > 0 {
+				fmt.Printf("Pruned %d stale tombstone file(s) older than %s from %s\n", removed, reaperTombstoneRetention, dir)
 			}
 		}
 
@@ -931,7 +998,28 @@ Lines before their rows are removed from Dolt, so the record outlives the row.
 			return err
 		}
 
+		// The protected-wisp archive answers "was this id exported before
+		// deletion". It has nothing to say about the OTHER half of purge — the
+		// unprotected wisps that are deleted with no archive at all — so an id
+		// lookup that misses here falls back to the tombstone store, the only
+		// place that half leaves a per-id record (gt-60ju).
+		var tombScan *reaper.TombstoneScan
+		if reaperArchiveID != "" && len(scan.Records) == 0 {
+			tombDir := filepath.Join(dir, "tombstones")
+			tombScan, err = reaper.ReadTombstones(tombDir, reaper.TombstoneFilter{
+				Database: reaperDB,
+				ID:       reaperArchiveID,
+			})
+			if err != nil {
+				return err
+			}
+		}
+
 		if reaperJSON {
+			if tombScan != nil && len(tombScan.Records) > 0 {
+				fmt.Println(reaper.FormatJSON(tombScan))
+				return nil
+			}
 			fmt.Println(reaper.FormatJSON(scan))
 			return nil
 		}
@@ -940,7 +1028,18 @@ Lines before their rows are removed from Dolt, so the record outlives the row.
 		if scan.Malformed > 0 {
 			fmt.Fprintf(os.Stderr, "WARNING: %d unreadable line(s) in %s\n", scan.Malformed, dir)
 		}
+		if tombScan != nil && len(tombScan.Records) > 0 {
+			for _, t := range tombScan.Records {
+				printTombstone(t)
+			}
+			return nil
+		}
 		if len(scan.Records) == 0 {
+			if reaperArchiveID != "" {
+				fmt.Printf("No record of %s in %s or its tombstones (%d archive file(s), %d tombstone file(s) read)\n",
+					reaperArchiveID, dir, scan.Files, tombstoneFileCount(tombScan))
+				return nil
+			}
 			fmt.Printf("No archived wisps in %s (%d file(s) read)\n", dir, scan.Files)
 			return nil
 		}
@@ -966,6 +1065,38 @@ Lines before their rows are removed from Dolt, so the record outlives the row.
 			style.Dim.Render("Archive:"), len(scan.Records), scan.Files, dir)
 		return nil
 	},
+}
+
+// tombstoneFileCount reports how many tombstone files were read, tolerating a
+// nil scan (no lookup was attempted, e.g. the archive already answered).
+func tombstoneFileCount(scan *reaper.TombstoneScan) int {
+	if scan == nil {
+		return 0
+	}
+	return scan.Files
+}
+
+// printTombstone reports the lean record left for a purged-and-unprotected
+// wisp: this is not an ArchivedWisp, so there is no title or description to
+// show — only that it existed, when it was purged, and how much else went
+// with it.
+func printTombstone(rec reaper.Tombstone) {
+	fmt.Printf("%s  (%s)\n", rec.ID, rec.Database)
+	fmt.Printf("  Purged (unprotected, no archive record): %s\n", rec.PurgedAt.Format(time.RFC3339))
+	if rec.WispType != "" {
+		fmt.Printf("  Wisp type:    %s\n", rec.WispType)
+	}
+	if len(rec.AuxCounts) > 0 {
+		parts := make([]string, 0, len(rec.AuxCounts))
+		for _, tbl := range []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"} {
+			if cnt, ok := rec.AuxCounts[tbl]; ok {
+				parts = append(parts, fmt.Sprintf("%s=%d", tbl, cnt))
+			}
+		}
+		if len(parts) > 0 {
+			fmt.Printf("  Aux rows also purged: %s\n", strings.Join(parts, ", "))
+		}
+	}
 }
 
 func printArchivedWisp(rec reaper.ArchivedWisp) {
@@ -1080,6 +1211,10 @@ func init() {
 	for _, cmd := range []*cobra.Command{reaperPurgeCmd, reaperRunCmd} {
 		cmd.Flags().BoolVar(&reaperNoArchive, "no-archive", false,
 			"Keep protected wisps in the database instead of archiving and releasing them")
+	}
+	for _, cmd := range []*cobra.Command{reaperPurgeCmd, reaperRunCmd} {
+		cmd.Flags().StringVar(&reaperTombstoneRetention, "tombstone-retention", "2160h",
+			"Max age of purge tombstones (per-id purge records) before they are pruned (90d)")
 	}
 	reaperArchiveCmd.Flags().StringVar(&reaperDB, "db", "", "Only records from this database")
 	reaperArchiveCmd.Flags().StringVar(&reaperArchiveID, "id", "", "Show one archived wisp in full")

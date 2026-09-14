@@ -177,8 +177,16 @@ type PurgeResult struct {
 	// a purge_digest_mismatch anomaly rather than being smoothed over — a
 	// breakdown that does not sum to its total is worse than no breakdown.
 	WispsPurgedByType map[string]int `json:"wisps_purged_by_type,omitempty"`
-	DryRun            bool           `json:"dry_run,omitempty"`
-	Anomalies         []Anomaly      `json:"anomalies,omitempty"`
+	// WispsTombstoned counts purged-and-unprotected wisps for which a lean
+	// per-id record (id, purged_at, wisp_type, aux-row counts) was written to
+	// the tombstone store before deletion, so an audit question about one of
+	// these ids has a per-id answer instead of only a population count
+	// (gt-60ju). Zero when no archive is configured — tombstoning shares the
+	// archive's on/off switch — or when every write in this pass failed (see
+	// Anomalies for "tombstone_write_failed"/"tombstone_collect_failed").
+	WispsTombstoned int       `json:"wisps_tombstoned,omitempty"`
+	DryRun          bool      `json:"dry_run,omitempty"`
+	Anomalies       []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -1241,7 +1249,8 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 type PurgeOption func(*purgeOptions)
 
 type purgeOptions struct {
-	archive Archiver
+	archive      Archiver
+	tombstoneDir string
 }
 
 // WithArchive lets purge export protected wisps to a durable store and then
@@ -1259,6 +1268,23 @@ func WithArchive(archive Archiver) PurgeOption {
 	return func(o *purgeOptions) { o.archive = archive }
 }
 
+// WithTombstoneDir turns on tombstoning of the closed-wisp purge's
+// unprotected half: for each id deleted with no archive record at all, a lean
+// per-id record (id, purged_at, wisp_type, aux-row counts) is written under
+// dir before the delete (gt-60ju, split from gt-wv8h).
+//
+// This is a SEPARATE option from WithArchive, deliberately not derived from
+// an Archiver's Location(): an Archiver is free to report a Location() that
+// is not a real, writable filesystem path — a label for humans, or (as in
+// this package's own tests) a placeholder string — and deriving a directory
+// to actually create and write files under from that would give every such
+// caller filesystem side effects it never asked for. An empty dir (the
+// default) means tombstoning is off, matching WithArchive's own "nil archive,
+// no export" default.
+func WithTombstoneDir(dir string) PurgeOption {
+	return func(o *purgeOptions) { o.tombstoneDir = dir }
+}
+
 // Purge deletes old closed wisps and mail from a database.
 func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dryRun bool, opts ...PurgeOption) (*PurgeResult, error) {
 	options := purgeOptions{}
@@ -1271,7 +1297,7 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	counts, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive)
+	counts, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun, options.archive, options.tombstoneDir)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
@@ -1279,6 +1305,7 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result.WispsArchived = counts.archived
 	result.WispsProtected = counts.protected
 	result.WispsPurgedByType = counts.byType
+	result.WispsTombstoned = counts.tombstoned
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
 	// Purge old mail. Its anomalies are appended before the error check: a
@@ -1302,17 +1329,18 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 // with one another, and the caller assigning them by position is where such a
 // confusion would land silently.
 type purgedWispCounts struct {
-	purged    int
-	archived  int
-	protected int
-	byType    map[string]int
+	purged     int
+	archived   int
+	protected  int
+	tombstoned int
+	byType     map[string]int
 }
 
 // purgeClosedWisps deletes closed wisps past purgeAge and, when an archive is
 // configured, exports the label-protected ones before deleting those too.
 //
 // The counts partition the closed-past-cutoff window; see PurgeResult.
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver) (purgedWispCounts, []Anomaly, error) {
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool, archive Archiver, tombstoneDir string) (purgedWispCounts, []Anomaly, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -1409,11 +1437,21 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		protectWhere, DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables)
+	// Tombstone the unprotected half before it is deleted (gt-60ju, split from
+	// gt-wv8h). This is the only record that will ever exist for these ids:
+	// unlike the protected half above, they get no ArchivedWisp. A failure here
+	// is logged as an anomaly and does not stop the delete — the purge's job is
+	// to keep this table bounded, and a tombstone write outage must not become
+	// a purge outage on top of it.
+	var tombstoneCount int
+	beforeDelete := tombstoneBeforeDelete(dbName, tombstoneDir, time.Now().UTC(), auxTables, &tombstoneCount, &anomalies)
+
+	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, deleteCutoff, "wisps", auxTables, beforeDelete)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
 		return counts, anomalies, err
 	}
+	counts.tombstoned = tombstoneCount
 
 	if totalDeleted > 0 {
 		if err := session.commit(ctx); err != nil {
@@ -1685,7 +1723,7 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 		dbName, dbName, DefaultBatchSize)
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, mailCutoff, "issues", auxTables)
+	totalDeleted, err := batchDeleteRows(ctx, session.conn, idQuery, mailCutoff, "issues", auxTables, nil)
 	if err != nil {
 		// release rolls the batch back, so nothing was purged.
 		return 0, anomalies, err
@@ -2106,7 +2144,15 @@ func AutoClosePatrolSteps(db *sql.DB, dbName string, candidateIDs []string, patr
 // connection they pinned for the write sequence — every batch must run on the
 // session that disabled autocommit, or the deletes commit one at a time and the
 // caller's flushing COMMIT has nothing to flush (gt-gjh).
-func batchDeleteRows(ctx context.Context, db sqlRunner, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
+//
+// beforeDelete, if non-nil, runs on each batch's ids after they are selected
+// but before they are deleted — the only point at which a caller can still
+// read what the delete is about to remove. It must be best-effort from the
+// caller's perspective: batchDeleteRows treats its error as fatal to the whole
+// purge, so a caller that wants a failure here to be non-fatal (see
+// tombstoneBeforeDelete) must swallow its own errors into an anomaly instead
+// of returning them.
+func batchDeleteRows(ctx context.Context, db sqlRunner, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string, beforeDelete func(ctx context.Context, db sqlRunner, ids []string) error) (int, error) {
 	totalDeleted := 0
 	for {
 		idRows, err := db.QueryContext(ctx, idQuery, cutoffArg)
@@ -2127,6 +2173,12 @@ func batchDeleteRows(ctx context.Context, db sqlRunner, idQuery string, cutoffAr
 
 		if len(ids) == 0 {
 			break
+		}
+
+		if beforeDelete != nil {
+			if err := beforeDelete(ctx, db, ids); err != nil {
+				return totalDeleted, err
+			}
 		}
 
 		affected, err := deleteRowsByID(ctx, db, ids, primaryTable, auxTables)
