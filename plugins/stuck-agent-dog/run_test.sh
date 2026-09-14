@@ -197,6 +197,32 @@ case "${1:-}" in
       fi
       exit 0
     fi
+    if [ "${2:-}" = "reconcile" ]; then
+      rig="${3:-}"
+      bead=""
+      shift 3 2>/dev/null || shift $#
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --bead)
+            bead="${2:-}"
+            shift 2
+            ;;
+          *)
+            shift
+            ;;
+        esac
+      done
+      printf '%s|--bead|%s\n' "$rig" "$bead" >> "$TEST_STATE/mq_reconcile_calls.log"
+      if [ -f "$TEST_STATE/mq_reconcile_fail" ]; then
+        exit 1
+      fi
+      landed=false
+      if [ -f "$TEST_STATE/reconcile_landed/$bead" ]; then
+        landed=true
+      fi
+      printf '{"rig":"%s","ref":"origin/main","fetched":true,"bead":"%s","landed":%s,"commits":[]}\n' "$rig" "$bead" "$landed"
+      exit 0
+    fi
     ;;
   rig)
     if [ "${2:-}" = "list" ] && [ "${3:-}" = "--json" ]; then
@@ -404,7 +430,7 @@ setup_case() {
   export GT_STUCK_AGENT_DOG_STATE_DIR="$TEST_TMP/dogstate"
   local bin_dir="$TEST_TMP/bin"
 
-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/needs_recovery" "$TEST_STATE/check_recovery_fail" "$bin_dir"
+  mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/needs_recovery" "$TEST_STATE/check_recovery_fail" "$TEST_STATE/reconcile_landed" "$bin_dir"
   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
   : > "$TEST_STATE/mail.log"
@@ -416,6 +442,7 @@ setup_case() {
   : > "$TEST_STATE/capacity.list"
   : > "$TEST_STATE/mr.list"
   : > "$TEST_STATE/mq_calls.log"
+  : > "$TEST_STATE/mq_reconcile_calls.log"
   printf '%s\n' "$GT_TOWN_ROOT" > "$TEST_STATE/town_root_value"
   touch "$TEST_STATE/sessions/hq-deacon"
 
@@ -433,6 +460,16 @@ add_mr() {
   local rig="$1" source_issue="$2" status="${3:-open}"
 
   printf '%s|%s|%s\n' "$rig" "$source_issue" "$status" >> "$TEST_STATE/mr.list"
+}
+
+# mark_landed_on_target fakes `gt mq reconcile <rig> --bead <bead> --json`
+# reporting the bead's work as already on the target under another branch —
+# the ghoul case (gt-8qc7): a polecat whose work landed by resolving a
+# conflict on ANOTHER polecat's branch has no MR of its own to join against.
+mark_landed_on_target() {
+  local bead="$1"
+
+  touch "$TEST_STATE/reconcile_landed/$bead"
 }
 
 # seed_crash_candidate fakes a PRIOR observation of a crash candidate, aged by
@@ -1042,6 +1079,73 @@ test_chrome_real_zombie_with_clean_git_is_crashed() {
   assert_file_contains "$TEST_STATE/output.log" "no MR in any state" "chrome zombie: stated the discriminator"
 }
 
+# --- Ghoul case (gt-8qc7) ------------------------------------------------------
+# A polecat whose work lands under ANOTHER polecat's branch (cross-branch
+# conflict resolution) has no MR naming its own hook bead as source_issue, so
+# the MR join above finds nothing even though the work is already merged.
+# `gt mq reconcile <rig> --bead <bead> --json` is the third, independent check:
+# it asks whether the target carries a commit naming the bead under ANY
+# branch. MUST NOT read as crashed, same as fury — but through a different
+# gate, since no MR exists to join against at all.
+test_ghoul_landed_work_is_post_submission_not_crashed() {
+  setup_case
+  add_polecat ghoul session-dead
+  mark_landed_on_target gt-hook-ghoul
+  seed_crash_candidate gastown ghoul gt-hook-ghoul 3600
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "ghoul: no restart mail for landed-elsewhere work"
+  assert_file_empty "$TEST_STATE/kill.log" "ghoul: no session kill"
+  assert_file_not_contains "$TEST_STATE/output.log" "CRASHED: gt-ghoul" "ghoul: not classified crashed"
+  assert_file_contains "$TEST_STATE/output.log" "POST-SUBMISSION: gt-ghoul" "ghoul: named as post-submission"
+  assert_file_contains "$TEST_STATE/output.log" "ghoul case" "ghoul: discriminator stated by name"
+  assert_file_contains "$TEST_STATE/mq_reconcile_calls.log" "gastown|--bead|gt-hook-ghoul" "ghoul: reconcile checked the right rig and bead"
+}
+
+# Same case with the runtime probe reporting agent-dead (live session, dead
+# runtime) instead of session-dead. The MR-join arm handles both statuses
+# separately in run.sh, so both need their own coverage.
+test_ghoul_landed_work_agent_dead_is_post_submission() {
+  setup_case
+  add_polecat phantom agent-dead
+  mark_landed_on_target gt-hook-phantom
+  run_script
+
+  assert_file_empty "$TEST_STATE/mail.log" "ghoul agent-dead: no restart mail"
+  assert_file_empty "$TEST_STATE/kill.log" "ghoul agent-dead: session left alone"
+  assert_file_contains "$TEST_STATE/output.log" "POST-SUBMISSION: gt-phantom" "ghoul agent-dead: named as post-submission"
+}
+
+# chrome@19:50 must stay crashed through the ghoul gate too — its bead was
+# never marked landed, so `gt mq reconcile --bead` reports NOT FOUND and the
+# real zombie still reaches CRASHED. Guards against a future change that makes
+# the ghoul check fail open (treat "unlandable" as "landed").
+test_chrome_real_zombie_is_not_rescued_by_the_ghoul_gate() {
+  setup_case
+  add_polecat chrome session-dead
+  seed_crash_candidate gastown chrome gt-hook-chrome 3600
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "CRASHED: gt-chrome" "chrome zombie vs ghoul gate: still classified crashed"
+  assert_file_not_contains "$TEST_STATE/output.log" "ghoul case" "chrome zombie vs ghoul gate: no false ghoul reading"
+}
+
+# An unreachable reconcile command must fail TOWARD detection, same policy as
+# an unreachable merge queue (test_mr_query_unavailable_does_not_silence_the_dog):
+# a candidate that cannot be ruled out still has to survive the persistence
+# gate before it is acted on, and a genuine zombie must not go silent just
+# because this extra check could not run.
+test_reconcile_unavailable_does_not_silence_the_dog() {
+  setup_case
+  add_polecat chrome session-dead
+  touch "$TEST_STATE/mq_reconcile_fail"
+  seed_crash_candidate gastown chrome gt-hook-chrome 3600
+  run_script
+
+  assert_file_contains "$TEST_STATE/output.log" "CRASHED: gt-chrome" "reconcile unavailable: still detects the real zombie"
+  assert_file_contains "$TEST_STATE/output.log" "cannot rule out the ghoul case" "reconcile unavailable: degradation announced"
+}
+
 # --- Stranded branches (gt-j994, mirrors hq-o3xwk) ----------------------------
 # A polecat that pushed its branch but never reached the merge queue presents
 # identically to a crash at the session probe. The old rule restarted it,
@@ -1395,6 +1499,10 @@ test_mass_death_skips_actions
 test_fury_merged_mr_with_open_hook_is_not_crashed
 test_open_mr_also_reads_as_post_submission
 test_chrome_real_zombie_with_clean_git_is_crashed
+test_ghoul_landed_work_is_post_submission_not_crashed
+test_ghoul_landed_work_agent_dead_is_post_submission
+test_chrome_real_zombie_is_not_rescued_by_the_ghoul_gate
+test_reconcile_unavailable_does_not_silence_the_dog
 test_stranded_session_dead_branch_is_submitted_not_restarted
 test_stranded_agent_dead_branch_is_submitted_not_restarted
 test_unpushed_branch_is_still_crashed
