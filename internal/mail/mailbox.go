@@ -825,6 +825,15 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 		return err
 	}
 
+	// Stamp the forced close so it can be distinguished from a clean one
+	// (gt-f8p02, mirrors hq-smicg). Best-effort: the close already succeeded.
+	if m.forceClose {
+		labelArgs := []string{"update", id, "--add-label=" + beads.ForceCloseLabel}
+		if _, labelErr := runBdCommand(ctx, labelArgs, m.workDir, beadsDir); labelErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: force-closed %s but failed to stamp %q label: %v\n", id, beads.ForceCloseLabel, labelErr)
+		}
+	}
+
 	return nil
 }
 

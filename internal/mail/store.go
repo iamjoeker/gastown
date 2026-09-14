@@ -8,10 +8,12 @@ package mail
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
 )
@@ -133,6 +135,16 @@ func (m *Mailbox) storeCloseInDir(id string) error {
 		}
 		return fmt.Errorf("store close message: %w", err)
 	}
+
+	// Stamp the forced close so it can be distinguished from a clean one,
+	// matching closeInDir's subprocess path (gt-f8p02, mirrors hq-smicg).
+	// Best-effort: the close already succeeded.
+	if m.forceClose {
+		if labelErr := m.store.AddLabel(ctx, id, beads.ForceCloseLabel, ""); labelErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: force-closed %s but failed to stamp %q label: %v\n", id, beads.ForceCloseLabel, labelErr)
+		}
+	}
+
 	return nil
 }
 

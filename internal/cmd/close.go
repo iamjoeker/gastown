@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -125,15 +126,49 @@ func runClose(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	beadIDs := extractBeadIDs(filteredArgs)
+
+	// Stamp forced closes so they can be distinguished from clean ones
+	// (gt-f8p02, mirrors hq-smicg). Best-effort: the close already succeeded.
+	if hasForceFlag(convertedArgs) && len(beadIDs) > 0 {
+		stampForceClosed(changeDir, beadIDs)
+	}
+
 	// After successful close, check convoy completion for each closed issue.
 	// This is best-effort: failures are silently ignored since the daemon's
 	// event polling and deacon patrol serve as backup mechanisms.
-	beadIDs := extractBeadIDs(filteredArgs)
 	if len(beadIDs) > 0 {
 		checkConvoyCompletion(beadIDs)
 	}
 
 	return nil
+}
+
+// hasForceFlag reports whether --force is present among bd close args.
+func hasForceFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--force" || arg == "-f" {
+			return true
+		}
+	}
+	return false
+}
+
+// stampForceClosed adds the force-closed label to each id after a forced
+// `bd close --force` has already succeeded. Best-effort: a labeling failure
+// is reported but does not fail the close, which already happened.
+func stampForceClosed(changeDir string, ids []string) {
+	labelArgs := append([]string{"update"}, ids...)
+	labelArgs = append(labelArgs, "--add-label="+beads.ForceCloseLabel)
+	labelCmd := exec.Command("bd", labelArgs...)
+	labelCmd.Stderr = os.Stderr
+	if dir := closeBeadDir(changeDir, ids); dir != "" {
+		labelCmd.Dir = dir
+		labelCmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
+	}
+	if err := labelCmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: force-closed %s but failed to stamp %q label: %v\n", strings.Join(ids, ","), beads.ForceCloseLabel, err)
+	}
 }
 
 // extractCascadeFlag removes --cascade from args and returns whether it was present.
@@ -230,7 +265,14 @@ func closeChildren(parentID, changeDir string, visited map[string]bool, depth in
 		closeBd.Dir = dir
 		closeBd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
 	}
-	return closeBd.Run()
+	if err := closeBd.Run(); err != nil {
+		return err
+	}
+
+	// Stamp forced closes so they can be distinguished from clean ones
+	// (gt-f8p02, mirrors hq-smicg). Best-effort: the close already succeeded.
+	stampForceClosed(changeDir, childIDs)
+	return nil
 }
 
 // bdChangeDirFlags are Beads' -C / --directory globals, which name a directory.
