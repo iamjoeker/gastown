@@ -289,34 +289,41 @@ func TestBrowser_EmptyState(t *testing.T) {
 
 	page.MustWaitLoad()
 
-	// Check for empty state message
+	// Check for empty state message. The convoy panel's empty state
+	// (internal/web/templates/convoy.html) no longer prints a "gt convoy
+	// create" hint inline — that affordance moved to the always-present
+	// "+ New Convoy" button in the panel header.
 	bodyText := page.MustElement("body").MustText()
 
-	if !strings.Contains(bodyText, "No convoys") {
-		t.Errorf("Expected 'No convoys' empty state message, got: %s", bodyText[:min(len(bodyText), 500)])
+	if !strings.Contains(bodyText, "No active convoys") {
+		t.Errorf("Expected 'No active convoys' empty state message, got: %s", bodyText[:min(len(bodyText), 500)])
 	}
 
-	// Verify help text is shown
-	if !strings.Contains(bodyText, "gt convoy create") {
-		t.Error("Expected help text with 'gt convoy create' command")
+	// Verify the create-convoy affordance is shown
+	if !strings.Contains(bodyText, "New Convoy") {
+		t.Error("Expected 'New Convoy' button as create-convoy affordance")
 	}
 
-	t.Log("PASSED: Empty state displays correctly")
+	if !t.Failed() {
+		t.Log("PASSED: Empty state displays correctly")
+	}
 }
 
-// TestBrowser_StatusIndicators tests open/closed status indicators
+// TestBrowser_StatusIndicators tests convoy work-status badges. The dashboard
+// no longer renders raw open/closed status classes; ConvoyRow.WorkStatus (see
+// internal/convoy.WorkStatus) drives the badge shown per row.
 func TestBrowser_StatusIndicators(t *testing.T) {
 	fetcher := &mockFetcher{
 		convoys: []ConvoyRow{
 			{
-				ID:     "hq-cv-open",
-				Title:  "Open Convoy",
-				Status: "open",
+				ID:         "hq-cv-open",
+				Title:      "Open Convoy",
+				WorkStatus: "ready",
 			},
 			{
-				ID:     "hq-cv-closed",
-				Title:  "Closed Convoy",
-				Status: "closed",
+				ID:         "hq-cv-closed",
+				Title:      "Closed Convoy",
+				WorkStatus: "complete",
 			},
 		},
 	}
@@ -340,15 +347,17 @@ func TestBrowser_StatusIndicators(t *testing.T) {
 
 	html := page.MustHTML()
 
-	// Check for status classes
-	if !strings.Contains(html, "status-open") {
-		t.Error("Expected status-open class for open convoy")
+	// Check for work-status badges
+	if !strings.Contains(html, `title="Dispatchable work with no worker on it`) {
+		t.Error("Expected 'Ready' badge for a convoy with WorkStatus \"ready\"")
 	}
-	if !strings.Contains(html, "status-closed") {
-		t.Error("Expected status-closed class for closed convoy")
+	if !strings.Contains(html, `title="Every tracked issue is closed"`) {
+		t.Error("Expected '✓ Done' badge for a convoy with WorkStatus \"complete\"")
 	}
 
-	t.Log("PASSED: Status indicators display correctly")
+	if !t.Failed() {
+		t.Log("PASSED: Status indicators display correctly")
+	}
 }
 
 // TestBrowser_ProgressDisplay tests progress bar rendering
