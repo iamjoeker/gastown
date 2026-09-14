@@ -10,11 +10,41 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 func hasTmux() bool {
 	_, err := exec.LookPath("tmux")
 	return err == nil
+}
+
+// waitForSupportedShellCommand polls GetPaneCommand until it returns one of
+// constants.SupportedShells, or the timeout elapses. This closes the race
+// between a readiness check (e.g. WaitForShellReady) confirming the pane was
+// running a shell and a later, separate GetPaneCommand call observing a
+// transient non-shell process that ran afterward.
+func waitForSupportedShellCommand(tm *Tmux, session string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	var cmd string
+	var err error
+	for {
+		cmd, err = tm.GetPaneCommand(session)
+		if err == nil {
+			for _, shell := range constants.SupportedShells {
+				if cmd == shell {
+					return cmd, nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return "", err
+			}
+			return cmd, nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // newTestTmux returns a Tmux instance connected to the package-level test
@@ -398,8 +428,12 @@ func TestIsAgentRunning(t *testing.T) {
 		t.Fatalf("WaitForShellReady: %v", err)
 	}
 
-	// Get the current pane command (should be bash/zsh/etc)
-	cmd, err := tm.GetPaneCommand(sessionName)
+	// Get the current pane command (should be bash/zsh/etc). WaitForShellReady
+	// only guarantees the pane WAS running a shell at poll time; a separate
+	// GetPaneCommand call made right after can still race with a transient
+	// non-shell process (e.g. a profile-sourced command), so poll here too
+	// until the command settles on a supported shell.
+	cmd, err := waitForSupportedShellCommand(tm, sessionName, 2*time.Second)
 	if err != nil {
 		t.Fatalf("GetPaneCommand: %v", err)
 	}
