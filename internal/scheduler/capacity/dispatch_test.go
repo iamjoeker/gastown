@@ -101,6 +101,55 @@ func TestDispatchCycle_Run_AllSuccess(t *testing.T) {
 	}
 }
 
+// TestDispatchCycle_RunPlan_OnSuccessObservesIncrementalProgress guards
+// against gt-trn65: a long-running cycle must let callers record dispatch
+// progress after each successful item, not only once after the whole plan
+// finishes. It simulates the production pattern of updating a shared
+// "last dispatch" state snapshot from inside OnSuccess.
+func TestDispatchCycle_RunPlan_OnSuccessObservesIncrementalProgress(t *testing.T) {
+	var snapshots []int
+	dispatchedSoFar := 0
+
+	cycle := &DispatchCycle{
+		Execute: func(b PendingBead) error { return nil },
+		OnSuccess: func(b PendingBead) error {
+			dispatchedSoFar++
+			// Simulate a fresh-read/update/save of shared state, taking a
+			// snapshot of the count as observed at this point in the loop.
+			snapshots = append(snapshots, dispatchedSoFar)
+			return nil
+		},
+		BatchSize: 10,
+	}
+
+	plan := DispatchPlan{
+		ToDispatch: []PendingBead{
+			{ID: "a", WorkBeadID: "wa"},
+			{ID: "b", WorkBeadID: "wb"},
+			{ID: "c", WorkBeadID: "wc"},
+		},
+	}
+
+	report, err := cycle.RunPlan(plan)
+	if err != nil {
+		t.Fatalf("RunPlan() error: %v", err)
+	}
+	if report.Dispatched != 3 {
+		t.Fatalf("Dispatched = %d, want 3", report.Dispatched)
+	}
+	// The key assertion: progress was observable incrementally (1, 2, 3),
+	// not just once at the end (which would show only [3]).
+	want := []int{1, 2, 3}
+	if len(snapshots) != len(want) {
+		t.Fatalf("snapshots = %v, want %v", snapshots, want)
+	}
+	for i, v := range want {
+		if snapshots[i] != v {
+			t.Errorf("snapshots[%d] = %d, want %d (progress must update per item, not only after the full cycle)", i, snapshots[i], v)
+		}
+	}
+}
+
 func TestDispatchCycle_Run_WithFailures(t *testing.T) {
 	failuresCalled := []string{}
 
