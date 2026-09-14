@@ -29,7 +29,13 @@ import (
 // storage table, not the role.
 //
 // See: gt-ybz
-const refineryPatrolFormula = "formulas/mol-refinery-patrol.formula.toml"
+//
+// The Step 3 lookups below locate their section by TITLE, not by the literal
+// "**Step 3: ...**" ordinal — that was the defect class gt-yb33 fixed for the
+// deacon patrol (see patrol_section_test.go): a section inserted above this
+// one and a renumbering would otherwise break these tests even though neither
+// change touched the orphan sweep. See gt-5pd9.
+const orphanedMRBeadsSection = "Check for orphaned MR beads"
 
 // mrLookupLiterals are the shapes of the blind query. None may appear in the
 // formula — not as an instruction, and not quoted inside a warning, because an
@@ -98,25 +104,7 @@ func TestRefineryPatrolHasNoMergeRequestTypeFilter(t *testing.T) {
 // reader that can actually see wisps, and to --verify, which is the only part
 // that answers the question the step asks ("is the branch gone?").
 func TestRefineryOrphanSweepUsesMergeQueueReader(t *testing.T) {
-	body := readRefineryPatrol(t)
-
-	const marker = "**Step 3: Check for orphaned MR beads**"
-	idx := strings.Index(body, marker)
-	if idx < 0 {
-		t.Fatalf("refinery patrol formula: %q section not found", marker)
-	}
-
-	rest := body[idx:]
-	open := strings.Index(rest, "```bash\n")
-	if open < 0 {
-		t.Fatal("refinery patrol formula: no bash block after the orphaned-MR heading")
-	}
-	rest = rest[open+len("```bash\n"):]
-	closeIdx := strings.Index(rest, "\n```")
-	if closeIdx < 0 {
-		t.Fatal("refinery patrol formula: unterminated bash block in the orphaned-MR step")
-	}
-	script := rest[:closeIdx]
+	script := patrolSectionScript(t, refineryPatrolFormula, orphanedMRBeadsSection)
 
 	if !strings.Contains(script, "gt mq list") {
 		t.Errorf("orphaned-MR sweep does not use `gt mq list`; got:\n%s", script)
@@ -172,19 +160,9 @@ func TestMRLookupProhibitionSurvivesRoleFlip(t *testing.T) {
 // refinery how to read a zero. "No orphans" and "could not see any MR beads"
 // produce the same empty output, and only a control distinguishes them.
 func TestOrphanSweepDemandsAPositiveControl(t *testing.T) {
-	body := readRefineryPatrol(t)
-
-	const marker = "**Step 3: Check for orphaned MR beads**"
-	idx := strings.Index(body, marker)
-	if idx < 0 {
-		t.Fatalf("refinery patrol formula: %q section not found", marker)
-	}
-	// Bound the search to this step so a stray "NOT MEASURED" elsewhere in the
-	// formula cannot satisfy it.
-	section := body[idx:]
-	if end := strings.Index(section, "\n[[steps]]"); end >= 0 {
-		section = section[:end]
-	}
+	// findPatrolSection already bounds the search at the next heading, so a
+	// stray "NOT MEASURED" elsewhere in the formula cannot satisfy this.
+	section := patrolSection(t, refineryPatrolFormula, orphanedMRBeadsSection)
 
 	for _, required := range []string{
 		"--status all",

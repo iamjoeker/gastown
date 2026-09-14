@@ -22,23 +22,26 @@ import (
 //
 // See: gt-yb33, gt-hkv, gt-32z
 
-// patrolSectionHeading matches any "**<n>. <title>**" heading line.
-var patrolSectionHeading = regexp.MustCompile(`(?m)^\*\*\d+\. .*\*\*\r?$`)
+// patrolSectionHeading matches any "**<n>. <title>**" or "**Step <n>: <title>**"
+// heading line — the deacon patrol numbers sections the first way, the
+// refinery patrol the second.
+var patrolSectionHeading = regexp.MustCompile(`(?m)^\*\*(?:\d+\.|Step \d+:) .*\*\*\r?$`)
 
 const deaconPatrolFormula = "formulas/mol-deacon-patrol.formula.toml"
+const refineryPatrolFormula = "formulas/mol-refinery-patrol.formula.toml"
 
-// findPatrolSectionScript returns the first bash block inside the section of
-// body titled title. Errors name the way the lookup failed, so a renamed
-// section, a duplicated one and a section with no script are distinguishable.
-func findPatrolSectionScript(body, title string) (string, error) {
-	heading := regexp.MustCompile(`(?m)^\*\*\d+\. ` + regexp.QuoteMeta(title) + `\*\*\r?$`)
+// findPatrolSection returns the section of body titled title, from its heading
+// up to (but not including) the next heading. Errors name the way the lookup
+// failed, so a renamed section and a duplicated one are distinguishable.
+func findPatrolSection(body, title string) (string, error) {
+	heading := regexp.MustCompile(`(?m)^\*\*(?:\d+\.|Step \d+:) ` + regexp.QuoteMeta(title) + `\*\*\r?$`)
 	locs := heading.FindAllStringIndex(body, -1)
 	switch len(locs) {
 	case 1:
 		// found
 	case 0:
-		return "", fmt.Errorf("no section titled %q (expected a heading of the form %q)",
-			title, "**<n>. "+title+"**")
+		return "", fmt.Errorf("no section titled %q (expected a heading of the form %q or %q)",
+			title, "**<n>. "+title+"**", "**Step <n>: "+title+"**")
 	default:
 		return "", fmt.Errorf("%d sections titled %q; the lookup cannot tell which one is meant", len(locs), title)
 	}
@@ -50,6 +53,16 @@ func findPatrolSectionScript(body, title string) (string, error) {
 	section := body[start:]
 	if next := patrolSectionHeading.FindStringIndex(section[locs[0][1]-start:]); next != nil {
 		section = section[:locs[0][1]-start+next[0]]
+	}
+	return section, nil
+}
+
+// findPatrolSectionScript returns the first bash block inside the section of
+// body titled title.
+func findPatrolSectionScript(body, title string) (string, error) {
+	section, err := findPatrolSection(body, title)
+	if err != nil {
+		return "", err
 	}
 
 	const fence = "```bash\n"
@@ -79,6 +92,23 @@ func patrolSectionScript(t *testing.T, formulaFile, title string) string {
 		t.Fatalf("%s: %v", formulaFile, err)
 	}
 	return script
+}
+
+// patrolSection reads an embedded formula and returns the full text of the
+// section with the given title, for tests that need the prose around the
+// bash block rather than just the block itself.
+func patrolSection(t *testing.T, formulaFile, title string) string {
+	t.Helper()
+
+	content, err := formulasFS.ReadFile(formulaFile)
+	if err != nil {
+		t.Fatalf("reading %s: %v", formulaFile, err)
+	}
+	section, err := findPatrolSection(string(content), title)
+	if err != nil {
+		t.Fatalf("%s: %v", formulaFile, err)
+	}
+	return section
 }
 
 // synthetic patrol body used by the lookup's own tests. %s takes the ordinal of
