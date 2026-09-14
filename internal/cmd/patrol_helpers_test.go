@@ -917,6 +917,39 @@ func TestFindActivePatrolHooked(t *testing.T) {
 	}
 }
 
+// TestFindActivePatrolCrossAssigneeForm reproduces gt-ytil3 (gt-mm0 Defect 2,
+// 3rd+4th surface): a patrol wisp written by one caller with the bare
+// "deacon" assignee must still be found by gt prime's lookup, which passes
+// the canonical "deacon/" form. Before the AgentAddressForms fan-out
+// (gt-mm0, gt-gbv4) this returned not-found and gt prime minted a duplicate.
+func TestFindActivePatrolCrossAssigneeForm(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-deacon-patrol"
+	writtenAssignee := "deacon" // bare form, as gt patrol report historically wrote it
+
+	rootID := createHookedPatrol(t, b, molName, writtenAssignee, true /* withOpenChild */)
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      "deacon/", // canonical form, as gt prime queries
+		Beads:         b,
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(cfg)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected to find active patrol written under the bare assignee form, got not found")
+	}
+	if patrolID != rootID {
+		t.Errorf("patrolID = %q, want %q", patrolID, rootID)
+	}
+}
+
 func TestFindActivePatrolStale(t *testing.T) {
 	requireBd(t)
 	tmpDir, b := setupPatrolTestDB(t)
