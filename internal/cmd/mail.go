@@ -35,6 +35,7 @@ var (
 	mailReplyMessage  string
 	mailReplyCC       []string // CC recipients on a reply (its own var, not mailCC)
 	mailStdin         bool     // Read message body from stdin
+	mailBodyFile      string   // Read message body from a file (gt-pw3cg)
 	mailAllowEmpty    bool     // Permit a subject-only message (gt-gxxm)
 
 	// Search flags
@@ -132,6 +133,15 @@ Priority levels:
 
 Use --urgent as shortcut for --priority 0.
 
+WARNING: --message/-m is evaluated by YOUR SHELL before gt ever sees it.
+Backticks, $(...), $VAR, and ! are expanded or stripped by the shell first —
+usually to empty — so whole fragments can silently vanish from the body. The
+send still reports success, and the recipient receives a well-formed message
+with holes where content used to be; there is no way to detect the loss from
+either end. If the body contains any shell metacharacters (backticks,
+command substitution, variables, code, or quoted commands), use --stdin or
+--body-file instead — neither passes through shell expansion.
+
 A message with an empty (or whitespace-only) body is refused, whatever the
 source: a harness that does not attach stdin used to deliver a subject with
 nothing under it while printing the same success line as a real send, and the
@@ -153,7 +163,10 @@ Examples:
   # Read body from stdin (avoids shell quoting issues):
   gt mail send mayor/ -s "Update" --stdin <<'BODY'
   Message with 'quotes' and "quotes" and $variables.
-  BODY`,
+  BODY
+
+  # Read body from a file (also avoids shell expansion):
+  gt mail send mayor/ -s "Update" --body-file /tmp/msg.txt`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runMailSend,
 }
@@ -497,6 +510,7 @@ func init() {
 	mailSendCmd.Flags().StringVarP(&mailBody, "message", "m", "", "Message body")
 	mailSendCmd.Flags().StringVar(&mailBody, "body", "", "Alias for --message")
 	mailSendCmd.Flags().BoolVar(&mailStdin, "stdin", false, "Read message body from stdin (avoids shell quoting issues)")
+	mailSendCmd.Flags().StringVar(&mailBodyFile, "body-file", "", "Read message body from a file (avoids shell expansion, unlike --message/-m)")
 	// An empty body is refused by default (gt-gxxm): it delivers a subject with
 	// nothing under it and neither end can tell that from a real send.
 	mailSendCmd.Flags().BoolVar(&mailAllowEmpty, "allow-empty", false, "Send even when the body is empty (subject-only message)")

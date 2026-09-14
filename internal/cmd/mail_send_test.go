@@ -139,15 +139,15 @@ func TestPickReplyTo(t *testing.T) {
 // registration exercises the distinction.
 func setSendFlags(t *testing.T, args ...string) {
 	t.Helper()
-	prevBody, prevStdin, prevAllowEmpty, prevHuman := mailBody, mailStdin, mailAllowEmpty, mailSendHuman
+	prevBody, prevStdin, prevBodyFile, prevAllowEmpty, prevHuman := mailBody, mailStdin, mailBodyFile, mailAllowEmpty, mailSendHuman
 	changed := map[string]bool{}
-	for _, name := range []string{"message", "body", "stdin", "allow-empty", "human"} {
+	for _, name := range []string{"message", "body", "stdin", "body-file", "allow-empty", "human"} {
 		if f := mailSendCmd.Flags().Lookup(name); f != nil {
 			changed[name] = f.Changed
 		}
 	}
 	t.Cleanup(func() {
-		mailBody, mailStdin, mailAllowEmpty, mailSendHuman = prevBody, prevStdin, prevAllowEmpty, prevHuman
+		mailBody, mailStdin, mailBodyFile, mailAllowEmpty, mailSendHuman = prevBody, prevStdin, prevBodyFile, prevAllowEmpty, prevHuman
 		for name, was := range changed {
 			if f := mailSendCmd.Flags().Lookup(name); f != nil {
 				f.Changed = was
@@ -213,6 +213,8 @@ func TestMailBodySource(t *testing.T) {
 		{name: "body alias", args: []string{"-s", "x", "--body", "hi"}, want: "--body"},
 		{name: "stdin", args: []string{"-s", "x", "--stdin"}, want: "--stdin"},
 		{name: "stdin wins over message", args: []string{"-s", "x", "--stdin", "-m", "hi"}, want: "--stdin"},
+		{name: "body-file", args: []string{"-s", "x", "--body-file", "/tmp/does-not-need-to-exist.txt"}, want: "--body-file"},
+		{name: "stdin wins over body-file", args: []string{"-s", "x", "--stdin", "--body-file", "/tmp/does-not-need-to-exist.txt"}, want: "--stdin"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -308,6 +310,60 @@ func TestRunMailSendRefusesEmptyBody(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "refusing to send") || !strings.Contains(err.Error(), "--message/-m") {
 			t.Errorf("error %q is not the empty--m refusal", err.Error())
+		}
+	})
+}
+
+// TestRunMailSendBodyFile reproduces gt-pw3cg: --message/-m is evaluated by
+// the CALLER's shell before gt ever sees the argument, so backticks and
+// $(...) in a -m body are silently expanded or stripped, usually to empty.
+// --body-file reads the file directly, bypassing shell expansion entirely, so
+// content that would vanish through -m survives verbatim.
+func TestRunMailSendBodyFile(t *testing.T) {
+	detachFromTown(t)
+
+	path := t.TempDir() + "/body.txt"
+	want := "check `command not found` and $(also gone) and $UNSET_VAR and !history\n"
+	if err := os.WriteFile(path, []byte(want), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	setSendFlags(t, "-s", "canary", "--body-file", path)
+
+	// runMailSend fails past the body guard at workspace lookup (detachFromTown),
+	// but only after resolving mailBody from the file — so a workspace error
+	// here (not a body refusal) proves the file content was read and accepted.
+	err := runMailSend(mailSendCmd, []string{"mayor/"})
+	if err == nil || !strings.Contains(err.Error(), "not in a Gas Town workspace") {
+		t.Fatalf("runMailSend with --body-file = %v, want workspace error (body should have been read from file)", err)
+	}
+	if mailBody != strings.TrimRight(want, "\n") {
+		t.Errorf("mailBody = %q, want file content %q verbatim (no shell expansion)", mailBody, want)
+	}
+}
+
+// TestRunMailSendBodyFileMutuallyExclusive: --body-file combined with
+// --stdin or --message/-m is ambiguous about which body wins, so both are
+// rejected rather than silently picking one.
+func TestRunMailSendBodyFileMutuallyExclusive(t *testing.T) {
+	path := t.TempDir() + "/body.txt"
+	if err := os.WriteFile(path, []byte("hi"), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	t.Run("with --stdin", func(t *testing.T) {
+		setSendFlags(t, "-s", "canary", "--stdin", "--body-file", path)
+		err := runMailSend(mailSendCmd, []string{"mayor/"})
+		if err == nil || !strings.Contains(err.Error(), "cannot use --stdin with --body-file") {
+			t.Errorf("runMailSend = %v, want --stdin/--body-file conflict error", err)
+		}
+	})
+
+	t.Run("with --message", func(t *testing.T) {
+		setSendFlags(t, "-s", "canary", "-m", "hi", "--body-file", path)
+		err := runMailSend(mailSendCmd, []string{"mayor/"})
+		if err == nil || !strings.Contains(err.Error(), "cannot use --body-file with --message/-m") {
+			t.Errorf("runMailSend = %v, want --body-file/--message conflict error", err)
 		}
 	})
 }
