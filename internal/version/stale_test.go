@@ -536,22 +536,41 @@ func TestStaleBinaryInfo_Describe(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "commits behind known",
-			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 3},
+			name:    "commits behind known, refreshed against the remote",
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 3, Refreshed: true},
 			subject: "Binary",
 			want:    "Binary is 3 commits behind main (built from abc123456789, main at fed098765432)",
 		},
 		{
-			name:    "count unknown falls back to stale wording",
-			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "origin/main", CommitsBehind: 0},
+			name:    "count unknown falls back to stale wording, refreshed",
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "origin/main", CommitsBehind: 0, Refreshed: true},
 			subject: "gt binary",
 			want:    "gt binary is stale (built from abc123456789, origin/main at fed098765432)",
 		},
 		{
 			name:    "short hashes are not truncated",
-			info:    StaleBinaryInfo{BinaryCommit: "abc123", RepoCommit: "def456", CompareRef: "carry/ops", CommitsBehind: 1},
+			info:    StaleBinaryInfo{BinaryCommit: "abc123", RepoCommit: "def456", CompareRef: "carry/ops", CommitsBehind: 1, Refreshed: true},
 			subject: "Binary",
 			want:    "Binary is 1 commits behind carry/ops (built from abc123, carry/ops at def456)",
+		},
+		{
+			// gt-el0s: the startup banner never refreshes (it runs before every
+			// command and can't afford a fetch), so its compare commit is a local
+			// ref that can lag real main for hours. Describe must say so instead
+			// of presenting it as current.
+			name:    "never refreshed (the startup banner's case) gets a caveat",
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 0},
+			subject: "gt binary",
+			want:    "gt binary is stale (built from abc123456789, main at fed098765432) — local reference, may lag; run 'gt stale' for the current comparison",
+		},
+		{
+			// A refresh that was attempted and failed still proved staleness via
+			// local-lag containment; it should not get the "never refreshed"
+			// caveat, which would misstate what happened.
+			name:    "refresh attempted and failed gets no caveat",
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "origin/main", CommitsBehind: 1, RefreshError: "dial tcp: timeout"},
+			subject: "Binary",
+			want:    "Binary is 1 commits behind origin/main (built from abc123456789, origin/main at fed098765432)",
 		},
 	}
 	for _, tt := range tests {
