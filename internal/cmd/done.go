@@ -1360,14 +1360,31 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead\n%s",
 								branch, baseRef, supersededRefusalHint(superseded))
 						}
-						if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
-							// A lost annotation is already reported loudly by the helper;
-							// the close is refused either way.
-							_ = noteVerifiedPushFailure(bd, cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
-							return fmt.Errorf("cannot close no-MR code bead: %w\n%s", verifyErr, supersededRefusalHint(superseded))
-						}
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
+						if branchPushedWithWork {
+							if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
+								// A lost annotation is already reported loudly by the helper;
+								// the close is refused either way.
+								_ = noteVerifiedPushFailure(bd, cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
+								return fmt.Errorf("cannot close no-MR code bead: %w\n%s", verifyErr, supersededRefusalHint(superseded))
+							}
+							if noMRCommitSHA != "" {
+								closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
+							}
+						} else {
+							// gt-wsrw: with no pushed branch work, verifying HEAD against
+							// origin/<default> is vacuous here — aheadCount==0 already
+							// means HEAD is an ancestor of origin/<default> by
+							// construction, so the check can never fail. HEAD is just
+							// the base ref (on an ordinary rig, a stranger's commit, not
+							// this completion's work), so record that no commit backs
+							// this close rather than let a tautology stand in as proof
+							// (gt-r5p). Only non-polecats reach this branch:
+							// noMRCloseRefusal above already refuses a polecat with no
+							// pushed work.
+							if noteErr := noteVerifiedPushSkipped(g, bd, sourceIssueForNoMerge, cwd, issueID, defaultBranch, "", "no-MR close with no pushed branch work"); noteErr != nil {
+								style.PrintWarning("%v", noteErr)
+							}
+							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: none (no pushed branch work to verify)", closeReason, defaultBranch)
 						}
 					}
 					// G15 fix: Force-close bypasses molecule dependency checks.

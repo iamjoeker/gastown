@@ -199,6 +199,74 @@ func TestRunDoneRefusesNonForkCloseWhenNothingLandedAndBranchNeverPushed(t *test
 	}
 }
 
+// setupBaseAdvancedPastPushedBranch builds the GH#wd7 configuration: a
+// polecat pushed real work to its own feature branch, then base advanced past
+// it (another MR landed the same commits), so the branch is zero commits
+// ahead of origin/main even though it carries real, fully-pushed work. This is
+// the one population that must still reach the verify-and-record arm after
+// gt-wsrw's split on branchPushedWithWork — it is real evidence, not a
+// stranger's commit, and the close must keep recording it.
+func setupBaseAdvancedPastPushedBranch(t *testing.T, workDir string) string {
+	t.Helper()
+	remote := t.TempDir()
+	runGitForMQSubmitTest(t, remote, "init", "--bare")
+	runGitForMQSubmitTest(t, workDir, "init")
+	runGitForMQSubmitTest(t, workDir, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, workDir, "config", "user.name", "Test User")
+	runGitForMQSubmitTest(t, workDir, "remote", "add", "origin", remote)
+	writeMQSubmitTestFile(t, workDir, ".gitignore", ".beads/\n.runtime/\n")
+	writeMQSubmitTestFile(t, workDir, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, workDir, "add", ".gitignore", "file.txt")
+	runGitForMQSubmitTest(t, workDir, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, workDir, "branch", "-M", "main")
+	runGitForMQSubmitTest(t, workDir, "push", "-u", "origin", "main")
+
+	branch := "polecat/refuge/bd-source"
+	runGitForMQSubmitTest(t, workDir, "checkout", "-b", branch)
+	writeMQSubmitTestFile(t, workDir, "work.txt", "real work\n")
+	runGitForMQSubmitTest(t, workDir, "add", "work.txt")
+	runGitForMQSubmitTest(t, workDir, "commit", "-m", "fix: unrelated internal cleanup")
+	runGitForMQSubmitTest(t, workDir, "push", "-u", "origin", branch)
+
+	// Base advances past the branch's commit — e.g. a sibling's MR merged it,
+	// or it landed via fast-forward through another route. The branch itself
+	// gets no new commits, so it stays fully pushed with zero unpushed work.
+	runGitForMQSubmitTest(t, workDir, "checkout", "main")
+	runGitForMQSubmitTest(t, workDir, "merge", "--ff-only", branch)
+	runGitForMQSubmitTest(t, workDir, "push", "origin", "main")
+	runGitForMQSubmitTest(t, workDir, "checkout", branch)
+
+	return branch
+}
+
+// gt-wsrw: the vacuous-verify arm records commit_sha for a bead only when
+// branchPushedWithWork is true — the GH#wd7 case above. This locks in that
+// the split introduced to fix gt-wsrw did not also break that legitimate
+// close: the real, fully-pushed commit is still recorded as proof.
+func TestRunDoneRecordsPushedBranchCommitWhenBaseAdvancedPastIt(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupBaseAdvancedPastPushedBranch(t, workDir)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetDoneFlagsForTest(t)
+	primeSupersededDoneEnv(t, workDir, routedSourceTestTownRoot(workDir))
+
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	if !strings.Contains(log, "close bd-source") {
+		t.Fatalf("bd log has no close of bd-source:\n%s", log)
+	}
+	if strings.Contains(log, "commit_sha: none") {
+		t.Errorf("close recorded no evidence for real, fully-pushed work:\n%s", log)
+	}
+	if !strings.Contains(log, "target_branch: main") {
+		t.Errorf("close reason is missing target_branch:\n%s", log)
+	}
+}
+
 // gt-gubw, at the level the pure guard cannot reach: that runDone actually
 // consults the bead's status before refusing.
 //
