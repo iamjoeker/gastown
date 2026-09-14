@@ -48,6 +48,7 @@ NOT anomalies (do NOT escalate these):
   This is expected behavior, not a bug."""
 formula = "mol-dog-reaper"
 version = 3
+pour = true
 
 [squash]
 trigger = "on_complete"

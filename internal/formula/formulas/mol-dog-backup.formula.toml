@@ -29,6 +29,7 @@ Backups are additive — they never modify production data. Backup sync
 overwrites the backup destination, but that is the intended behavior."""
 formula = "mol-dog-backup"
 version = 1
+pour = true
 
 [squash]
 trigger = "on_complete"

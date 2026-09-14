@@ -34,6 +34,7 @@ The daemon:
 - Refinery squash-merges anyway, so WIP commits never reach main"""
 formula = "mol-dog-checkpoint"
 version = 1
+pour = true
 
 [squash]
 trigger = "on_complete"

@@ -35,6 +35,7 @@ Exports are read-only against Dolt. Git operations are append-only
 the main codebase."""
 formula = "mol-dog-jsonl"
 version = 1
+pour = true
 
 [squash]
 trigger = "on_complete"
