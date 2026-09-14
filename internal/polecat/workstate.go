@@ -80,6 +80,39 @@ const (
 	// Every `verdict != SAFE_TO_NUKE` guard in the tree therefore fails closed
 	// on it, which is the intent (gt-49dp).
 	WorkstateVerdictUnverified = "UNVERIFIED"
+
+	// WorkstateVerdictParkedMismatch is the answer for a polecat whose bead says
+	// working (State == StateWorking, so the not-idle road below would otherwise
+	// fire) while the pane was POSITIVELY read as tmux.LivenessParked: no turn in
+	// flight, no auth wall, nothing generating. The bead and the pane disagree
+	// about whether this polecat is doing anything.
+	//
+	// This is the exact shape that read WORKING/leave-alone for 42+ minutes on
+	// gastown/brahmin while it sat on an unanswered AskUserQuestion menu, and for
+	// ~1h50m on the Mayor before that (gt-3veeb, hq-79f59). Both times the
+	// tool's own doc comment already told a human to read the pane by hand —
+	// `tmux capture-pane -p -t <session> | grep -c 'esc to interrupt'` — but
+	// nothing automated ran that check. A polecat that has finished and parked
+	// looks identical to one parked mid-menu on every OTHER surface (bead
+	// lifecycle, hook, session presence), so the pane is the only place the two
+	// cases differ, and this verdict is what makes that reading a fact this
+	// package can act on instead of prose a human has to remember to check.
+	//
+	// It is deliberately its own verdict rather than folded into WORKING: WORKING
+	// routes to leave-alone (see witnessActionFor), and leave-alone is precisely
+	// the behavior that let both incidents run for hours. It is deliberately not
+	// SUSPECT_STALL either — that state requires a turn to be OPEN with a static
+	// token counter; here there is no turn open at all, which is stronger
+	// evidence, not weaker, and conflating the two would blur two different pane
+	// readings behind one name (gt-mkpm's whole complaint).
+	//
+	// It routes to escalate, not restart: SessionParked only fires on the
+	// stronger of the two roads DecideWorkstate can take to WORKING (see
+	// SessionParked's own doc comment) and a caller that read the pane that
+	// carefully has already done the one thing a restart would throw away. A
+	// human or the Mayor reads the menu and answers it, or takes over — an
+	// unanswered menu is a question, not a stall a runtime restart clears.
+	WorkstateVerdictParkedMismatch = "PARKED_MISMATCH"
 )
 
 // Reason strings. They are named because callers RENDER prose off them, and the
@@ -148,6 +181,12 @@ const (
 	// that only knows the MR is open) found the referenced merge request
 	// genuinely still in flight.
 	WorkstateReasonActiveMROpen = "active-mr-open"
+
+	// WorkstateReasonSessionParkedMismatch means the bead's lifecycle state says
+	// working while the pane was read and positively classified
+	// tmux.LivenessParked — no turn in flight, no auth wall. See
+	// WorkstateVerdictParkedMismatch.
+	WorkstateReasonSessionParkedMismatch = "session-parked-mismatch"
 )
 
 // SessionPresence is what a direct `tmux has-session` on the polecat's session
@@ -386,6 +425,25 @@ type WorkstateInput struct {
 	// SessionSuspectStall were taken. Reported in the blocker so the claim can
 	// be read as the measurement it is (gt-y39t).
 	SessionStallWindow time.Duration
+
+	// SessionParked is a SINGLE-sample pane read: tmux.ClassifyLiveness
+	// returned LivenessParked for the current pane (no turn in flight, no
+	// auth-wall marker). Unlike SessionSuspectStall this needs no delta and no
+	// window — LivenessParked is decidable from one capture — so any caller
+	// that reads the pane at all can set it.
+	//
+	// It exists to give the not-idle road below (bead says State==StateWorking)
+	// a fact about the pane it never otherwise consults. A polecat parked on an
+	// unanswered interactive menu — no turn open, so SessionBusy is false — is
+	// indistinguishable from one still generating UNTIL something reads the
+	// pane, and gt-3veeb is two live incidents of exactly that gap: 42+ minutes
+	// on gastown/brahmin, ~1h50m on the Mayor (hq-79f59), each read WORKING with
+	// witness action leave-alone the entire time. See
+	// WorkstateVerdictParkedMismatch.
+	//
+	// Left false by every caller that does not sample the pane, which keeps
+	// their verdict exactly what it was before this field existed.
+	SessionParked bool
 
 	HookBead                       string
 	CleanupStatus                  CleanupStatus
@@ -791,6 +849,26 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	// queue as "stalled" — the word for the failure case — for the whole
 	// in-flight window (gt-mkpm).
 	if in.State != StateIdle && in.State != StateDone && in.State != StateHandedOff {
+		// The bead says working, and SessionBusy above did not catch it — a
+		// wedged/generating agent renders the busy marker and would have returned
+		// already. Before trusting the bead-derived WORKING verdict below, ask
+		// whether the pane was actually read and positively found parked. This is
+		// the ONE fact the not-idle road never had: two live incidents (gt-3veeb,
+		// hq-79f59) sat on an unanswered menu for 42+ minutes and ~1h50m
+		// respectively, reporting WORKING/leave-alone the whole time, because
+		// agent_state=working was treated as proof of activity that nobody had
+		// actually measured. See WorkstateVerdictParkedMismatch.
+		if in.State == StateWorking && in.SessionParked {
+			return WorkstateDisposition{
+				Verdict:              WorkstateVerdictParkedMismatch,
+				Reason:               WorkstateReasonSessionParkedMismatch,
+				CountsTowardCapacity: true,
+				Blockers: []string{
+					"polecat_state=working (agent bead says not idle) but session_state=parked (pane read: no turn in flight, no auth wall) — bead and pane disagree; likely parked on an unanswered menu",
+				},
+			}
+		}
+
 		verdict := WorkstateVerdictNeedsRecovery
 		needsRecovery := true
 		if in.State == StateWorking {

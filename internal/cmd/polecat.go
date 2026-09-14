@@ -1408,6 +1408,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 	input.SessionSuspectStall = liveness.SuspectStall()
 	input.SessionStallWindow = liveness.Window
+	// A single-sample read decides LivenessParked (see ClassifyLiveness): no
+	// turn in flight, no auth-wall marker. Feeding it to DecideWorkstate is what
+	// gt-3veeb is about — the not-idle road used to trust agent_state=working
+	// with no pane evidence at all, which is exactly what let a polecat parked
+	// on an unanswered menu read WORKING/leave-alone for 42+ minutes.
+	input.SessionParked = liveness.State == tmux.LivenessParked
 	// Set only where an open MR for this polecat was actually looked up and read
 	// back open. It promotes a detected "stalled" to "handed-off" below, so it
 	// must never be set from a fail-closed "could not rule one out".
@@ -1714,6 +1720,27 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Printf("  %s\n", style.Dim.Render("This verdict used to read WORKING, because a logged-out agent keeps its"))
 		fmt.Printf("  %s\n", style.Dim.Render("hooked bead and its lifecycle state — hooked-ness read as liveness (gt-acb1)"))
+	case polecat.WorkstateVerdictParkedMismatch:
+		fmt.Printf("  Verdict:         %s\n", style.Error.Render("PARKED_MISMATCH"))
+		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)
+		fmt.Println()
+		for _, blocker := range status.Blockers {
+			fmt.Printf("    - %s\n", blocker)
+		}
+		fmt.Println()
+		fmt.Printf("  %s The agent bead says working, but the pane was read and shows no turn\n", style.Warning.Render("⚠"))
+		fmt.Println("  in flight and no auth wall — it is sitting at its prompt. This is what a")
+		fmt.Println("  polecat parked on an unanswered interactive menu looks like: the bead's")
+		fmt.Println("  lifecycle state never changed, so every bead-derived fact says WORKING,")
+		fmt.Println("  and only the pane disagrees.")
+		fmt.Println()
+		fmt.Println("  Look at the pane and answer the menu, or take over:")
+		fmt.Printf("    gt session at %s/%s\n", rigName, polecatName)
+		fmt.Println()
+		fmt.Printf("  %s\n", style.Dim.Render("This case used to read WORKING with witness action leave-alone: the"))
+		fmt.Printf("  %s\n", style.Dim.Render("not-idle road reads the agent bead and never looked at the pane at all,"))
+		fmt.Printf("  %s\n", style.Dim.Render("which is how the same gap stranded a polecat for 42+ minutes and the"))
+		fmt.Printf("  %s\n", style.Dim.Render("Mayor for ~1h50m before anyone noticed (gt-3veeb, hq-79f59)."))
 	case polecat.WorkstateVerdictSuspectStall:
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("SUSPECT_STALL"))
 		fmt.Printf("  Witness action:  %s\n", status.WitnessAction)

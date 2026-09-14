@@ -163,6 +163,10 @@ case "${1:-}" in
       if [ -f "$TEST_STATE/needs_recovery/$name" ]; then
         needs_recovery=true
       fi
+      if [ -f "$TEST_STATE/parked_mismatch/$name" ]; then
+        printf '{"needs_recovery":false,"verdict":"PARKED_MISMATCH","witness_action":"escalate"}\n'
+        exit 0
+      fi
       printf '{"needs_recovery":%s}\n' "$needs_recovery"
       exit 0
     fi
@@ -430,7 +434,7 @@ setup_case() {
   export GT_STUCK_AGENT_DOG_STATE_DIR="$TEST_TMP/dogstate"
   local bin_dir="$TEST_TMP/bin"
 
-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/needs_recovery" "$TEST_STATE/check_recovery_fail" "$TEST_STATE/reconcile_landed" "$bin_dir"
+  mkdir -p "$TEST_STATE/health" "$TEST_STATE/hook_fail" "$TEST_STATE/hook_status" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/needs_recovery" "$TEST_STATE/parked_mismatch" "$TEST_STATE/check_recovery_fail" "$TEST_STATE/reconcile_landed" "$bin_dir"
   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
   : > "$TEST_STATE/mail.log"
@@ -587,6 +591,27 @@ test_healthy_session_but_needs_recovery_is_not_counted_healthy() {
   assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 0 uncounted, 0 terminal, 0 post-submission, 0 stranded, 0 pending, 1 needs_recovery" "needs-recovery mismatch: split out of healthy"
   assert_file_empty "$TEST_STATE/mail.log" "needs-recovery mismatch: no restart mail (reporting only)"
   assert_file_not_contains "$TEST_STATE/output.log" "WARN:" "needs-recovery mismatch: denominator still balances"
+}
+
+# A polecat parked on an unanswered interactive menu passes session health as
+# "healthy" (runtime alive, recently active) on every poll — the session probe
+# has no way to see that a turn never opened. check-recovery's witness_action
+# is the only surface that disagrees, and needs_recovery stays false because
+# nothing is proven LOST, only unanswered (gt-3veeb, hq-79f59).
+test_healthy_session_but_parked_mismatch_escalates() {
+  setup_case
+  add_polecat brahmin healthy
+  touch "$TEST_STATE/parked_mismatch/brahmin"
+  run_script
+
+  assert_file_contains "$TEST_STATE/check_recovery_calls.log" "gastown/brahmin" "parked mismatch: check-recovery consulted"
+  assert_file_contains "$TEST_STATE/output.log" "PARKED_MISMATCH: gt-brahmin session healthy but check-recovery says verdict=PARKED_MISMATCH witness_action=escalate; escalating" "parked mismatch: named"
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 0 healthy, 0 observed, 0 uncounted, 0 terminal, 0 post-submission, 0 stranded, 0 pending, 0 needs_recovery, 1 parked_mismatch" "parked mismatch: split out of healthy"
+  assert_line_count "$TEST_STATE/escalate.log" 1 "parked mismatch: one escalation"
+  assert_file_contains "$TEST_STATE/escalate.log" "verdict=PARKED_MISMATCH" "parked mismatch: escalation names the verdict"
+  assert_file_contains "$TEST_STATE/escalate.log" "--fingerprint stuck-agent-dog:parked-mismatch:gastown/brahmin" "parked mismatch: per-polecat fingerprint"
+  assert_file_empty "$TEST_STATE/mail.log" "parked mismatch: no restart mail (escalation only)"
+  assert_file_not_contains "$TEST_STATE/output.log" "WARN:" "parked mismatch: denominator still balances"
 }
 
 test_check_recovery_unavailable_trusts_session_health() {
@@ -1465,6 +1490,7 @@ test_healthy_runtime bun
 test_healthy_runtime node
 test_healthy_runtime claude
 test_healthy_session_but_needs_recovery_is_not_counted_healthy
+test_healthy_session_but_parked_mismatch_escalates
 test_check_recovery_unavailable_trusts_session_health
 test_agent_hung_observe_only
 test_session_dead_without_hook_is_uncounted

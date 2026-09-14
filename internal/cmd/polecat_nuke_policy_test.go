@@ -246,9 +246,15 @@ func TestWitnessActionFor(t *testing.T) {
 		// WORKING, and not restart either: two pane samples a minute apart show
 		// nothing moving, which is not the same as showing the agent is dead,
 		// and a restart discards its context to find out (gt-y39t).
-		"SUSPECT_STALL":  "escalate",
-		"":               "restart",
-		"SOME_NEW_STATE": "restart",
+		"SUSPECT_STALL": "escalate",
+		// Not leave-alone, which is what this used to get under plain WORKING —
+		// the not-idle road never checked the pane, so a polecat parked on an
+		// unanswered menu read WORKING/leave-alone for 42+ minutes (gt-3veeb,
+		// hq-79f59). Not restart: the pane was read and found parked, not dead,
+		// and an unanswered menu is a question for a human, not a runtime fault.
+		"PARKED_MISMATCH": "escalate",
+		"":                "restart",
+		"SOME_NEW_STATE":  "restart",
 	}
 
 	for verdict, want := range tests {

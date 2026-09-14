@@ -220,15 +220,38 @@ session_health_status() {
 # Fails OPEN (trusts session health) when check-recovery itself is unreachable
 # or unparseable: an unrelated outage in the recovery-check surface must not
 # turn every healthy polecat into a false NEEDS_RECOVERY report.
-needs_recovery_per_check_recovery() {
+#
+# One call, three answers. needs_recovery is the pre-existing NEEDS_RECOVERY
+# cross-check above. witness_action/verdict are read from the SAME response so
+# a caller can also catch the escalate-but-not-needs-recovery verdicts —
+# NEEDS_LOGIN, SUSPECT_STALL, and PARKED_MISMATCH — none of which set
+# needs_recovery=true (nothing is proven LOST for any of them; the pane just
+# disagrees with the bead) but all of which the session-health probe reads as
+# indistinguishable from a generating agent. PARKED_MISMATCH is the exact gap
+# gt-3veeb was filed about: a polecat parked on an unanswered interactive menu
+# passes session_health_status as "healthy" (the runtime is alive and was
+# recently active) every single poll, and without this second field it stayed
+# invisible to this dog too.
+CHECK_RECOVERY_NEEDS_RECOVERY=""
+CHECK_RECOVERY_WITNESS_ACTION=""
+CHECK_RECOVERY_VERDICT=""
+
+read_check_recovery() {
   local rig="$1" pcat="$2"
   local json=""
+
+  CHECK_RECOVERY_NEEDS_RECOVERY=""
+  CHECK_RECOVERY_WITNESS_ACTION=""
+  CHECK_RECOVERY_VERDICT=""
 
   if ! json=$(gt polecat check-recovery "$rig/$pcat" --json 2>/dev/null); then
     log "  NOTICE: check-recovery unavailable for $rig/$pcat; trusting session health"
     return 1
   fi
-  [ "$(printf '%s' "$json" | jq -r '.needs_recovery // false' 2>/dev/null)" = "true" ]
+  CHECK_RECOVERY_NEEDS_RECOVERY=$(printf '%s' "$json" | jq -r '.needs_recovery // false' 2>/dev/null || echo false)
+  CHECK_RECOVERY_WITNESS_ACTION=$(printf '%s' "$json" | jq -r '.witness_action // empty' 2>/dev/null || true)
+  CHECK_RECOVERY_VERDICT=$(printf '%s' "$json" | jq -r '.verdict // empty' 2>/dev/null || true)
+  return 0
 }
 
 operational_rig_prefix_map() {
@@ -652,6 +675,14 @@ PENDING=0
 # HEALTHY for agent-hung: the summary must not assert a clean bill of health
 # the check-recovery probe itself denies.
 NEEDS_RECOVERY_MISMATCH=0
+# PARKED_MISMATCH: session health said healthy, needs_recovery is false, but
+# check-recovery's witness_action is "escalate" anyway — NEEDS_LOGIN,
+# SUSPECT_STALL, or PARKED_MISMATCH (gt-3veeb). Nothing is proven lost for any
+# of these, which is why needs_recovery is false and this is not folded into
+# NEEDS_RECOVERY_MISMATCH, but the pane and the bead disagree and a human
+# needs to look — exactly what session_health_status cannot see, since the
+# runtime is alive and (for the menu case) was recently active.
+PARKED_MISMATCH=0
 # ENUMERATED: polecat directories walked. Every one of them must land in exactly
 # one bucket; the guard after the loop says so out loud rather than trusting it.
 ENUMERATED=0
@@ -674,9 +705,19 @@ while IFS='|' read -r RIG PREFIX; do
     HEALTH_STATUS=$(session_health_status "$SESSION_NAME" || true)
     case "$HEALTH_STATUS" in
       healthy)
-        if needs_recovery_per_check_recovery "$RIG" "$PCAT_NAME"; then
+        if ! read_check_recovery "$RIG" "$PCAT_NAME"; then
+          HEALTHY=$((HEALTHY + 1))
+        elif [ "$CHECK_RECOVERY_NEEDS_RECOVERY" = "true" ]; then
           NEEDS_RECOVERY_MISMATCH=$((NEEDS_RECOVERY_MISMATCH + 1))
           log "  NEEDS_RECOVERY: $SESSION_NAME session healthy but check-recovery verdict says needs_recovery=true"
+        elif [ "$CHECK_RECOVERY_WITNESS_ACTION" = "escalate" ]; then
+          PARKED_MISMATCH=$((PARKED_MISMATCH + 1))
+          log "  PARKED_MISMATCH: $SESSION_NAME session healthy but check-recovery says verdict=${CHECK_RECOVERY_VERDICT:-unknown} witness_action=escalate; escalating"
+          gt escalate "Polecat $RIG/$PCAT_NAME: bead says working but check-recovery verdict=${CHECK_RECOVERY_VERDICT:-unknown} (pane disagrees; possible unanswered menu)" \
+            -s HIGH \
+            --source "plugin:stuck-agent-dog" \
+            --fingerprint "stuck-agent-dog:parked-mismatch:$RIG/$PCAT_NAME" 2>/dev/null || \
+            log "  WARN: escalate failed for $SESSION_NAME"
         else
           HEALTHY=$((HEALTHY + 1))
         fi
@@ -759,14 +800,14 @@ done <<< "$RIG_PREFIX_MAP"
 persist_crash_candidates
 
 log ""
-log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, ${#STRANDED[@]} stranded, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
+log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, ${#STRANDED[@]} stranded, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery, $PARKED_MISMATCH parked_mismatch"
 
 # Conservation guard. The defect this plugin keeps re-acquiring is a bucket that
 # silently drops rows, and a shrinking denominator reads exactly like an
 # all-clear. State the identity instead of assuming it. POST_SUBMISSION and
 # PENDING are excluded from action but NOT from the denominator, for the same
 # reason: an exclusion that does not show up in the arithmetic is invisible.
-BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + ${#STRANDED[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL + POST_SUBMISSION + PENDING + NEEDS_RECOVERY_MISMATCH ))
+BUCKET_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} + ${#STRANDED[@]} + HEALTHY + OBSERVED + UNCOUNTED + TERMINAL + POST_SUBMISSION + PENDING + NEEDS_RECOVERY_MISMATCH + PARKED_MISMATCH ))
 if [ "$BUCKET_TOTAL" -eq "$ENUMERATED" ]; then
   log "Denominator: $BUCKET_TOTAL bucketed == $ENUMERATED polecat directories enumerated"
 else
@@ -947,7 +988,7 @@ fi
 
 # --- Report -------------------------------------------------------------------
 
-SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, ${#STRANDED[@]} stranded, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery"
+SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy, $OBSERVED observed, $UNCOUNTED uncounted, $TERMINAL terminal, $POST_SUBMISSION post-submission, ${#STRANDED[@]} stranded, $PENDING pending, $NEEDS_RECOVERY_MISMATCH needs_recovery, $PARKED_MISMATCH parked_mismatch"
 [ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 [ -n "$DEACON_DIVERGENCE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_DIVERGENCE (not escalated)"
 log ""

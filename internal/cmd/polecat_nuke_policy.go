@@ -132,6 +132,17 @@ func witnessActionFor(verdict string, state polecat.State) string {
 		// logged-out agent; only a human at a browser clears it. Restart-first is
 		// correct for ordinary stalls and wrong for exactly this one (gt-acb1).
 		return "escalate"
+	case polecat.WorkstateVerdictParkedMismatch:
+		// Escalate, not restart, and not leave-alone — the same shape as
+		// SUSPECT_STALL just below, for the same reason: leave-alone is what
+		// this case used to get (it read WORKING, because the not-idle road
+		// never checked the pane) and that is the whole defect (gt-3veeb,
+		// hq-79f59). Restart is wrong too: the pane was read and confirmed
+		// parked, not confirmed dead, and an unanswered interactive menu is a
+		// question for a human or the Mayor to answer, not a runtime fault a
+		// restart clears — a restart would just discard the agent's context on
+		// the way to presenting the same menu again.
+		return "escalate"
 	case polecat.WorkstateVerdictSuspectStall:
 		// Escalate, not restart, and not leave-alone.
 		//
