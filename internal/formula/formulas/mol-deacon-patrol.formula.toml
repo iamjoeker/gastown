@@ -138,7 +138,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 23
+version = 24
 
 [vars]
 [vars.wisp_type]
@@ -1078,19 +1078,48 @@ The Witness is responsible for cleaning up polecats after they complete work.
 This step provides backup DETECTION in case the Witness fails to clean up.
 Detection only - Boot handles termination.
 
-**Zombie criteria:**
+**Zombie criteria (polecat STATE, not OS processes):**
 - State: idle or done (no active work assigned)
 - Session: not running (tmux session dead)
 - No hooked work (nothing pending for this polecat)
 - Last activity: older than 10 minutes
 
-**Run the zombie scan (DRY RUN ONLY):**
+**`gt deacon zombie-scan` does NOT detect this.** It scans OS processes for
+Claude/codex processes with no controlling tmux pane — a completely different
+failure mode (orphaned subagent processes, already covered by the
+orphan-process-cleanup step). A polecat that is registered, idle, and has no
+session at all owns no process, so it is invisible to a process scan BY
+CONSTRUCTION: it can report "No zombie claude processes found" while several
+polecats meet every criterion above (gt-a6t96). Do not run it for this step.
+
+**Run the state-level scan (READ ONLY — this step only queries, never kills):**
 ```bash
-gt deacon zombie-scan --dry-run
+# gt polecat list already joins registered polecats against live tmux
+# sessions (session_running) and hooked work (issue) — no separate tmux
+# call is needed.
+for rig_path in $(gt rig list --json | jq -r '.[].path'); do
+  rig=$(basename "$(dirname "$rig_path")")
+  gt polecat list "$rig" --all --json
+done
 ```
 
+For each entry, a zombie CANDIDATE is one where:
+- `state` is `idle` or `done`
+- `session_running` is `false`
+- `issue` is empty (no hooked work)
+
+Then confirm the last-activity criterion per candidate (`bd show` prints
+`Updated:` for the polecat's agent bead):
+```bash
+bd show <rig>/polecats/<name>
+# Confirm "Updated:" is older than 10 minutes before treating as a zombie
+```
+
+Only candidates that also fail the last-activity check are true zombies.
+A candidate that flipped idle moments ago is not one yet — give the Witness
+its normal cleanup window.
+
 **NEVER run:**
-- `gt deacon zombie-scan` (without --dry-run)
 - `tmux kill-session`
 - `gt polecat nuke`
 - Any command that terminates a session
