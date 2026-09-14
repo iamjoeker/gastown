@@ -206,6 +206,37 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
+// isQueueFull reports whether a session's queue is at or over capacity.
+//
+// Expired entries are swept first. Without that sweep the cap is enforced by
+// age alone: a queue full of nudges that are already past their TTL — and so
+// would be discarded unread by the very next Drain — refuses the live message
+// arriving now. State has to be consulted before age, or a dead entry
+// outlives the message that supersedes it (gt-loz6).
+func isQueueFull(townRoot, session string) (full bool, pending, maxDepth int) {
+	maxDepth = nudgeConfig(townRoot).MaxQueueDepthV()
+	pending, _ = Pending(townRoot, session)
+	if pending >= maxDepth {
+		if swept, _ := PurgeExpired(townRoot, session); swept > 0 {
+			pending, _ = Pending(townRoot, session)
+		}
+	}
+	return pending >= maxDepth, pending, maxDepth
+}
+
+// IsQueueFull reports whether a session's nudge queue is at capacity under
+// the current configuration.
+//
+// A saturated queue means nothing the session is sent right now can ever be
+// drained — the queue itself is evidence the session cannot make progress.
+// Callers that pick a recipient for new work (e.g. dog dispatch selecting an
+// idle dog) should treat a full queue as disqualifying rather than send the
+// work and let it join the same wedged pile (gt-r57w2).
+func IsQueueFull(townRoot, session string) bool {
+	full, _, _ := isQueueFull(townRoot, session)
+	return full
+}
+
 // Enqueue writes a nudge to the queue for the given session.
 // The nudge will be picked up by the agent's hook at the next turn boundary.
 // Returns an error if the queue is full (MaxQueueDepth reached).
@@ -225,20 +256,7 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	}
 
 	// Check queue depth before writing to prevent runaway senders.
-	//
-	// Expired entries are swept first. Without that sweep the cap is enforced by
-	// age alone: a queue full of nudges that are already past their TTL — and so
-	// would be discarded unread by the very next Drain — refuses the live message
-	// arriving now. State has to be consulted before age, or a dead entry
-	// outlives the message that supersedes it (gt-loz6).
-	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
-	pending, _ := Pending(townRoot, session)
-	if pending >= maxDepth {
-		if swept, _ := PurgeExpired(townRoot, session); swept > 0 {
-			pending, _ = Pending(townRoot, session)
-		}
-	}
-	if pending >= maxDepth {
+	if full, pending, maxDepth := isQueueFull(townRoot, session); full {
 		return fmt.Errorf("nudge queue for %s is full (%d/%d pending)", session, pending, maxDepth)
 	}
 

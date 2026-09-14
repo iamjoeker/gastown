@@ -14,7 +14,9 @@ import (
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -727,6 +729,40 @@ func (m *Manager) GetIdleDog() (*Dog, error) {
 	}
 
 	return nil, nil // No idle dogs
+}
+
+// GetDispatchableDog returns an idle dog whose nudge queue has room, for
+// assigning new dispatch work.
+//
+// An idle dog whose nudge queue is already saturated cannot receive the
+// dispatch notification, let alone anything after it — the saturation is
+// itself proof the dog is not making progress (e.g. it has exhausted its
+// token budget and can no longer act on anything sent to it). Selecting such
+// a dog marks it "working" against work it can never execute, silently
+// stranding it. See gt-r57w2.
+//
+// Returns the first idle dog with room in its queue. If skippedFull is
+// nonzero, that many idle dogs existed but were skipped for having full
+// queues — a nil Dog with skippedFull > 0 tells the caller idle dogs exist
+// but none can currently be dispatched to, as opposed to no idle dogs at all.
+func (m *Manager) GetDispatchableDog() (target *Dog, skippedFull int, err error) {
+	dogs, err := m.List()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	for _, d := range dogs {
+		if d.State != StateIdle {
+			continue
+		}
+		if nudge.IsQueueFull(m.townRoot, session.DogSessionName(d.Name)) {
+			skippedFull++
+			continue
+		}
+		return d, skippedFull, nil
+	}
+
+	return nil, skippedFull, nil
 }
 
 // IdleCount returns the number of idle dogs.

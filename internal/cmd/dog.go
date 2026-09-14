@@ -1561,8 +1561,11 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("dog %s is already working", dogDispatchDog)
 		}
 	} else {
-		// Find idle dog from pool
-		targetDog, err = mgr.GetIdleDog()
+		// Find idle dog from pool. Idle dogs whose nudge queue is already
+		// full cannot receive the dispatch, so they are skipped rather than
+		// selected and silently stranded (gt-r57w2).
+		var skippedFull int
+		targetDog, skippedFull, err = mgr.GetDispatchableDog()
 		if err != nil {
 			return fmt.Errorf("finding idle dog: %w", err)
 		}
@@ -1591,6 +1594,8 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 						}
 					}
 				}
+			} else if skippedFull > 0 {
+				return fmt.Errorf("no dispatchable dogs available: %d idle dog(s) skipped with a full nudge queue (use --dog to target one explicitly or --create to add one)", skippedFull)
 			} else {
 				return fmt.Errorf("no idle dogs available (use --create to add one)")
 			}

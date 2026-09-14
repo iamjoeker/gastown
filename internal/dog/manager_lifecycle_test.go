@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 // =============================================================================
@@ -846,6 +848,71 @@ func TestManager_GetIdleDog_findsIdleDog(t *testing.T) {
 	}
 	if dog.Name != "idler" {
 		t.Errorf("GetIdleDog().Name = %q, want 'idler'", dog.Name)
+	}
+}
+
+// =============================================================================
+// GetDispatchableDog Tests
+// =============================================================================
+
+// fillNudgeQueue enqueues enough nudges to saturate the given dog's queue,
+// simulating a dog that cannot make progress (e.g. token-exhausted).
+func fillNudgeQueue(t *testing.T, townRoot, dogName string) {
+	t.Helper()
+	sessionID := session.DogSessionName(dogName)
+	depth := config.LoadOperationalConfig(townRoot).GetNudgeConfig().MaxQueueDepthV()
+	for i := 0; i < depth; i++ {
+		if err := nudge.Enqueue(townRoot, sessionID, nudge.QueuedNudge{
+			Sender:  "system",
+			Message: "filler",
+		}); err != nil {
+			t.Fatalf("filling nudge queue: %v", err)
+		}
+	}
+}
+
+func TestManager_GetDispatchableDog_skipsFullQueueDog(t *testing.T) {
+	m, root := testManager(t)
+
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateIdle, LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	setupDogWithState(t, m, "bravo", &DogState{
+		Name: "bravo", State: StateIdle, LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	fillNudgeQueue(t, root, "alpha")
+
+	d, skipped, err := m.GetDispatchableDog()
+	if err != nil {
+		t.Fatalf("GetDispatchableDog() error = %v", err)
+	}
+	if d == nil || d.Name != "bravo" {
+		t.Fatalf("GetDispatchableDog() = %v, want bravo (alpha's queue is full)", d)
+	}
+	if skipped != 1 {
+		t.Errorf("skippedFull = %d, want 1", skipped)
+	}
+}
+
+func TestManager_GetDispatchableDog_allFullReturnsNilWithSkippedCount(t *testing.T) {
+	m, root := testManager(t)
+
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateIdle, LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	fillNudgeQueue(t, root, "alpha")
+
+	d, skipped, err := m.GetDispatchableDog()
+	if err != nil {
+		t.Fatalf("GetDispatchableDog() error = %v", err)
+	}
+	if d != nil {
+		t.Errorf("GetDispatchableDog() = %v, want nil when every idle dog's queue is full", d)
+	}
+	if skipped != 1 {
+		t.Errorf("skippedFull = %d, want 1", skipped)
 	}
 }
 
