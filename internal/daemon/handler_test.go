@@ -453,6 +453,7 @@ func TestReapIdleDogs_Constants(t *testing.T) {
 func TestDispatchPlugins_SkipsManualGatePlugin(t *testing.T) {
 	townRoot := t.TempDir()
 	d := testHandlerDaemon(t, townRoot)
+	stubDogHasHookedBead(t, nil)
 
 	pluginDir := filepath.Join(townRoot, "plugins", "test-manual")
 	if err := os.MkdirAll(pluginDir, 0755); err != nil {
@@ -483,9 +484,22 @@ func TestDispatchPlugins_SkipsManualGatePlugin(t *testing.T) {
 		t.Errorf("dog work = %q, want empty (manual-gate plugin must not auto-dispatch)", dg.Work)
 	}
 }
+
+// stubDogHasHookedBead replaces dogHasHookedBeadFn for the duration of the
+// test so findDispatchableDog's beads lookup never shells out to bd.
+func stubDogHasHookedBead(t *testing.T, hooked map[string]bool) {
+	t.Helper()
+	prev := dogHasHookedBeadFn
+	dogHasHookedBeadFn = func(townRoot, dogName string) (bool, error) {
+		return hooked[dogName], nil
+	}
+	t.Cleanup(func() { dogHasHookedBeadFn = prev })
+}
+
 func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 	townRoot := t.TempDir()
 	d := testHandlerDaemon(t, townRoot)
+	stubDogHasHookedBead(t, nil)
 
 	testSetupDogState(t, townRoot, "alpha", dog.StateIdle, time.Now())
 	testSetupDogState(t, townRoot, "bravo", dog.StateIdle, time.Now())
@@ -493,12 +507,32 @@ func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 	mgr := dog.NewManager(townRoot, nil)
 	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
 
-	got := findDispatchableDog(mgr, sm, d.logger)
+	got := findDispatchableDog(mgr, sm, townRoot, d.logger)
 	if got == nil {
 		t.Fatal("findDispatchableDog returned nil; expected an idle dog")
 	}
 	if got.Name != "alpha" && got.Name != "bravo" {
 		t.Errorf("findDispatchableDog = %q, want alpha or bravo", got.Name)
+	}
+}
+
+func TestFindDispatchableDog_SkipsDogWithHookedBead(t *testing.T) {
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	stubDogHasHookedBead(t, map[string]bool{"alpha": true})
+
+	testSetupDogState(t, townRoot, "alpha", dog.StateIdle, time.Now())
+	testSetupDogState(t, townRoot, "bravo", dog.StateIdle, time.Now())
+
+	mgr := dog.NewManager(townRoot, nil)
+	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
+
+	got := findDispatchableDog(mgr, sm, townRoot, d.logger)
+	if got == nil {
+		t.Fatal("findDispatchableDog returned nil; expected bravo to be dispatchable")
+	}
+	if got.Name != "bravo" {
+		t.Errorf("findDispatchableDog = %q, want bravo (alpha still carries a hooked bead)", got.Name)
 	}
 }
 

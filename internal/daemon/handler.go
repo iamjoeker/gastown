@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/dog"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -365,7 +366,7 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		// pick the same first idle dog — infinite-looping the same failed
 		// dispatch instead of advancing to the next idle dog in the pack.
 		// See gt-o24.
-		idleDog := findDispatchableDog(mgr, sm, d.logger)
+		idleDog := findDispatchableDog(mgr, sm, d.config.TownRoot, d.logger)
 		if idleDog == nil {
 			d.logger.Printf("Handler: no dispatchable idle dogs available, deferring remaining plugins")
 			return
@@ -425,8 +426,9 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 }
 
 // findDispatchableDog returns the first dog in the kennel whose registry
-// state is idle AND whose tmux session is NOT currently running. Returns nil
-// when no dog satisfies both conditions.
+// state is idle, whose tmux session is NOT currently running, and which does
+// not already carry a hooked formula/molecule bead. Returns nil when no dog
+// satisfies all three conditions.
 //
 // This exists because a dog can be marked idle (via gt dog done or the reaper)
 // before its tmux session fully terminates, producing a transient window where
@@ -434,9 +436,21 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 // dispatch tick infinite-loops the same failed dispatch instead of advancing
 // to another genuinely-free dog in the pack. See gt-o24.
 //
-// IsRunning errors are logged and treated as "not dispatchable" so a flaky
-// tmux check can't wedge the whole dispatch cycle.
-func findDispatchableDog(mgr *dog.Manager, sm *dog.SessionManager, logger *log.Logger) *dog.Dog {
+// The hooked-bead check exists because dog.Manager's idle/working state and a
+// dog's beads-level hook (attached_molecule/attached_formula on its agent
+// bead) can diverge: a dog that exited without reaching its formula's report
+// step (crash, timeout, collision with a prior dispatch) goes back to idle in
+// the Manager while its hook bead stays "hooked" with nothing to clear it.
+// Dispatching a plugin to that dog hands it two live assignments at once — the
+// stale hook and the new plugin mail — and which one it executes is
+// non-deterministic (gt-ei3r6 / hq-8901e). Skipping such dogs here mirrors the
+// singleton check gt sling already performs before re-dispatching a formula to
+// the same dog (see findHookedFormulaSingleton in cmd/sling_formula.go).
+//
+// IsRunning and hooked-bead check errors are logged and treated as "not
+// dispatchable" so a flaky tmux or beads check can't wedge the whole dispatch
+// cycle by repeatedly offering the same broken dog.
+func findDispatchableDog(mgr *dog.Manager, sm *dog.SessionManager, townRoot string, logger *log.Logger) *dog.Dog {
 	dogs, err := mgr.List()
 	if err != nil {
 		logger.Printf("Handler: failed to list dogs while picking dispatch target: %v", err)
@@ -454,9 +468,49 @@ func findDispatchableDog(mgr *dog.Manager, sm *dog.SessionManager, logger *log.L
 		if running {
 			continue
 		}
+		hooked, err := dogHasHookedBeadFn(townRoot, d.Name)
+		if err != nil {
+			logger.Printf("Handler: hooked-bead check failed for dog %s: %v; skipping", d.Name, err)
+			continue
+		}
+		if hooked {
+			logger.Printf("Handler: dog %s is idle but still carries a hooked formula/molecule bead; skipping to avoid a dual-assignment collision (gt-ei3r6)", d.Name)
+			continue
+		}
 		return d
 	}
 	return nil
+}
+
+// dogHasHookedBeadFn is a package-level indirection so tests can stub out the
+// beads lookup instead of shelling out to bd. Production code should not
+// reassign this outside of tests.
+var dogHasHookedBeadFn = dogHasHookedBead
+
+// dogHasHookedBead reports whether the given dog's agent bead
+// (deacon/dogs/<name>) currently has a hooked formula or molecule attached.
+func dogHasHookedBead(townRoot, dogName string) (bool, error) {
+	if townRoot == "" || dogName == "" {
+		return false, nil
+	}
+	b := beads.New(townRoot)
+	hookedBeads, err := b.List(beads.ListOptions{
+		Status:    beads.StatusHooked,
+		Assignee:  fmt.Sprintf("deacon/dogs/%s", dogName),
+		Priority:  -1,
+		Ephemeral: true,
+		Limit:     0,
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, bead := range hookedBeads {
+		fields := beads.ParseAttachmentFields(bead)
+		if fields != nil && (fields.AttachedFormula != "" || fields.AttachedMolecule != "") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // loadRigsConfig loads the rigs configuration from mayor/rigs.json.
