@@ -34,7 +34,7 @@ type ConvoyFetcher interface {
 	FetchHooks() (StoreResult[HookRow], error)
 	FetchMayor() (*MayorStatus, error)
 	FetchIssues() (StoreResult[IssueRow], error)
-	FetchActivity() ([]ActivityRow, error)
+	FetchActivity() ([]ActivityRow, bool, error)
 }
 
 // expandCacheEntry holds a cached expanded-view response.
@@ -270,14 +270,15 @@ func (h *ConvoyHandler) collectDashboard(ctx context.Context, expandPanel string
 		// level above the per-store failures StoreResult carries: with no result
 		// at all there are no failed stores to name, so the reason has to come
 		// from the error or the panel falls back to "No hooked work".
-		hooksErr    error
-		mayor       *MayorStatus
-		mayorErr    error
-		issues      StoreResult[IssueRow]
-		issuesErr   error
-		activity    []ActivityRow
-		activityErr error
-		wg          sync.WaitGroup
+		hooksErr          error
+		mayor             *MayorStatus
+		mayorErr          error
+		issues            StoreResult[IssueRow]
+		issuesErr         error
+		activity          []ActivityRow
+		activityTruncated bool
+		activityErr       error
+		wg                sync.WaitGroup
 	)
 
 	// Run all fetches in parallel with error logging
@@ -376,7 +377,7 @@ func (h *ConvoyHandler) collectDashboard(ctx context.Context, expandPanel string
 	}()
 	go func() {
 		defer wg.Done()
-		activity, activityErr = h.fetcher.FetchActivity()
+		activity, activityTruncated, activityErr = h.fetcher.FetchActivity()
 		if activityErr != nil {
 			log.Printf("dashboard: FetchActivity failed: %v", activityErr)
 		}
@@ -480,9 +481,12 @@ func (h *ConvoyHandler) collectDashboard(ctx context.Context, expandPanel string
 		IssuesUnavailable:      unionUnavailable(issuesErr, issues.UnavailableReason()),
 		Activity:               activity,
 		ActivityUnavailable:    unavailableMessage(activityErr),
-		Summary:                summary,
-		Expand:                 expandPanel,
-		CSRFToken:              h.csrfToken,
+		// Same rule as MailTruncated: the timeline window is a deliberate cap,
+		// but a capped read is a floor and the count must say so (gt-t3cgz).
+		ActivityTruncated: activityTruncated,
+		Summary:           summary,
+		Expand:            expandPanel,
+		CSRFToken:         h.csrfToken,
 	}
 
 	return data

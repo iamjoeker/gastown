@@ -289,7 +289,7 @@ func TestFetchActivity_UnreadableEventLogIsAnError(t *testing.T) {
 		t.Fatalf("creating unreadable event log: %v", err)
 	}
 
-	rows, err := f.FetchActivity()
+	rows, _, err := f.FetchActivity()
 	if err == nil {
 		t.Fatal("an unreadable event log must return an error, not an empty timeline")
 	}
@@ -306,7 +306,7 @@ func TestFetchActivity_MissingEventLogIsNotAnError(t *testing.T) {
 	// that has not logged anything yet has no file, and that is not a failure.
 	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
 
-	rows, err := f.FetchActivity()
+	rows, _, err := f.FetchActivity()
 	if err != nil {
 		t.Fatalf("a town with no event log yet must not error: %v", err)
 	}
@@ -321,12 +321,42 @@ func TestFetchActivity_EmptyEventLogIsNotAnError(t *testing.T) {
 		t.Fatalf("writing empty event log: %v", err)
 	}
 
-	rows, err := f.FetchActivity()
+	rows, _, err := f.FetchActivity()
 	if err != nil {
 		t.Fatalf("an empty event log must not error: %v", err)
 	}
 	if len(rows) != 0 {
 		t.Errorf("rows = %v, want empty", rows)
+	}
+}
+
+// TestFetchActivity_TruncationSurvivesAuditFiltering pins the reason
+// truncated is computed from the raw line count rather than len(rows):
+// audit-only events are dropped from rows after the window is taken, so a log
+// with more lines than activityFetchLimit can win a truncated window whose
+// surviving row count comes in under the limit. Deriving truncated from
+// len(rows) instead would silently miss exactly this case (gt-t3cgz).
+func TestFetchActivity_TruncationSurvivesAuditFiltering(t *testing.T) {
+	f := &LiveConvoyFetcher{townRoot: t.TempDir()}
+
+	const auditLine = `{"ts":"2026-01-01T00:00:00Z","type":"sling","visibility":"audit"}`
+	var lines []string
+	for i := 0; i < activityFetchLimit+1; i++ {
+		lines = append(lines, auditLine)
+	}
+	if err := os.WriteFile(filepath.Join(f.townRoot, ".events.jsonl"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatalf("writing event log: %v", err)
+	}
+
+	rows, truncated, err := f.FetchActivity()
+	if err != nil {
+		t.Fatalf("FetchActivity() error = %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rows = %d, want 0 — every line here is audit-only and must be filtered", len(rows))
+	}
+	if !truncated {
+		t.Error("truncated = false, want true — the log held more lines than the window, even though every surviving row was filtered out")
 	}
 }
 
