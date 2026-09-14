@@ -22,6 +22,42 @@ func TestSyncDeaconAgentBeadHeartbeat_ReturnsErrorOnFailure(t *testing.T) {
 	}
 }
 
+// gt-64u14: gt heartbeat only stamped the heartbeat:EPOCH label on the agent
+// bead when GT_ROLE was "deacon" (via syncDeaconHeartbeatStores). Every other
+// role — witness, refinery, polecat, crew, mayor — fell straight through to
+// "Heartbeat updated" having touched only the session heartbeat file, so the
+// agent bead's label never moved no matter how often the agent heartbeat.
+func TestSyncAgentBeadHeartbeat_ResolvesBeadForNonDeaconRole(t *testing.T) {
+	oldGetRole := getRoleForHeartbeat
+	getRoleForHeartbeat = func() (RoleInfo, error) {
+		return RoleInfo{Role: RoleWitness, Rig: "nonexistent-rig", TownRoot: t.TempDir()}, nil
+	}
+	t.Cleanup(func() { getRoleForHeartbeat = oldGetRole })
+
+	// No real rig/beads store exists, so the resolved agent bead lookup must
+	// fail — proving syncAgentBeadHeartbeat actually resolved a bead ID and
+	// attempted to sync it, rather than silently no-oping for this role.
+	err := syncAgentBeadHeartbeat(t.TempDir())
+	if err == nil {
+		t.Fatal("expected an error attempting to sync a heartbeat for an unresolvable witness bead, got nil")
+	}
+}
+
+func TestSyncAgentBeadHeartbeat_NoopForRoleWithoutAgentBead(t *testing.T) {
+	oldGetRole := getRoleForHeartbeat
+	getRoleForHeartbeat = func() (RoleInfo, error) {
+		// Witness/refinery/polecat/crew all return "" from getAgentBeadID
+		// when Rig/Polecat are unset. Confirm that's treated as "nothing to
+		// stamp" rather than an error.
+		return RoleInfo{Role: RoleWitness}, nil
+	}
+	t.Cleanup(func() { getRoleForHeartbeat = oldGetRole })
+
+	if err := syncAgentBeadHeartbeat(t.TempDir()); err != nil {
+		t.Fatalf("expected no error for a role with no resolvable agent bead, got: %v", err)
+	}
+}
+
 func TestSyncDeaconHeartbeatStores_SurfacesAgentBeadSyncError(t *testing.T) {
 	townRoot := t.TempDir()
 	oldSync := deaconAgentBeadHeartbeatSync

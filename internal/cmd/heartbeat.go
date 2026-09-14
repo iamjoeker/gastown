@@ -76,6 +76,17 @@ func runHeartbeat(cmd *cobra.Command, args []string) error {
 		if err := syncDeaconHeartbeatStores(townRoot, context); err != nil {
 			fmt.Printf("warning: failed to touch deacon heartbeat file: %v\n", err)
 		}
+	} else {
+		// gt-64u14: every other role (witness, refinery, polecat, crew,
+		// mayor) only ever touched the session heartbeat file above. Watchers
+		// that read the heartbeat:EPOCH label on the agent bead — the
+		// second-order signal Witness monitoring keys on — never saw it move
+		// no matter how often the agent called `gt heartbeat`, so a
+		// conscientious agent was indistinguishable from one that never
+		// heartbeat at all. Stamp it here too, best-effort.
+		if err := agentBeadHeartbeatSync(townRoot); err != nil {
+			style.PrintWarning("could not stamp agent-bead heartbeat: %v", err)
+		}
 	}
 
 	fmt.Printf("Heartbeat updated: state=%s\n", state)
@@ -122,9 +133,43 @@ func syncDeaconHeartbeatStores(townRoot, action string) error {
 // command over it — but the error is returned rather than discarded so a
 // caller can at least warn instead of reporting unconditional success.
 func syncDeaconAgentBeadHeartbeat(townRoot string) error {
-	agentBead := beads.DeaconBeadIDTown()
-	beadsDir := beads.ResolveBeadsDir(townRoot)
+	return syncAgentBeadHeartbeatThrottled(beads.DeaconBeadIDTown(), beads.ResolveBeadsDir(townRoot))
+}
 
+// agentBeadHeartbeatSync is an indirection over syncAgentBeadHeartbeat so
+// tests can observe it without shelling out to bd.
+var agentBeadHeartbeatSync = syncAgentBeadHeartbeat
+
+// getRoleForHeartbeat is an indirection over GetRole so tests can supply a
+// fixed RoleInfo instead of relying on real cwd/env-based role detection.
+var getRoleForHeartbeat = GetRole
+
+// syncAgentBeadHeartbeat refreshes the heartbeat:EPOCH label on the current
+// role's own agent bead. This is the non-deacon counterpart to
+// syncDeaconAgentBeadHeartbeat: `gt heartbeat` previously stamped this label
+// only when GT_ROLE was "deacon", so a witness, refinery, polecat, crew, or
+// mayor session calling `gt heartbeat` touched only the session heartbeat
+// file — the agent bead's heartbeat:EPOCH label, which second-order Witness
+// monitoring reads, never moved no matter how often the agent heartbeat
+// (gt-64u14). Best-effort: a stamping failure must not fail the command.
+func syncAgentBeadHeartbeat(townRoot string) error {
+	ctx, err := getRoleForHeartbeat()
+	if err != nil {
+		return fmt.Errorf("detecting role: %w", err)
+	}
+	agentBead := getAgentBeadID(ctx)
+	if agentBead == "" {
+		// Unknown or bead-less role (e.g. detection failed): nothing to stamp.
+		return nil
+	}
+	return syncAgentBeadHeartbeatThrottled(agentBead, beads.ResolveBeadsDir(townRoot))
+}
+
+// syncAgentBeadHeartbeatThrottled refreshes the heartbeat:EPOCH label on
+// agentBead unless it was already refreshed within deaconBeadHeartbeatSyncThreshold —
+// each refresh is a permanent Dolt commit, so this throttles the write
+// cadence rather than stamping on every call.
+func syncAgentBeadHeartbeatThrottled(agentBead, beadsDir string) error {
 	labels, err := getAllAgentLabels(agentBead, beadsDir)
 	if err != nil {
 		return fmt.Errorf("reading agent bead labels: %w", err)
