@@ -6,9 +6,31 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
+
+func TestRetryBudgetExceeded(t *testing.T) {
+	tests := []struct {
+		name    string
+		elapsed time.Duration
+		budget  time.Duration
+		want    bool
+	}{
+		{"well under budget", 1 * time.Second, 20 * time.Second, false},
+		{"just under budget", 19*time.Second + 999*time.Millisecond, 20 * time.Second, false},
+		{"exactly at budget", 20 * time.Second, 20 * time.Second, true},
+		{"over budget", 61 * time.Second, 20 * time.Second, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryBudgetExceeded(tt.elapsed, tt.budget); got != tt.want {
+				t.Errorf("retryBudgetExceeded(%v, %v) = %v, want %v", tt.elapsed, tt.budget, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestOutputMoleculeStatus_StandaloneFormulaShowsVars(t *testing.T) {
 	cwd, err := os.Getwd()
