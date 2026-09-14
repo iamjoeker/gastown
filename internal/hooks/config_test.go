@@ -612,6 +612,25 @@ func TestComputeExpectedNoBase(t *testing.T) {
 		}
 	}
 
+	// Witness has a built-in PreCompact override (gt-a4r4), same mechanism as
+	// crew/refinery: auto-cycle the session on context compaction instead of
+	// compacting in place.
+	if len(witness.PreCompact) == 0 {
+		t.Error("expected witness to have PreCompact hook from DefaultOverrides (gt-a4r4)")
+	} else {
+		found := false
+		for _, entry := range witness.PreCompact {
+			for _, h := range entry.Hooks {
+				if strings.Contains(h.Command, "handoff --cycle --reason compaction") {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Error("expected witness PreCompact hook to run gt handoff --cycle --reason compaction")
+		}
+	}
+
 	// Deacon should get DefaultBase + built-in patrol-formula-guard plus anti-batch guards.
 	deacon, err := ComputeExpected("deacon")
 	if err != nil {
@@ -640,6 +659,25 @@ func TestComputeExpectedNoBase(t *testing.T) {
 	for matcher, found := range deaconPatrolMatchers {
 		if !found {
 			t.Errorf("deacon missing patrol-formula-guard matcher: %s", matcher)
+		}
+	}
+
+	// Deacon has a built-in PreCompact override (gt-a4r4), same mechanism as
+	// crew/refinery/witness: auto-cycle the session on context compaction
+	// instead of compacting in place.
+	if len(deacon.PreCompact) == 0 {
+		t.Error("expected deacon to have PreCompact hook from DefaultOverrides (gt-a4r4)")
+	} else {
+		found := false
+		for _, entry := range deacon.PreCompact {
+			for _, h := range entry.Hooks {
+				if strings.Contains(h.Command, "handoff --cycle --reason compaction") {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Error("expected deacon PreCompact hook to run gt handoff --cycle --reason compaction")
 		}
 	}
 

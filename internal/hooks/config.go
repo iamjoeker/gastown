@@ -366,6 +366,23 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// that survive session restarts and accumulate unbounded.
 		"witness": {
 			UserPromptSubmit: []HookEntry{{Matcher: ""}},
+			// Auto-cycle session on context compaction (gt-a4r4, same fix as
+			// refinery in gt-q6t5). Witness runs unattended patrol shifts with
+			// no self-compaction step of its own; without this override,
+			// PreCompact falls through to the base default (gt prime --hook),
+			// which re-primes but does not replace the session, letting
+			// context climb unbounded over a shift.
+			PreCompact: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: gtCommand("gt handoff --cycle --reason compaction"),
+						},
+					},
+				},
+			},
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*bd mol pour*patrol*)",
@@ -413,6 +430,23 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// Deacons also run patrols and must use wisps, not persistent molecules.
 		"deacon": {
 			UserPromptSubmit: []HookEntry{{Matcher: ""}},
+			// Auto-cycle session on context compaction (gt-a4r4, same fix as
+			// refinery in gt-q6t5). Deacon runs unattended patrol shifts with
+			// no self-compaction step of its own; without this override,
+			// PreCompact falls through to the base default (gt prime --hook),
+			// which re-primes but does not replace the session, letting
+			// context climb unbounded over a shift.
+			PreCompact: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: gtCommand("gt handoff --cycle --reason compaction"),
+						},
+					},
+				},
+			},
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*for *seq*)",
