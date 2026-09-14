@@ -19,6 +19,13 @@ import (
 
 // Note: Agent field parsing is now in internal/beads/fields.go (AgentFields, ParseAgentFields)
 
+// retryBudgetExceeded reports whether elapsed has consumed the retry budget,
+// in which case the hook-lookup retry loop should stop rather than start
+// another attempt.
+func retryBudgetExceeded(elapsed, budget time.Duration) bool {
+	return elapsed >= budget
+}
+
 // buildAgentBeadID constructs the agent bead ID from an agent identity.
 // Uses canonical naming: prefix-rig-role-name
 // Town-level agents use hq- prefix; rig-level agents use rig's prefix.
@@ -447,7 +454,20 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		const maxRetries = 5
 		const baseBackoff = 500 * time.Millisecond
 		const maxBackoff = 8 * time.Second
+		// lookupHookedWork issues many sequential bd subprocess calls (per
+		// status x per assignee address form x issues/wisps), each capable of
+		// independently blocking up to the bd subprocess timeout under Dolt
+		// lock contention (see gt-mknqc). Retrying the full schedule after a
+		// lookup that already ate most of its time budget compounds a single
+		// stall into a multi-minute hang instead of catching genuine Dolt
+		// propagation lag, which this loop exists for. Bound the retries by
+		// total elapsed time, not just attempt count.
+		const retryBudget = 20 * time.Second
+		retryStart := time.Now()
 		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if retryBudgetExceeded(time.Since(retryStart), retryBudget) {
+				break
+			}
 			backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
 			time.Sleep(backoff)
 			hookBead = lookupHookedWork()
