@@ -529,6 +529,18 @@ func (d *Daemon) Run() (err error) {
 		}
 	}
 
+	// Verify Dolt is reachable before opening beads stores or spawning any
+	// patrol agents. Without this, a daemon that (re)starts while Dolt is
+	// already down never notices: it opens empty beads stores, spawns Deacon
+	// and Mayor into a dead data plane, and just re-logs the circuit-breaker
+	// error every few seconds forever. The prescribed escalation path (write a
+	// bead) is unavailable exactly when it's needed, since that also requires
+	// Dolt. This check runs unconditionally, independent of whether the
+	// dolt_server patrol is configured, so it also covers towns (like this
+	// one) where Dolt is supervised externally (e.g. systemd) and the
+	// dolt_server patrol is intentionally left unconfigured. (gt-sxxpg)
+	d.ensureDoltReachableAtStartup()
+
 	// Write PID file with nonce for ownership verification
 	if _, err := writePIDFile(d.config.PidFile, os.Getpid()); err != nil {
 		return fmt.Errorf("writing PID file: %w", err)
@@ -1071,6 +1083,42 @@ func (d *Daemon) rotateOversizedLogs() {
 	for _, err := range result.Errors {
 		d.logger.Printf("log_rotation: error: %v", err)
 	}
+}
+
+// ensureDoltReachableAtStartup verifies Dolt is reachable exactly once, at
+// daemon startup, before any beads stores are opened or patrol agents are
+// spawned. It is independent of the dolt_server patrol (d.doltServer may be
+// nil) so it still catches a dead Dolt on towns that don't opt into full
+// lifecycle management, e.g. because Dolt is supervised externally.
+//
+// A remote Dolt server is reported but not started — the daemon has no
+// business starting a process on another host, so recovery there is a human
+// or ops-tooling responsibility. A local server gets a best-effort start via
+// doltserver.Start, which is supervisor-aware (routes through systemd when a
+// unit owns the process) and idempotent (no-op if already running).
+func (d *Daemon) ensureDoltReachableAtStartup() {
+	reachErr := doltserver.CheckServerReachable(d.config.TownRoot)
+	if reachErr == nil {
+		return
+	}
+	d.logger.Printf("Dolt server unreachable at daemon startup: %v", reachErr)
+
+	config := doltserver.DefaultConfig(d.config.TownRoot)
+	if config.IsRemote() {
+		d.logger.Printf("ERROR: Dolt server is remote (%s) and unreachable — daemon cannot self-start it, manual intervention required", config.HostPort())
+		return
+	}
+
+	d.logger.Printf("Attempting to start Dolt server (was unreachable at startup)")
+	if err := doltserver.Start(d.config.TownRoot); err != nil {
+		d.logger.Printf("ERROR: failed to start Dolt server at daemon startup: %v", err)
+		return
+	}
+	if err := doltserver.WaitForReady(d.config.TownRoot, 30*time.Second); err != nil {
+		d.logger.Printf("ERROR: Dolt server did not become ready after start attempt: %v", err)
+		return
+	}
+	d.logger.Printf("Dolt server recovered at daemon startup (was unreachable)")
 }
 
 // ensureDoltServerRunning ensures the Dolt SQL server is running if configured.
