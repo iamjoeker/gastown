@@ -249,6 +249,150 @@ func TestDispatchReaperDogLogsMolecule(t *testing.T) {
 	}
 }
 
+// fakeBDShow writes a fake `bd` script that answers `bd show <id> --json`
+// with the given status/close_reason, and returns its path.
+func fakeBDShow(t *testing.T, status, closeReason string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	fakeBD := filepath.Join(binDir, "bd")
+	script := fmt.Sprintf("#!/bin/sh\ncat <<'EOF'\n[{\"status\":%q,\"close_reason\":%q}]\nEOF\n", status, closeReason)
+	if err := os.WriteFile(fakeBD, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	return fakeBD
+}
+
+// fakeGTEscalateRecorder writes a fake `gt` script that appends its args to
+// logPath every time it runs, so a test can tell whether escalate() fired.
+func fakeGTEscalateRecorder(t *testing.T, logPath string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	fakeGT := filepath.Join(binDir, "gt")
+	script := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %q\n", logPath)
+	if err := os.WriteFile(fakeGT, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+	return fakeGT
+}
+
+// TestCheckReaperDogReportedSkipsBeforeTimeout is the case where the Dog is
+// still within its grace period — the watchdog must not check (or clear the
+// pending dispatch) yet.
+func TestCheckReaperDogReportedSkipsBeforeTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock")
+	}
+
+	escalateLog := filepath.Join(t.TempDir(), "escalate.log")
+	d := &Daemon{
+		config:                 &Config{TownRoot: t.TempDir()},
+		bdPath:                 fakeBDShow(t, "open", ""),
+		gtPath:                 fakeGTEscalateRecorder(t, escalateLog),
+		logger:                 log.New(&bytes.Buffer{}, "", 0),
+		lastReaperDispatchID:   "gt-wisp-abc123",
+		lastReaperDispatchTime: time.Now(),
+	}
+
+	d.checkReaperDogReported()
+
+	if d.lastReaperDispatchID == "" {
+		t.Fatalf("checkReaperDogReported cleared a dispatch still inside the grace period")
+	}
+	if _, err := os.Stat(escalateLog); err == nil {
+		t.Fatalf("checkReaperDogReported escalated before the timeout elapsed")
+	}
+}
+
+// TestCheckReaperDogReportedEscalatesWhenStillOpen is the gt-154h shape: the
+// Dog's session died mid-cycle and the dispatched molecule never closed at all.
+func TestCheckReaperDogReportedEscalatesWhenStillOpen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock")
+	}
+
+	escalateLog := filepath.Join(t.TempDir(), "escalate.log")
+	d := &Daemon{
+		config:                 &Config{TownRoot: t.TempDir()},
+		bdPath:                 fakeBDShow(t, "open", ""),
+		gtPath:                 fakeGTEscalateRecorder(t, escalateLog),
+		logger:                 log.New(&bytes.Buffer{}, "", 0),
+		lastReaperDispatchID:   "gt-wisp-abc123",
+		lastReaperDispatchTime: time.Now().Add(-2 * reaperReportTimeout),
+	}
+
+	d.checkReaperDogReported()
+
+	if d.lastReaperDispatchID != "" {
+		t.Fatalf("checkReaperDogReported left the dispatch id set after checking it: %q", d.lastReaperDispatchID)
+	}
+	data, err := os.ReadFile(escalateLog)
+	if err != nil {
+		t.Fatalf("checkReaperDogReported did not escalate a still-open dispatch: %v", err)
+	}
+	if !strings.Contains(string(data), "gt-wisp-abc123") {
+		t.Fatalf("escalation did not name the stalled molecule, got: %s", data)
+	}
+}
+
+// TestCheckReaperDogReportedEscalatesWhenClosedWithoutReason is the gt-kx7f
+// shape the bug describes verbatim: the molecule closed (e.g. by an unrelated
+// sweep) but the Dog never ran the report step's bd close --reason-file, so
+// there is no reason recorded — the cycle's counts are lost even though the
+// wisp itself is gone.
+func TestCheckReaperDogReportedEscalatesWhenClosedWithoutReason(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock")
+	}
+
+	escalateLog := filepath.Join(t.TempDir(), "escalate.log")
+	d := &Daemon{
+		config:                 &Config{TownRoot: t.TempDir()},
+		bdPath:                 fakeBDShow(t, "closed", ""),
+		gtPath:                 fakeGTEscalateRecorder(t, escalateLog),
+		logger:                 log.New(&bytes.Buffer{}, "", 0),
+		lastReaperDispatchID:   "gt-wisp-abc123",
+		lastReaperDispatchTime: time.Now().Add(-2 * reaperReportTimeout),
+	}
+
+	d.checkReaperDogReported()
+
+	data, err := os.ReadFile(escalateLog)
+	if err != nil {
+		t.Fatalf("checkReaperDogReported did not escalate a reasonless close: %v", err)
+	}
+	if !strings.Contains(string(data), "gt-wisp-abc123") {
+		t.Fatalf("escalation did not name the molecule, got: %s", data)
+	}
+}
+
+// TestCheckReaperDogReportedNoEscalationWhenReported is the healthy path: the
+// Dog closed the root with a reason (its report), and the watchdog must not
+// escalate a normal cycle.
+func TestCheckReaperDogReportedNoEscalationWhenReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock")
+	}
+
+	escalateLog := filepath.Join(t.TempDir(), "escalate.log")
+	d := &Daemon{
+		config:                 &Config{TownRoot: t.TempDir()},
+		bdPath:                 fakeBDShow(t, "closed", "cycle complete — reaped=3 purged=1"),
+		gtPath:                 fakeGTEscalateRecorder(t, escalateLog),
+		logger:                 log.New(&bytes.Buffer{}, "", 0),
+		lastReaperDispatchID:   "gt-wisp-abc123",
+		lastReaperDispatchTime: time.Now().Add(-2 * reaperReportTimeout),
+	}
+
+	d.checkReaperDogReported()
+
+	if d.lastReaperDispatchID != "" {
+		t.Fatalf("checkReaperDogReported left the dispatch id set after checking it: %q", d.lastReaperDispatchID)
+	}
+	if _, err := os.Stat(escalateLog); err == nil {
+		t.Fatalf("checkReaperDogReported escalated a normally-reported cycle")
+	}
+}
+
 func TestDoltServerHostIgnoresStaleBeadsHost(t *testing.T) {
 	t.Setenv("GT_DOLT_HOST", "")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")

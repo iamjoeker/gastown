@@ -126,6 +126,15 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastDoctorMolTime time.Time
 
+	// lastReaperDispatchID/lastReaperDispatchTime track the most recently
+	// dispatched mol-dog-reaper root wisp, so the START of the next
+	// wisp_reaper cycle can verify the Dog actually reached the report step
+	// (checkReaperDogReported, gt-kx7f). dispatchReaperDog never waits for or
+	// checks that result itself. Cleared once checked.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	lastReaperDispatchID   string
+	lastReaperDispatchTime time.Time
+
 	// lastMaintenanceRun tracks when scheduled maintenance last ran.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastMaintenanceRun time.Time

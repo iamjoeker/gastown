@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -56,6 +57,19 @@ const (
 	//
 	// This is the constant that auto-closed 7 of 8 agent beads town-wide, twice.
 	defaultStaleIssueAge = 30 * 24 * time.Hour
+
+	// reaperReportTimeout bounds how long a dispatched mol-dog-reaper Dog gets
+	// to reach the report step (bd close <root> --reason-file, gt-0gxt) before
+	// the NEXT cycle's watchdog check (checkReaperDogReported) treats it as
+	// having failed to report (gt-kx7f). dispatchReaperDog never waits for or
+	// reads back the Dog's result, so nothing else in this file notices a Dog
+	// that died mid-cycle — this is the only place that gap is checked.
+	//
+	// Only needs to be longer than a realistic Dog cycle and shorter than the
+	// patrol interval (default 1h): the check runs at the START of the next
+	// cycle, so by construction at least one interval has already elapsed by
+	// the time it runs.
+	reaperReportTimeout = 20 * time.Minute
 )
 
 // WispReaperConfig holds configuration for the wisp_reaper patrol.
@@ -182,6 +196,10 @@ func (d *Daemon) reapWisps() {
 		return
 	}
 
+	// Check whether the PREVIOUS cycle's dispatched Dog ever reached the
+	// report step before dispatching a new one — see checkReaperDogReported.
+	d.checkReaperDogReported()
+
 	config := d.patrolConfig.Patrols.WispReaper
 	maxAge := wispReaperMaxAge(d.patrolConfig)
 	deleteAge := wispDeleteAge(d.patrolConfig)
@@ -289,14 +307,101 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 	if err != nil {
 		return fmt.Errorf("gt sling: %w", err)
 	}
-	if d.logger != nil {
-		if m := reaperMolRootRe.FindSubmatch(output); m != nil {
-			d.logger.Printf("wisp_reaper: dispatched to Dog, molecule=%s", string(m[1]))
-		} else {
-			d.logger.Printf("wisp_reaper: dispatched to Dog (could not parse molecule id from sling output)")
+	if m := reaperMolRootRe.FindSubmatch(output); m != nil {
+		rootID := string(m[1])
+		// Recorded so the NEXT cycle's checkReaperDogReported can verify this
+		// Dog actually reached the report step (gt-kx7f) — dispatch itself
+		// never waits for or reads back that result.
+		d.lastReaperDispatchID = rootID
+		d.lastReaperDispatchTime = time.Now()
+		if d.logger != nil {
+			d.logger.Printf("wisp_reaper: dispatched to Dog, molecule=%s", rootID)
 		}
+	} else if d.logger != nil {
+		d.logger.Printf("wisp_reaper: dispatched to Dog (could not parse molecule id from sling output)")
 	}
 	return nil
+}
+
+// checkReaperDogReported verifies that the Dog dispatched by the PREVIOUS
+// dispatchReaperDog call reached the mol-dog-reaper formula's report step —
+// `bd close <root> --reason-file <path>` (gt-0gxt) — closing the root wisp
+// with a durable reason. dispatchReaperDog itself never waits for or checks
+// this (see its doc comment): it returns as soon as `gt sling` pours the
+// molecule and assigns a Dog. If the Dog's session dies, times out, or
+// otherwise skips the report step after purge/reap already ran, the cycle's
+// accounting is lost with nothing else in the daemon ever noticing (gt-154h's
+// incident: gt-154h, this gap: gt-kx7f).
+//
+// Called at the START of the next reapWisps cycle, so by construction the
+// full patrol interval has already elapsed for the prior dispatch — long
+// enough that a Dog which is still running past reaperReportTimeout is
+// stalled, not merely slow.
+//
+// Non-fatal and self-clearing: a watchdog that leaves its own state dirty on
+// a check it could not complete would either skip every future check (state
+// stuck non-empty forever) or re-escalate the same stale dispatch every cycle
+// (state never cleared) — the id is cleared unconditionally before the check
+// runs so a `bd show` failure here costs one missed check, not a jam.
+func (d *Daemon) checkReaperDogReported() {
+	if d.lastReaperDispatchID == "" {
+		return
+	}
+	if time.Since(d.lastReaperDispatchTime) < reaperReportTimeout {
+		return
+	}
+
+	id := d.lastReaperDispatchID
+	d.lastReaperDispatchID = ""
+
+	status, closeReason, err := d.showReaperDispatch(id)
+	if err != nil {
+		if d.logger != nil {
+			d.logger.Printf("wisp_reaper: watchdog: could not verify prior dispatch %s (%v) — skipping check", id, err)
+		}
+		return
+	}
+
+	switch {
+	case status != "closed":
+		d.escalate("wisp_reaper", fmt.Sprintf(
+			"dispatched Dog molecule %s is still %q more than %s after dispatch — "+
+				"the Dog likely died or stalled before reaching the report step, and this cycle's "+
+				"reap/purge/auto-close counts (if any work ran) are unrecorded", id, status, reaperReportTimeout))
+	case strings.TrimSpace(closeReason) == "":
+		d.escalate("wisp_reaper", fmt.Sprintf(
+			"dispatched Dog molecule %s closed with no reason recorded — it was closed without ever "+
+				"running the report step's `bd close --reason-file` (gt-0gxt), so this cycle's counts are lost", id))
+	default:
+		if d.logger != nil {
+			d.logger.Printf("wisp_reaper: watchdog: prior dispatch %s reported normally", id)
+		}
+	}
+}
+
+// showReaperDispatch reads the status and close reason of a dispatched
+// mol-dog-reaper root wisp via `bd show <id> --json`.
+func (d *Daemon) showReaperDispatch(id string) (status, closeReason string, err error) {
+	cmd := exec.Command(d.bdPath, "show", id, "--json") //nolint:gosec // G204: id parsed from our own prior dispatch output
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return "", "", err
+	}
+
+	var issues []struct {
+		Status      string `json:"status"`
+		CloseReason string `json:"close_reason"`
+	}
+	if err := json.Unmarshal(output, &issues); err != nil {
+		return "", "", err
+	}
+	if len(issues) == 0 {
+		return "", "", fmt.Errorf("bd show %s --json returned no issues", id)
+	}
+	return issues[0].Status, issues[0].CloseReason, nil
 }
 
 // wispArchive resolves the archive the inline purge exports protected wisps to
