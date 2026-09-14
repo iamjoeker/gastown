@@ -264,26 +264,45 @@ func (t *Tmux) probeSubmission(target, needle, promptPrefix string) submitProbe 
 	return analyzeSubmission(content, needle, promptPrefix)
 }
 
+// pollSubmission polls up to attempts times, waiting submitProbeInterval
+// between checks, and folds the sequence via foldSubmitProbes.
 func (t *Tmux) pollSubmission(target, needle, promptPrefix string, attempts int) submitProbe {
-	last := probeUnknown
-	stranded := false
-	for i := 0; i < attempts; i++ {
+	get := func(i int) submitProbe {
 		if i > 0 {
 			time.Sleep(submitProbeInterval)
 		}
-		probe := t.probeSubmission(target, needle, promptPrefix)
+		return t.probeSubmission(target, needle, promptPrefix)
+	}
+	return foldSubmitProbes(get, attempts)
+}
+
+// foldSubmitProbes reduces up to attempts sequential probes to a single
+// verdict. A dirty composer gets the same benefit of the doubt as a stranded
+// one (gt-wl4c9): the "other text" it found may belong to the target's own
+// in-flight turn and clear before the last attempt, so seeing
+// probeComposerDirty once must not short-circuit the remaining attempts —
+// only probeTurnStarted/probeComposerCleared (an unambiguous win) does.
+func foldSubmitProbes(get func(attempt int) submitProbe, attempts int) submitProbe {
+	last := probeUnknown
+	stranded := false
+	dirty := false
+	for i := 0; i < attempts; i++ {
+		probe := get(i)
 		switch probe {
 		case probeTurnStarted, probeComposerCleared:
 			return probe
-		case probeComposerDirty:
-			return probe
 		case probeStranded:
 			stranded = true
+		case probeComposerDirty:
+			dirty = true
 		}
 		last = probe
 	}
 	if stranded {
 		return probeStranded
+	}
+	if dirty {
+		return probeComposerDirty
 	}
 	return last
 }
@@ -301,17 +320,30 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeUnknown:
 		return enterErr
 	case probeComposerDirty:
-		return fmt.Errorf("%w (composer held other text after Enter; our message was never seen stranded)", ErrSubmitNotVerified)
+		// The composer still held other text after every poll attempt: give
+		// it one recovery pass rather than dropping the message outright
+		// (gt-wl4c9). It is possible the "other text" is a stray fragment
+		// (not a human actively typing), in which case the reset below
+		// clears it and our message goes through on the retry.
+		return t.recoverComposer(target, message, needle, promptPrefix,
+			"composer held other text after Enter; our message was never seen")
 	case probeStranded:
-		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
+		return t.recoverComposer(target, message, needle, promptPrefix,
+			"message stranded in composer")
 	default:
 		return enterErr
 	}
 }
 
-func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix string) error {
+// recoverComposer attempts one reset-and-retype recovery after the initial
+// submit failed to verify. cause describes the failure that triggered
+// recovery, for error wording only — it does not change behavior. Shared by
+// both the stranded and dirty-composer branches (gt-wl4c9): both leave the
+// composer in a state that a C-j reset can clear, and both deserve a retry
+// instead of an unconditional failure.
+func (t *Tmux) recoverComposer(target, message, needle, promptPrefix, cause string) error {
 	if _, err := t.run("send-keys", "-t", target, "C-j"); err != nil {
-		return fmt.Errorf("%w (message stranded in composer; C-j reset failed: %v)", ErrSubmitNotVerified, err)
+		return fmt.Errorf("%w (%s; C-j reset failed: %v)", ErrSubmitNotVerified, cause, err)
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -320,18 +352,18 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		return nil
 	case probeComposerCleared:
 		if err := t.sendMessageToTarget(target, message); err != nil {
-			return fmt.Errorf("%w (message stranded in composer; retype failed: %v)", ErrSubmitNotVerified, err)
+			return fmt.Errorf("%w (%s; retype failed: %v)", ErrSubmitNotVerified, cause, err)
 		}
 		time.Sleep(adaptiveTextDelay(len(message)))
 		_ = t.sendEnterVerified(target)
 	case probeStranded, probeComposerDirty, probeUnknown:
-		return fmt.Errorf("%w (message stranded in composer; composer state after C-j: %s)", ErrSubmitNotVerified, probe)
+		return fmt.Errorf("%w (%s; composer state after C-j: %s)", ErrSubmitNotVerified, cause, probe)
 	}
 
 	switch probe := t.pollSubmission(target, needle, promptPrefix, submitProbeAttempts); probe {
 	case probeTurnStarted, probeComposerCleared:
 		return nil
 	default:
-		return fmt.Errorf("nudge submit to %q: %w (message stranded in composer; final state: %s)", target, ErrSubmitNotVerified, probe)
+		return fmt.Errorf("nudge submit to %q: %w (%s; final state: %s)", target, ErrSubmitNotVerified, cause, probe)
 	}
 }

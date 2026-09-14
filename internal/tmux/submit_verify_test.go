@@ -139,6 +139,60 @@ func TestAnalyzeSubmission(t *testing.T) {
 	}
 }
 
+// TestFoldSubmitProbes_DirtyComposerGetsFullPollWindow guards gt-wl4c9: a
+// composer seen as dirty on the first attempt must not be given up on
+// immediately. If it clears (or the message's own turn starts) before the
+// poll window closes, that later, unambiguous state wins.
+func TestFoldSubmitProbes_DirtyComposerGetsFullPollWindow(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		probes []submitProbe
+		want   submitProbe
+	}{
+		{
+			name:   "dirty on first attempt, clears on second",
+			probes: []submitProbe{probeComposerDirty, probeComposerCleared},
+			want:   probeComposerCleared,
+		},
+		{
+			name:   "dirty on first attempt, our turn starts on last",
+			probes: []submitProbe{probeComposerDirty, probeComposerDirty, probeTurnStarted},
+			want:   probeTurnStarted,
+		},
+		{
+			name:   "dirty on every attempt stays dirty",
+			probes: []submitProbe{probeComposerDirty, probeComposerDirty, probeComposerDirty},
+			want:   probeComposerDirty,
+		},
+		{
+			name:   "stranded still takes priority over a later dirty read",
+			probes: []submitProbe{probeStranded, probeComposerDirty},
+			want:   probeStranded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			get := func(i int) submitProbe {
+				calls++
+				return tt.probes[i]
+			}
+			if got := foldSubmitProbes(get, len(tt.probes)); got != tt.want {
+				t.Errorf("foldSubmitProbes() = %v, want %v", got, tt.want)
+			}
+			if tt.want == probeComposerCleared || tt.want == probeTurnStarted {
+				// Early return: only probes up to and including the winning one are taken.
+				if calls > len(tt.probes) {
+					t.Errorf("foldSubmitProbes() called get %d times, want <= %d", calls, len(tt.probes))
+				}
+			} else if calls != len(tt.probes) {
+				t.Errorf("foldSubmitProbes() called get %d times, want %d (full window)", calls, len(tt.probes))
+			}
+		})
+	}
+}
+
 func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 	t.Parallel()
 	wrapped := fmt.Errorf("nudge to session: %w", fmt.Errorf("submit: %w", ErrSubmitNotVerified))
