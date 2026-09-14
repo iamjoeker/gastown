@@ -374,6 +374,12 @@ type deliveryStatus struct {
 }
 
 func runEscalateList(cmd *cobra.Command, args []string) error {
+	// Cobra only honours SilenceUsage from the executed command and the ROOT, so
+	// the flag on `escalate` never reached its subcommands (gt-u3mo). Setting it
+	// here rather than on the command keeps usage on arg/flag misuse, which
+	// cobra validates before RunE.
+	cmd.SilenceUsage = true
+
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -524,6 +530,12 @@ func printStrandedEscalations(w io.Writer, stranded []*beads.Issue) {
 func runEscalateAck(cmd *cobra.Command, args []string) error {
 	escalationID := args[0]
 
+	// Cobra only honours SilenceUsage from the executed command and the ROOT, so
+	// the flag on `escalate` never reached its subcommands (gt-u3mo). Setting it
+	// here rather than on the command keeps usage on arg/flag misuse, which
+	// cobra validates before RunE.
+	cmd.SilenceUsage = true
+
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -640,6 +652,12 @@ func printEscalateCloseReport(w io.Writer, result *beads.EscalationCloseResult, 
 }
 
 func runEscalateStale(cmd *cobra.Command, args []string) error {
+	// Cobra only honours SilenceUsage from the executed command and the ROOT, so
+	// the flag on `escalate` never reached its subcommands (gt-u3mo). Setting it
+	// here rather than on the command keeps usage on arg/flag misuse, which
+	// cobra validates before RunE.
+	cmd.SilenceUsage = true
+
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -836,6 +854,12 @@ func formatReescalationMailBody(result *beads.ReescalationResult, reescalatedBy 
 
 func runEscalateShow(cmd *cobra.Command, args []string) error {
 	escalationID := args[0]
+
+	// Cobra only honours SilenceUsage from the executed command and the ROOT, so
+	// the flag on `escalate` never reached its subcommands (gt-u3mo). Setting it
+	// here rather than on the command keeps usage on arg/flag misuse, which
+	// cobra validates before RunE.
+	cmd.SilenceUsage = true
 
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {

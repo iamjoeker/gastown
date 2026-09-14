@@ -912,6 +912,236 @@ func TestEscalateCloseUsageOnlyForMalformedInvocations(t *testing.T) {
 	})
 }
 
+// escalateListCmdDeclaredSilenceUsage, escalateAckCmdDeclaredSilenceUsage,
+// escalateStaleCmdDeclaredSilenceUsage and escalateShowCmdDeclaredSilenceUsage
+// capture the declared values before any test can mutate the shared commands,
+// mirroring escalateCloseCmdDeclaredSilenceUsage above.
+var (
+	escalateListCmdDeclaredSilenceUsage  = escalateListCmd.SilenceUsage
+	escalateAckCmdDeclaredSilenceUsage   = escalateAckCmd.SilenceUsage
+	escalateStaleCmdDeclaredSilenceUsage = escalateStaleCmd.SilenceUsage
+	escalateShowCmdDeclaredSilenceUsage  = escalateShowCmd.SilenceUsage
+)
+
+// TestEscalateListUsageOnlyForMalformedInvocations, TestEscalateAckUsageOnlyForMalformedInvocations,
+// TestEscalateStaleUsageOnlyForMalformedInvocations and TestEscalateShowUsageOnlyForMalformedInvocations
+// cover gt-k9z6: the same SilenceUsage defect gt-u3mo fixed for `gt escalate
+// close` and gt-5h2 fixed for `gt nudge` also affected `gt escalate list`,
+// `gt escalate ack`, `gt escalate stale` and `gt escalate show` — escalateCmd
+// declares SilenceUsage: true, but cobra only honours it from the executed
+// command and the ROOT, so it never reached these subcommands.
+func TestEscalateListUsageOnlyForMalformedInvocations(t *testing.T) {
+	if escalateListCmdDeclaredSilenceUsage {
+		t.Fatal("escalateListCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runEscalateList instead (gt-k9z6)")
+	}
+
+	newListTestCmd := func(out *bytes.Buffer) *cobra.Command {
+		c := &cobra.Command{
+			Use:          escalateListCmd.Use,
+			Args:         escalateListCmd.Args,
+			RunE:         runEscalateList,
+			SilenceUsage: escalateListCmdDeclaredSilenceUsage,
+		}
+		c.SetOut(out)
+		c.SetErr(out)
+		return c
+	}
+
+	t.Run("runtime error prints no usage", func(t *testing.T) {
+		outside := t.TempDir()
+		t.Setenv("GT_TOWN_ROOT", outside)
+		t.Setenv("GT_ROOT", outside)
+		t.Chdir(outside)
+
+		var out bytes.Buffer
+		c := newListTestCmd(&out)
+		c.SetArgs([]string{})
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() outside a workspace returned nil, want an error")
+		}
+		got := out.String()
+		if !strings.Contains(got, "not in a Gas Town workspace") {
+			t.Errorf("output does not carry the diagnosis; the error itself must keep printing:\n%s", got)
+		}
+		if strings.Contains(got, "Usage:") {
+			t.Errorf("runtime failure printed cobra's usage block over its error:\n%s", got)
+		}
+	})
+
+	t.Run("malformed invocation still prints usage", func(t *testing.T) {
+		var out bytes.Buffer
+		c := newListTestCmd(&out)
+		c.SetArgs([]string{"--not-a-real-flag"}) // unknown flag, rejected before RunE
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() with an unknown flag returned nil, want a flag-parse error")
+		}
+		if got := out.String(); !strings.Contains(got, "Usage:") {
+			t.Errorf("malformed invocation lost its usage block:\n%s", got)
+		}
+	})
+}
+
+func TestEscalateAckUsageOnlyForMalformedInvocations(t *testing.T) {
+	if escalateAckCmdDeclaredSilenceUsage {
+		t.Fatal("escalateAckCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runEscalateAck instead (gt-k9z6)")
+	}
+
+	newAckTestCmd := func(out *bytes.Buffer) *cobra.Command {
+		c := &cobra.Command{
+			Use:          escalateAckCmd.Use,
+			Args:         escalateAckCmd.Args,
+			RunE:         runEscalateAck,
+			SilenceUsage: escalateAckCmdDeclaredSilenceUsage,
+		}
+		c.SetOut(out)
+		c.SetErr(out)
+		return c
+	}
+
+	t.Run("runtime error prints no usage", func(t *testing.T) {
+		outside := t.TempDir()
+		t.Setenv("GT_TOWN_ROOT", outside)
+		t.Setenv("GT_ROOT", outside)
+		t.Chdir(outside)
+
+		var out bytes.Buffer
+		c := newAckTestCmd(&out)
+		c.SetArgs([]string{"hq-wisp-nosuch"})
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() outside a workspace returned nil, want an error")
+		}
+		got := out.String()
+		if !strings.Contains(got, "not in a Gas Town workspace") {
+			t.Errorf("output does not carry the diagnosis; the error itself must keep printing:\n%s", got)
+		}
+		if strings.Contains(got, "Usage:") {
+			t.Errorf("runtime failure printed cobra's usage block over its error:\n%s", got)
+		}
+	})
+
+	t.Run("malformed invocation still prints usage", func(t *testing.T) {
+		var out bytes.Buffer
+		c := newAckTestCmd(&out)
+		c.SetArgs([]string{}) // violates Args: ExactArgs(1), so RunE never runs
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() with no arguments returned nil, want an arg-count error")
+		}
+		if got := out.String(); !strings.Contains(got, "Usage:") {
+			t.Errorf("malformed invocation lost its usage block:\n%s", got)
+		}
+	})
+}
+
+func TestEscalateStaleUsageOnlyForMalformedInvocations(t *testing.T) {
+	if escalateStaleCmdDeclaredSilenceUsage {
+		t.Fatal("escalateStaleCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runEscalateStale instead (gt-k9z6)")
+	}
+
+	newStaleTestCmd := func(out *bytes.Buffer) *cobra.Command {
+		c := &cobra.Command{
+			Use:          escalateStaleCmd.Use,
+			Args:         escalateStaleCmd.Args,
+			RunE:         runEscalateStale,
+			SilenceUsage: escalateStaleCmdDeclaredSilenceUsage,
+		}
+		c.SetOut(out)
+		c.SetErr(out)
+		return c
+	}
+
+	t.Run("runtime error prints no usage", func(t *testing.T) {
+		outside := t.TempDir()
+		t.Setenv("GT_TOWN_ROOT", outside)
+		t.Setenv("GT_ROOT", outside)
+		t.Chdir(outside)
+
+		var out bytes.Buffer
+		c := newStaleTestCmd(&out)
+		c.SetArgs([]string{})
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() outside a workspace returned nil, want an error")
+		}
+		got := out.String()
+		if !strings.Contains(got, "not in a Gas Town workspace") {
+			t.Errorf("output does not carry the diagnosis; the error itself must keep printing:\n%s", got)
+		}
+		if strings.Contains(got, "Usage:") {
+			t.Errorf("runtime failure printed cobra's usage block over its error:\n%s", got)
+		}
+	})
+
+	t.Run("malformed invocation still prints usage", func(t *testing.T) {
+		var out bytes.Buffer
+		c := newStaleTestCmd(&out)
+		c.SetArgs([]string{"--not-a-real-flag"}) // unknown flag, rejected before RunE
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() with an unknown flag returned nil, want a flag-parse error")
+		}
+		if got := out.String(); !strings.Contains(got, "Usage:") {
+			t.Errorf("malformed invocation lost its usage block:\n%s", got)
+		}
+	})
+}
+
+func TestEscalateShowUsageOnlyForMalformedInvocations(t *testing.T) {
+	if escalateShowCmdDeclaredSilenceUsage {
+		t.Fatal("escalateShowCmd declares SilenceUsage: true, which also suppresses usage for flag-parse and arg-count errors; set cmd.SilenceUsage inside runEscalateShow instead (gt-k9z6)")
+	}
+
+	newShowTestCmd := func(out *bytes.Buffer) *cobra.Command {
+		c := &cobra.Command{
+			Use:          escalateShowCmd.Use,
+			Args:         escalateShowCmd.Args,
+			RunE:         runEscalateShow,
+			SilenceUsage: escalateShowCmdDeclaredSilenceUsage,
+		}
+		c.SetOut(out)
+		c.SetErr(out)
+		return c
+	}
+
+	t.Run("runtime error prints no usage", func(t *testing.T) {
+		outside := t.TempDir()
+		t.Setenv("GT_TOWN_ROOT", outside)
+		t.Setenv("GT_ROOT", outside)
+		t.Chdir(outside)
+
+		var out bytes.Buffer
+		c := newShowTestCmd(&out)
+		c.SetArgs([]string{"hq-wisp-nosuch"})
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() outside a workspace returned nil, want an error")
+		}
+		got := out.String()
+		if !strings.Contains(got, "not in a Gas Town workspace") {
+			t.Errorf("output does not carry the diagnosis; the error itself must keep printing:\n%s", got)
+		}
+		if strings.Contains(got, "Usage:") {
+			t.Errorf("runtime failure printed cobra's usage block over its error:\n%s", got)
+		}
+	})
+
+	t.Run("malformed invocation still prints usage", func(t *testing.T) {
+		var out bytes.Buffer
+		c := newShowTestCmd(&out)
+		c.SetArgs([]string{}) // violates Args: ExactArgs(1), so RunE never runs
+
+		if err := c.Execute(); err == nil {
+			t.Fatal("Execute() with no arguments returned nil, want an arg-count error")
+		}
+		if got := out.String(); !strings.Contains(got, "Usage:") {
+			t.Errorf("malformed invocation lost its usage block:\n%s", got)
+		}
+	})
+}
+
 func TestEscalateHelpDoesNotPointAtTildeGt(t *testing.T) {
 	if strings.Contains(escalateCmd.Long, "~/gt/settings") {
 		t.Error("escalate help documents ~/gt/settings, which is not where the config lives")
