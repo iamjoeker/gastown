@@ -95,14 +95,28 @@ func resolveCommitHash() string {
 //
 // It is only meaningful when i.IsStale; callers gate on that. A zero
 // CommitsBehind (count unknown) falls back to the "is stale" wording.
+//
+// When the comparison never attempted a remote refresh (the per-command
+// startup warning's case — see RefreshRemote's doc comment), the result
+// appends a caveat: that CompareRef is a local ref that only moves on
+// fetch, so it can silently lag the refreshed value gt stale/gt doctor
+// would report. A refresh that was attempted but failed (RefreshError set)
+// is not flagged this way — that path already proved staleness via local
+// ancestry containment, so the local-ref caveat would be misleading.
 func (i *StaleBinaryInfo) Describe(subject string) string {
+	var msg string
 	if i.CommitsBehind > 0 {
-		return fmt.Sprintf("%s is %d commits behind %s (built from %s, %s at %s)",
+		msg = fmt.Sprintf("%s is %d commits behind %s (built from %s, %s at %s)",
 			subject, i.CommitsBehind, i.CompareRef,
 			ShortCommit(i.BinaryCommit), i.CompareRef, ShortCommit(i.RepoCommit))
+	} else {
+		msg = fmt.Sprintf("%s is stale (built from %s, %s at %s)",
+			subject, ShortCommit(i.BinaryCommit), i.CompareRef, ShortCommit(i.RepoCommit))
 	}
-	return fmt.Sprintf("%s is stale (built from %s, %s at %s)",
-		subject, ShortCommit(i.BinaryCommit), i.CompareRef, ShortCommit(i.RepoCommit))
+	if !i.Refreshed && i.RefreshError == "" {
+		msg += " — local reference, may lag; run gt stale for the current comparison"
+	}
+	return msg
 }
 
 // ShortCommit returns first 12 characters of a hash.

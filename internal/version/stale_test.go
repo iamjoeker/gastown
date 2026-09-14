@@ -537,21 +537,37 @@ func TestStaleBinaryInfo_Describe(t *testing.T) {
 	}{
 		{
 			name:    "commits behind known",
-			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 3},
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 3, Refreshed: true},
 			subject: "Binary",
 			want:    "Binary is 3 commits behind main (built from abc123456789, main at fed098765432)",
 		},
 		{
 			name:    "count unknown falls back to stale wording",
-			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "origin/main", CommitsBehind: 0},
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "origin/main", CommitsBehind: 0, Refreshed: true},
 			subject: "gt binary",
 			want:    "gt binary is stale (built from abc123456789, origin/main at fed098765432)",
 		},
 		{
 			name:    "short hashes are not truncated",
-			info:    StaleBinaryInfo{BinaryCommit: "abc123", RepoCommit: "def456", CompareRef: "carry/ops", CommitsBehind: 1},
+			info:    StaleBinaryInfo{BinaryCommit: "abc123", RepoCommit: "def456", CompareRef: "carry/ops", CommitsBehind: 1, Refreshed: true},
 			subject: "Binary",
 			want:    "Binary is 1 commits behind carry/ops (built from abc123, carry/ops at def456)",
+		},
+		{
+			// The startup banner's case: no refresh was ever attempted, so the
+			// compare ref is a local ref that only moves on fetch (gt-el0s).
+			name:    "unrefreshed local ref gets the lag caveat",
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 1},
+			subject: "gt binary",
+			want:    "gt binary is 1 commits behind main (built from abc123456789, main at fed098765432) — local reference, may lag; run gt stale for the current comparison",
+		},
+		{
+			// A refresh was attempted but failed; staleness was still proven via
+			// local-ancestry containment, so the local-ref caveat would mislead.
+			name:    "refresh attempted but failed gets no caveat",
+			info:    StaleBinaryInfo{BinaryCommit: bin, RepoCommit: repo, CompareRef: "main", CommitsBehind: 1, RefreshError: "origin unreachable"},
+			subject: "gt binary",
+			want:    "gt binary is 1 commits behind main (built from abc123456789, main at fed098765432)",
 		},
 	}
 	for _, tt := range tests {

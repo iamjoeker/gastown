@@ -42,6 +42,7 @@ func TestStaleResult(t *testing.T) {
 				IsStale: true, IsForward: true, OnMainBranch: true,
 				CommitsBehind: 2, CompareRef: "main",
 				BinaryCommit: "abc1234567890", RepoCommit: "def4567890123",
+				Refreshed: true, // doctor always refreshes; no local-ref caveat
 			},
 			wantStatus:  StatusWarning,
 			wantMessage: "Binary is 2 commits behind main (built from abc123456789, main at def456789012)",
@@ -52,6 +53,7 @@ func TestStaleResult(t *testing.T) {
 			info: &version.StaleBinaryInfo{
 				IsStale: true, CompareRef: "origin/main",
 				BinaryCommit: "abc1234567890", RepoCommit: "def4567890123",
+				Refreshed: true, // doctor always refreshes; no local-ref caveat
 			},
 			wantStatus:  StatusWarning,
 			wantMessage: "Binary is stale (built from abc123456789, origin/main at def456789012)",
