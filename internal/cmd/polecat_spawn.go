@@ -126,6 +126,93 @@ func poolReuseGateOutcome(rigName string, idlePolecat *polecat.Polecat, candidat
 	return o
 }
 
+// poolReuseRefusalEscalationThreshold is how many consecutive dispatches a
+// polecat can be refused for the identical reuse reason before the gate
+// escalates instead of refusing silently forever (gt-83m4). Crossing it more
+// than once costs nothing extra: escalatePoolReuseRefusal's fingerprint keys
+// on (rig, polecat, reason), so raiseEscalation reports later hits as
+// duplicates of the still-open escalation rather than filing a new one.
+const poolReuseRefusalEscalationThreshold = 5
+
+// recordPoolReuseRefusalStreaks persists the consecutive-refusal streak for
+// every candidate the reuse gate turned down this sling, and escalates any
+// polecat now refused for the SAME reason on poolReuseRefusalEscalationThreshold
+// consecutive dispatches. The candidate the gate accepted, if any, has its
+// streak reset instead: a successful reuse breaks the run the streak exists to
+// count, so the next refusal — whatever its reason — must start a new one.
+//
+// This is deliberately best-effort: a failure to read or write one polecat's
+// streak is reported and skipped, never allowed to block the sling that is
+// already in progress.
+func recordPoolReuseRefusalStreaks(townRoot, rigName string, polecatMgr *polecat.Manager, idlePolecat *polecat.Polecat, candidates []polecat.PoolReuseCandidate) {
+	for _, c := range candidates {
+		if c.Reusable {
+			if idlePolecat != nil && c.Name == idlePolecat.Name {
+				if err := polecatMgr.ResetPoolReuseRefusal(c.Name); err != nil {
+					style.PrintWarning("could not reset reuse-refusal streak for %s: %v", c.Name, err)
+				}
+			}
+			continue
+		}
+		reason := c.Reason
+		if reason == "" {
+			reason = "unknown"
+		}
+		count, err := polecatMgr.RecordPoolReuseRefusal(c.Name, reason)
+		if err != nil {
+			style.PrintWarning("could not record reuse-refusal streak for %s: %v", c.Name, err)
+			continue
+		}
+		if count >= poolReuseRefusalEscalationThreshold {
+			escalatePoolReuseRefusal(townRoot, rigName, c.Name, reason, count)
+		}
+	}
+}
+
+// escalatePoolReuseRefusal makes a permanently-refused polecat loud instead of
+// letting the reuse gate reconsider it silently forever (gt-83m4). Like
+// escalateDoneRebaseFailure, it never blocks or fails the sling: an escalation
+// problem here is reported, not propagated.
+func escalatePoolReuseRefusal(townRoot, rigName, polecatName, reason string, count int) {
+	if townRoot == "" {
+		style.PrintWarning("could not escalate repeated reuse refusal for %s/polecats/%s: no town root resolved", rigName, polecatName)
+		return
+	}
+	escalationConfig, cfgErr := config.LoadOrCreateEscalationConfig(config.EscalationConfigPath(townRoot))
+	if cfgErr != nil {
+		style.PrintWarning("could not escalate repeated reuse refusal for %s/polecats/%s: loading escalation config: %v", rigName, polecatName, cfgErr)
+		return
+	}
+
+	agentID := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
+	description := fmt.Sprintf("%s refused for %s on %d consecutive dispatches", agentID, reason, count)
+	reasonBody := fmt.Sprintf("The reuse gate has refused %s for the SAME reason (%q) on %d consecutive dispatches. "+
+		"Nothing else counts or compares refusals across dispatches, so without this escalation the condition would "+
+		"repeat forever with no tripwire (gt-83m4). Investigate why %q cannot clear for this polecat, or run "+
+		"`gt polecat clear-state %s` if it is safe to do so.", agentID, reason, count, reason, agentID)
+
+	outcome, escErr := raiseEscalationFn(escalationRequest{
+		TownRoot:    townRoot,
+		AgentID:     "system",
+		Description: description,
+		Severity:    config.SeverityMedium,
+		Reason:      reasonBody,
+		Source:      "gt sling",
+		Fingerprint: escalationFingerprintLabel(fmt.Sprintf("pool-reuse-refused:%s:%s", agentID, reason)),
+		Config:      escalationConfig,
+	})
+	switch {
+	case escErr != nil:
+		style.PrintWarning("could not escalate repeated reuse refusal for %s: %v", agentID, escErr)
+	case outcome.Duplicate:
+		// Already escalated and still open — the fingerprint is doing its job.
+	case !outcome.Delivered:
+		style.PrintWarning("%v", undeliveredEscalationError(townRoot, outcome.RecordID, config.SeverityMedium, outcome.Actions))
+	default:
+		fmt.Printf("  %s Escalated repeated reuse refusal: %s\n", style.Bold.Render("⚠"), outcome.RecordID)
+	}
+}
+
 // SpawnedPolecatInfo contains info about a spawned polecat session.
 type SpawnedPolecatInfo struct {
 	RigName     string // Rig name (e.g., "gastown")
@@ -297,6 +384,9 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		style.PrintWarning("could not evaluate idle polecats for reuse: %v; allocating fresh...", findErr)
 	}
 	reuseOutcome := poolReuseGateOutcome(rigName, idlePolecat, reuseCandidates, findErr)
+	if findErr == nil {
+		recordPoolReuseRefusalStreaks(townRoot, rigName, polecatMgr, idlePolecat, reuseCandidates)
+	}
 	if findErr != nil || idlePolecat == nil {
 		// The gate's verdict IS the outcome here: there is nothing left to
 		// attempt, so it can be logged now.

@@ -2462,6 +2462,24 @@ func (m *Manager) ReuseDecisionForPolecat(name string, state State) SlotReuseDec
 	return m.reuseDecisionForPolecat(name, state)
 }
 
+// RecordPoolReuseRefusal persists the consecutive same-reason reuse-refusal
+// streak for a polecat and returns the resulting count (gt-83m4). Without
+// this, a polecat refused for an unclearable reason is reconsidered by the
+// gate silently forever: the reason was recorded per-sling but nothing joined
+// those readings across time, so a caller could not tell "refused once" from
+// "refused on every dispatch for weeks" without opening every event by hand.
+func (m *Manager) RecordPoolReuseRefusal(name, reason string) (int, error) {
+	count, _, err := m.agentBeads().RecordReuseRefusalStreak(m.agentBeadID(name), reason, time.Now())
+	return count, err
+}
+
+// ResetPoolReuseRefusal clears a polecat's consecutive reuse-refusal streak.
+// Callers must invoke this when the gate accepts the polecat: a successful
+// reuse breaks the run the streak exists to count.
+func (m *Manager) ResetPoolReuseRefusal(name string) error {
+	return m.agentBeads().ResetReuseRefusalStreak(m.agentBeadID(name))
+}
+
 // WorkstateDispositionForPolecat exposes the canonical lifecycle disposition
 // used by reuse, recovery, list, witness, and scheduler capacity projections.
 func (m *Manager) WorkstateDispositionForPolecat(name string, state State, issue string) WorkstateDisposition {

@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func installMockBDFixedShowOutput(t *testing.T, showOutput string) {
@@ -311,6 +312,150 @@ func TestClearAgentActiveMRIfMatchesRejectsNonAgent(t *testing.T) {
 	logOutput := readMockBDLog(t, logPath)
 	if strings.Contains(logOutput, "update gt-task") {
 		t.Fatalf("mock bd log %q unexpectedly updated non-agent", logOutput)
+	}
+}
+
+func TestRecordReuseRefusalStreakStartsAtOne(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: done\nhook_bead: null"}]`)
+	bd := NewIsolated(tmpDir)
+
+	count, since, err := bd.RecordReuseRefusalStreak("gt-gastown-polecat-nux", "mq-not-submitted", time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("RecordReuseRefusalStreak: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1 for a polecat with no prior streak", count)
+	}
+	if since != "2026-09-13T00:00:00Z" {
+		t.Fatalf("since = %q, want the timestamp of this first refusal", since)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q missing update call", logOutput)
+	}
+}
+
+// TestRecordReuseRefusalStreakIncrementsSameReason pins the case gt-83m4 exists
+// to detect: the SAME reason on consecutive dispatches must accumulate, not
+// reset, or a permanently-refused polecat would never cross an escalation
+// threshold.
+func TestRecordReuseRefusalStreakIncrementsSameReason(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: done\nreuse_refusal_reason: mq-not-submitted\nreuse_refusal_count: 4\nreuse_refusal_since: 2026-09-01T00:00:00Z"}]`)
+	bd := NewIsolated(tmpDir)
+
+	count, since, err := bd.RecordReuseRefusalStreak("gt-gastown-polecat-nux", "mq-not-submitted", time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("RecordReuseRefusalStreak: %v", err)
+	}
+	if count != 5 {
+		t.Fatalf("count = %d, want 5 (4 prior + this one)", count)
+	}
+	// The streak's start must survive the increment: it identifies how long the
+	// condition has been going on, which is the whole point of counting it.
+	if since != "2026-09-01T00:00:00Z" {
+		t.Fatalf("since = %q, want the ORIGINAL streak start preserved across an increment", since)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q missing update call", logOutput)
+	}
+}
+
+// TestRecordReuseRefusalStreakResetsOnDifferentReason pins the other half:
+// two DIFFERENT refusal reasons must never be summed into one streak, or an
+// intermittent, self-clearing condition would look identical to a permanently
+// stuck one.
+func TestRecordReuseRefusalStreakResetsOnDifferentReason(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: done\nreuse_refusal_reason: mq-not-submitted\nreuse_refusal_count: 4\nreuse_refusal_since: 2026-09-01T00:00:00Z"}]`)
+	bd := NewIsolated(tmpDir)
+
+	count, since, err := bd.RecordReuseRefusalStreak("gt-gastown-polecat-nux", "git-dirty", time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("RecordReuseRefusalStreak: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1 — a different reason must restart the streak", count)
+	}
+	if since != "2026-09-13T00:00:00Z" {
+		t.Fatalf("since = %q, want the NEW streak's start, not the old one's", since)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q missing update call", logOutput)
+	}
+}
+
+func TestResetReuseRefusalStreakClearsFields(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: working\nreuse_refusal_reason: mq-not-submitted\nreuse_refusal_count: 4\nreuse_refusal_since: 2026-09-01T00:00:00Z"}]`)
+	bd := NewIsolated(tmpDir)
+
+	if err := bd.ResetReuseRefusalStreak("gt-gastown-polecat-nux"); err != nil {
+		t.Fatalf("ResetReuseRefusalStreak: %v", err)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q missing update call", logOutput)
+	}
+}
+
+// TestResetReuseRefusalStreakNoopsWhenNoStreak covers the success path's cheap
+// case: a polecat reused straight out of the gate with no prior refusal should
+// not cost an update call every single reuse.
+func TestResetReuseRefusalStreakNoopsWhenNoStreak(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: working"}]`)
+	bd := NewIsolated(tmpDir)
+
+	if err := bd.ResetReuseRefusalStreak("gt-gastown-polecat-nux"); err != nil {
+		t.Fatalf("ResetReuseRefusalStreak: %v", err)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q unexpectedly updated a bead with no streak to clear", logOutput)
 	}
 }
 

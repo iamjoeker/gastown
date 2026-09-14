@@ -662,6 +662,41 @@ func TestParseAgentFields_WithCompletionMetadata(t *testing.T) {
 	}
 }
 
+// TestAgentFieldsReuseRefusalStreakRoundTrip covers gt-83m4: the streak fields
+// must survive a Format/Parse round trip, and — the omission this exists to
+// catch — must not appear at all when there is no streak, so an untouched
+// agent bead never grows three stale-looking zero fields.
+func TestAgentFieldsReuseRefusalStreakRoundTrip(t *testing.T) {
+	fields := &AgentFields{
+		RoleType:           "polecat",
+		Rig:                "gastown",
+		AgentState:         "done",
+		ReuseRefusalReason: "mq-not-submitted-closed-source",
+		ReuseRefusalCount:  7,
+		ReuseRefusalSince:  "2026-09-01T00:00:00Z",
+	}
+	desc := FormatAgentDescription("Polecat nux", fields)
+	got := ParseAgentFields(desc)
+
+	if got.ReuseRefusalReason != fields.ReuseRefusalReason {
+		t.Errorf("ReuseRefusalReason = %q, want %q", got.ReuseRefusalReason, fields.ReuseRefusalReason)
+	}
+	if got.ReuseRefusalCount != fields.ReuseRefusalCount {
+		t.Errorf("ReuseRefusalCount = %d, want %d", got.ReuseRefusalCount, fields.ReuseRefusalCount)
+	}
+	if got.ReuseRefusalSince != fields.ReuseRefusalSince {
+		t.Errorf("ReuseRefusalSince = %q, want %q", got.ReuseRefusalSince, fields.ReuseRefusalSince)
+	}
+
+	noStreak := ParseAgentFields(FormatAgentDescription("Polecat nux", &AgentFields{RoleType: "polecat", AgentState: "idle"}))
+	if noStreak.ReuseRefusalCount != 0 || noStreak.ReuseRefusalReason != "" || noStreak.ReuseRefusalSince != "" {
+		t.Errorf("a polecat with no streak got non-zero reuse-refusal fields: %+v", noStreak)
+	}
+	if strings.Contains(FormatAgentDescription("Polecat nux", &AgentFields{RoleType: "polecat", AgentState: "idle"}), "reuse_refusal") {
+		t.Error("FormatAgentDescription emitted reuse_refusal fields for a polecat with no streak")
+	}
+}
+
 // --- Convoy watcher tests ---
 
 func TestConvoyFieldsWatchersRoundTrip(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +70,16 @@ type AgentFields struct {
 	// completion — which is how a refused polecat came to read SAFE_TO_NUKE with
 	// its work stranded, visible only in a mail nobody had to read (gt-46rk).
 	MRRefused bool
+
+	// Consecutive pool-reuse-refusal streak (gt-83m4). The reuse gate used to
+	// reconsider a permanently-refused polecat silently forever: the refusal
+	// reason was recorded per-sling but nothing joined those readings across
+	// time, so "refused once by coincidence" and "refused for the 40th
+	// consecutive dispatch" were the same shape in the feed. These three fields
+	// let RecordReuseRefusalStreak tell them apart.
+	ReuseRefusalReason string // The Reason last refused for; keyed on Reason, not ReuseStatus (gt-uapr)
+	ReuseRefusalCount  int    // Consecutive dispatches refused for ReuseRefusalReason
+	ReuseRefusalSince  string // RFC3339 timestamp the current streak started
 }
 
 // Notification level constants
@@ -153,6 +164,15 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 		lines = append(lines, fmt.Sprintf("completion_time: %s", fields.CompletionTime))
 	}
 
+	// Reuse-refusal streak (gt-83m4). Omitted entirely at count 0 rather than
+	// written as zeros: a polecat that has never been refused, or whose streak
+	// was just reset, should not carry three stale-looking fields.
+	if fields.ReuseRefusalCount > 0 {
+		lines = append(lines, fmt.Sprintf("reuse_refusal_reason: %s", fields.ReuseRefusalReason))
+		lines = append(lines, fmt.Sprintf("reuse_refusal_count: %d", fields.ReuseRefusalCount))
+		lines = append(lines, fmt.Sprintf("reuse_refusal_since: %s", fields.ReuseRefusalSince))
+	}
+
 	return strings.Join(lines, "\n")
 }
 
@@ -211,6 +231,15 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.MRRefused = value == "true"
 		case "completion_time":
 			fields.CompletionTime = value
+		// Reuse-refusal streak (gt-83m4)
+		case "reuse_refusal_reason":
+			fields.ReuseRefusalReason = value
+		case "reuse_refusal_count":
+			if n, convErr := strconv.Atoi(value); convErr == nil {
+				fields.ReuseRefusalCount = n
+			}
+		case "reuse_refusal_since":
+			fields.ReuseRefusalSince = value
 		}
 	}
 
@@ -604,6 +633,81 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	if updates.CompletionTime != nil {
 		fields.CompletionTime = *updates.CompletionTime
 	}
+
+	description := FormatAgentDescription(issue.Title, fields)
+	return b.Update(id, UpdateOptions{Description: &description})
+}
+
+// RecordReuseRefusalStreak updates the agent bead's consecutive
+// pool-reuse-refusal streak (gt-83m4): incrementing when reason matches the
+// reason the previous refusal was recorded under, and starting a fresh streak
+// otherwise. It returns the resulting count and the streak's first-seen
+// timestamp so the caller can decide whether the repetition is worth
+// escalating, without having to re-read the bead.
+//
+// Keyed on the disposition Reason the caller passes in, not on ReuseStatus:
+// ReuseStatus is a projection over thirteen predicates and collapses distinct
+// refusal causes into one string (see DecideWorkstate's doc comment, gt-uapr),
+// which would make two different problems look like the same repeating one.
+func (b *Beads) RecordReuseRefusalStreak(id, reason string, now time.Time) (count int, since string, err error) {
+	if target := b.agentBeadTarget(); target != b {
+		return target.RecordReuseRefusalStreak(id, reason, now)
+	}
+
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return 0, "", fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	issue, err := b.Show(id)
+	if err != nil {
+		return 0, "", err
+	}
+	fields := ParseAgentFields(issue.Description)
+
+	if fields.ReuseRefusalCount > 0 && fields.ReuseRefusalReason == reason {
+		fields.ReuseRefusalCount++
+	} else {
+		fields.ReuseRefusalReason = reason
+		fields.ReuseRefusalCount = 1
+		fields.ReuseRefusalSince = now.Format(time.RFC3339)
+	}
+
+	description := FormatAgentDescription(issue.Title, fields)
+	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+		return 0, "", err
+	}
+	return fields.ReuseRefusalCount, fields.ReuseRefusalSince, nil
+}
+
+// ResetReuseRefusalStreak clears an agent bead's consecutive
+// pool-reuse-refusal streak (gt-83m4). Call it when the reuse gate accepts the
+// polecat: a successful reuse breaks the run the streak exists to count, so
+// the next refusal — whatever its reason — starts a new one rather than
+// extending a run that no longer reflects reality.
+func (b *Beads) ResetReuseRefusalStreak(id string) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.ResetReuseRefusalStreak(id)
+	}
+
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	fields := ParseAgentFields(issue.Description)
+	if fields.ReuseRefusalCount == 0 {
+		return nil
+	}
+	fields.ReuseRefusalReason = ""
+	fields.ReuseRefusalCount = 0
+	fields.ReuseRefusalSince = ""
 
 	description := FormatAgentDescription(issue.Title, fields)
 	return b.Update(id, UpdateOptions{Description: &description})
